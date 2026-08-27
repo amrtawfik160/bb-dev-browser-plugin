@@ -5,7 +5,7 @@ import type {
   PluginSettingsSectionProps,
   PluginThreadPanelProps,
 } from "@get-bb/plugin-sdk";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -20,6 +20,11 @@ import {
 import { experimental_createHostEntryHarness } from "@get-bb/plugin-sdk/testing/host";
 import {
   browserActivityRecordsSchema,
+  browserActivityAcknowledgementRequestSchema,
+  browserActivityClearResponseSchema,
+  browserActivityExportSchema,
+  browserActivityOutboxRequestSchema,
+  browserActivityReconciliationRequestSchema,
   browserDiagnosticsSchema,
   browserLifecycleRequestSchema,
   browserLifecycleResponseSchema,
@@ -229,8 +234,15 @@ export async function createPublicPluginHarness(options?: {
       rootDirectory: profileStorageRoot!,
       installationId: "installation-public-test",
     });
+  const hostDataRoot = await mkdtemp(join(tmpdir(), "bb-browser-host-"));
   const host = experimental_createHostEntryHarness(
     createBrowserHostEntry(hostBoundary, profileStore),
+    {
+      experimental_paths: {
+        dataDir: hostDataRoot,
+        tempDir: join(hostDataRoot, "tmp"),
+      },
+    },
   );
   const backend = createFakePluginHost({
     pluginId: "browser",
@@ -317,6 +329,27 @@ export async function createPublicPluginHarness(options?: {
           { signal },
         );
       }
+      if (method === "activityOutbox") {
+        return host.experimental_call(
+          "activityOutbox",
+          browserActivityOutboxRequestSchema.parse(input),
+          { signal },
+        );
+      }
+      if (method === "acknowledgeActivity") {
+        return host.experimental_call(
+          "acknowledgeActivity",
+          browserActivityAcknowledgementRequestSchema.parse(input),
+          { signal },
+        );
+      }
+      if (method === "reconcileActivity") {
+        return host.experimental_call(
+          "reconcileActivity",
+          browserActivityReconciliationRequestSchema.parse(input),
+          { signal },
+        );
+      }
       if (method === "listProfiles") {
         return host.experimental_call(
           "listProfiles",
@@ -377,6 +410,20 @@ export async function createPublicPluginHarness(options?: {
         "browser_activity_records",
         input,
       ) as Promise<ReturnType<typeof browserActivityRecordsSchema.parse>>,
+    browser_activity_export: (input: { hostId: string; profileId: string }) =>
+      backend.harness.behavior.callRpc(
+        "browser_activity_export",
+        input,
+      ) as Promise<ReturnType<typeof browserActivityExportSchema.parse>>,
+    browser_activity_clear: (input: {
+      hostId: string;
+      profileId: string;
+      confirmation: string;
+    }) =>
+      backend.harness.behavior.callRpc(
+        "browser_activity_clear",
+        input,
+      ) as Promise<ReturnType<typeof browserActivityClearResponseSchema.parse>>,
     browser_setup_plan: (input: { hostId: string; profileId: string }) =>
       backend.harness.behavior.callRpc("browser_setup_plan", input) as Promise<
         ReturnType<typeof browserSetupPlanSchema.parse>
@@ -569,6 +616,21 @@ export async function createPublicPluginHarness(options?: {
     });
   }
 
+  function persistedActivityRows() {
+    return backend.bb.storage
+      .database()
+      .prepare("SELECT * FROM browser_activity_records ORDER BY id")
+      .all();
+  }
+
+  function persistedHostOutbox() {
+    return readFile(join(hostDataRoot, "browser-activity-outbox.json"), "utf8");
+  }
+
+  function diagnosticLogEntries() {
+    return backend.harness.logEntries;
+  }
+
   function runBrowserProfiles(
     hostId = configuredHostId,
     context?: { projectId?: string | null; threadId?: string },
@@ -632,12 +694,22 @@ export async function createPublicPluginHarness(options?: {
     return { content: [reply.content[0]], isError: true };
   }
 
-  async function runBrowserScriptWithProfile(profileId?: string) {
+  async function runBrowserScriptWithProfile(
+    profileId?: string,
+    overrides?: {
+      purpose?: string;
+      code?: string;
+      destinationOrigin?: string;
+    },
+  ) {
     const reply = await backend.harness.behavior.callAgentTool(
       "browser_script",
       {
-        purpose: "Verify profile resolution",
-        code: "return page.url();",
+        purpose: overrides?.purpose ?? "Verify profile resolution",
+        code: overrides?.code ?? "return page.url();",
+        ...(overrides?.destinationOrigin === undefined
+          ? {}
+          : { destinationOrigin: overrides.destinationOrigin }),
         ...(profileId === undefined ? {} : { profileId }),
       },
       { threadId: THREAD_ID, projectId: PROJECT_ID },
@@ -698,6 +770,12 @@ export async function createPublicPluginHarness(options?: {
           retryDelay: 20,
         });
       }
+      await rm(hostDataRoot, {
+        recursive: true,
+        force: true,
+        maxRetries: 10,
+        retryDelay: 20,
+      });
     }
   }
 
@@ -719,6 +797,9 @@ export async function createPublicPluginHarness(options?: {
     runDiagnosticsCli,
     runBrowserCli,
     runBrowserActivityRecords,
+    persistedActivityRows,
+    persistedHostOutbox,
+    diagnosticLogEntries,
     runBrowserProfiles,
     createBrowserProfile,
     renameBrowserProfile,
