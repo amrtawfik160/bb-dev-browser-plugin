@@ -1,0 +1,3 @@
+# Broker files without mounting workspaces
+
+The `bb-browser` user receives no direct repository access: an explicitly selected workspace upload is resolved through BB's environment file API, must remain inside the environment after realpath resolution, and is copied through one-use Transfer Staging. Every Host Download remains quarantined until the owner explicitly exports it, and existing workspace files require separate overwrite confirmation. This mediation costs extra copies and transfer plumbing but prevents compromised web content from turning a browser session into ambient workspace filesystem access; files are never opened or executed automatically.

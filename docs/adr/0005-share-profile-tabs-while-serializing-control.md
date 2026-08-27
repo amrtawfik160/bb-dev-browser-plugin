@@ -1,0 +1,3 @@
+# Share profile tabs while serializing control
+
+Browser Tabs, one active tab, and one Browser Instance belong to a Browser Profile rather than to a BB thread, so Browser Panels across threads and BB clients observe the same ordered tab set, tab selection, and controller-driven logical viewport; popup windows are normalized into that tab set. Input remains serialized through a Control Lease: owner interaction has priority, an agent script receives a visible, interruptible lease lasting no more than 30 seconds, and a second owner client remains view-only until it explicitly takes control. Agent work is rejected while an owner controls the profile and waits at most five seconds behind another agent, preventing stale queued automation.

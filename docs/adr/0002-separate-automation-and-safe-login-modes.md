@@ -1,0 +1,3 @@
+# Separate automation and safe-login modes
+
+Normal browsing uses a streamed Automation Mode shared with `dev-browser`. When a site rejects automation, the plugin warns about transient state, interrupts agents, gracefully stops Chrome, and exposes the same Browser Profile in owner-only Safe Login Mode without an automation attachment; choosing **Done**, lease expiry, or closing the final Safe Login panel gracefully relaunches Automation Mode. Each Safe Login lease lasts 15 minutes, warns before expiry, and may be extended by the owner. The additional lifecycle complexity is accepted to support hostile login flows without claiming that hardware-bound passkeys, DRM, or corporate device policies will work.

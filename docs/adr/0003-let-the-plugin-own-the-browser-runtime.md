@@ -1,0 +1,3 @@
+# Let the plugin own the browser runtime
+
+The host worker owns browser processes, profiles, and the interactive stream, while `dev-browser` attaches to its Automation Mode endpoint instead of the plugin reusing a daemon-launched browser or maintaining a fork of the daemon. This separation enables smooth streaming and Safe Login relaunches; the existing `dev-browser` `default` profile remains untouched while the plugin creates a dedicated `bb-personal` profile. Adoption is an offline staged copy into a new stable profile identifier, promoted atomically only after compatibility validation; it never mutates the source or weakens Chrome when encrypted state cannot migrate.
