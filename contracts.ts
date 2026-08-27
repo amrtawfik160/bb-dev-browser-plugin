@@ -70,6 +70,8 @@ export const browserSetupPlanSchema = z
     nextStepId: setupStepIdSchema.nullable(),
     storageRoot: z.string().min(1),
     hostStoragePath: z.string().min(1),
+    storageOwner: z.literal("bb-browser"),
+    storageMode: z.literal("0700"),
     configurationPath: z.string().min(1),
     runtime: z
       .object({
@@ -382,6 +384,26 @@ export const browserDiagnosticsSchema = z
 
 export type BrowserDiagnostics = z.infer<typeof browserDiagnosticsSchema>;
 
+export const browserActivityRecordSchema = z
+  .object({
+    id: z.number().int().positive(),
+    occurredAt: z.string().datetime(),
+    actor: z.literal("owner"),
+    hostId: z.string().min(1),
+    profileId: z.string().min(1),
+    kind: z.enum(["setup", "lifecycle", "purge"]),
+    action: z.string().min(1),
+    outcome: z.string().min(1),
+    interrupted: z.boolean(),
+  })
+  .strict();
+
+export const browserActivityRecordsSchema = z
+  .array(browserActivityRecordSchema)
+  .max(10_000);
+
+export type BrowserActivityRecord = z.infer<typeof browserActivityRecordSchema>;
+
 export function setupRequiredStatus(
   target: BrowserStatusTarget,
 ): BrowserStatus {
@@ -463,6 +485,10 @@ export const rpcContract = defineRpcContract({
   browser_diagnostics: {
     input: browserStatusTargetSchema,
     output: browserDiagnosticsSchema,
+  },
+  browser_activity_records: {
+    input: browserHostTargetSchema,
+    output: browserActivityRecordsSchema,
   },
   browser_setup_plan: {
     input: browserHostTargetSchema,

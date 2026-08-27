@@ -218,6 +218,37 @@ describe("Browser host administration contract", () => {
     expect(executor.attemptedOperations).toEqual([]);
   });
 
+  it("R4-CONNECT-ENROLLMENT blocks setup when BB Connect is missing", async () => {
+    const notEnrolled: BrowserStatus = {
+      ...setupRequiredStatus(target),
+      capabilities: setupRequiredStatus(target).capabilities.map(
+        (capability) =>
+          capability.id === "bb-connect"
+            ? {
+                ...capability,
+                status: "missing" as const,
+                reason: "Enroll this host in BB Connect before Browser setup.",
+              }
+            : capability,
+      ),
+    };
+    const { boundary, executor } = administrationFixture(
+      undefined,
+      notEnrolled,
+    );
+    const plan = await boundary.setupPlan(target);
+
+    const blocked = await boundary.setup({
+      ...target,
+      stepId: plan.steps[0]!.id,
+      confirmation: plan.steps[0]!.confirmationText,
+    });
+
+    expect(blocked.outcome).toBe("blocked");
+    expect(blocked.message).toContain("Enroll this host in BB Connect");
+    expect(executor.attemptedOperations).toEqual([]);
+  });
+
   it("persists setup progress across host-boundary recreation", async () => {
     const dataDirectory = await mkdtemp(join(tmpdir(), "browser-admin-state-"));
     try {
@@ -358,6 +389,76 @@ describe("Browser host administration contract", () => {
     });
     expect(repeated.outcome).toBe("already-purged");
     expect(executor.successfulOperations).toHaveLength(4);
+  });
+
+  it("R4-PURGE-SCOPE carries installation identity through lifecycle and purge operations", async () => {
+    const lifecycle = administrationFixture();
+    await lifecycle.boundary.disable({
+      ...target,
+      confirmation: STOP_BROWSER_CONFIRMATION,
+    });
+
+    expect(lifecycle.executor.successfulOperations).toMatchObject([
+      {
+        kind: "stop-owned-processes",
+        hostId: target.hostId,
+        installationId,
+      },
+    ]);
+
+    const purge = administrationFixture();
+    const plan = await purge.boundary.purgePlan(target);
+    await purge.boundary.purge({
+      ...target,
+      confirmation: plan.confirmationText,
+    });
+
+    expect(purge.executor.successfulOperations).toMatchObject([
+      {
+        kind: "stop-owned-processes",
+        hostId: target.hostId,
+        installationId,
+      },
+      {
+        kind: "remove-browser-data",
+        hostId: target.hostId,
+        installationId,
+      },
+      {
+        kind: "remove-installation-configuration",
+        installationId,
+      },
+      {
+        kind: "remove-dedicated-user",
+        hostId: target.hostId,
+        installationId,
+        guard: {
+          type: "last-installation-only",
+          hostId: target.hostId,
+          installationId,
+        },
+      },
+    ]);
+  });
+
+  it("R4-ADMIN-SERIALIZATION serializes concurrent host mutations per host", async () => {
+    const { boundary, executor } = administrationFixture();
+    const request = {
+      ...target,
+      stepId: "dedicated-user" as const,
+      confirmation: "Create bb-browser",
+    };
+
+    const responses = await Promise.all([
+      boundary.setup(request),
+      boundary.setup(request),
+    ]);
+
+    expect(executor.successfulOperations).toHaveLength(1);
+    expect(responses.map((response) => response.outcome).sort()).toEqual([
+      "already-complete",
+      "progressed",
+    ]);
   });
 
   it("resumes purge after an injected target failure without repeating completed targets", async () => {

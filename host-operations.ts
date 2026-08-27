@@ -108,6 +108,7 @@ export type PrivilegedOperation =
       kind: "stop-owned-processes";
       owner: typeof BROWSER_USER;
       hostId: string;
+      installationId: string;
       confirmation: string;
     }
   | {
@@ -126,6 +127,13 @@ export type PrivilegedOperation =
   | {
       kind: "remove-dedicated-user";
       username: typeof BROWSER_USER;
+      hostId: string;
+      installationId: string;
+      guard: {
+        type: "last-installation-only";
+        hostId: string;
+        installationId: string;
+      };
       confirmation: string;
     };
 
@@ -417,6 +425,8 @@ function setupPlan(
     state: setupState(steps),
     nextStepId: steps.find((step) => step.state !== "completed")?.id ?? null,
     ...browserInstallationPaths(installationId, target.hostId),
+    storageOwner: BROWSER_USER,
+    storageMode: "0700",
     runtime: setupRuntime(),
     packages: BROWSER_SYSTEM_PACKAGES,
     steps,
@@ -617,6 +627,7 @@ function purgePlan(
 }
 
 function stopOwnedProcessesOperation(
+  installationId: string,
   hostId: string,
   confirmation: string,
 ): PrivilegedOperation {
@@ -624,6 +635,7 @@ function stopOwnedProcessesOperation(
     kind: "stop-owned-processes",
     owner: BROWSER_USER,
     hostId,
+    installationId,
     confirmation,
   };
 }
@@ -658,11 +670,20 @@ function removeConfigurationOperation(
 }
 
 function removeDedicatedUserOperation(
+  target: BrowserHostTarget,
+  installationId: string,
   confirmation: string,
 ): PrivilegedOperation {
   return {
     kind: "remove-dedicated-user",
     username: BROWSER_USER,
+    hostId: target.hostId,
+    installationId,
+    guard: {
+      type: "last-installation-only",
+      hostId: target.hostId,
+      installationId,
+    },
     confirmation,
   };
 }
@@ -674,7 +695,11 @@ function purgeOperation(
   confirmation: string,
 ): PrivilegedOperation {
   if (id === "stop-owned-processes") {
-    return stopOwnedProcessesOperation(target.hostId, confirmation);
+    return stopOwnedProcessesOperation(
+      installationId,
+      target.hostId,
+      confirmation,
+    );
   }
   if (id === "browser-data") {
     return removeBrowserDataOperation(target, installationId, confirmation);
@@ -682,7 +707,7 @@ function purgeOperation(
   if (id === "configuration") {
     return removeConfigurationOperation(target, installationId, confirmation);
   }
-  return removeDedicatedUserOperation(confirmation);
+  return removeDedicatedUserOperation(target, installationId, confirmation);
 }
 
 function purgeResponse(
@@ -726,6 +751,29 @@ interface HostAdministrationRuntime {
   installationId: string;
   executor: PrivilegedExecutor;
   stateStore: HostAdministrationStateStore;
+  mutationQueues: Map<string, Promise<void>>;
+}
+
+async function withHostMutationLock<T>(
+  runtime: HostAdministrationRuntime,
+  hostId: string,
+  mutation: () => Promise<T>,
+): Promise<T> {
+  const previous = runtime.mutationQueues.get(hostId) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  runtime.mutationQueues.set(hostId, current);
+  await previous;
+  try {
+    return await mutation();
+  } finally {
+    release();
+    if (runtime.mutationQueues.get(hostId) === current) {
+      runtime.mutationQueues.delete(hostId);
+    }
+  }
 }
 
 async function readState(
@@ -771,6 +819,12 @@ function setupReadinessBlock(readiness: BrowserStatus): string | null {
     readiness.state === "host-offline"
   ) {
     return readiness.message;
+  }
+  const connectCapability = readiness.capabilities.find(
+    ({ id }) => id === "bb-connect",
+  );
+  if (connectCapability?.status === "missing") {
+    return connectCapability.reason;
   }
   return null;
 }
@@ -869,7 +923,11 @@ async function tryStopOwnedProcesses(
 ): Promise<boolean> {
   try {
     await runtime.executor.execute(
-      stopOwnedProcessesOperation(request.hostId, request.confirmation),
+      stopOwnedProcessesOperation(
+        runtime.installationId,
+        request.hostId,
+        request.confirmation,
+      ),
     );
     return true;
   } catch (error) {
@@ -1099,6 +1157,7 @@ function createAdministrationRuntime(
     executor: options.executor,
     stateStore:
       options.stateStore ?? createMemoryHostAdministrationStateStore(),
+    mutationQueues: new Map(),
   };
 }
 
@@ -1132,11 +1191,23 @@ export function createHostAdministrationBoundary(
     inspect: (target) => runtime.readiness.inspect(target),
     diagnostics: (target) => runtime.readiness.diagnostics(target),
     setupPlan: (target) => readSetupPlan(target, runtime),
-    setup: (request) => runSetup(request, runtime),
-    disable: (request) => stopProcesses(request, "disable", runtime),
-    uninstall: (request) => stopProcesses(request, "uninstall", runtime),
+    setup: (request) =>
+      withHostMutationLock(runtime, request.hostId, () =>
+        runSetup(request, runtime),
+      ),
+    disable: (request) =>
+      withHostMutationLock(runtime, request.hostId, () =>
+        stopProcesses(request, "disable", runtime),
+      ),
+    uninstall: (request) =>
+      withHostMutationLock(runtime, request.hostId, () =>
+        stopProcesses(request, "uninstall", runtime),
+      ),
     purgePlan: (target) => readPurgePlan(target, runtime),
-    purge: (request) => runPurge(request, runtime),
+    purge: (request) =>
+      withHostMutationLock(runtime, request.hostId, () =>
+        runPurge(request, runtime),
+      ),
   };
 }
 

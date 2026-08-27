@@ -2,11 +2,13 @@
 import { fireEvent } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import {
+  browserActivityRecordsSchema,
   browserDiagnosticsSchema,
   browserLifecycleResponseSchema,
   browserSetupPlanSchema,
   browserSetupResponseSchema,
   browserPurgePlanSchema,
+  browserPurgeResponseSchema,
   browserScriptFailureSchema,
   browserStatusSchema,
   DEFAULT_PROFILE_ID,
@@ -382,6 +384,152 @@ describe("Browser public plugin contract", () => {
     expect(
       executor.successfulOperations.map((operation) => operation.kind),
     ).toContain("stop-owned-processes");
+    await browser.dispose();
+  });
+
+  it("R4-SETUP-PLAN-DETAILS exposes storage owner and permissions everywhere", async () => {
+    const browser = await createPublicPluginHarness();
+    const settings = browser.renderSettings();
+
+    const jsonReply = await browser.runBrowserCli(["setup", "--json"]);
+    const plan = browserSetupPlanSchema.parse(JSON.parse(jsonReply.stdout));
+    const textReply = await browser.runBrowserCli(["setup"]);
+
+    expect(plan.storageOwner).toBe("bb-browser");
+    expect(plan.storageMode).toBe("0700");
+    expect(textReply.stdout).toContain("Storage owner: bb-browser");
+    expect(textReply.stdout).toContain("Storage permissions: 0700");
+    await settings.findByText("bb-browser", { selector: "code" });
+    await settings.findByText("0700", { selector: "code" });
+    await browser.dispose();
+  });
+
+  it("R4-AUDIT-RECORDS records metadata-only setup, lifecycle, and purge activity", async () => {
+    const executor = createSimulatedPrivilegedExecutor();
+    const browser = await createPublicPluginHarness({
+      privilegedExecutor: executor,
+    });
+
+    const setup = await browser.runBrowserCli([
+      "setup",
+      "--step",
+      "dedicated-user",
+      "--confirm",
+      "Create bb-browser",
+      "--json",
+    ]);
+    expect(setup.exitCode).toBe(0);
+
+    const lifecycle = await browser.runBrowserCli([
+      "disable",
+      "--confirm",
+      "Stop Browser processes",
+      "--json",
+    ]);
+    expect(lifecycle.exitCode).toBe(0);
+
+    const purgePlanReply = await browser.runBrowserCli(["purge", "--json"]);
+    const purgePlan = browserPurgePlanSchema.parse(
+      JSON.parse(purgePlanReply.stdout),
+    );
+    const purge = await browser.runBrowserCli([
+      "purge",
+      "--confirm",
+      purgePlan.confirmationText,
+      "--json",
+    ]);
+    expect(purge.exitCode).toBe(0);
+
+    const activity = await browser.runBrowserCli(["activity", "--json"]);
+    const records = browserActivityRecordsSchema.parse(
+      JSON.parse(activity.stdout),
+    );
+    expect(await browser.runBrowserActivityRecords()).toEqual(records);
+
+    expect(
+      records.map(({ kind, action, outcome }) => ({
+        kind,
+        action,
+        outcome,
+      })),
+    ).toEqual([
+      { kind: "setup", action: "dedicated-user", outcome: "progressed" },
+      { kind: "lifecycle", action: "disable", outcome: "stopped" },
+      { kind: "purge", action: "purge", outcome: "purged" },
+    ]);
+    expect(records).toEqual(
+      records.map((record) => ({
+        ...record,
+        actor: "owner",
+        hostId: "host-browser-test",
+        profileId: DEFAULT_PROFILE_ID,
+        interrupted: false,
+      })),
+    );
+    expect(records.every((record) => record.occurredAt.length > 0)).toBe(true);
+    expect(JSON.stringify(records)).not.toContain("Create bb-browser");
+    expect(JSON.stringify(records)).not.toContain("PURGE Browser installation");
+    expect(executor.successfulOperations.length).toBeGreaterThan(0);
+    await browser.dispose();
+  });
+
+  it("R4-CLI-REJECTION-STATUS returns nonzero for rejected and blocked actions", async () => {
+    const executor = createSimulatedPrivilegedExecutor();
+    const browser = await createPublicPluginHarness({
+      privilegedExecutor: executor,
+    });
+
+    const rejectedSetup = await browser.runBrowserCli([
+      "setup",
+      "--step",
+      "dedicated-user",
+      "--confirm",
+      "wrong",
+      "--json",
+    ]);
+    expect(rejectedSetup.exitCode).toBe(1);
+    expect(
+      browserSetupResponseSchema.parse(JSON.parse(rejectedSetup.stdout))
+        .outcome,
+    ).toBe("confirmation-required");
+
+    const blockedSetup = await browser.runBrowserCli([
+      "setup",
+      "--step",
+      "protected-storage",
+      "--confirm",
+      "Configure protected Browser storage",
+      "--json",
+    ]);
+    expect(blockedSetup.exitCode).toBe(1);
+    expect(
+      browserSetupResponseSchema.parse(JSON.parse(blockedSetup.stdout)).outcome,
+    ).toBe("blocked");
+
+    const rejectedPurge = await browser.runBrowserCli([
+      "purge",
+      "--confirm",
+      "wrong",
+      "--json",
+    ]);
+    expect(rejectedPurge.exitCode).toBe(1);
+    expect(
+      browserPurgeResponseSchema.parse(JSON.parse(rejectedPurge.stdout))
+        .outcome,
+    ).toBe("confirmation-required");
+
+    const rejectedLifecycle = await browser.runBrowserCli([
+      "disable",
+      "--confirm",
+      "wrong",
+      "--json",
+    ]);
+    expect(rejectedLifecycle.exitCode).toBe(1);
+    expect(
+      browserLifecycleResponseSchema.parse(JSON.parse(rejectedLifecycle.stdout))
+        .outcome,
+    ).toBe("confirmation-required");
+    expect(executor.attemptedOperations).toEqual([]);
     await browser.dispose();
   });
 

@@ -196,6 +196,12 @@ function SetupControls({
           <p className="mt-2 text-sm text-muted-foreground">
             Protected storage: <code>{setupPlan.hostStoragePath}</code>
           </p>
+          <p className="mt-2 text-sm text-muted-foreground">
+            Storage owner: <code>{setupPlan.storageOwner}</code>
+          </p>
+          <p className="mt-2 text-sm text-muted-foreground">
+            Storage permissions: <code>{setupPlan.storageMode}</code>
+          </p>
           <ol aria-label="Browser setup steps" className="mt-3 space-y-3">
             {setupPlan.steps.map((step) => (
               <li key={step.id} className="rounded border p-3">

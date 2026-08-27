@@ -11,6 +11,7 @@ import {
 } from "./browser-service.js";
 import {
   browserScriptParametersSchema,
+  type BrowserActivityRecord,
   rpcContract,
   setupStepIdSchema,
   DEFAULT_PROFILE_ID,
@@ -23,15 +24,17 @@ import {
 } from "./contracts.js";
 
 const CLI_USAGE = [
-  "Usage: bb browser <status|diagnostics|setup|disable|uninstall|purge> [options]",
+  "Usage: bb browser <status|diagnostics|activity|setup|disable|uninstall|purge> [options]",
   "  setup [--profile <id>] [--step <id> --confirm <text>] [--json]",
   "  purge [--profile <id>] [--confirm <text>] [--json]",
   "  disable|uninstall [--profile <id>] --confirm <text> [--json]",
+  "  activity [--profile <id>] [--json]",
 ].join("\n");
 type BrowserScriptParameters = z.output<typeof browserScriptParametersSchema>;
 const BROWSER_COMMANDS = [
   "status",
   "diagnostics",
+  "activity",
   "setup",
   "disable",
   "uninstall",
@@ -72,6 +75,8 @@ function cliSetupPlanText(plan: BrowserSetupPlan) {
     `Runtime: ${plan.runtime.runAsUser} (${plan.runtime.shell}, Chrome sandbox required)`,
     `Storage root: ${plan.storageRoot}`,
     `Host storage: ${plan.hostStoragePath}`,
+    `Storage owner: ${plan.storageOwner}`,
+    `Storage permissions: ${plan.storageMode}`,
     `Configuration: ${plan.configurationPath}`,
     "Packages:",
     ...packages,
@@ -107,8 +112,29 @@ function cliPurgeResponseText(response: BrowserPurgeResponse) {
   return [response.message, "", cliPurgePlanText(response.plan)].join("\n");
 }
 
+function cliActivityText(records: readonly BrowserActivityRecord[]) {
+  if (records.length === 0) return "No Browser activity records.";
+  return records
+    .map(
+      (record) =>
+        `${record.occurredAt} ${record.kind}:${record.action} ${record.outcome}`,
+    )
+    .join("\n");
+}
+
 function cliJsonOrText<T>(json: boolean, payload: T, textValue: string) {
   return json ? JSON.stringify(payload) : textValue;
+}
+
+function administrationExitCode(outcome: string) {
+  return [
+    "confirmation-required",
+    "blocked",
+    "partial-failure",
+    "failed",
+  ].includes(outcome)
+    ? 1
+    : 0;
 }
 
 function requiredOptionValue(
@@ -200,7 +226,7 @@ function validateCliCommandOptions(
     return `--step is only valid for setup.\n${CLI_USAGE}`;
   }
   if (
-    ["status", "diagnostics"].includes(command) &&
+    ["status", "diagnostics", "activity"].includes(command) &&
     parseState.confirmation !== undefined
   ) {
     return `Confirmation is not valid for ${command}.\n${CLI_USAGE}`;
@@ -289,6 +315,18 @@ async function runDiagnosticsCli(
   return { exitCode: 0, stdout };
 }
 
+async function runActivityCli(
+  browser: BrowserService,
+  target: { hostId: string; profileId: string },
+  json: boolean,
+) {
+  const records = await browser.activityRecords(target);
+  return {
+    exitCode: 0,
+    stdout: cliJsonOrText(json, records, cliActivityText(records)),
+  };
+}
+
 async function runSetupCli(
   browser: BrowserService,
   target: { hostId: string; profileId: string },
@@ -314,7 +352,7 @@ async function runSetupCli(
     signal,
   );
   return {
-    exitCode: response.outcome === "partial-failure" ? 1 : 0,
+    exitCode: administrationExitCode(response.outcome),
     stdout: cliJsonOrText(
       cliArguments.json,
       response,
@@ -341,7 +379,7 @@ async function runPurgeCli(
     signal,
   );
   return {
-    exitCode: response.outcome === "partial-failure" ? 1 : 0,
+    exitCode: administrationExitCode(response.outcome),
     stdout: cliJsonOrText(
       cliArguments.json,
       response,
@@ -369,7 +407,7 @@ async function runLifecycleCli(
     signal,
   );
   return {
-    exitCode: response.outcome === "failed" ? 1 : 0,
+    exitCode: administrationExitCode(response.outcome),
     stdout: cliArguments.json ? JSON.stringify(response) : response.message,
   };
 }
@@ -380,6 +418,9 @@ async function runAdministrationCli(
   context: PluginCliContext,
 ) {
   const target = await browser.resolveTarget(context, cliArguments.profileId);
+  if (cliArguments.command === "activity") {
+    return runActivityCli(browser, target, cliArguments.json);
+  }
   if (cliArguments.command === "setup") {
     return runSetupCli(browser, target, cliArguments, context.signal);
   }
@@ -442,6 +483,11 @@ function registerCli(bb: BbPluginApi, browser: BrowserService) {
         usage: "bb browser diagnostics [--json]",
       },
       {
+        name: "activity",
+        summary: "List retained Browser activity records",
+        usage: "bb browser activity [--json]",
+      },
+      {
         name: "setup",
         summary: "Show or apply the consent-gated Browser setup plan",
         usage: "bb browser setup [--step <id> --confirm <text>] [--json]",
@@ -493,6 +539,7 @@ export default function plugin(bb: BbPluginApi) {
     browser_settings_status: (input) =>
       browser.settingsStatuses(input.profileId),
     browser_diagnostics: (input) => browser.diagnostics(input),
+    browser_activity_records: (input) => browser.activityRecords(input),
     browser_setup_plan: (input) => browser.setupPlan(input),
     browser_setup: (input) => browser.setup(input),
     browser_disable: (input) => browser.lifecycle("disable", input),

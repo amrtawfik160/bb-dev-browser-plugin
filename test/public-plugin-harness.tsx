@@ -16,6 +16,7 @@ import {
 } from "@get-bb/plugin-sdk/testing/app";
 import { experimental_createHostEntryHarness } from "@get-bb/plugin-sdk/testing/host";
 import {
+  browserActivityRecordsSchema,
   browserDiagnosticsSchema,
   browserLifecycleRequestSchema,
   browserLifecycleResponseSchema,
@@ -293,6 +294,11 @@ export async function createPublicPluginHarness(options?: {
       backend.harness.behavior.callRpc("browser_diagnostics", input) as Promise<
         ReturnType<typeof browserDiagnosticsSchema.parse>
       >,
+    browser_activity_records: (input: { hostId: string; profileId: string }) =>
+      backend.harness.behavior.callRpc(
+        "browser_activity_records",
+        input,
+      ) as Promise<ReturnType<typeof browserActivityRecordsSchema.parse>>,
     browser_setup_plan: (input: { hostId: string; profileId: string }) =>
       backend.harness.behavior.callRpc("browser_setup_plan", input) as Promise<
         ReturnType<typeof browserSetupPlanSchema.parse>
@@ -434,6 +440,13 @@ export async function createPublicPluginHarness(options?: {
     });
   }
 
+  function runBrowserActivityRecords() {
+    return rpc.browser_activity_records({
+      hostId: HOST_ID,
+      profileId: DEFAULT_PROFILE_ID,
+    });
+  }
+
   function runBrowserStatus(input: BrowserStatusInput) {
     return rpc.browser_status(input);
   }
@@ -514,6 +527,7 @@ export async function createPublicPluginHarness(options?: {
     runStatusCliText,
     runDiagnosticsCli,
     runBrowserCli,
+    runBrowserActivityRecords,
     runBrowserScript,
     privilegedExecutor: options?.privilegedExecutor ?? null,
     resolveAgentCapabilities,
