@@ -2,6 +2,7 @@ import type {
   JsonValue,
   PluginCliExecutionResult,
   PluginNewThreadPanelProps,
+  PluginSettingsSectionProps,
   PluginThreadPanelProps,
 } from "@get-bb/plugin-sdk";
 import {
@@ -15,6 +16,7 @@ import {
 } from "@get-bb/plugin-sdk/testing/app";
 import { experimental_createHostEntryHarness } from "@get-bb/plugin-sdk/testing/host";
 import {
+  browserDiagnosticsSchema,
   browserScriptRequestSchema,
   browserHostTargetSchema,
   DEFAULT_PROFILE_ID,
@@ -25,6 +27,10 @@ import {
   type rpcContract,
 } from "../contracts.js";
 import { createBrowserHostEntry, type HostSetupBoundary } from "../host.js";
+import {
+  createHostReadinessBoundary,
+  type HostProbeSnapshot,
+} from "../readiness.js";
 import plugin from "../server.js";
 
 const HOST_ID = "host-browser-test";
@@ -88,12 +94,12 @@ function environmentFixture() {
   };
 }
 
-function hostFixture() {
+function hostFixture(status: "connected" | "disconnected" = "connected") {
   return {
     id: HOST_ID,
     name: "Browser contract host",
     type: "persistent" as const,
-    status: "connected" as const,
+    status,
     maxPermissionMode: "full" as const,
     lastSeenAt: 1,
     lastRejectedProtocolVersion: null,
@@ -106,21 +112,48 @@ function panelKey(actionId: string, params: unknown) {
   return `${actionId}:${JSON.stringify(params)}`;
 }
 
-export async function createPublicPluginHarness() {
+export async function createPublicPluginHarness(options?: {
+  status?: BrowserStatus;
+  hostConnection?: "connected" | "disconnected";
+  connectEnrolled?: boolean;
+  snapshot?: HostProbeSnapshot;
+}) {
   let hostMutationCount = 0;
   const setupInspectionTargets: BrowserHostTarget[] = [];
-  const expectedStatus = setupRequiredStatus({
-    hostId: HOST_ID,
-    profileId: DEFAULT_PROFILE_ID,
-  });
+  const expectedStatus =
+    options?.status ??
+    setupRequiredStatus({
+      hostId: HOST_ID,
+      profileId: DEFAULT_PROFILE_ID,
+    });
+  const fixtureBoundary: HostSetupBoundary =
+    options?.snapshot === undefined
+      ? {
+          inspect: () => expectedStatus,
+          diagnostics: (target) => ({
+            hostId: target.hostId,
+            profileId: target.profileId,
+            generatedAt: "2026-08-27T00:00:00.000Z",
+            readiness: expectedStatus,
+            dependencies: [],
+            processes: [],
+            resourceUse: {
+              diskFreeBytes: 0,
+              diskTotalBytes: 0,
+              workerRssBytes: 0,
+            },
+            exitLogs: [],
+          }),
+        }
+      : createHostReadinessBoundary({
+          snapshot: async () => options.snapshot!,
+        });
   const setupBoundary: HostSetupBoundary = {
     inspect: (target) => {
       setupInspectionTargets.push(target);
-      return setupRequiredStatus(target);
+      return fixtureBoundary.inspect(target);
     },
-    provision: () => {
-      hostMutationCount += 1;
-    },
+    diagnostics: (target) => fixtureBoundary.diagnostics(target),
   };
   const host = experimental_createHostEntryHarness(
     createBrowserHostEntry(setupBoundary),
@@ -139,8 +172,19 @@ export async function createPublicPluginHarness() {
       },
       environments: { get: async () => environmentFixture() },
       projects: { get: async () => projectFixture() },
-      hosts: { list: async () => [hostFixture()] },
+      hosts: {
+        list: async () => [hostFixture(options?.hostConnection)],
+      },
     },
+    sharedPortTunnelIdentities:
+      options?.connectEnrolled === false
+        ? undefined
+        : {
+            [HOST_ID]: {
+              label: "browser-contract",
+              baseDomain: "getbb.test",
+            },
+          },
     experimental_callHostRpc: ({ method, input, signal }) => {
       if (method === "status") {
         return host.experimental_call(
@@ -151,17 +195,29 @@ export async function createPublicPluginHarness() {
           },
         );
       }
-      return host.experimental_call(
-        "browserScript",
-        browserScriptRequestSchema.parse(input),
-        { signal },
-      );
+      if (method === "diagnostics") {
+        return host.experimental_call(
+          "diagnostics",
+          browserHostTargetSchema.parse(input),
+          { signal },
+        );
+      }
+      if (method === "browserScript") {
+        return host.experimental_call(
+          "browserScript",
+          browserScriptRequestSchema.parse(input),
+          { signal },
+        );
+      }
+      hostMutationCount += 1;
+      throw new Error(`Unexpected mutating host method: ${method}`);
     },
   });
   await plugin(backend.bb);
   const app = await loadPluginApp(() => import("../app.js"));
   const threadPanels = new Map<string, RenderedSlot>();
   const newThreadPanels = new Map<string, RenderedSlot>();
+  const settingsPanels: RenderedSlot[] = [];
 
   const rpc = {
     browser_status: (input: BrowserStatusInput) =>
@@ -169,7 +225,29 @@ export async function createPublicPluginHarness() {
         "browser_status",
         input,
       ) as Promise<BrowserStatus>,
+    browser_settings_status: (input: { profileId: string }) =>
+      backend.harness.behavior.callRpc(
+        "browser_settings_status",
+        input,
+      ) as Promise<BrowserStatus[]>,
+    browser_diagnostics: (input: {
+      hostId: string | null;
+      profileId: string;
+    }) =>
+      backend.harness.behavior.callRpc("browser_diagnostics", input) as Promise<
+        ReturnType<typeof browserDiagnosticsSchema.parse>
+      >,
   };
+
+  function renderSettings() {
+    const panel = renderSlot<PluginSettingsSectionProps, typeof rpcContract>(
+      app.settingsSections[0]!,
+      {},
+      { rpc },
+    );
+    settingsPanels.push(panel);
+    return panel;
+  }
 
   function renderExistingPanel(params: JsonValue | null) {
     return renderSlot<PluginThreadPanelProps, typeof rpcContract>(
@@ -238,8 +316,26 @@ export async function createPublicPluginHarness() {
     });
   }
 
+  function runStatusCliText(): Promise<PluginCliExecutionResult> {
+    return backend.harness.behavior.runCli(["status"], {
+      threadId: THREAD_ID,
+      projectId: PROJECT_ID,
+    });
+  }
+
+  function runDiagnosticsCli(): Promise<PluginCliExecutionResult> {
+    return backend.harness.behavior.runCli(["diagnostics", "--json"], {
+      threadId: THREAD_ID,
+      projectId: PROJECT_ID,
+    });
+  }
+
   function runBrowserStatus(input: BrowserStatusInput) {
     return rpc.browser_status(input);
+  }
+
+  function runSettingsStatuses() {
+    return rpc.browser_settings_status({ profileId: DEFAULT_PROFILE_ID });
   }
 
   async function runBrowserScript(): Promise<PublicToolFailure> {
@@ -292,6 +388,7 @@ export async function createPublicPluginHarness() {
   async function dispose() {
     for (const panel of threadPanels.values()) panel.lifecycle.unmount();
     for (const panel of newThreadPanels.values()) panel.lifecycle.unmount();
+    for (const panel of settingsPanels) panel.lifecycle.unmount();
     await backend.harness.lifecycle.dispose();
     await host.experimental_dispose();
   }
@@ -306,8 +403,12 @@ export async function createPublicPluginHarness() {
     },
     openExistingThreadPanel,
     openNewThreadPanel,
+    renderSettings,
     runBrowserStatus,
+    runSettingsStatuses,
     runStatusCli,
+    runStatusCliText,
+    runDiagnosticsCli,
     runBrowserScript,
     resolveAgentCapabilities,
     dispose,

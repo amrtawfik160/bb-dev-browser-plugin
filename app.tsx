@@ -6,6 +6,7 @@ import type {
 } from "@get-bb/plugin-sdk/app";
 import {
   DEFAULT_PROFILE_ID,
+  type BrowserDiagnostics,
   type BrowserStatus,
   type BrowserStatusInput,
   type rpcContract,
@@ -13,7 +14,26 @@ import {
 
 const panelParams = { profileId: DEFAULT_PROFILE_ID } as const;
 
-function SetupRequiredView({ status }: { status: BrowserStatus }) {
+function ReadinessChecklist({ status }: { status: BrowserStatus }) {
+  return (
+    <ul
+      aria-label="Host readiness checklist"
+      className="mt-5 space-y-3 text-left"
+    >
+      {status.capabilities.map((capability) => (
+        <li key={capability.id} className="text-sm text-foreground">
+          <span aria-hidden="true">
+            {capability.status === "ready" ? "✓" : "–"}
+          </span>{" "}
+          <strong>{capability.label}</strong>
+          <p className="ml-5 text-muted-foreground">{capability.reason}</p>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+function ReadinessView({ status }: { status: BrowserStatus }) {
   return (
     <main className="flex h-full min-h-0 items-center justify-center bg-background p-6">
       <section
@@ -28,6 +48,7 @@ function SetupRequiredView({ status }: { status: BrowserStatus }) {
         <p className="mt-3 font-mono text-xs text-muted-foreground">
           {status.profileId}
         </p>
+        <ReadinessChecklist status={status} />
       </section>
     </main>
   );
@@ -48,7 +69,61 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
       </div>
     );
   }
-  return <SetupRequiredView status={status} />;
+  return <ReadinessView status={status} />;
+}
+
+function BrowserSettings() {
+  const rpc = useRpc<typeof rpcContract>();
+  const [statuses, setStatuses] = useState<BrowserStatus[] | null>(null);
+  const [diagnostics, setDiagnostics] = useState<BrowserDiagnostics | null>(
+    null,
+  );
+
+  useEffect(() => {
+    void rpc
+      .call("browser_settings_status", { profileId: DEFAULT_PROFILE_ID })
+      .then(setStatuses);
+  }, [rpc]);
+
+  if (statuses === null) {
+    return <p role="status">Checking Browser hosts…</p>;
+  }
+  if (statuses.length === 0) {
+    return <p>No workspace hosts are enrolled.</p>;
+  }
+  return (
+    <div className="space-y-6">
+      {statuses.map((status) => (
+        <section key={status.hostId} aria-label={`Host ${status.hostId}`}>
+          <h3 className="font-semibold">{status.label}</h3>
+          <p className="text-sm text-muted-foreground">{status.message}</p>
+          <ReadinessChecklist status={status} />
+          <button
+            type="button"
+            className="mt-4 rounded border px-3 py-2 text-sm"
+            onClick={() => {
+              void rpc
+                .call("browser_diagnostics", {
+                  hostId: status.hostId,
+                  profileId: status.profileId,
+                })
+                .then(setDiagnostics);
+            }}
+          >
+            Generate redacted diagnostics
+          </button>
+        </section>
+      ))}
+      {diagnostics === null ? null : (
+        <pre
+          aria-label="Redacted diagnostics"
+          className="overflow-auto text-xs"
+        >
+          {JSON.stringify(diagnostics, null, 2)}
+        </pre>
+      )}
+    </div>
+  );
 }
 
 function ThreadBrowserPanel({ threadId }: PluginThreadPanelProps) {
@@ -72,6 +147,14 @@ function NewThreadBrowserPanel({ projectId }: PluginNewThreadPanelProps) {
 }
 
 export default definePluginApp((app) => {
+  app.slots.settingsSection({
+    id: "host-readiness",
+    title: "Host readiness",
+    description:
+      "Check Workspace Browser prerequisites without changing the host.",
+    component: BrowserSettings,
+  });
+
   app.slots.threadPanelAction({
     id: "browser",
     title: "Browser",

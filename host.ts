@@ -1,34 +1,42 @@
 import { experimental_defineHostEntry } from "@get-bb/plugin-sdk/host";
-import {
-  setupRequiredStatus,
-  type BrowserHostTarget,
-  type BrowserStatus,
-} from "./contracts.js";
 import { browserHostContract } from "./host-contract.js";
+import {
+  createHostReadinessBoundary,
+  defaultHostSnapshotReader,
+  type HostReadinessBoundary,
+} from "./readiness.js";
 
-export interface HostSetupBoundary {
-  inspect(target: BrowserHostTarget): BrowserStatus | Promise<BrowserStatus>;
-  provision(): void | Promise<void>;
-}
+export type HostSetupBoundary = HostReadinessBoundary;
 
-export function createBrowserHostEntry(setup: HostSetupBoundary) {
+export function createBrowserHostEntry(readiness: HostReadinessBoundary) {
+  let workerLease: { dispose(): Promise<void> } | undefined;
   return experimental_defineHostEntry({
     contract: browserHostContract,
     handlers: {
-      status: (target) => setup.inspect(target),
-      browserScript: async ({ hostId, profileId }) => ({
-        ok: false as const,
-        error: await setup.inspect({ hostId, profileId }),
-      }),
+      status: (target, context) => {
+        workerLease ??= context.experimental_retainWorker();
+        return readiness.inspect(target);
+      },
+      diagnostics: (target, context) => {
+        workerLease ??= context.experimental_retainWorker();
+        return readiness.diagnostics(target);
+      },
+      browserScript: async ({ hostId, profileId }, context) => {
+        workerLease ??= context.experimental_retainWorker();
+        return {
+          ok: false as const,
+          error: await readiness.inspect({
+            hostId,
+            profileId,
+            connectEnrolled: true,
+          }),
+        };
+      },
     },
+    dispose: async () => workerLease?.dispose(),
   });
 }
 
-const absentHostSetup: HostSetupBoundary = {
-  inspect: setupRequiredStatus,
-  provision() {
-    throw new Error("Privileged Browser setup is outside issue #2.");
-  },
-};
-
-export default createBrowserHostEntry(absentHostSetup);
+export default createBrowserHostEntry(
+  createHostReadinessBoundary(defaultHostSnapshotReader),
+);

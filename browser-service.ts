@@ -4,7 +4,10 @@ import { z } from "zod";
 import {
   browserScriptParametersSchema,
   DEFAULT_PROFILE_ID,
+  hostOfflineStatus,
   setupRequiredStatus,
+  type BrowserDiagnostics,
+  type BrowserStatus,
   type BrowserStatusInput,
 } from "./contracts.js";
 import { browserHostContract } from "./host-contract.js";
@@ -61,6 +64,31 @@ async function resolvedHostId(bb: BbPluginApi, identity: BrowserIdentity) {
   return null;
 }
 
+function offlineDiagnostics(status: BrowserStatus): BrowserDiagnostics {
+  return {
+    hostId: status.hostId!,
+    profileId: status.profileId,
+    generatedAt: new Date().toISOString(),
+    readiness: status,
+    dependencies: [
+      { name: "bb-plugin-browser", version: "0.1.0" },
+      { name: "@get-bb/plugin-sdk", version: "0.4.21" },
+      { name: "dev-browser", version: "0.2.9" },
+      { name: "playwright", version: "1.58.2" },
+    ],
+    processes: [
+      { name: "host-worker", state: "stopped" },
+      { name: "browser", state: "stopped" },
+    ],
+    resourceUse: {
+      diskFreeBytes: 0,
+      diskTotalBytes: 0,
+      workerRssBytes: 0,
+    },
+    exitLogs: [],
+  };
+}
+
 export function panelIdentity(input: BrowserStatusInput): BrowserIdentity {
   return input.surface === "thread"
     ? { threadId: input.threadId }
@@ -72,6 +100,43 @@ export function createBrowserService(bb: BbPluginApi) {
   bb.storage.migrate(database, migrations);
   const host = bb.hosts.experimental_client({ contract: browserHostContract });
 
+  async function hostConnection(hostId: string, signal?: AbortSignal) {
+    const hosts = await bb.sdk.hosts.list({ signal });
+    return hosts.find((candidate) => candidate.id === hostId)?.status ?? null;
+  }
+
+  async function connectEnrolled(hostId: string) {
+    try {
+      await bb.hosts.ensureSharedPortTunnel(hostId);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async function hostStatus(
+    hostId: string,
+    profileId: string,
+    signal?: AbortSignal,
+  ) {
+    const target = { hostId, profileId };
+    if ((await hostConnection(hostId, signal)) !== "connected") {
+      return hostOfflineStatus(target);
+    }
+    try {
+      return await host.call(
+        "status",
+        {
+          ...target,
+          connectEnrolled: await connectEnrolled(hostId),
+        },
+        { hostId, signal },
+      );
+    } catch {
+      return hostOfflineStatus(target);
+    }
+  }
+
   async function status(
     identity: BrowserIdentity,
     profileId = defaultProfileId(database),
@@ -79,7 +144,42 @@ export function createBrowserService(bb: BbPluginApi) {
   ) {
     const hostId = await resolvedHostId(bb, identity);
     if (hostId === null) return setupRequiredStatus({ hostId, profileId });
-    return host.call("status", { hostId, profileId }, { hostId, signal });
+    return hostStatus(hostId, profileId, signal);
+  }
+
+  async function settingsStatuses(profileId = defaultProfileId(database)) {
+    const hosts = await bb.sdk.hosts.list();
+    return Promise.all(
+      hosts.map((candidate) => hostStatus(candidate.id, profileId)),
+    );
+  }
+
+  async function diagnostics(
+    target: { hostId: string | null; profileId: string },
+    signal?: AbortSignal,
+  ) {
+    if (target.hostId === null) {
+      throw new Error("Select a workspace host before requesting diagnostics.");
+    }
+    const readiness = await hostStatus(target.hostId, target.profileId, signal);
+    if (readiness.state === "host-offline") {
+      return offlineDiagnostics(readiness);
+    }
+    try {
+      return await host.call(
+        "diagnostics",
+        {
+          hostId: target.hostId,
+          profileId: target.profileId,
+          connectEnrolled: readiness.capabilities.some(
+            (item) => item.id === "bb-connect" && item.status === "ready",
+          ),
+        },
+        { hostId: target.hostId, signal },
+      );
+    } catch {
+      return offlineDiagnostics(hostOfflineStatus(target));
+    }
   }
 
   async function browserScript(
@@ -110,7 +210,7 @@ export function createBrowserService(bb: BbPluginApi) {
     );
   }
 
-  return { browserScript, status };
+  return { browserScript, diagnostics, settingsStatuses, status };
 }
 
 export type BrowserService = ReturnType<typeof createBrowserService>;
