@@ -1,4 +1,5 @@
 import {
+  chown,
   chmod,
   open,
   mkdir,
@@ -30,13 +31,6 @@ import {
   type BrowserProfileSelectRequest,
 } from "./contracts.js";
 
-const profileSelectionSchema = z
-  .object({
-    version: z.literal(PROFILE_MANIFEST_VERSION),
-    selectedProfileId: browserProfileIdSchema,
-  })
-  .strict();
-
 const PROFILE_DIRECTORY_MODE = 0o700;
 const PROFILE_MANIFEST_MODE = 0o600;
 
@@ -66,6 +60,7 @@ export interface ProfileStoragePaths {
 
 export interface BrowserProfileStore {
   listProfiles(hostId: string): Promise<BrowserProfileInventory>;
+  initialize(hostId: string): Promise<void>;
   createProfile(request: BrowserProfileCreateRequest): Promise<BrowserProfile>;
   renameProfile(request: BrowserProfileRenameRequest): Promise<BrowserProfile>;
   selectProfile(
@@ -78,6 +73,124 @@ export interface FileBrowserProfileStoreOptions {
   installationId: string;
   clock?: () => Date;
   idFactory?: () => string;
+  ownership?: ProfileStorageOwnershipBoundary;
+}
+
+export interface ProfileStorageOwner {
+  uid: number;
+  gid: number;
+}
+
+export interface ProfileStorageOwnershipMetadata {
+  uid: number;
+  gid: number;
+  mode: number;
+}
+
+export interface ProfileStorageOwnershipOperations {
+  chown(path: string, uid: number, gid: number): Promise<void>;
+  inspect(path: string): Promise<ProfileStorageOwnershipMetadata>;
+}
+
+export interface ProfileStorageOwnershipBoundary {
+  ensureOwned(path: string, mode: number): Promise<void>;
+  verifyOwned(path: string, mode: number): Promise<void>;
+}
+
+const filesystemOwnershipOperations: ProfileStorageOwnershipOperations = {
+  chown,
+  async inspect(path) {
+    const metadata = await lstat(path);
+    return { uid: metadata.uid, gid: metadata.gid, mode: metadata.mode };
+  },
+};
+
+function validateProfileStorageOwner(owner: ProfileStorageOwner) {
+  if (
+    !Number.isSafeInteger(owner.uid) ||
+    owner.uid < 0 ||
+    !Number.isSafeInteger(owner.gid) ||
+    owner.gid < 0
+  ) {
+    throw new Error("Browser Profile storage ownership is invalid.");
+  }
+}
+
+export function createProfileStorageOwnershipBoundary(
+  owner: ProfileStorageOwner,
+  operations: ProfileStorageOwnershipOperations = filesystemOwnershipOperations,
+): ProfileStorageOwnershipBoundary {
+  validateProfileStorageOwner(owner);
+  async function verifyOwned(path: string, mode: number) {
+    const metadata = await operations.inspect(path);
+    if (
+      metadata.uid !== owner.uid ||
+      metadata.gid !== owner.gid ||
+      (metadata.mode & 0o7777) !== mode
+    ) {
+      throw new Error(
+        `Browser Profile storage ownership or permissions are invalid: ${path}`,
+      );
+    }
+  }
+  return {
+    async ensureOwned(path, mode) {
+      await operations.chown(path, owner.uid, owner.gid);
+      await verifyOwned(path, mode);
+    },
+    verifyOwned,
+  };
+}
+
+async function browserUserOwner(
+  passwdPath: string,
+): Promise<ProfileStorageOwner> {
+  const passwd = await readFile(passwdPath, "utf8");
+  const fields = passwd
+    .split("\n")
+    .find((line) => line.startsWith("bb-browser:"))
+    ?.split(":");
+  const uid = Number(fields?.[2]);
+  const gid = Number(fields?.[3]);
+  if (
+    fields === undefined ||
+    !Number.isSafeInteger(uid) ||
+    uid <= 0 ||
+    !Number.isSafeInteger(gid) ||
+    gid < 0
+  ) {
+    throw new Error("The bb-browser system user is not configured.");
+  }
+  return { uid, gid };
+}
+
+export function createBrowserUserProfileOwnershipBoundary(
+  options: {
+    passwdPath?: string;
+    operations?: ProfileStorageOwnershipOperations;
+  } = {},
+): ProfileStorageOwnershipBoundary {
+  let ownerPromise: Promise<ProfileStorageOwner> | undefined;
+  let boundaryPromise: Promise<ProfileStorageOwnershipBoundary> | undefined;
+  const passwdPath = options.passwdPath ?? "/etc/passwd";
+  const operations = options.operations ?? filesystemOwnershipOperations;
+  function browserUserBoundary() {
+    ownerPromise ??= browserUserOwner(passwdPath);
+    boundaryPromise ??= ownerPromise.then((owner) =>
+      createProfileStorageOwnershipBoundary(owner, operations),
+    );
+    return boundaryPromise;
+  }
+  return {
+    ensureOwned: (path, mode) =>
+      browserUserBoundary().then((boundary) =>
+        boundary.ensureOwned(path, mode),
+      ),
+    verifyOwned: (path, mode) =>
+      browserUserBoundary().then((boundary) =>
+        boundary.verifyOwned(path, mode),
+      ),
+  };
 }
 
 type ProfileClock = () => Date;
@@ -87,7 +200,6 @@ export type BrowserProfileErrorCode =
   | "profile-name-conflict"
   | "profile-not-found"
   | "profile-manifest-corrupt"
-  | "profile-selection-corrupt"
   | "profile-host-mismatch"
   | "profile-unsupported-version"
   | "profile-id-conflict"
@@ -152,30 +264,35 @@ export function profileStoragePaths(options: {
   );
 }
 
-async function secureDirectory(path: string) {
+async function secureDirectory(
+  path: string,
+  ownership: ProfileStorageOwnershipBoundary,
+) {
   await mkdir(path, { recursive: true, mode: PROFILE_DIRECTORY_MODE });
   const directoryStats = await lstat(path);
   if (!directoryStats.isDirectory()) {
     throw new Error(`Browser Profile storage path is not a directory: ${path}`);
   }
   await chmod(path, PROFILE_DIRECTORY_MODE);
+  await ownership.ensureOwned(path, PROFILE_DIRECTORY_MODE);
 }
 
 async function secureProfileNamespace(
   options: FileBrowserProfileStoreOptions,
   paths: ProfileStoragePaths,
+  ownership: ProfileStorageOwnershipBoundary,
 ) {
   const installationsDirectory = join(options.rootDirectory, "installations");
   const installationDirectory = join(
     installationsDirectory,
     options.installationId,
   );
-  await secureDirectory(options.rootDirectory);
-  await secureDirectory(installationsDirectory);
-  await secureDirectory(installationDirectory);
-  await secureDirectory(join(installationDirectory, "hosts"));
-  await secureDirectory(paths.hostStoragePath);
-  await secureDirectory(paths.profilesDirectory);
+  await secureDirectory(options.rootDirectory, ownership);
+  await secureDirectory(installationsDirectory, ownership);
+  await secureDirectory(installationDirectory, ownership);
+  await secureDirectory(join(installationDirectory, "hosts"), ownership);
+  await secureDirectory(paths.hostStoragePath, ownership);
+  await secureDirectory(paths.profilesDirectory, ownership);
 }
 
 async function pathExists(path: string) {
@@ -201,7 +318,11 @@ async function removeTemporaryJson(path: string) {
   }
 }
 
-async function writeJson(path: string, jsonValue: unknown) {
+async function writeJson(
+  path: string,
+  jsonValue: unknown,
+  ownership: ProfileStorageOwnershipBoundary,
+) {
   const temporaryPath = `${path}.${randomUUID()}.tmp`;
   let moved = false;
   try {
@@ -210,9 +331,11 @@ async function writeJson(path: string, jsonValue: unknown) {
       mode: PROFILE_MANIFEST_MODE,
     });
     await chmod(temporaryPath, PROFILE_MANIFEST_MODE);
+    await ownership.ensureOwned(temporaryPath, PROFILE_MANIFEST_MODE);
     await rename(temporaryPath, path);
     moved = true;
     await chmod(path, PROFILE_MANIFEST_MODE);
+    await ownership.ensureOwned(path, PROFILE_MANIFEST_MODE);
   } finally {
     if (!moved) await removeTemporaryJson(temporaryPath);
   }
@@ -265,70 +388,12 @@ async function writeProfile(
   options: FileBrowserProfileStoreOptions,
   paths: ProfileStoragePaths,
   manifest: BrowserProfileManifest,
+  ownership: ProfileStorageOwnershipBoundary,
 ) {
-  await secureProfileNamespace(options, paths);
-  await secureDirectory(paths.profileDirectory);
-  await secureDirectory(paths.browserDataPath);
-  await writeJson(paths.manifestPath, manifest);
-}
-
-async function writeSelection(path: string, profileId: string) {
-  await writeJson(path, {
-    version: PROFILE_MANIFEST_VERSION,
-    selectedProfileId: profileId,
-  });
-}
-
-async function readSelection(path: string): Promise<string | null> {
-  let selectionStats;
-  try {
-    selectionStats = await lstat(path);
-  } catch (error) {
-    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
-      return null;
-    }
-    throw new BrowserProfileError(
-      "profile-selection-corrupt",
-      `Browser Profile selection cannot be read: ${path}`,
-    );
-  }
-  if (!selectionStats.isFile()) {
-    throw new BrowserProfileError(
-      "profile-selection-corrupt",
-      `Browser Profile selection is not a regular file: ${path}`,
-    );
-  }
-  let contents: string;
-  try {
-    contents = await readFile(path, "utf8");
-  } catch (error) {
-    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
-      return null;
-    }
-    if (!(error instanceof Error)) throw error;
-    throw new BrowserProfileError(
-      "profile-selection-corrupt",
-      `Browser Profile selection cannot be read: ${path}`,
-    );
-  }
-  let raw: unknown;
-  try {
-    raw = JSON.parse(contents);
-  } catch (error) {
-    if (!(error instanceof SyntaxError)) throw error;
-    throw new BrowserProfileError(
-      "profile-selection-corrupt",
-      `Browser Profile selection is invalid: ${path}`,
-    );
-  }
-  const selection = profileSelectionSchema.safeParse(raw);
-  if (!selection.success) {
-    throw new BrowserProfileError(
-      "profile-selection-corrupt",
-      `Browser Profile selection is invalid: ${path}`,
-    );
-  }
-  return selection.data.selectedProfileId;
+  await secureProfileNamespace(options, paths, ownership);
+  await secureDirectory(paths.profileDirectory, ownership);
+  await secureDirectory(paths.browserDataPath, ownership);
+  await writeJson(paths.manifestPath, manifest, ownership);
 }
 
 function profileFromManifest(
@@ -463,6 +528,7 @@ async function acquireFileLock(path: string) {
 async function withMutationLock<T>(
   options: FileBrowserProfileStoreOptions,
   hostId: string,
+  ownership: ProfileStorageOwnershipBoundary,
   operation: () => Promise<T>,
 ): Promise<T> {
   const key = lockKey(options, hostId);
@@ -476,7 +542,7 @@ async function withMutationLock<T>(
   const path = lockPath(options, hostId);
   let lockAcquired = false;
   try {
-    await secureDirectory(join(options.rootDirectory, ".locks"));
+    await secureDirectory(join(options.rootDirectory, ".locks"), ownership);
     await acquireFileLock(path);
     lockAcquired = true;
     return await operation();
@@ -501,11 +567,16 @@ async function withMutationLock<T>(
   }
 }
 
+type ReadProfileManifest = {
+  manifest: BrowserProfileManifest;
+  legacy: unknown | null;
+};
+
 async function readManifest(
   paths: ProfileStoragePaths,
   hostId: string,
   installationId: string,
-): Promise<BrowserProfileManifest> {
+): Promise<ReadProfileManifest> {
   let manifestStats;
   try {
     manifestStats = await lstat(paths.manifestPath);
@@ -577,9 +648,6 @@ async function readManifest(
       `Browser Profile manifest is for another host or installation: ${paths.manifestPath}`,
     );
   }
-  await secureDirectory(paths.profileDirectory);
-  await secureDirectory(paths.browserDataPath);
-  await chmod(paths.manifestPath, PROFILE_MANIFEST_MODE);
   const settings = profileSettings(
     migrated.manifest.locale,
     migrated.manifest.timezone,
@@ -588,11 +656,78 @@ async function readManifest(
     ...migrated.manifest,
     ...settings,
   });
-  if (migrated.legacy !== null) {
-    await writeJson(paths.manifestBackupPath, migrated.legacy);
-    await writeJson(paths.manifestPath, validatedManifest);
+  return { manifest: validatedManifest, legacy: migrated.legacy };
+}
+
+async function profileDirectoryMetadata(path: string) {
+  try {
+    const metadata = await lstat(path);
+    if (!metadata.isDirectory()) {
+      throw new BrowserProfileError(
+        "profile-manifest-corrupt",
+        `Browser Profile storage path is not a directory: ${path}`,
+      );
+    }
+    return metadata;
+  } catch (error) {
+    if (error instanceof BrowserProfileError) throw error;
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      throw new BrowserProfileError(
+        "profile-manifest-corrupt",
+        `Browser Profile storage directory is missing: ${path}`,
+      );
+    }
+    throw new BrowserProfileError(
+      "profile-manifest-corrupt",
+      `Browser Profile storage directory cannot be read: ${path}`,
+    );
   }
-  return validatedManifest;
+}
+
+async function verifyProfileDirectory(
+  path: string,
+  ownership: ProfileStorageOwnershipBoundary,
+) {
+  await profileDirectoryMetadata(path);
+  await ownership.verifyOwned(path, PROFILE_DIRECTORY_MODE);
+}
+
+async function verifyProfileStorage(
+  paths: ProfileStoragePaths,
+  ownership: ProfileStorageOwnershipBoundary,
+) {
+  await verifyProfileDirectory(paths.profileDirectory, ownership);
+  await verifyProfileDirectory(paths.browserDataPath, ownership);
+  await ownership.verifyOwned(paths.manifestPath, PROFILE_MANIFEST_MODE);
+}
+
+async function readVerifiedManifest(
+  paths: ProfileStoragePaths,
+  hostId: string,
+  installationId: string,
+  ownership: ProfileStorageOwnershipBoundary,
+) {
+  const parsed = await readManifest(paths, hostId, installationId);
+  await verifyProfileStorage(paths, ownership);
+  return parsed;
+}
+
+async function repairManifest(
+  paths: ProfileStoragePaths,
+  hostId: string,
+  installationId: string,
+  ownership: ProfileStorageOwnershipBoundary,
+) {
+  const parsed = await readManifest(paths, hostId, installationId);
+  await secureDirectory(paths.profileDirectory, ownership);
+  await secureDirectory(paths.browserDataPath, ownership);
+  await chmod(paths.manifestPath, PROFILE_MANIFEST_MODE);
+  await ownership.ensureOwned(paths.manifestPath, PROFILE_MANIFEST_MODE);
+  if (parsed.legacy !== null) {
+    await writeJson(paths.manifestBackupPath, parsed.legacy, ownership);
+    await writeJson(paths.manifestPath, parsed.manifest, ownership);
+  }
+  return parsed.manifest;
 }
 
 function profileIdFromFactory(factory: ProfileIdFactory): string {
@@ -605,6 +740,12 @@ export function createFileBrowserProfileStore(
 ): BrowserProfileStore {
   const clock = options.clock ?? (() => new Date());
   const idFactory = options.idFactory ?? randomUUID;
+  const ownership =
+    options.ownership ??
+    createProfileStorageOwnershipBoundary({
+      uid: process.getuid?.() ?? 0,
+      gid: process.getgid?.() ?? 0,
+    });
 
   async function ensureDefaultProfile(hostId: string) {
     const paths = profilePaths(
@@ -613,7 +754,7 @@ export function createFileBrowserProfileStore(
       hostId,
       DEFAULT_PROFILE_ID,
     );
-    await secureProfileNamespace(options, paths);
+    await secureProfileNamespace(options, paths, ownership);
     const profileDirectoryEntries = await readdir(paths.profilesDirectory, {
       withFileTypes: true,
     });
@@ -627,7 +768,7 @@ export function createFileBrowserProfileStore(
       (entry) => entry.isDirectory() && entry.name === DEFAULT_PROFILE_ID,
     );
     if (defaultDirectoryExists) {
-      await readManifest(paths, hostId, options.installationId);
+      await repairManifest(paths, hostId, options.installationId, ownership);
     } else {
       const manifest = profileManifest(
         {
@@ -640,32 +781,76 @@ export function createFileBrowserProfileStore(
         },
         clock,
       );
-      await writeProfile(options, paths, manifest);
+      await writeProfile(options, paths, manifest, ownership);
     }
-    const selectedProfileId = await readSelection(paths.selectionPath);
-    if (selectedProfileId === null) {
-      await writeSelection(paths.selectionPath, DEFAULT_PROFILE_ID);
+    for (const entry of profileDirectoryEntries) {
+      if (entry.name === DEFAULT_PROFILE_ID) continue;
+      const parsedProfileId = browserProfileIdSchema.safeParse(entry.name);
+      if (!parsedProfileId.success) {
+        throw new BrowserProfileError(
+          "profile-manifest-corrupt",
+          `Browser Profile directory is invalid: ${entry.name}`,
+        );
+      }
+      await repairManifest(
+        profilePaths(
+          options.rootDirectory,
+          options.installationId,
+          hostId,
+          parsedProfileId.data,
+        ),
+        hostId,
+        options.installationId,
+        ownership,
+      );
     }
   }
 
   async function listProfilesUnlocked(
     hostId: string,
+    selectedProfileId = DEFAULT_PROFILE_ID,
   ): Promise<BrowserProfileInventory> {
-    await ensureDefaultProfile(hostId);
     const defaultPaths = profilePaths(
       options.rootDirectory,
       options.installationId,
       hostId,
       DEFAULT_PROFILE_ID,
     );
-    const selectedProfileId =
-      (await readSelection(defaultPaths.selectionPath)) ?? DEFAULT_PROFILE_ID;
+    let profilesDirectoryStats;
+    try {
+      profilesDirectoryStats = await lstat(defaultPaths.profilesDirectory);
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        "code" in error &&
+        error.code === "ENOENT"
+      ) {
+        return {
+          hostId,
+          installationId: options.installationId,
+          selectedProfileId: DEFAULT_PROFILE_ID,
+          profiles: [],
+        };
+      }
+      throw error;
+    }
+    if (!profilesDirectoryStats.isDirectory()) {
+      throw new BrowserProfileError(
+        "profile-manifest-corrupt",
+        `Browser Profile storage path is not a directory: ${defaultPaths.profilesDirectory}`,
+      );
+    }
     const entries = await readdir(defaultPaths.profilesDirectory, {
       withFileTypes: true,
     });
+    if (entries.some((entry) => !entry.isDirectory())) {
+      throw new BrowserProfileError(
+        "profile-manifest-corrupt",
+        `Browser Profile directory contains a non-directory entry on host ${hostId}.`,
+      );
+    }
     const profiles = await Promise.all(
       entries
-        .filter((entry) => entry.isDirectory())
         .sort((left, right) => left.name.localeCompare(right.name))
         .map(async (entry) => {
           const parsedProfileId = browserProfileIdSchema.safeParse(entry.name);
@@ -675,7 +860,7 @@ export function createFileBrowserProfileStore(
               `Browser Profile directory is invalid: ${entry.name}`,
             );
           }
-          const manifest = await readManifest(
+          const { manifest } = await readVerifiedManifest(
             profilePaths(
               options.rootDirectory,
               options.installationId,
@@ -684,6 +869,7 @@ export function createFileBrowserProfileStore(
             ),
             hostId,
             options.installationId,
+            ownership,
           );
           if (manifest.profileId !== parsedProfileId.data) {
             throw new BrowserProfileError(
@@ -694,12 +880,6 @@ export function createFileBrowserProfileStore(
           return profileFromManifest(manifest, selectedProfileId);
         }),
     );
-    if (!profiles.some((profile) => profile.profileId === selectedProfileId)) {
-      throw new BrowserProfileError(
-        "profile-selection-corrupt",
-        `Browser Profile selection references a missing profile on host ${hostId}.`,
-      );
-    }
     return {
       hostId,
       installationId: options.installationId,
@@ -711,15 +891,20 @@ export function createFileBrowserProfileStore(
   async function listProfiles(
     hostId: string,
   ): Promise<BrowserProfileInventory> {
-    return withMutationLock(options, hostId, () =>
-      listProfilesUnlocked(hostId),
+    return listProfilesUnlocked(hostId);
+  }
+
+  async function initialize(hostId: string): Promise<void> {
+    await withMutationLock(options, hostId, ownership, () =>
+      ensureDefaultProfile(hostId),
     );
   }
 
   async function createProfile(
     request: BrowserProfileCreateRequest,
   ): Promise<BrowserProfile> {
-    return withMutationLock(options, request.hostId, async () => {
+    return withMutationLock(options, request.hostId, ownership, async () => {
+      await ensureDefaultProfile(request.hostId);
       const inventory = await listProfilesUnlocked(request.hostId);
       if (profileNameConflict(inventory.profiles, request.name)) {
         throw new BrowserProfileError(
@@ -754,7 +939,7 @@ export function createFileBrowserProfileStore(
         clock,
       );
       try {
-        await writeProfile(options, paths, manifest);
+        await writeProfile(options, paths, manifest, ownership);
       } catch (error) {
         await rm(paths.profileDirectory, { recursive: true, force: true });
         throw error;
@@ -766,7 +951,8 @@ export function createFileBrowserProfileStore(
   async function renameProfile(
     request: BrowserProfileRenameRequest,
   ): Promise<BrowserProfile> {
-    return withMutationLock(options, request.hostId, async () => {
+    return withMutationLock(options, request.hostId, ownership, async () => {
+      await ensureDefaultProfile(request.hostId);
       const inventory = await listProfilesUnlocked(request.hostId);
       const current = inventory.profiles.find(
         (profile) => profile.profileId === request.profileId,
@@ -791,10 +977,11 @@ export function createFileBrowserProfileStore(
         request.hostId,
         request.profileId,
       );
-      const manifest = await readManifest(
+      const manifest = await repairManifest(
         paths,
         request.hostId,
         options.installationId,
+        ownership,
       );
       const renamed = browserProfileManifestSchema.parse({
         ...manifest,
@@ -805,7 +992,7 @@ export function createFileBrowserProfileStore(
         ),
         updatedAt: clock().toISOString(),
       });
-      await writeJson(paths.manifestPath, renamed);
+      await writeJson(paths.manifestPath, renamed, ownership);
       return profileFromManifest(renamed, inventory.selectedProfileId);
     });
   }
@@ -813,7 +1000,8 @@ export function createFileBrowserProfileStore(
   async function selectProfile(
     request: BrowserProfileSelectRequest,
   ): Promise<BrowserProfileInventory> {
-    return withMutationLock(options, request.hostId, async () => {
+    return withMutationLock(options, request.hostId, ownership, async () => {
+      await ensureDefaultProfile(request.hostId);
       const inventory = await listProfilesUnlocked(request.hostId);
       const selected = inventory.profiles.some(
         (profile) => profile.profileId === request.profileId,
@@ -824,19 +1012,13 @@ export function createFileBrowserProfileStore(
           `Browser Profile ${request.profileId} does not exist on host ${request.hostId}.`,
         );
       }
-      const paths = profilePaths(
-        options.rootDirectory,
-        options.installationId,
-        request.hostId,
-        DEFAULT_PROFILE_ID,
-      );
-      await writeSelection(paths.selectionPath, request.profileId);
-      return listProfilesUnlocked(request.hostId);
+      return listProfilesUnlocked(request.hostId, request.profileId);
     });
   }
 
   return {
     listProfiles,
+    initialize,
     createProfile,
     renameProfile,
     selectProfile,

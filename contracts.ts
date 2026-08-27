@@ -308,6 +308,22 @@ export const browserProfileSelectRequestSchema = z
   })
   .strict();
 
+const browserProfileContextSchema = z
+  .object({
+    projectId: z.string().min(1).nullable().optional(),
+    threadId: z.string().min(1).optional(),
+  })
+  .strict();
+
+export const browserProfileQuerySchema = browserProfileHostTargetSchema
+  .extend(browserProfileContextSchema.shape)
+  .strict();
+
+export const browserProfileSelectionRequestSchema =
+  browserProfileSelectRequestSchema
+    .extend(browserProfileContextSchema.shape)
+    .strict();
+
 export const browserProfileInventorySchema = z
   .object({
     hostId: z.string().min(1),
@@ -355,6 +371,10 @@ export type BrowserProfileRenameRequest = z.infer<
 >;
 export type BrowserProfileSelectRequest = z.infer<
   typeof browserProfileSelectRequestSchema
+>;
+export type BrowserProfileQuery = z.infer<typeof browserProfileQuerySchema>;
+export type BrowserProfileSelectionRequest = z.infer<
+  typeof browserProfileSelectionRequestSchema
 >;
 export type BrowserProfileInventory = z.infer<
   typeof browserProfileInventorySchema
@@ -670,7 +690,7 @@ export const rpcContract = defineRpcContract({
     output: browserPurgeResponseSchema,
   },
   browser_profiles: {
-    input: browserProfileHostTargetSchema,
+    input: browserProfileQuerySchema,
     output: browserProfileInventorySchema,
   },
   browser_profile_create: {
@@ -682,7 +702,7 @@ export const rpcContract = defineRpcContract({
     output: browserProfileSchema,
   },
   browser_profile_select: {
-    input: browserProfileSelectRequestSchema,
+    input: browserProfileSelectionRequestSchema,
     output: browserProfileInventorySchema,
   },
   browser_host_choices: {

@@ -537,7 +537,11 @@ async function runProfileListCli(
 ) {
   const target = await profileTarget(browser, cliArguments, context);
   const inventory = await browser.profiles(
-    { hostId: target.hostId },
+    {
+      hostId: target.hostId,
+      projectId: context.projectId,
+      threadId: context.threadId,
+    },
     context.signal,
   );
   return {
@@ -608,7 +612,12 @@ async function runProfileSelectCli(
 ) {
   const target = await profileTarget(browser, cliArguments, context);
   const inventory = await browser.selectProfile(
-    { hostId: target.hostId, profileId: cliArguments.profileId! },
+    {
+      hostId: target.hostId,
+      profileId: cliArguments.profileId!,
+      projectId: context.projectId,
+      threadId: context.threadId,
+    },
     context.signal,
   );
   return {

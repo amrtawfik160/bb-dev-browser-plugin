@@ -418,7 +418,11 @@ export async function createPublicPluginHarness(options?: {
       backend.harness.behavior.callRpc("browser_purge", input) as Promise<
         ReturnType<typeof browserPurgeResponseSchema.parse>
       >,
-    browser_profiles: (input: { hostId: string }) =>
+    browser_profiles: (input: {
+      hostId: string;
+      projectId?: string | null;
+      threadId?: string;
+    }) =>
       backend.harness.behavior.callRpc("browser_profiles", input) as Promise<
         ReturnType<typeof browserProfileInventorySchema.parse>
       >,
@@ -443,7 +447,12 @@ export async function createPublicPluginHarness(options?: {
         "browser_profile_rename",
         input,
       ) as Promise<ReturnType<typeof browserProfileSchema.parse>>,
-    browser_profile_select: (input: { hostId: string; profileId: string }) =>
+    browser_profile_select: (input: {
+      hostId: string;
+      profileId: string;
+      projectId?: string | null;
+      threadId?: string;
+    }) =>
       backend.harness.behavior.callRpc(
         "browser_profile_select",
         input,
@@ -560,8 +569,11 @@ export async function createPublicPluginHarness(options?: {
     });
   }
 
-  function runBrowserProfiles(hostId = configuredHostId) {
-    return rpc.browser_profiles({ hostId });
+  function runBrowserProfiles(
+    hostId = configuredHostId,
+    context?: { projectId?: string | null; threadId?: string },
+  ) {
+    return rpc.browser_profiles({ hostId, ...context });
   }
 
   function createBrowserProfile(input: {
@@ -583,8 +595,13 @@ export async function createPublicPluginHarness(options?: {
     return rpc.browser_profile_rename(input);
   }
 
-  function selectBrowserProfile(input: { hostId: string; profileId: string }) {
-    return rpc.browser_profile_select(input);
+  function selectBrowserProfile(
+    input: { hostId: string; profileId: string },
+    context?: { projectId?: string | null; threadId?: string },
+  ) {
+    const selectionContext =
+      context === undefined ? { projectId: PROJECT_ID } : context;
+    return rpc.browser_profile_select({ ...input, ...selectionContext });
   }
 
   function runBrowserHostChoices(input: BrowserHostChoicesInput) {

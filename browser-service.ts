@@ -4,7 +4,9 @@ import { z } from "zod";
 import {
   browserActivityRecordSchema,
   browserActivityRecordsSchema,
+  browserProfileIdSchema,
   browserScriptParametersSchema,
+  browserProfileUnavailableStatus,
   DEFAULT_PROFILE_ID,
   hostOfflineStatus,
   hostProbeFailedStatus,
@@ -16,10 +18,11 @@ import {
   type BrowserLifecycleRequest,
   type BrowserProfile,
   type BrowserProfileCreateRequest,
-  type BrowserProfileHostTarget,
   type BrowserProfileInventory,
+  type BrowserProfileQuery,
   type BrowserProfileRenameRequest,
   type BrowserProfileSelectRequest,
+  type BrowserProfileSelectionRequest,
   type BrowserPurgePlan,
   type BrowserPurgeRequest,
   type BrowserPurgeResponse,
@@ -57,6 +60,13 @@ const migrations = [
     payload TEXT NOT NULL,
     acknowledged_at TEXT
   )`,
+  `ALTER TABLE browser_preferences RENAME TO browser_preferences_legacy`,
+  `CREATE TABLE browser_preferences (
+    project_id TEXT NOT NULL,
+    host_id TEXT NOT NULL,
+    profile_id TEXT NOT NULL,
+    PRIMARY KEY (project_id, host_id)
+  )`,
 ];
 
 const activityRowSchema = z
@@ -73,12 +83,33 @@ const activityRowSchema = z
   })
   .strict();
 type BrowserScriptParameters = z.output<typeof browserScriptParametersSchema>;
+const profilePreferenceRowSchema = z
+  .object({ profile_id: browserProfileIdSchema })
+  .strict();
+const SETTINGS_PROJECT_ID = "__browser_settings__";
 type BrowserIdentity = {
   projectId?: string;
   threadId?: string;
   hostId?: string;
 };
 type ActivityRecordInput = Omit<BrowserActivityRecord, "id">;
+
+type ProfileContext = Pick<BrowserProfileQuery, "projectId" | "threadId">;
+
+type ProfileHostCall = {
+  createProfile: {
+    request: BrowserProfileCreateRequest;
+    response: BrowserProfile;
+  };
+  renameProfile: {
+    request: BrowserProfileRenameRequest;
+    response: BrowserProfile;
+  };
+  selectProfile: {
+    request: BrowserProfileSelectRequest;
+    response: BrowserProfileInventory;
+  };
+};
 
 function activityRecordFromRow(row: unknown): BrowserActivityRecord {
   const parsed = activityRowSchema.parse(row);
@@ -170,9 +201,77 @@ function listActivityRecords(
   return browserActivityRecordsSchema.parse(rows.map(activityRecordFromRow));
 }
 
+function selectedProfilePreference(
+  database: Database.Database,
+  projectId: string,
+  hostId: string,
+) {
+  const row = database
+    .prepare(
+      `SELECT profile_id
+       FROM browser_preferences
+       WHERE project_id = ? AND host_id = ?`,
+    )
+    .get(projectId, hostId);
+  if (row === undefined) return null;
+  return profilePreferenceRowSchema.parse(row).profile_id;
+}
+
+function saveSelectedProfilePreference(
+  database: Database.Database,
+  projectId: string,
+  hostId: string,
+  profileId: string,
+) {
+  database
+    .prepare(
+      `INSERT INTO browser_preferences (project_id, host_id, profile_id)
+       VALUES (?, ?, ?)
+       ON CONFLICT (project_id, host_id)
+       DO UPDATE SET profile_id = excluded.profile_id`,
+    )
+    .run(projectId, hostId, profileId);
+}
+
+function inventoryWithSelectedProfile(
+  inventory: BrowserProfileInventory,
+  preferredProfileId: string | null,
+): BrowserProfileInventory {
+  const selectedProfileId =
+    preferredProfileId !== null &&
+    inventory.profiles.some(
+      (profile) => profile.profileId === preferredProfileId,
+    )
+      ? preferredProfileId
+      : DEFAULT_PROFILE_ID;
+  return {
+    ...inventory,
+    selectedProfileId,
+    profiles: inventory.profiles.map((profile) => ({
+      ...profile,
+      selected: profile.profileId === selectedProfileId,
+    })),
+  };
+}
+
+async function profileContextProjectId(
+  bb: BbPluginApi,
+  context: ProfileContext,
+): Promise<string> {
+  if (context.projectId !== undefined && context.projectId !== null) {
+    return context.projectId;
+  }
+  if (context.threadId !== undefined) {
+    const thread = await bb.sdk.threads.get({ threadId: context.threadId });
+    return thread.projectId;
+  }
+  return SETTINGS_PROJECT_ID;
+}
+
 type HostResolution = {
   candidates: string[];
   preferredHostId: string | null;
+  projectId: string | null;
 };
 
 function uniqueHostIds(hostIds: readonly (string | undefined)[]) {
@@ -204,6 +303,7 @@ async function projectHostResolution(
         : candidates.length === 1
           ? candidates[0]!
           : null,
+    projectId,
   };
 }
 
@@ -221,6 +321,7 @@ async function threadHostResolution(
   return {
     candidates: [environment.hostId],
     preferredHostId: environment.hostId,
+    projectId: thread.projectId,
   };
 }
 
@@ -234,7 +335,7 @@ async function identityHostResolution(
   if (identity.projectId !== undefined) {
     return projectHostResolution(bb, identity.projectId);
   }
-  return { candidates: [], preferredHostId: null };
+  return { candidates: [], preferredHostId: null, projectId: null };
 }
 
 async function resolvedHostId(bb: BbPluginApi, identity: BrowserIdentity) {
@@ -310,16 +411,42 @@ export function createBrowserService(bb: BbPluginApi) {
     }
   }
 
+  async function callConnectedProfile<Method extends keyof ProfileHostCall>(
+    method: Method,
+    request: ProfileHostCall[Method]["request"],
+    signal?: AbortSignal,
+  ): Promise<ProfileHostCall[Method]["response"]> {
+    await requireConnectedHost(request.hostId, signal);
+    return host.call(method, request, {
+      hostId: request.hostId,
+      signal,
+    });
+  }
+
   async function profileInventory(
-    target: BrowserProfileHostTarget,
+    target: BrowserProfileQuery,
     signal?: AbortSignal,
   ): Promise<BrowserProfileInventory> {
     await requireConnectedHost(target.hostId, signal);
-    return host.call("listProfiles", target, { hostId: target.hostId, signal });
+    const inventory = await host.call(
+      "listProfiles",
+      { hostId: target.hostId },
+      { hostId: target.hostId, signal },
+    );
+    const projectId = await profileContextProjectId(bb, target);
+    return inventoryWithSelectedProfile(
+      inventory,
+      selectedProfilePreference(database, projectId, target.hostId),
+    );
   }
 
-  async function selectedProfileId(hostId: string, signal?: AbortSignal) {
-    return (await profileInventory({ hostId }, signal)).selectedProfileId;
+  async function selectedProfileId(identity: BrowserIdentity, hostId: string) {
+    const resolution = await identityHostResolution(bb, identity);
+    const projectId = resolution.projectId ?? SETTINGS_PROJECT_ID;
+    return (
+      selectedProfilePreference(database, projectId, hostId) ??
+      DEFAULT_PROFILE_ID
+    );
   }
 
   async function resolveTarget(
@@ -348,6 +475,15 @@ export function createBrowserService(bb: BbPluginApi) {
       hostId: requestedHostId ?? identity.hostId,
     });
     if (hostId === null) return setupRequiredStatus({ hostId, profileId });
+    if ((await hostConnection(hostId, signal)) !== "connected") {
+      return hostStatus(hostId, profileId, signal);
+    }
+    const inventory = await profileInventory({ hostId }, signal);
+    if (
+      !inventory.profiles.some((profile) => profile.profileId === profileId)
+    ) {
+      return browserProfileUnavailableStatus({ hostId, profileId });
+    }
     return hostStatus(hostId, profileId, signal);
   }
 
@@ -369,7 +505,11 @@ export function createBrowserService(bb: BbPluginApi) {
     if ((await hostConnection(hostId, signal)) !== "connected") {
       return hostStatus(hostId, DEFAULT_PROFILE_ID, signal);
     }
-    return hostStatus(hostId, await selectedProfileId(hostId, signal), signal);
+    return hostStatus(
+      hostId,
+      await selectedProfileId(identity, hostId),
+      signal,
+    );
   }
 
   async function settingsStatuses(profileId = DEFAULT_PROFILE_ID) {
@@ -383,10 +523,7 @@ export function createBrowserService(bb: BbPluginApi) {
     return listActivityRecords(database, target);
   }
 
-  async function profiles(
-    target: BrowserProfileHostTarget,
-    signal?: AbortSignal,
-  ) {
+  async function profiles(target: BrowserProfileQuery, signal?: AbortSignal) {
     return profileInventory(target, signal);
   }
 
@@ -394,33 +531,52 @@ export function createBrowserService(bb: BbPluginApi) {
     request: BrowserProfileCreateRequest,
     signal?: AbortSignal,
   ): Promise<BrowserProfile> {
-    await requireConnectedHost(request.hostId, signal);
-    return host.call("createProfile", request, {
-      hostId: request.hostId,
-      signal,
-    });
+    return recordProfileActivity(
+      { hostId: request.hostId, profileId: DEFAULT_PROFILE_ID },
+      "create",
+      () => callConnectedProfile("createProfile", request, signal),
+      (profile) => ({ hostId: request.hostId, profileId: profile.profileId }),
+    );
   }
 
   async function renameProfile(
     request: BrowserProfileRenameRequest,
     signal?: AbortSignal,
   ): Promise<BrowserProfile> {
-    await requireConnectedHost(request.hostId, signal);
-    return host.call("renameProfile", request, {
-      hostId: request.hostId,
-      signal,
-    });
+    return recordProfileActivity(
+      { hostId: request.hostId, profileId: request.profileId },
+      "rename",
+      () => callConnectedProfile("renameProfile", request, signal),
+    );
   }
 
   async function selectProfile(
-    request: BrowserProfileSelectRequest,
+    request: BrowserProfileSelectionRequest,
     signal?: AbortSignal,
   ): Promise<BrowserProfileInventory> {
-    await requireConnectedHost(request.hostId, signal);
-    return host.call("selectProfile", request, {
+    const hostRequest = {
       hostId: request.hostId,
-      signal,
-    });
+      profileId: request.profileId,
+    } satisfies BrowserProfileSelectRequest;
+    return recordProfileActivity(
+      { hostId: request.hostId, profileId: request.profileId },
+      "select",
+      async () => {
+        const inventory = await callConnectedProfile(
+          "selectProfile",
+          hostRequest,
+          signal,
+        );
+        const projectId = await profileContextProjectId(bb, request);
+        saveSelectedProfilePreference(
+          database,
+          projectId,
+          request.hostId,
+          request.profileId,
+        );
+        return inventoryWithSelectedProfile(inventory, request.profileId);
+      },
+    );
   }
 
   async function hostChoices(
@@ -449,23 +605,26 @@ export function createBrowserService(bb: BbPluginApi) {
       );
   }
 
-  async function recordAdministrativeActivity<T extends { outcome: string }>(
-    target: BrowserHostTarget,
-    kind: BrowserActivityRecord["kind"],
-    action: string,
-    operation: () => Promise<T>,
-  ): Promise<T> {
+  async function recordActivity<T>(request: {
+    target: BrowserHostTarget;
+    kind: BrowserActivityRecord["kind"];
+    action: string;
+    operation: () => Promise<T>;
+    outcome: (response: T) => string;
+    successTarget?: (response: T) => BrowserHostTarget;
+  }): Promise<T> {
     const occurredAt = new Date().toISOString();
     try {
-      const response = await operation();
+      const response = await request.operation();
+      const target = request.successTarget?.(response) ?? request.target;
       appendActivityRecord(database, {
         occurredAt,
         actor: "owner",
         hostId: target.hostId,
         profileId: target.profileId,
-        kind,
-        action,
-        outcome: response.outcome,
+        kind: request.kind,
+        action: request.action,
+        outcome: request.outcome(response),
         interrupted: false,
       });
       return response;
@@ -473,15 +632,46 @@ export function createBrowserService(bb: BbPluginApi) {
       appendActivityRecord(database, {
         occurredAt,
         actor: "owner",
-        hostId: target.hostId,
-        profileId: target.profileId,
-        kind,
-        action,
+        hostId: request.target.hostId,
+        profileId: request.target.profileId,
+        kind: request.kind,
+        action: request.action,
         outcome: "failed",
         interrupted: false,
       });
       throw error;
     }
+  }
+
+  function recordAdministrativeActivity<T extends { outcome: string }>(
+    target: BrowserHostTarget,
+    kind: BrowserActivityRecord["kind"],
+    action: string,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    return recordActivity({
+      target,
+      kind,
+      action,
+      operation,
+      outcome: (response) => response.outcome,
+    });
+  }
+
+  function recordProfileActivity<T>(
+    target: BrowserHostTarget,
+    action: string,
+    operation: () => Promise<T>,
+    successTarget?: (response: T) => BrowserHostTarget,
+  ): Promise<T> {
+    return recordActivity({
+      target,
+      kind: "lifecycle",
+      action,
+      operation,
+      outcome: () => "succeeded",
+      successTarget,
+    });
   }
 
   async function diagnostics(
@@ -608,7 +798,7 @@ export function createBrowserService(bb: BbPluginApi) {
       };
     }
     const profileId =
-      parameters.profileId ?? (await selectedProfileId(hostId, context.signal));
+      parameters.profileId ?? (await selectedProfileId(context, hostId));
     return host.call(
       "browserScript",
       {

@@ -2,6 +2,7 @@ import { experimental_defineHostEntry } from "@get-bb/plugin-sdk/host";
 import { join } from "node:path";
 import { browserHostContract } from "./host-contract.js";
 import {
+  createBrowserUserProfileOwnershipBoundary,
   createFileBrowserProfileStore,
   type BrowserProfileStore,
 } from "./profile-storage.js";
@@ -18,6 +19,7 @@ import {
 } from "./readiness.js";
 import {
   BROWSER_STORAGE_ROOT,
+  DEFAULT_PROFILE_ID,
   browserProfileUnavailableStatus,
 } from "./contracts.js";
 
@@ -31,6 +33,14 @@ function isAdministrationBoundary(
   boundary: HostBoundary,
 ): boundary is HostAdministrationBoundary {
   return "setupPlan" in boundary;
+}
+
+async function requireReadyForProfileMutation(
+  boundary: HostAdministrationBoundary,
+  target: { hostId: string; profileId: string },
+) {
+  const status = await boundary.inspect(target);
+  if (status.state !== "healthy") throw new Error(status.message);
 }
 
 export function createBrowserHostEntry(
@@ -93,9 +103,14 @@ export function createBrowserHostEntry(
       },
       setup: (request, context) => {
         retainWorker(context);
-        return administration(context.experimental_paths.dataDir).setup(
-          request,
-        );
+        return (async () => {
+          const dataDir = context.experimental_paths.dataDir;
+          const response = await administration(dataDir).setup(request);
+          if (response.plan.state === "ready") {
+            await profiles(dataDir).initialize(request.hostId);
+          }
+          return response;
+        })();
       },
       disable: (request, context) => {
         retainWorker(context);
@@ -123,9 +138,13 @@ export function createBrowserHostEntry(
       },
       browserScript: async ({ hostId, profileId }, context) => {
         retainWorker(context);
-        const inventory = await profiles(
-          context.experimental_paths.dataDir,
-        ).listProfiles(hostId);
+        const dataDir = context.experimental_paths.dataDir;
+        const target = { hostId, profileId };
+        const readiness = await administration(dataDir).inspect(target);
+        if (readiness.state !== "healthy") {
+          return { ok: false as const, error: readiness };
+        }
+        const inventory = await profiles(dataDir).listProfiles(hostId);
         if (
           !inventory.profiles.some((profile) => profile.profileId === profileId)
         ) {
@@ -150,23 +169,26 @@ export function createBrowserHostEntry(
           target.hostId,
         );
       },
-      createProfile: (request, context) => {
+      createProfile: async (request, context) => {
         retainWorker(context);
-        return profiles(context.experimental_paths.dataDir).createProfile(
-          request,
-        );
+        const dataDir = context.experimental_paths.dataDir;
+        await requireReadyForProfileMutation(administration(dataDir), {
+          hostId: request.hostId,
+          profileId: DEFAULT_PROFILE_ID,
+        });
+        return profiles(dataDir).createProfile(request);
       },
-      renameProfile: (request, context) => {
+      renameProfile: async (request, context) => {
         retainWorker(context);
-        return profiles(context.experimental_paths.dataDir).renameProfile(
-          request,
-        );
+        const dataDir = context.experimental_paths.dataDir;
+        await requireReadyForProfileMutation(administration(dataDir), request);
+        return profiles(dataDir).renameProfile(request);
       },
-      selectProfile: (request, context) => {
+      selectProfile: async (request, context) => {
         retainWorker(context);
-        return profiles(context.experimental_paths.dataDir).selectProfile(
-          request,
-        );
+        const dataDir = context.experimental_paths.dataDir;
+        await requireReadyForProfileMutation(administration(dataDir), request);
+        return profiles(dataDir).selectProfile(request);
       },
     },
     dispose: async () => workerLease?.dispose(),
@@ -186,5 +208,6 @@ export default createBrowserHostEntry(
     createFileBrowserProfileStore({
       rootDirectory: BROWSER_STORAGE_ROOT,
       installationId: hostInstallationId(dataDir),
+      ownership: createBrowserUserProfileOwnershipBoundary(),
     }),
 );

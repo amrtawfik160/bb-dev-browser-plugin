@@ -2,6 +2,7 @@ import {
   mkdtemp,
   mkdir,
   readFile,
+  readdir,
   rm,
   stat,
   writeFile,
@@ -11,12 +12,153 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { DEFAULT_PROFILE_ID, PROFILE_MANIFEST_VERSION } from "../contracts.js";
 import {
+  createProfileStorageOwnershipBoundary,
+  createBrowserUserProfileOwnershipBoundary,
   createFileBrowserProfileStore,
   profileStoragePaths,
 } from "../profile-storage.js";
 
 describe("host-local Browser Profile storage", () => {
-  it("creates bb-personal with stable clean-start metadata and secure modes", async () => {
+  it("lists an uninitialized host without creating Browser Profile storage", async () => {
+    const rootDirectory = await mkdtemp(join(tmpdir(), "bb-browser-profile-"));
+    try {
+      const store = createFileBrowserProfileStore({
+        rootDirectory,
+        installationId: "installation-test",
+      });
+
+      await expect(store.listProfiles("host-a")).resolves.toEqual({
+        hostId: "host-a",
+        installationId: "installation-test",
+        selectedProfileId: DEFAULT_PROFILE_ID,
+        profiles: [],
+      });
+      await expect(readdir(rootDirectory)).resolves.toEqual([]);
+    } finally {
+      await rm(rootDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("R5-01 does not repair initialized storage during inventory reads", async () => {
+    const rootDirectory = await mkdtemp(join(tmpdir(), "bb-browser-profile-"));
+    const ownershipCalls: string[] = [];
+    try {
+      const store = createFileBrowserProfileStore({
+        rootDirectory,
+        installationId: "installation-test",
+        ownership: {
+          ensureOwned: async (path) => {
+            ownershipCalls.push(path);
+          },
+          verifyOwned: async () => undefined,
+        },
+      });
+
+      await store.initialize!("host-a");
+      ownershipCalls.length = 0;
+      await store.listProfiles("host-a");
+
+      expect(ownershipCalls).toEqual([]);
+    } finally {
+      await rm(rootDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("creates profile storage with the configured browser-user ownership", async () => {
+    const rootDirectory = await mkdtemp(join(tmpdir(), "bb-browser-profile-"));
+    try {
+      const owner = {
+        uid: process.getuid?.() ?? 0,
+        gid: process.getgid?.() ?? 0,
+      };
+      const store = createFileBrowserProfileStore({
+        rootDirectory,
+        installationId: "installation-test",
+        ownership: createProfileStorageOwnershipBoundary(owner, {
+          chown: async () => undefined,
+          inspect: async (path) => {
+            const metadata = await stat(path);
+            return {
+              uid: metadata.uid,
+              gid: metadata.gid,
+              mode: metadata.mode,
+            };
+          },
+        }),
+      });
+
+      const created = await store.createProfile({
+        hostId: "host-a",
+        name: "Owned profile",
+      });
+
+      const paths = profileStoragePaths({
+        rootDirectory,
+        installationId: "installation-test",
+        hostId: "host-a",
+        profileId: created.profileId,
+      });
+      const entries = [
+        rootDirectory,
+        join(rootDirectory, "installations"),
+        join(rootDirectory, "installations", "installation-test"),
+        join(rootDirectory, "installations", "installation-test", "hosts"),
+        paths.hostStoragePath,
+        paths.profilesDirectory,
+        paths.profileDirectory,
+        paths.browserDataPath,
+        paths.manifestPath,
+      ];
+
+      for (const path of entries) {
+        const metadata = await stat(path);
+        expect({ uid: metadata.uid, gid: metadata.gid }).toEqual(owner);
+      }
+    } finally {
+      await rm(rootDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("R5-02 resolves bb-browser ownership through a safe host boundary", async () => {
+    const rootDirectory = await mkdtemp(join(tmpdir(), "bb-browser-profile-"));
+    const passwdPath = join(rootDirectory, "passwd");
+    const ownershipCalls: Array<{ path: string; uid: number; gid: number }> =
+      [];
+    try {
+      await writeFile(
+        passwdPath,
+        "bb-browser:x:1001:1002:Browser:/var/lib/bb-browser:/usr/sbin/nologin\n",
+      );
+      const ownership = createBrowserUserProfileOwnershipBoundary({
+        passwdPath,
+        operations: {
+          async chown(path, uid, gid) {
+            ownershipCalls.push({ path, uid, gid });
+          },
+          async inspect(path) {
+            const metadata = await stat(path);
+            return { uid: 1001, gid: 1002, mode: metadata.mode };
+          },
+        },
+      });
+      const store = createFileBrowserProfileStore({
+        rootDirectory: join(rootDirectory, "storage"),
+        installationId: "installation-test",
+        ownership,
+      });
+
+      await store.createProfile({ hostId: "host-a", name: "Safe owner" });
+
+      expect(ownershipCalls.length).toBeGreaterThan(0);
+      expect(
+        new Set(ownershipCalls.map(({ uid, gid }) => `${uid}:${gid}`)),
+      ).toEqual(new Set(["1001:1002"]));
+    } finally {
+      await rm(rootDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("creates bb-personal with stable clean-start metadata after initialization", async () => {
     const rootDirectory = await mkdtemp(join(tmpdir(), "bb-browser-profile-"));
     try {
       const store = createFileBrowserProfileStore({
@@ -25,6 +167,7 @@ describe("host-local Browser Profile storage", () => {
         clock: () => new Date("2026-08-27T00:00:00.000Z"),
       });
 
+      await store.initialize!("host-a");
       const inventory = await store.listProfiles("host-a");
       const personal = inventory.profiles.find(
         (profile) => profile.profileId === DEFAULT_PROFILE_ID,
@@ -170,6 +313,7 @@ describe("host-local Browser Profile storage", () => {
       });
 
       await hostA.createProfile({ hostId: "host-a", name: "Only A" });
+      await hostB.initialize!("host-b");
       const hostBProfiles = await hostB.listProfiles("host-b");
       expect(hostBProfiles.profiles.map((profile) => profile.name)).toEqual([
         DEFAULT_PROFILE_ID,
@@ -238,6 +382,7 @@ describe("host-local Browser Profile storage", () => {
         { mode: 0o600 },
       );
 
+      await store.initialize!("host-a");
       const migrated = await store.listProfiles("host-a");
       expect(
         migrated.profiles.find((profile) => profile.profileId === "legacy"),
@@ -303,7 +448,7 @@ describe("host-local Browser Profile storage", () => {
     }
   });
 
-  it("fails closed when selection points to a missing profile", async () => {
+  it("R5-03 ignores legacy host-global selection state", async () => {
     const rootDirectory = await mkdtemp(join(tmpdir(), "bb-browser-profile-"));
     try {
       const store = createFileBrowserProfileStore({
@@ -317,7 +462,11 @@ describe("host-local Browser Profile storage", () => {
         profileId: DEFAULT_PROFILE_ID,
       });
 
-      await store.listProfiles("host-a");
+      await store.initialize!("host-a");
+      const created = await store.createProfile({
+        hostId: "host-a",
+        name: "Project profile",
+      });
       await writeFile(
         paths.selectionPath,
         JSON.stringify({
@@ -327,8 +476,14 @@ describe("host-local Browser Profile storage", () => {
         { encoding: "utf8", mode: 0o600 },
       );
 
-      await expect(store.listProfiles("host-a")).rejects.toMatchObject({
-        code: "profile-selection-corrupt",
+      await expect(store.listProfiles("host-a")).resolves.toMatchObject({
+        selectedProfileId: DEFAULT_PROFILE_ID,
+      });
+      await expect(
+        store.selectProfile({ hostId: "host-a", profileId: created.profileId }),
+      ).resolves.toMatchObject({ selectedProfileId: created.profileId });
+      await expect(store.listProfiles("host-a")).resolves.toMatchObject({
+        selectedProfileId: DEFAULT_PROFILE_ID,
       });
     } finally {
       await rm(rootDirectory, { recursive: true, force: true });

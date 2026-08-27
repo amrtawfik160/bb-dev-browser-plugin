@@ -166,6 +166,12 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
           profileSelection: "selected",
         };
 
+  function profileContext() {
+    return request.surface === "thread"
+      ? { threadId: request.threadId }
+      : { projectId: request.projectId };
+  }
+
   useEffect(() => {
     setStatus(null);
     void rpc.call("browser_status", statusRequest).then(setStatus);
@@ -195,7 +201,7 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
       return;
     }
     void rpc
-      .call("browser_profiles", { hostId })
+      .call("browser_profiles", { hostId, ...profileContext() })
       .then(setProfiles)
       .catch((error: unknown) =>
         setProfileError(administrationErrorMessage(error)),
@@ -207,7 +213,11 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
     if (hostId === null || hostId === undefined) return;
     setProfileError(null);
     void rpc
-      .call("browser_profile_select", { hostId, profileId })
+      .call("browser_profile_select", {
+        hostId,
+        profileId,
+        ...profileContext(),
+      })
       .then((inventory) => {
         setProfiles(inventory);
         return rpc.call("browser_status", {
@@ -387,6 +397,11 @@ function ProfileInventoryView({
   return (
     <>
       <p className="mt-3 text-sm">Selected: {inventory.selectedProfileId}</p>
+      {inventory.profiles.length === 0 ? (
+        <p className="mt-1 text-xs text-muted-foreground">
+          Default Browser Profile: <code>{inventory.selectedProfileId}</code>
+        </p>
+      ) : null}
       <div className="mt-3 space-y-3">
         {inventory.profiles.map((profile) => (
           <ProfileRow
