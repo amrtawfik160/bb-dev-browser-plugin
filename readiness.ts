@@ -129,6 +129,71 @@ function statusTarget(target: BrowserHostTarget): BrowserStatusTarget {
   return { hostId: target.hostId, profileId: target.profileId };
 }
 
+type CapabilityEvaluation = Pick<ReadinessCapability, "status" | "reason">;
+
+const DEDICATED_USER_EVALUATIONS: Record<
+  HostProbeSnapshot["dedicatedUser"]["state"],
+  CapabilityEvaluation
+> = {
+  ready: {
+    status: "ready",
+    reason: "The unprivileged bb-browser user is configured.",
+  },
+  missing: {
+    status: "missing",
+    reason:
+      "Create the unprivileged bb-browser user through explicit Browser setup.",
+  },
+  invalid: {
+    status: "failed",
+    reason:
+      "Repair the bb-browser user so it is unprivileged and cannot log in.",
+  },
+};
+
+const PROTECTED_STORAGE_EVALUATIONS: Record<
+  HostProbeSnapshot["protectedStorage"]["state"],
+  CapabilityEvaluation
+> = {
+  ready: {
+    status: "ready",
+    reason: "Browser storage is owner-only and its host state is valid.",
+  },
+  missing: {
+    status: "missing",
+    reason: "Create protected Browser storage through explicit Browser setup.",
+  },
+  partial: {
+    status: "missing",
+    reason: "Resume Browser setup to finish protected storage.",
+  },
+  corrupt: {
+    status: "failed",
+    reason: "Repair the corrupt Browser host state before continuing.",
+  },
+  insecure: {
+    status: "failed",
+    reason:
+      "Repair Browser storage ownership and permissions before continuing.",
+  },
+};
+
+type OverallReadinessState = Exclude<BrowserStatus["state"], "host-offline">;
+
+function overallReadinessState(
+  platformSupported: boolean,
+  capabilities: readonly ReadinessCapability[],
+): OverallReadinessState {
+  if (!platformSupported) return "unsupported";
+  if (capabilities.some(({ status }) => status === "failed")) {
+    return "repair-required";
+  }
+  if (capabilities.some(({ status }) => status !== "ready")) {
+    return "setup-required";
+  }
+  return "healthy";
+}
+
 function report(
   target: BrowserHostTarget,
   snapshot: HostProbeSnapshot,
@@ -140,6 +205,10 @@ function report(
     snapshot.architecture.toLowerCase(),
   );
   const platformSupported = supportedOs && supportedArchitecture;
+  const dedicatedUserEvaluation =
+    DEDICATED_USER_EVALUATIONS[snapshot.dedicatedUser.state];
+  const protectedStorageEvaluation =
+    PROTECTED_STORAGE_EVALUATIONS[snapshot.protectedStorage.state];
   const capabilities: ReadinessCapability[] = [
     capability(
       "operating-system",
@@ -190,34 +259,14 @@ function report(
     capability(
       "dedicated-user",
       "Dedicated browser user",
-      snapshot.dedicatedUser.state === "ready"
-        ? "ready"
-        : snapshot.dedicatedUser.state === "missing"
-          ? "missing"
-          : "failed",
-      snapshot.dedicatedUser.state === "ready"
-        ? "The unprivileged bb-browser user is configured."
-        : snapshot.dedicatedUser.state === "missing"
-          ? "Create the unprivileged bb-browser user through explicit Browser setup."
-          : "Repair the bb-browser user so it is unprivileged and cannot log in.",
+      dedicatedUserEvaluation.status,
+      dedicatedUserEvaluation.reason,
     ),
     capability(
       "protected-storage",
       "Protected storage",
-      snapshot.protectedStorage.state === "ready"
-        ? "ready"
-        : ["missing", "partial"].includes(snapshot.protectedStorage.state)
-          ? "missing"
-          : "failed",
-      snapshot.protectedStorage.state === "ready"
-        ? "Browser storage is owner-only and its host state is valid."
-        : snapshot.protectedStorage.state === "missing"
-          ? "Create protected Browser storage through explicit Browser setup."
-          : snapshot.protectedStorage.state === "partial"
-            ? "Resume Browser setup to finish protected storage."
-            : snapshot.protectedStorage.state === "corrupt"
-              ? "Repair the corrupt Browser host state before continuing."
-              : "Repair Browser storage ownership and permissions before continuing.",
+      protectedStorageEvaluation.status,
+      protectedStorageEvaluation.reason,
     ),
     capability(
       "disk-headroom",
@@ -237,7 +286,8 @@ function report(
     ),
   ];
 
-  if (!platformSupported) {
+  const state = overallReadinessState(platformSupported, capabilities);
+  if (state === "unsupported") {
     return {
       ...statusTarget(target),
       state: "unsupported",
@@ -248,8 +298,7 @@ function report(
     };
   }
 
-  const repairRequired = capabilities.some((item) => item.status === "failed");
-  if (repairRequired) {
+  if (state === "repair-required") {
     return {
       ...statusTarget(target),
       state: "repair-required",
@@ -260,7 +309,7 @@ function report(
     };
   }
 
-  if (capabilities.some((item) => item.status !== "ready")) {
+  if (state === "setup-required") {
     return {
       ...statusTarget(target),
       state: "setup-required",
