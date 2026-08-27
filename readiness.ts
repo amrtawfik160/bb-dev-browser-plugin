@@ -1,6 +1,8 @@
+import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { access, readFile, stat, statfs } from "node:fs/promises";
+import { access, lstat, readFile, stat, statfs } from "node:fs/promises";
 import { createServer } from "node:net";
+import { join, resolve } from "node:path";
 import { z } from "zod";
 import type {
   BrowserDiagnostics,
@@ -9,11 +11,37 @@ import type {
   BrowserStatusTarget,
   ReadinessCapability,
 } from "./contracts.js";
+import {
+  dependencyInventory,
+  PINNED_BROWSER_RUNTIME,
+} from "./dependency-inventory.js";
 
 const FIVE_GIB = 5 * 1024 ** 3;
-const PROTECTED_STORAGE_PATH = "/var/lib/bb-browser";
-const HOST_STATE_PATH = `${PROTECTED_STORAGE_PATH}/host-state.json`;
-const EXIT_LOG_PATH = `${PROTECTED_STORAGE_PATH}/exit.log`;
+
+export interface HostProbePaths {
+  osRelease: string;
+  passwd: string;
+  packageStatus: string;
+  userNamespaceSetting: string;
+  chromeStable: string;
+  chrome: string;
+  sandboxHelpers: readonly string[];
+  protectedStorageRoot: string;
+}
+
+const DEFAULT_PROBE_PATHS: HostProbePaths = {
+  osRelease: "/etc/os-release",
+  passwd: "/etc/passwd",
+  packageStatus: "/var/lib/dpkg/status",
+  userNamespaceSetting: "/proc/sys/kernel/unprivileged_userns_clone",
+  chromeStable: "/usr/bin/google-chrome-stable",
+  chrome: "/usr/bin/google-chrome",
+  sandboxHelpers: [
+    "/opt/google/chrome/chrome-sandbox",
+    "/usr/lib/chromium/chrome-sandbox",
+  ],
+  protectedStorageRoot: "/var/lib/bb-browser",
+};
 
 const hostStateSchema = z
   .object({
@@ -23,10 +51,43 @@ const hostStateSchema = z
   })
   .strict();
 
+const connectConfigSchema = z
+  .object({
+    machineCredential: z.string().min(1),
+  })
+  .passthrough();
+
+const fallbackBrowserVersionSchema = z
+  .object({
+    playwrightVersion: z.string().min(1),
+    chromiumRevision: z.string().min(1),
+    chromiumVersion: z.string().min(1),
+  })
+  .strict();
+
+function jsonDocument(contents: string) {
+  try {
+    return JSON.parse(contents) as unknown;
+  } catch (error) {
+    if (error instanceof SyntaxError) return null;
+    throw error;
+  }
+}
+
+function fallbackBrowserVersion(contents: string) {
+  const parsed = fallbackBrowserVersionSchema.safeParse(jsonDocument(contents));
+  return parsed.success ? parsed.data : null;
+}
+
 export interface HostProbeSnapshot {
   operatingSystem: { id: string; version: string; name: string };
   architecture: string;
-  browser: { name: string; version: string | null } | null;
+  connect: { enrolled: boolean };
+  browser: {
+    name: string;
+    version: string | null;
+    compatible: boolean;
+  } | null;
   sandbox: { available: boolean };
   dedicatedUser: { state: "ready" | "missing" | "invalid" };
   protectedStorage: {
@@ -64,9 +125,7 @@ function capability(
   return { id, label, status, reason };
 }
 
-function targetWithoutEnrollment(
-  target: BrowserHostTarget,
-): BrowserStatusTarget {
+function statusTarget(target: BrowserHostTarget): BrowserStatusTarget {
   return { hostId: target.hostId, profileId: target.profileId };
 }
 
@@ -101,18 +160,24 @@ function report(
     capability(
       "bb-connect",
       "BB Connect",
-      target.connectEnrolled ? "ready" : "missing",
-      target.connectEnrolled
+      snapshot.connect.enrolled ? "ready" : "missing",
+      snapshot.connect.enrolled
         ? "The host is enrolled in BB Connect."
         : "Enroll this host in BB Connect before Browser setup.",
     ),
     capability(
       "browser",
       "Browser",
-      snapshot.browser === null ? "missing" : "ready",
+      snapshot.browser === null
+        ? "missing"
+        : snapshot.browser.compatible
+          ? "ready"
+          : "failed",
       snapshot.browser === null
         ? "Install supported Chrome Stable or the pinned Chromium fallback."
-        : `${snapshot.browser.name}${snapshot.browser.version === null ? "" : ` ${snapshot.browser.version}`} is available.`,
+        : snapshot.browser.compatible
+          ? `${snapshot.browser.name}${snapshot.browser.version === null ? "" : ` ${snapshot.browser.version}`} is available.`
+          : `${snapshot.browser.name}${snapshot.browser.version === null ? " has an unknown version" : ` ${snapshot.browser.version}`} is incompatible with this Browser plugin.`,
     ),
     capability(
       "sandbox",
@@ -174,7 +239,7 @@ function report(
 
   if (!platformSupported) {
     return {
-      ...targetWithoutEnrollment(target),
+      ...statusTarget(target),
       state: "unsupported",
       code: "unsupported",
       label: "Unsupported",
@@ -183,14 +248,10 @@ function report(
     };
   }
 
-  const repairRequired =
-    ["corrupt", "insecure"].includes(snapshot.protectedStorage.state) ||
-    snapshot.dedicatedUser.state === "invalid" ||
-    snapshot.disk.freeBytes < FIVE_GIB ||
-    !snapshot.loopback.available;
+  const repairRequired = capabilities.some((item) => item.status === "failed");
   if (repairRequired) {
     return {
-      ...targetWithoutEnrollment(target),
+      ...statusTarget(target),
       state: "repair-required",
       code: "repair_required",
       label: "Repair required",
@@ -201,7 +262,7 @@ function report(
 
   if (capabilities.some((item) => item.status !== "ready")) {
     return {
-      ...targetWithoutEnrollment(target),
+      ...statusTarget(target),
       state: "setup-required",
       code: "setup_required",
       label: "Setup required",
@@ -212,7 +273,7 @@ function report(
   }
 
   return {
-    ...targetWithoutEnrollment(target),
+    ...statusTarget(target),
     state: "healthy",
     code: "healthy",
     label: "Ready",
@@ -240,10 +301,7 @@ export function createHostReadinessBoundary(
         generatedAt: new Date().toISOString(),
         readiness,
         dependencies: [
-          { name: "bb-plugin-browser", version: "0.1.0" },
-          { name: "@get-bb/plugin-sdk", version: "0.4.21" },
-          { name: "dev-browser", version: "0.2.9" },
-          { name: "playwright", version: "1.58.2" },
+          ...dependencyInventory(),
           ...(snapshot.browser === null
             ? []
             : [
@@ -317,63 +375,84 @@ function packageVersion(contents: string, packageName: string) {
   return null;
 }
 
-async function browserAvailability() {
-  const candidates = [
-    { path: "/usr/bin/google-chrome-stable", name: "Google Chrome Stable" },
-    { path: "/usr/bin/google-chrome", name: "Google Chrome" },
-    {
-      path: `${PROTECTED_STORAGE_PATH}/browsers/chromium/chrome`,
-      name: "Pinned Playwright Chromium",
-    },
-  ];
-  const browser = (
-    await Promise.all(
-      candidates.map(async (candidate) => ({
-        ...candidate,
-        available: await fileExists(candidate.path),
-      })),
-    )
-  ).find((candidate) => candidate.available);
-  if (browser === undefined) return null;
-  const packageStatus = await readFile("/var/lib/dpkg/status", "utf8").catch(
+async function chromeAvailability(paths: HostProbePaths) {
+  const packageStatus = await readFile(paths.packageStatus, "utf8").catch(
     () => "",
   );
-  const packageName = browser.name.startsWith("Google")
-    ? "google-chrome-stable"
-    : "playwright";
+  for (const candidate of [
+    { path: paths.chromeStable, name: "Google Chrome Stable" },
+    { path: paths.chrome, name: "Google Chrome" },
+  ]) {
+    if (!(await fileExists(candidate.path))) continue;
+    const version = packageVersion(packageStatus, "google-chrome-stable");
+    return { name: candidate.name, version, compatible: version !== null };
+  }
+  return null;
+}
+
+async function fallbackBrowserAvailability(hostStorage: string) {
+  const fallbackDirectory = join(hostStorage, "browsers", "chromium");
+  const executable = join(fallbackDirectory, "chrome");
+  if (!(await fileExists(executable))) return null;
+  const rawVersion = await readFile(
+    join(fallbackDirectory, "version.json"),
+    "utf8",
+  ).catch(() => null);
+  const installed = rawVersion && fallbackBrowserVersion(rawVersion);
+  if (!installed) {
+    return {
+      name: "Pinned Playwright Chromium",
+      version: null,
+      compatible: false,
+    };
+  }
   return {
-    name: browser.name,
-    version:
-      packageName === "playwright"
-        ? "1.58.2"
-        : packageVersion(packageStatus, packageName),
+    name: "Pinned Playwright Chromium",
+    version: installed.chromiumVersion,
+    compatible:
+      installed.playwrightVersion ===
+        PINNED_BROWSER_RUNTIME.playwrightVersion &&
+      installed.chromiumRevision === PINNED_BROWSER_RUNTIME.chromiumRevision &&
+      installed.chromiumVersion === PINNED_BROWSER_RUNTIME.chromiumVersion,
   };
 }
 
-async function sandboxAvailability() {
+async function browserAvailability(paths: HostProbePaths, hostStorage: string) {
+  const chrome = await chromeAvailability(paths);
+  if (chrome?.compatible === true) return chrome;
+  const fallback = await fallbackBrowserAvailability(hostStorage);
+  return fallback?.compatible === true ? fallback : (chrome ?? fallback);
+}
+
+async function validSandboxHelper(path: string) {
+  try {
+    const metadata = await lstat(path);
+    const validMode =
+      (metadata.mode & 0o111) !== 0 &&
+      (metadata.mode & 0o022) === 0 &&
+      (metadata.mode & 0o4000) !== 0;
+    if (!metadata.isFile() || metadata.uid !== 0 || !validMode) return false;
+    await access(path, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function sandboxAvailability(paths: HostProbePaths) {
   const userNamespaceSetting = await readFile(
-    "/proc/sys/kernel/unprivileged_userns_clone",
+    paths.userNamespaceSetting,
     "utf8",
   ).catch(() => "0");
   if (userNamespaceSetting.trim() === "1") return { available: true };
-  for (const path of [
-    "/opt/google/chrome/chrome-sandbox",
-    "/usr/lib/chromium/chrome-sandbox",
-  ]) {
-    try {
-      const metadata = await stat(path);
-      if ((metadata.mode & 0o4000) !== 0 && metadata.uid === 0) {
-        return { available: true };
-      }
-    } catch {
-      // The next supported sandbox location may still be available.
-    }
+  for (const path of paths.sandboxHelpers) {
+    if (await validSandboxHelper(path)) return { available: true };
   }
   return { available: false };
 }
 
-async function dedicatedUser() {
-  const passwd = await readFile("/etc/passwd", "utf8").catch(() => "");
+async function dedicatedUser(paths: HostProbePaths) {
+  const passwd = await readFile(paths.passwd, "utf8").catch(() => "");
   const fields = passwd
     .split("\n")
     .find((line) => line.startsWith("bb-browser:"))
@@ -394,12 +473,14 @@ async function dedicatedUser() {
 }
 
 async function protectedStorage(
+  storagePath: string,
+  installationId: string,
   hostId: string,
   browserUser: Awaited<ReturnType<typeof dedicatedUser>>,
 ) {
   let metadata;
   try {
-    metadata = await stat(PROTECTED_STORAGE_PATH);
+    metadata = await stat(storagePath);
   } catch {
     return { state: "missing" as const };
   }
@@ -414,7 +495,7 @@ async function protectedStorage(
   let manifest;
   try {
     manifest = hostStateSchema.parse(
-      JSON.parse(await readFile(HOST_STATE_PATH, "utf8")),
+      JSON.parse(await readFile(join(storagePath, "host-state.json"), "utf8")),
     );
   } catch (error) {
     const code =
@@ -427,14 +508,14 @@ async function protectedStorage(
   }
   return {
     state:
-      manifest.hostId === hostId ? ("ready" as const) : ("corrupt" as const),
+      manifest.installationId === installationId && manifest.hostId === hostId
+        ? ("ready" as const)
+        : ("corrupt" as const),
   };
 }
 
-async function diskHeadroom() {
-  const filesystem = await statfs(PROTECTED_STORAGE_PATH).catch(() =>
-    statfs("/"),
-  );
+async function diskHeadroom(storagePath: string) {
+  const filesystem = await statfs(storagePath).catch(() => statfs("/"));
   return {
     freeBytes: filesystem.bavail * filesystem.bsize,
     totalBytes: filesystem.blocks * filesystem.bsize,
@@ -451,45 +532,90 @@ async function loopbackAvailability() {
   });
 }
 
-async function redactedLogSource() {
-  const contents = await readFile(EXIT_LOG_PATH, "utf8").catch(() => "");
+async function redactedLogSource(storagePath: string) {
+  const contents = await readFile(join(storagePath, "exit.log"), "utf8").catch(
+    () => "",
+  );
   return contents.split("\n").filter(Boolean).slice(-50);
 }
 
-export const defaultHostSnapshotReader: HostSnapshotReader = {
-  async snapshot(target) {
-    const browserUser = await dedicatedUser();
-    const [
-      operatingSystemContents,
-      browser,
-      sandbox,
-      storage,
-      disk,
-      loopback,
-      exitLogs,
-    ] = await Promise.all([
-      readFile("/etc/os-release", "utf8").catch(() => ""),
-      browserAvailability(),
-      sandboxAvailability(),
-      protectedStorage(target.hostId, browserUser),
-      diskHeadroom(),
-      loopbackAvailability(),
-      redactedLogSource(),
-    ]);
-    return {
-      operatingSystem: parseOsRelease(operatingSystemContents),
-      architecture: process.arch,
-      browser,
-      sandbox,
-      dedicatedUser: { state: browserUser.state },
-      protectedStorage: storage,
-      disk,
-      loopback,
-      processes: [
-        { name: "host-worker", state: "running", pid: process.pid },
-        { name: "browser", state: "stopped" },
-      ],
-      exitLogs,
-    };
-  },
-};
+export function hostInstallationId(dataDir: string) {
+  const daemonDataDir = resolve(dataDir, "../../..");
+  return createHash("sha256").update(daemonDataDir).digest("hex").slice(0, 32);
+}
+
+function hostStoragePath(
+  paths: HostProbePaths,
+  installationId: string,
+  hostId: string,
+) {
+  return join(
+    paths.protectedStorageRoot,
+    "installations",
+    installationId,
+    "hosts",
+    encodeURIComponent(hostId),
+  );
+}
+
+async function connectEnrollment(dataDir: string) {
+  const configPath = resolve(dataDir, "../../../config.json");
+  const contents = await readFile(configPath, "utf8").catch(() => null);
+  if (contents === null) return { enrolled: false };
+  return {
+    enrolled: connectConfigSchema.safeParse(jsonDocument(contents)).success,
+  };
+}
+
+export function createDefaultHostSnapshotReader(
+  dataDir: string,
+  paths: HostProbePaths = DEFAULT_PROBE_PATHS,
+): HostSnapshotReader {
+  const installationId = hostInstallationId(dataDir);
+  return {
+    async snapshot(target) {
+      const storagePath = hostStoragePath(paths, installationId, target.hostId);
+      const browserUser = await dedicatedUser(paths);
+      const [
+        operatingSystemContents,
+        connect,
+        browser,
+        sandbox,
+        storage,
+        disk,
+        loopback,
+        exitLogs,
+      ] = await Promise.all([
+        readFile(paths.osRelease, "utf8").catch(() => ""),
+        connectEnrollment(dataDir),
+        browserAvailability(paths, storagePath),
+        sandboxAvailability(paths),
+        protectedStorage(
+          storagePath,
+          installationId,
+          target.hostId,
+          browserUser,
+        ),
+        diskHeadroom(storagePath),
+        loopbackAvailability(),
+        redactedLogSource(storagePath),
+      ]);
+      return {
+        operatingSystem: parseOsRelease(operatingSystemContents),
+        architecture: process.arch,
+        connect,
+        browser,
+        sandbox,
+        dedicatedUser: { state: browserUser.state },
+        protectedStorage: storage,
+        disk,
+        loopback,
+        processes: [
+          { name: "host-worker", state: "running", pid: process.pid },
+          { name: "browser", state: "stopped" },
+        ],
+        exitLogs,
+      };
+    },
+  };
+}

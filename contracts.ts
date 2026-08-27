@@ -43,7 +43,6 @@ export const browserHostTargetSchema = z
   .object({
     hostId: z.string().min(1),
     profileId: z.string().min(1),
-    connectEnrolled: z.boolean(),
   })
   .strict();
 
@@ -188,6 +187,22 @@ export function hostOfflineStatus(target: BrowserStatusTarget): BrowserStatus {
     message: "Reconnect this workspace host to run Browser readiness checks.",
     capabilities: unavailableCapabilities(
       "Reconnect the host to inspect this capability.",
+    ),
+  };
+}
+
+export function hostProbeFailedStatus(
+  target: BrowserStatusTarget,
+): BrowserStatus {
+  return {
+    ...target,
+    state: "repair-required",
+    code: "repair_required",
+    label: "Repair required",
+    message:
+      "Connected host readiness checks failed. Retry, then inspect Browser diagnostics.",
+    capabilities: unavailableCapabilities(
+      "The retained host worker could not complete this check.",
     ),
   };
 }

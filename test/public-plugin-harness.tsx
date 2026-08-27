@@ -115,10 +115,9 @@ function panelKey(actionId: string, params: unknown) {
 export async function createPublicPluginHarness(options?: {
   status?: BrowserStatus;
   hostConnection?: "connected" | "disconnected";
-  connectEnrolled?: boolean;
+  probeFailure?: boolean;
   snapshot?: HostProbeSnapshot;
 }) {
-  let hostMutationCount = 0;
   const setupInspectionTargets: BrowserHostTarget[] = [];
   const expectedStatus =
     options?.status ??
@@ -151,9 +150,17 @@ export async function createPublicPluginHarness(options?: {
   const setupBoundary: HostSetupBoundary = {
     inspect: (target) => {
       setupInspectionTargets.push(target);
+      if (options?.probeFailure === true) {
+        throw new Error("retained worker probe failed");
+      }
       return fixtureBoundary.inspect(target);
     },
-    diagnostics: (target) => fixtureBoundary.diagnostics(target),
+    diagnostics: (target) => {
+      if (options?.probeFailure === true) {
+        throw new Error("retained worker diagnostics failed");
+      }
+      return fixtureBoundary.diagnostics(target);
+    },
   };
   const host = experimental_createHostEntryHarness(
     createBrowserHostEntry(setupBoundary),
@@ -176,15 +183,6 @@ export async function createPublicPluginHarness(options?: {
         list: async () => [hostFixture(options?.hostConnection)],
       },
     },
-    sharedPortTunnelIdentities:
-      options?.connectEnrolled === false
-        ? undefined
-        : {
-            [HOST_ID]: {
-              label: "browser-contract",
-              baseDomain: "getbb.test",
-            },
-          },
     experimental_callHostRpc: ({ method, input, signal }) => {
       if (method === "status") {
         return host.experimental_call(
@@ -209,8 +207,7 @@ export async function createPublicPluginHarness(options?: {
           { signal },
         );
       }
-      hostMutationCount += 1;
-      throw new Error(`Unexpected mutating host method: ${method}`);
+      throw new Error(`Unexpected host method: ${method}`);
     },
   });
   await plugin(backend.bb);
@@ -395,11 +392,11 @@ export async function createPublicPluginHarness(options?: {
 
   return {
     expectedStatus,
-    get hostMutationCount() {
-      return hostMutationCount;
-    },
     get setupInspectionTargets() {
       return setupInspectionTargets;
+    },
+    get sharedPortDeclarations() {
+      return backend.harness.inspection.sharedPortDeclarations;
     },
     openExistingThreadPanel,
     openNewThreadPanel,

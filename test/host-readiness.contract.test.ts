@@ -1,8 +1,26 @@
 import { experimental_createHostEntryHarness } from "@get-bb/plugin-sdk/testing/host";
+import {
+  chmod,
+  chown,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  lstat,
+  symlink,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { DEFAULT_PROFILE_ID } from "../contracts.js";
 import {
+  createDefaultHostSnapshotReader,
   createHostReadinessBoundary,
+  hostInstallationId,
+  type HostProbePaths,
   type HostProbeSnapshot,
 } from "../readiness.js";
 import { createBrowserHostEntry } from "../host.js";
@@ -10,7 +28,6 @@ import { createBrowserHostEntry } from "../host.js";
 const target = {
   hostId: "host-readiness-test",
   profileId: DEFAULT_PROFILE_ID,
-  connectEnrolled: true,
 };
 
 const healthySnapshot: HostProbeSnapshot = {
@@ -20,7 +37,12 @@ const healthySnapshot: HostProbeSnapshot = {
     name: "Ubuntu 24.04 LTS",
   },
   architecture: "x64",
-  browser: { name: "Google Chrome", version: "140.0.7339.80" },
+  connect: { enrolled: true },
+  browser: {
+    name: "Google Chrome",
+    version: "140.0.7339.80",
+    compatible: true,
+  },
   sandbox: { available: true },
   dedicatedUser: { state: "ready" },
   protectedStorage: { state: "ready" },
@@ -30,27 +52,143 @@ const healthySnapshot: HostProbeSnapshot = {
   exitLogs: [],
 };
 
+async function createRealProbeFixture() {
+  const root = await mkdtemp(join(tmpdir(), "browser-readiness-"));
+  const daemonRoot = join(root, "daemon");
+  const dataDir = join(daemonRoot, "plugins/browser/host-data");
+  const systemRoot = join(root, "system");
+  const protectedStorageRoot = join(root, "var/lib/bb-browser");
+  const daemonConfig = join(daemonRoot, "config.json");
+  const installationId = hostInstallationId(dataDir);
+  const hostStorage = join(
+    protectedStorageRoot,
+    "installations",
+    installationId,
+    "hosts",
+    encodeURIComponent(target.hostId),
+  );
+  const paths: HostProbePaths = {
+    osRelease: join(systemRoot, "os-release"),
+    passwd: join(systemRoot, "passwd"),
+    packageStatus: join(systemRoot, "dpkg-status"),
+    userNamespaceSetting: join(systemRoot, "unprivileged_userns_clone"),
+    chromeStable: join(systemRoot, "google-chrome-stable"),
+    chrome: join(systemRoot, "google-chrome"),
+    sandboxHelpers: [join(systemRoot, "chrome-sandbox")],
+    protectedStorageRoot,
+  };
+  await mkdir(dataDir, { recursive: true });
+  await mkdir(hostStorage, { recursive: true });
+  await mkdir(systemRoot, { recursive: true });
+  await writeFile(
+    daemonConfig,
+    JSON.stringify({
+      machineCredential: "credential",
+      connectMachineId: "machine",
+    }),
+  );
+  await writeFile(
+    paths.osRelease,
+    'ID=ubuntu\nVERSION_ID="24.04"\nPRETTY_NAME="Ubuntu 24.04 LTS"\n',
+  );
+  await writeFile(
+    paths.passwd,
+    "bb-browser:x:1001:1001::/var/lib/bb-browser:/usr/sbin/nologin\n",
+  );
+  await writeFile(paths.userNamespaceSetting, "1\n");
+  await writeFile(paths.chromeStable, "fixture executable");
+  await chmod(paths.chromeStable, 0o755);
+  await writeFile(
+    paths.packageStatus,
+    "Package: google-chrome-stable\nStatus: install ok installed\nVersion: 140.0.7339.80\n",
+  );
+  await writeFile(
+    join(hostStorage, "host-state.json"),
+    JSON.stringify({ schemaVersion: 1, installationId, hostId: target.hostId }),
+  );
+  await chmod(hostStorage, 0o700);
+  await chown(hostStorage, 1001, 1001);
+  return {
+    root,
+    dataDir,
+    daemonConfig,
+    hostStorage,
+    paths,
+    cleanup: () => rm(root, { recursive: true, force: true }),
+  };
+}
+
+function createRealProbeHost(
+  fixture: Awaited<ReturnType<typeof createRealProbeFixture>>,
+) {
+  return experimental_createHostEntryHarness(
+    createBrowserHostEntry(
+      createHostReadinessBoundary(
+        createDefaultHostSnapshotReader(fixture.dataDir, fixture.paths),
+      ),
+    ),
+  );
+}
+
+async function hostFingerprint(root: string) {
+  const entries = await readdir(root, { recursive: true, withFileTypes: true });
+  const filesystemEntries = await Promise.all(
+    entries.map(async (entry) => {
+      const path = join(entry.parentPath, entry.name);
+      const metadata = await lstat(path);
+      return {
+        path: path.slice(root.length),
+        kind: entry.isFile()
+          ? "file"
+          : entry.isDirectory()
+            ? "directory"
+            : "other",
+        mode: metadata.mode,
+        uid: metadata.uid,
+        contents: entry.isFile() ? await readFile(path, "utf8") : null,
+      };
+    }),
+  );
+  const processIds = await Promise.all(
+    (await readdir("/proc"))
+      .filter((name) => /^\d+$/.test(name))
+      .map(async (processId) => {
+        const command = await readFile(
+          `/proc/${processId}/cmdline`,
+          "utf8",
+        ).catch(() => "");
+        return command.includes(root) ? processId : null;
+      }),
+  );
+  return {
+    filesystem: filesystemEntries.sort((left, right) =>
+      left.path.localeCompare(right.path),
+    ),
+    processIds: processIds.filter((processId) => processId !== null).sort(),
+  };
+}
+
 describe("Workspace Browser host readiness contract", () => {
   it("classifies a fully prepared Ubuntu x64 host as healthy without mutation", async () => {
-    const mutationCount = 0;
-    const entry = createBrowserHostEntry(
-      createHostReadinessBoundary({
-        snapshot: async () => healthySnapshot,
-      }),
-    );
-    const host = experimental_createHostEntryHarness(entry);
+    const fixture = await createRealProbeFixture();
+    const host = createRealProbeHost(fixture);
+    const before = await hostFingerprint(fixture.root);
 
-    const status = await host.experimental_call("status", target);
+    try {
+      const status = await host.experimental_call("status", target);
 
-    expect(status.state).toBe("healthy");
-    expect(status.capabilities).toHaveLength(9);
-    expect(status.capabilities.every((item) => item.status === "ready")).toBe(
-      true,
-    );
-    expect(host.experimental_getRetainedWorkerLeaseCount()).toBe(1);
-    expect(mutationCount).toBe(0);
-    await host.experimental_dispose();
-    expect(host.experimental_getRetainedWorkerLeaseCount()).toBe(0);
+      expect(status.state).toBe("healthy");
+      expect(status.capabilities).toHaveLength(9);
+      expect(status.capabilities.every((item) => item.status === "ready")).toBe(
+        true,
+      );
+      expect(host.experimental_getRetainedWorkerLeaseCount()).toBe(1);
+      expect(await hostFingerprint(fixture.root)).toEqual(before);
+    } finally {
+      await host.experimental_dispose();
+      expect(host.experimental_getRetainedWorkerLeaseCount()).toBe(0);
+      await fixture.cleanup();
+    }
   });
 
   it("classifies Debian x86_64 as a supported platform", async () => {
@@ -76,23 +214,23 @@ describe("Workspace Browser host readiness contract", () => {
     await host.experimental_dispose();
   });
 
-  it("requires BB Connect enrollment before the host is ready", async () => {
-    const host = experimental_createHostEntryHarness(
-      createBrowserHostEntry(
-        createHostReadinessBoundary({ snapshot: async () => healthySnapshot }),
-      ),
-    );
+  it("issue #3 probes BB Connect enrollment from the retained worker", async () => {
+    const fixture = await createRealProbeFixture();
+    await writeFile(fixture.daemonConfig, JSON.stringify({}));
+    const host = createRealProbeHost(fixture);
 
-    const status = await host.experimental_call("status", {
-      ...target,
-      connectEnrolled: false,
-    });
+    try {
+      const status = await host.experimental_call("status", target);
 
-    expect(status.state).toBe("setup-required");
-    expect(
-      status.capabilities.find((item) => item.id === "bb-connect"),
-    ).toMatchObject({ status: "missing" });
-    await host.experimental_dispose();
+      expect(
+        status.capabilities.find((item) => item.id === "bb-connect"),
+      ).toMatchObject({ status: "missing" });
+      expect(host.experimental_getRetainedWorkerLeaseCount()).toBe(1);
+    } finally {
+      await host.experimental_dispose();
+      expect(host.experimental_getRetainedWorkerLeaseCount()).toBe(0);
+      await fixture.cleanup();
+    }
   });
 
   it("classifies unsupported operating systems and architectures without partial setup", async () => {
@@ -197,6 +335,152 @@ describe("Workspace Browser host readiness contract", () => {
     });
     await host.experimental_dispose();
   });
+
+  it.each([
+    {
+      name: "another BB installation",
+      manifest: {
+        schemaVersion: 1,
+        installationId: "another-installation",
+        hostId: target.hostId,
+      },
+    },
+    {
+      name: "another workspace host",
+      manifest: {
+        schemaVersion: 1,
+        installationId: null,
+        hostId: "another-host",
+      },
+    },
+  ])("issue #3 rejects protected storage for $name", async ({ manifest }) => {
+    const fixture = await createRealProbeFixture();
+    await writeFile(
+      join(fixture.hostStorage, "host-state.json"),
+      JSON.stringify({
+        ...manifest,
+        installationId:
+          manifest.installationId ?? hostInstallationId(fixture.dataDir),
+      }),
+    );
+    const host = createRealProbeHost(fixture);
+
+    try {
+      const status = await host.experimental_call("status", target);
+
+      expect(status.state).toBe("repair-required");
+      expect(
+        status.capabilities.find((item) => item.id === "protected-storage"),
+      ).toMatchObject({ status: "failed" });
+    } finally {
+      await host.experimental_dispose();
+      await fixture.cleanup();
+    }
+  });
+
+  it("issue #3 rejects a symlink masquerading as a Chrome sandbox helper", async () => {
+    const fixture = await createRealProbeFixture();
+    const helperTarget = `${fixture.paths.sandboxHelpers[0]}.target`;
+    await writeFile(fixture.paths.userNamespaceSetting, "0\n");
+    await writeFile(helperTarget, "fixture sandbox helper");
+    await chmod(helperTarget, 0o4755);
+    await symlink(helperTarget, fixture.paths.sandboxHelpers[0]);
+    const host = createRealProbeHost(fixture);
+
+    try {
+      const status = await host.experimental_call("status", target);
+
+      expect(
+        status.capabilities.find((item) => item.id === "sandbox"),
+      ).toMatchObject({ status: "missing" });
+    } finally {
+      await host.experimental_dispose();
+      await fixture.cleanup();
+    }
+  });
+
+  it.each([
+    { name: "non-executable", mode: 0o4600, expected: "missing" },
+    { name: "valid", mode: 0o4755, expected: "ready" },
+  ])(
+    "issue #3 classifies a $name Chrome sandbox helper as $expected",
+    async ({ mode, expected }) => {
+      const fixture = await createRealProbeFixture();
+      const helper = fixture.paths.sandboxHelpers[0];
+      await writeFile(fixture.paths.userNamespaceSetting, "0\n");
+      await writeFile(helper, "fixture sandbox helper");
+      await chmod(helper, mode);
+      const host = createRealProbeHost(fixture);
+
+      try {
+        const status = await host.experimental_call("status", target);
+
+        expect(
+          status.capabilities.find((item) => item.id === "sandbox"),
+        ).toMatchObject({ status: expected });
+      } finally {
+        await host.experimental_dispose();
+        await fixture.cleanup();
+      }
+    },
+  );
+
+  it.each([
+    {
+      name: "matching",
+      versionEvidence: JSON.stringify({
+        playwrightVersion: "1.58.2",
+        chromiumRevision: "1208",
+        chromiumVersion: "145.0.7632.6",
+      }),
+      expectedState: "healthy",
+      expectedCapability: "ready",
+    },
+    {
+      name: "drifted",
+      versionEvidence: JSON.stringify({
+        playwrightVersion: "1.57.0",
+        chromiumRevision: "1194",
+        chromiumVersion: "143.0.7499.4",
+      }),
+      expectedState: "repair-required",
+      expectedCapability: "failed",
+    },
+    {
+      name: "corrupt",
+      versionEvidence: "not json",
+      expectedState: "repair-required",
+      expectedCapability: "failed",
+    },
+  ])(
+    "issue #3 classifies $name pinned Chromium version evidence",
+    async ({ versionEvidence, expectedState, expectedCapability }) => {
+      const fixture = await createRealProbeFixture();
+      const fallbackDirectory = join(
+        fixture.hostStorage,
+        "browsers",
+        "chromium",
+      );
+      await unlink(fixture.paths.chromeStable);
+      await mkdir(fallbackDirectory, { recursive: true });
+      await writeFile(join(fallbackDirectory, "chrome"), "fixture executable");
+      await chmod(join(fallbackDirectory, "chrome"), 0o755);
+      await writeFile(join(fallbackDirectory, "version.json"), versionEvidence);
+      const host = createRealProbeHost(fixture);
+
+      try {
+        const status = await host.experimental_call("status", target);
+
+        expect(status.state).toBe(expectedState);
+        expect(
+          status.capabilities.find((item) => item.id === "browser"),
+        ).toMatchObject({ status: expectedCapability });
+      } finally {
+        await host.experimental_dispose();
+        await fixture.cleanup();
+      }
+    },
+  );
 
   it("returns only redacted diagnostics through the retained host contract", async () => {
     const host = experimental_createHostEntryHarness(

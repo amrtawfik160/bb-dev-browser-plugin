@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { describe, expect, it } from "vitest";
 import {
+  browserDiagnosticsSchema,
   browserScriptFailureSchema,
   browserStatusSchema,
   DEFAULT_PROFILE_ID,
@@ -17,7 +18,12 @@ const preparedSnapshot: HostProbeSnapshot = {
     name: "Ubuntu 24.04 LTS",
   },
   architecture: "x64",
-  browser: { name: "Google Chrome", version: "140.0.7339.80" },
+  connect: { enrolled: true },
+  browser: {
+    name: "Google Chrome",
+    version: "140.0.7339.80",
+    compatible: true,
+  },
   sandbox: { available: true },
   dedicatedUser: { state: "ready" },
   protectedStorage: { state: "ready" },
@@ -65,7 +71,7 @@ describe("Browser public plugin contract", () => {
     const status = browserStatusSchema.parse(JSON.parse(cli.stdout));
     expect(status.state).toBe("healthy");
     expect(status.capabilities).toHaveLength(9);
-    expect(browser.hostMutationCount).toBe(0);
+    expect(browser.sharedPortDeclarations).toEqual([]);
     await browser.dispose();
   });
 
@@ -117,7 +123,7 @@ describe("Browser public plugin contract", () => {
       await panel.panel.findByText(status.label);
       expect(status.state).toBe(state);
       expect(status.capabilities).toHaveLength(9);
-      expect(browser.hostMutationCount).toBe(0);
+      expect(browser.sharedPortDeclarations).toEqual([]);
       await browser.dispose();
     },
   );
@@ -156,7 +162,32 @@ describe("Browser public plugin contract", () => {
     expect(status.state).toBe("host-offline");
     expect(status.capabilities).toHaveLength(9);
     expect(browser.setupInspectionTargets).toEqual([]);
-    expect(browser.hostMutationCount).toBe(0);
+    expect(browser.sharedPortDeclarations).toEqual([]);
+    await browser.dispose();
+  });
+
+  it("issue #3 reports a connected readiness probe failure as Repair required", async () => {
+    const browser = await createPublicPluginHarness({ probeFailure: true });
+
+    const cli = await browser.runStatusCli();
+    const status = browserStatusSchema.parse(JSON.parse(cli.stdout));
+
+    expect(status.state).toBe("repair-required");
+    expect(status.message).toContain("readiness checks failed");
+    expect(browser.setupInspectionTargets).toEqual([
+      { hostId: "host-browser-test", profileId: DEFAULT_PROFILE_ID },
+    ]);
+    await browser.dispose();
+  });
+
+  it("issue #3 keeps connected worker failures distinct in redacted diagnostics", async () => {
+    const browser = await createPublicPluginHarness({ probeFailure: true });
+
+    const cli = await browser.runDiagnosticsCli();
+    const diagnostics = browserDiagnosticsSchema.parse(JSON.parse(cli.stdout));
+
+    expect(diagnostics.readiness.state).toBe("repair-required");
+    expect(diagnostics.readiness.message).toContain("readiness checks failed");
     await browser.dispose();
   });
 
@@ -251,10 +282,9 @@ describe("Browser public plugin contract", () => {
       {
         hostId: "host-browser-test",
         profileId: DEFAULT_PROFILE_ID,
-        connectEnrolled: true,
       },
     ]);
-    expect(browser.hostMutationCount).toBe(0);
+    expect(browser.sharedPortDeclarations).toEqual([]);
     await browser.dispose();
   });
 
