@@ -64,6 +64,58 @@ describe("host-local Browser Profile storage", () => {
     }
   });
 
+  it("R5-01 does not expose a profile directory before its manifest is ready", async () => {
+    const rootDirectory = await mkdtemp(join(tmpdir(), "bb-browser-profile-"));
+    const knownOwnedPaths = new Set<string>();
+    let profileCreationStarted = false;
+    let newProfileDirectoryReady!: () => void;
+    let releaseProfileCreation!: () => void;
+    const newProfileDirectoryReadyPromise = new Promise<void>((resolve) => {
+      newProfileDirectoryReady = resolve;
+    });
+    const profileCreationReleased = new Promise<void>((resolve) => {
+      releaseProfileCreation = resolve;
+    });
+    const store = createFileBrowserProfileStore({
+      rootDirectory,
+      installationId: "installation-test",
+      idFactory: () => "race",
+      ownership: {
+        ensureOwned: async (path) => {
+          if (!profileCreationStarted) {
+            knownOwnedPaths.add(path);
+          } else if (!knownOwnedPaths.has(path)) {
+            newProfileDirectoryReady();
+            await profileCreationReleased;
+          }
+        },
+        verifyOwned: async () => undefined,
+      },
+    });
+
+    try {
+      await store.initialize("host-a");
+      profileCreationStarted = true;
+      const creating = store.createProfile({
+        hostId: "host-a",
+        name: "Racing profile",
+      });
+      await newProfileDirectoryReadyPromise;
+
+      const inventory = await store.listProfiles("host-a");
+      expect(inventory.profiles.map((profile) => profile.profileId)).toEqual([
+        DEFAULT_PROFILE_ID,
+      ]);
+      releaseProfileCreation();
+      await expect(creating).resolves.toMatchObject({
+        profileId: "profile-race",
+      });
+    } finally {
+      releaseProfileCreation();
+      await rm(rootDirectory, { recursive: true, force: true });
+    }
+  });
+
   it("creates profile storage with the configured browser-user ownership", async () => {
     const rootDirectory = await mkdtemp(join(tmpdir(), "bb-browser-profile-"));
     try {

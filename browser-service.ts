@@ -505,11 +505,22 @@ export function createBrowserService(bb: BbPluginApi) {
     if ((await hostConnection(hostId, signal)) !== "connected") {
       return hostStatus(hostId, DEFAULT_PROFILE_ID, signal);
     }
-    return hostStatus(
+    const projectId = await profileContextProjectId(bb, identity);
+    const preferredProfileId = selectedProfilePreference(
+      database,
+      projectId,
       hostId,
-      await selectedProfileId(identity, hostId),
-      signal,
     );
+    const profileId = preferredProfileId ?? DEFAULT_PROFILE_ID;
+    if (preferredProfileId !== null) {
+      const inventory = await profileInventory({ ...identity, hostId }, signal);
+      if (
+        !inventory.profiles.some((profile) => profile.profileId === profileId)
+      ) {
+        return browserProfileUnavailableStatus({ hostId, profileId });
+      }
+    }
+    return hostStatus(hostId, profileId, signal);
   }
 
   async function settingsStatuses(profileId = DEFAULT_PROFILE_ID) {

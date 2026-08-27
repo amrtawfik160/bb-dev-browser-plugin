@@ -22,7 +22,10 @@ import {
 } from "../contracts.js";
 import { createPublicPluginHarness } from "./public-plugin-harness.js";
 import { createSimulatedPrivilegedExecutor } from "../host-operations.js";
-import { createFileBrowserProfileStore } from "../profile-storage.js";
+import {
+  createFileBrowserProfileStore,
+  profileStoragePaths,
+} from "../profile-storage.js";
 import type { HostProbeSnapshot } from "../readiness.js";
 
 const preparedSnapshot: HostProbeSnapshot = {
@@ -508,6 +511,61 @@ describe("Browser public plugin contract", () => {
     expect(projectAInventory.selectedProfileId).toBe(projectAProfile.profileId);
     expect(projectBInventory.selectedProfileId).toBe(projectBProfile.profileId);
     await browser.dispose();
+  });
+
+  it("R5-03 reports a stale selected Browser Profile like browser_script", async () => {
+    const rootDirectory = await mkdtemp(join(tmpdir(), "bb-browser-public-"));
+    const profileStore = createFileBrowserProfileStore({
+      rootDirectory,
+      installationId: "installation-public-test",
+    });
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+      profileStore,
+    });
+
+    try {
+      const selectedProfile = await browser.createBrowserProfile({
+        hostId: "host-browser-test",
+        name: "Stale selection",
+      });
+      await browser.selectBrowserProfile({
+        hostId: "host-browser-test",
+        profileId: selectedProfile.profileId,
+      });
+      await rm(
+        profileStoragePaths({
+          rootDirectory,
+          installationId: "installation-public-test",
+          hostId: "host-browser-test",
+          profileId: selectedProfile.profileId,
+        }).profileDirectory,
+        { recursive: true, force: true },
+      );
+
+      const status = await browser.runBrowserStatus({
+        surface: "new-thread",
+        projectId: "project-browser-test",
+        hostId: "host-browser-test",
+        profileId: DEFAULT_PROFILE_ID,
+        profileSelection: "selected",
+      });
+      const scriptFailure = browserScriptFailureSchema.parse(
+        JSON.parse(
+          (await browser.runBrowserScriptWithProfile()).content[0]!.text,
+        ),
+      );
+
+      expect(status).toMatchObject({
+        state: "repair-required",
+        code: "repair_required",
+        profileId: selectedProfile.profileId,
+      });
+      expect(scriptFailure.error).toEqual(status);
+    } finally {
+      await browser.dispose();
+      await rm(rootDirectory, { recursive: true, force: true });
+    }
   });
 
   it("R5-04 returns a typed unavailable status before probing an explicit missing profile", async () => {

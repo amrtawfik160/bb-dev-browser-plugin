@@ -391,9 +391,24 @@ async function writeProfile(
   ownership: ProfileStorageOwnershipBoundary,
 ) {
   await secureProfileNamespace(options, paths, ownership);
-  await secureDirectory(paths.profileDirectory, ownership);
-  await secureDirectory(paths.browserDataPath, ownership);
-  await writeJson(paths.manifestPath, manifest, ownership);
+  const stagingDirectory = join(
+    paths.hostStoragePath,
+    `.profile-${manifest.profileId}-${randomUUID()}.tmp`,
+  );
+  let promoted = false;
+  try {
+    await secureDirectory(stagingDirectory, ownership);
+    await secureDirectory(join(stagingDirectory, "chrome-data"), ownership);
+    await writeJson(
+      join(stagingDirectory, "manifest.json"),
+      manifest,
+      ownership,
+    );
+    await rename(stagingDirectory, paths.profileDirectory);
+    promoted = true;
+  } finally {
+    if (!promoted) await rm(stagingDirectory, { recursive: true, force: true });
+  }
 }
 
 function profileFromManifest(
