@@ -12,12 +12,43 @@ import {
 import {
   browserScriptParametersSchema,
   rpcContract,
+  setupStepIdSchema,
+  DEFAULT_PROFILE_ID,
   type BrowserScriptFailure,
+  type BrowserPurgePlan,
+  type BrowserPurgeResponse,
+  type BrowserSetupPlan,
+  type BrowserSetupResponse,
   type BrowserStatus,
 } from "./contracts.js";
 
-const CLI_USAGE = "Usage: bb browser <status|diagnostics> [--json]";
+const CLI_USAGE = [
+  "Usage: bb browser <status|diagnostics|setup|disable|uninstall|purge> [options]",
+  "  setup [--profile <id>] [--step <id> --confirm <text>] [--json]",
+  "  purge [--profile <id>] [--confirm <text>] [--json]",
+  "  disable|uninstall [--profile <id>] --confirm <text> [--json]",
+].join("\n");
 type BrowserScriptParameters = z.output<typeof browserScriptParametersSchema>;
+const BROWSER_COMMANDS = [
+  "status",
+  "diagnostics",
+  "setup",
+  "disable",
+  "uninstall",
+  "purge",
+] as const;
+type BrowserCommand = (typeof BROWSER_COMMANDS)[number];
+
+type ParsedCliArguments = {
+  command: BrowserCommand;
+  json: boolean;
+  profileId: string;
+  stepId?: z.output<typeof setupStepIdSchema>;
+  confirmation?: string;
+};
+
+type CliArgumentParseResult =
+  { arguments: ParsedCliArguments } | { error: string };
 
 function cliStatusText(status: BrowserStatus) {
   const checklist = status.capabilities.map((item) => {
@@ -27,36 +58,357 @@ function cliStatusText(status: BrowserStatus) {
   return [status.label, status.message, "", ...checklist].join("\n");
 }
 
+function cliSetupPlanText(plan: BrowserSetupPlan) {
+  const packages = plan.packages.map(
+    (packageSpec) => `- ${packageSpec.name}: ${packageSpec.purpose}`,
+  );
+  const steps = plan.steps.map(
+    (step) =>
+      `- ${step.state}: ${step.label} (type "${step.confirmationText}")`,
+  );
+  return [
+    `Browser setup plan for ${plan.hostId}`,
+    `State: ${plan.state}`,
+    `Runtime: ${plan.runtime.runAsUser} (${plan.runtime.shell}, Chrome sandbox required)`,
+    `Storage root: ${plan.storageRoot}`,
+    `Host storage: ${plan.hostStoragePath}`,
+    `Configuration: ${plan.configurationPath}`,
+    "Packages:",
+    ...packages,
+    "Steps:",
+    ...steps,
+  ].join("\n");
+}
+
+function cliPurgePlanText(plan: BrowserPurgePlan) {
+  const targets = plan.targets.map((target) => {
+    const location =
+      "path" in target
+        ? target.path
+        : "scope" in target
+          ? target.scope
+          : target.username;
+    return `- ${target.state}: ${target.id} — ${location}`;
+  });
+  return [
+    `Browser purge plan for ${plan.hostId}`,
+    `State: ${plan.state}`,
+    `Type exactly: ${plan.confirmationText}`,
+    "Targets:",
+    ...targets,
+  ].join("\n");
+}
+
+function cliSetupResponseText(response: BrowserSetupResponse) {
+  return [response.message, "", cliSetupPlanText(response.plan)].join("\n");
+}
+
+function cliPurgeResponseText(response: BrowserPurgeResponse) {
+  return [response.message, "", cliPurgePlanText(response.plan)].join("\n");
+}
+
+function cliJsonOrText<T>(json: boolean, payload: T, textValue: string) {
+  return json ? JSON.stringify(payload) : textValue;
+}
+
+function requiredOptionValue(
+  argv: string[],
+  index: number,
+  option: string,
+): { optionValue: string; nextIndex: number } | { error: string } {
+  const optionValue = argv[index + 1];
+  if (optionValue === undefined || optionValue.startsWith("--")) {
+    return { error: `${option} requires a value.\n${CLI_USAGE}` };
+  }
+  return { optionValue, nextIndex: index + 1 };
+}
+
+type CliOptionName = "--profile" | "--step" | "confirmation";
+type ParsedCliOption = {
+  name: CliOptionName;
+  optionValue: string;
+  nextIndex: number;
+};
+
+function cliOptionName(argument: string): CliOptionName | null {
+  if (argument === "--profile" || argument === "--step") return argument;
+  if (argument === "--confirm" || argument === "--confirmation") {
+    return "confirmation";
+  }
+  return null;
+}
+
+function readCliOption(
+  argv: string[],
+  index: number,
+  argument: string,
+): ParsedCliOption | { error: string } | null {
+  const name = cliOptionName(argument);
+  if (name === null) return null;
+  const optionResult = requiredOptionValue(argv, index, argument);
+  if ("error" in optionResult) return optionResult;
+  return { name, ...optionResult };
+}
+
+type CliParseState = {
+  positional: string[];
+  json: boolean;
+  profileId: string;
+  stepId?: ParsedCliArguments["stepId"];
+  confirmation?: string;
+};
+
+function applyCliOption(
+  parseState: CliParseState,
+  option: ParsedCliOption,
+): string | null {
+  if (option.name === "--profile") {
+    parseState.profileId = option.optionValue;
+    return null;
+  }
+  if (option.name === "--step") {
+    const parsedStep = setupStepIdSchema.safeParse(option.optionValue);
+    if (!parsedStep.success) {
+      return `Unknown setup step: ${option.optionValue}.\n${CLI_USAGE}`;
+    }
+    parseState.stepId = parsedStep.data;
+    return null;
+  }
+  parseState.confirmation = option.optionValue;
+  return null;
+}
+
+function isBrowserCommand(
+  command: string | undefined,
+): command is BrowserCommand {
+  return (
+    command !== undefined && BROWSER_COMMANDS.some((known) => known === command)
+  );
+}
+
+function parsedCommand(positional: string[]): BrowserCommand | null {
+  if (positional.length !== 1) return null;
+  const command = positional[0];
+  return isBrowserCommand(command) ? command : null;
+}
+
+function validateCliCommandOptions(
+  command: BrowserCommand,
+  parseState: CliParseState,
+): string | null {
+  if (command !== "setup" && parseState.stepId !== undefined) {
+    return `--step is only valid for setup.\n${CLI_USAGE}`;
+  }
+  if (
+    ["status", "diagnostics"].includes(command) &&
+    parseState.confirmation !== undefined
+  ) {
+    return `Confirmation is not valid for ${command}.\n${CLI_USAGE}`;
+  }
+  if (
+    command === "setup" &&
+    (parseState.stepId === undefined) !==
+      (parseState.confirmation === undefined)
+  ) {
+    return `setup changes require both --step and --confirm.\n${CLI_USAGE}`;
+  }
+  if (
+    ["disable", "uninstall"].includes(command) &&
+    parseState.confirmation === undefined
+  ) {
+    return `${command} requires --confirm.\n${CLI_USAGE}`;
+  }
+  return null;
+}
+
+function parseCliArguments(argv: string[]): CliArgumentParseResult {
+  const parseState: CliParseState = {
+    positional: [],
+    json: false,
+    profileId: DEFAULT_PROFILE_ID,
+  };
+  for (let index = 0; index < argv.length; index += 1) {
+    const argument = argv[index]!;
+    if (argument === "--json") {
+      parseState.json = true;
+      continue;
+    }
+    const option = readCliOption(argv, index, argument);
+    if (option !== null) {
+      if ("error" in option) return option;
+      index = option.nextIndex;
+      const optionError = applyCliOption(parseState, option);
+      if (optionError !== null) return { error: optionError };
+      continue;
+    }
+    if (argument.startsWith("--")) {
+      return { error: `Unknown option: ${argument}.\n${CLI_USAGE}` };
+    }
+    parseState.positional.push(argument);
+  }
+  const command = parsedCommand(parseState.positional);
+  if (command === null) return { error: CLI_USAGE };
+  const optionError = validateCliCommandOptions(command, parseState);
+  if (optionError !== null) return { error: optionError };
+  return {
+    arguments: {
+      command,
+      json: parseState.json,
+      profileId: parseState.profileId,
+      stepId: parseState.stepId,
+      confirmation: parseState.confirmation,
+    },
+  };
+}
+
+async function runStatusCli(
+  browser: BrowserService,
+  profileId: string,
+  json: boolean,
+  context: PluginCliContext,
+) {
+  const status = await browser.status(context, profileId, context.signal);
+  return {
+    exitCode: 0,
+    stdout: cliJsonOrText(json, status, cliStatusText(status)),
+  };
+}
+
+async function runDiagnosticsCli(
+  browser: BrowserService,
+  profileId: string,
+  json: boolean,
+  context: PluginCliContext,
+) {
+  const status = await browser.status(context, profileId, context.signal);
+  if (status.hostId === null) return { exitCode: 1, stderr: status.message };
+  const diagnostics = await browser.diagnostics(status, context.signal);
+  const stdout = json
+    ? JSON.stringify(diagnostics)
+    : JSON.stringify(diagnostics, null, 2);
+  return { exitCode: 0, stdout };
+}
+
+async function runSetupCli(
+  browser: BrowserService,
+  target: { hostId: string; profileId: string },
+  cliArguments: ParsedCliArguments,
+  signal?: AbortSignal,
+) {
+  const plan = await browser.setupPlan(target, signal);
+  if (
+    cliArguments.stepId === undefined ||
+    cliArguments.confirmation === undefined
+  ) {
+    return {
+      exitCode: 0,
+      stdout: cliJsonOrText(cliArguments.json, plan, cliSetupPlanText(plan)),
+    };
+  }
+  const response = await browser.setup(
+    {
+      ...target,
+      stepId: cliArguments.stepId,
+      confirmation: cliArguments.confirmation,
+    },
+    signal,
+  );
+  return {
+    exitCode: response.outcome === "partial-failure" ? 1 : 0,
+    stdout: cliJsonOrText(
+      cliArguments.json,
+      response,
+      cliSetupResponseText(response),
+    ),
+  };
+}
+
+async function runPurgeCli(
+  browser: BrowserService,
+  target: { hostId: string; profileId: string },
+  cliArguments: ParsedCliArguments,
+  signal?: AbortSignal,
+) {
+  const plan = await browser.purgePlan(target, signal);
+  if (cliArguments.confirmation === undefined) {
+    return {
+      exitCode: 0,
+      stdout: cliJsonOrText(cliArguments.json, plan, cliPurgePlanText(plan)),
+    };
+  }
+  const response = await browser.purge(
+    { ...target, confirmation: cliArguments.confirmation },
+    signal,
+  );
+  return {
+    exitCode: response.outcome === "partial-failure" ? 1 : 0,
+    stdout: cliJsonOrText(
+      cliArguments.json,
+      response,
+      cliPurgeResponseText(response),
+    ),
+  };
+}
+
+async function runLifecycleCli(
+  browser: BrowserService,
+  target: { hostId: string; profileId: string },
+  cliArguments: ParsedCliArguments,
+  signal?: AbortSignal,
+) {
+  const action = cliArguments.command;
+  if (action !== "disable" && action !== "uninstall") {
+    throw new Error(`${action} is not a lifecycle command.`);
+  }
+  if (cliArguments.confirmation === undefined) {
+    throw new Error(`${action} requires --confirm.`);
+  }
+  const response = await browser.lifecycle(
+    action,
+    { ...target, confirmation: cliArguments.confirmation },
+    signal,
+  );
+  return {
+    exitCode: response.outcome === "failed" ? 1 : 0,
+    stdout: cliArguments.json ? JSON.stringify(response) : response.message,
+  };
+}
+
+async function runAdministrationCli(
+  browser: BrowserService,
+  cliArguments: ParsedCliArguments,
+  context: PluginCliContext,
+) {
+  const target = await browser.resolveTarget(context, cliArguments.profileId);
+  if (cliArguments.command === "setup") {
+    return runSetupCli(browser, target, cliArguments, context.signal);
+  }
+  if (cliArguments.command === "purge") {
+    return runPurgeCli(browser, target, cliArguments, context.signal);
+  }
+  return runLifecycleCli(browser, target, cliArguments, context.signal);
+}
+
 async function runCli(
   browser: BrowserService,
   argv: string[],
   context: PluginCliContext,
 ) {
-  const json = argv.includes("--json");
-  const commands = argv.filter((argument) => argument !== "--json");
-  if (
-    commands.length !== 1 ||
-    !["status", "diagnostics"].includes(commands[0]!)
-  ) {
-    return { exitCode: 1, stderr: CLI_USAGE };
-  }
-  const status = await browser.status(context, undefined, context.signal);
-  if (commands[0] === "diagnostics") {
-    if (status.hostId === null) {
-      return { exitCode: 1, stderr: status.message };
+  const parsed = parseCliArguments(argv);
+  if ("error" in parsed) return { exitCode: 1, stderr: parsed.error };
+  const { command, json, profileId } = parsed.arguments;
+  try {
+    if (command === "status") {
+      return await runStatusCli(browser, profileId, json, context);
     }
-    const diagnostics = await browser.diagnostics(status, context.signal);
-    return {
-      exitCode: 0,
-      stdout: json
-        ? JSON.stringify(diagnostics)
-        : JSON.stringify(diagnostics, null, 2),
-    };
+    if (command === "diagnostics") {
+      return await runDiagnosticsCli(browser, profileId, json, context);
+    }
+    return await runAdministrationCli(browser, parsed.arguments, context);
+  } catch (error) {
+    if (error instanceof Error) return { exitCode: 1, stderr: error.message };
+    throw error;
   }
-  return {
-    exitCode: 0,
-    stdout: json ? JSON.stringify(status) : cliStatusText(status),
-  };
 }
 
 function toolFailure(failure: BrowserScriptFailure) {
@@ -77,7 +429,7 @@ async function runBrowserScript(
 function registerCli(bb: BbPluginApi, browser: BrowserService) {
   bb.cli.register({
     name: "browser",
-    summary: "Inspect Browser status",
+    summary: "Inspect and manage Browser host state",
     commands: [
       {
         name: "status",
@@ -88,6 +440,26 @@ function registerCli(bb: BbPluginApi, browser: BrowserService) {
         name: "diagnostics",
         summary: "Generate redacted Browser host diagnostics",
         usage: "bb browser diagnostics [--json]",
+      },
+      {
+        name: "setup",
+        summary: "Show or apply the consent-gated Browser setup plan",
+        usage: "bb browser setup [--step <id> --confirm <text>] [--json]",
+      },
+      {
+        name: "disable",
+        summary: "Stop Browser-owned processes and retain profiles",
+        usage: 'bb browser disable --confirm "Stop Browser processes"',
+      },
+      {
+        name: "uninstall",
+        summary: "Stop Browser-owned processes and retain profiles",
+        usage: 'bb browser uninstall --confirm "Stop Browser processes"',
+      },
+      {
+        name: "purge",
+        summary: "Show or apply the destructive Browser purge plan",
+        usage: "bb browser purge [--confirm <text>] [--json]",
       },
     ],
     run: (argv, context) => runCli(browser, argv, context),
@@ -121,6 +493,12 @@ export default function plugin(bb: BbPluginApi) {
     browser_settings_status: (input) =>
       browser.settingsStatuses(input.profileId),
     browser_diagnostics: (input) => browser.diagnostics(input),
+    browser_setup_plan: (input) => browser.setupPlan(input),
+    browser_setup: (input) => browser.setup(input),
+    browser_disable: (input) => browser.lifecycle("disable", input),
+    browser_uninstall: (input) => browser.lifecycle("uninstall", input),
+    browser_purge_plan: (input) => browser.purgePlan(input),
+    browser_purge: (input) => browser.purge(input),
   });
   registerCli(bb, browser);
   registerAgentTool(bb, browser);

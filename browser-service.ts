@@ -7,6 +7,14 @@ import {
   hostOfflineStatus,
   hostProbeFailedStatus,
   setupRequiredStatus,
+  type BrowserHostTarget,
+  type BrowserLifecycleRequest,
+  type BrowserPurgePlan,
+  type BrowserPurgeRequest,
+  type BrowserPurgeResponse,
+  type BrowserSetupPlan,
+  type BrowserSetupRequest,
+  type BrowserSetupResponse,
   type BrowserDiagnostics,
   type BrowserStatus,
   type BrowserStatusInput,
@@ -118,6 +126,23 @@ export function createBrowserService(bb: BbPluginApi) {
     }
   }
 
+  async function requireConnectedHost(hostId: string, signal?: AbortSignal) {
+    if ((await hostConnection(hostId, signal)) !== "connected") {
+      throw new Error(`Workspace host ${hostId} is not connected.`);
+    }
+  }
+
+  async function resolveTarget(
+    identity: BrowserIdentity,
+    profileId: string,
+  ): Promise<BrowserHostTarget> {
+    const hostId = await resolvedHostId(bb, identity);
+    if (hostId === null) {
+      throw new Error("Select a workspace host before changing Browser setup.");
+    }
+    return { hostId, profileId };
+  }
+
   async function status(
     identity: BrowserIdentity,
     profileId = defaultProfileId(database),
@@ -157,6 +182,56 @@ export function createBrowserService(bb: BbPluginApi) {
     }
   }
 
+  async function setupPlan(
+    target: BrowserHostTarget,
+    signal?: AbortSignal,
+  ): Promise<BrowserSetupPlan> {
+    await requireConnectedHost(target.hostId, signal);
+    return host.call("setupPlan", target, { hostId: target.hostId, signal });
+  }
+
+  async function setup(
+    request: BrowserSetupRequest,
+    signal?: AbortSignal,
+  ): Promise<BrowserSetupResponse> {
+    await requireConnectedHost(request.hostId, signal);
+    return host.call("setup", request, {
+      hostId: request.hostId,
+      signal,
+    });
+  }
+
+  async function lifecycle(
+    method: "disable" | "uninstall",
+    request: BrowserLifecycleRequest,
+    signal?: AbortSignal,
+  ) {
+    await requireConnectedHost(request.hostId, signal);
+    return host.call(method, request, {
+      hostId: request.hostId,
+      signal,
+    });
+  }
+
+  async function purgePlan(
+    target: BrowserHostTarget,
+    signal?: AbortSignal,
+  ): Promise<BrowserPurgePlan> {
+    await requireConnectedHost(target.hostId, signal);
+    return host.call("purgePlan", target, { hostId: target.hostId, signal });
+  }
+
+  async function purge(
+    request: BrowserPurgeRequest,
+    signal?: AbortSignal,
+  ): Promise<BrowserPurgeResponse> {
+    await requireConnectedHost(request.hostId, signal);
+    return host.call("purge", request, {
+      hostId: request.hostId,
+      signal,
+    });
+  }
+
   async function browserScript(
     parameters: BrowserScriptParameters,
     context: PluginAgentToolContext,
@@ -185,7 +260,18 @@ export function createBrowserService(bb: BbPluginApi) {
     );
   }
 
-  return { browserScript, diagnostics, settingsStatuses, status };
+  return {
+    browserScript,
+    diagnostics,
+    lifecycle,
+    purge,
+    purgePlan,
+    resolveTarget,
+    settingsStatuses,
+    setup,
+    setupPlan,
+    status,
+  };
 }
 
 export type BrowserService = ReturnType<typeof createBrowserService>;

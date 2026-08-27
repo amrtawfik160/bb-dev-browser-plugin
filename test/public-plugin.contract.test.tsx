@@ -1,7 +1,12 @@
 // @vitest-environment jsdom
+import { fireEvent } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import {
   browserDiagnosticsSchema,
+  browserLifecycleResponseSchema,
+  browserSetupPlanSchema,
+  browserSetupResponseSchema,
+  browserPurgePlanSchema,
   browserScriptFailureSchema,
   browserStatusSchema,
   DEFAULT_PROFILE_ID,
@@ -9,6 +14,7 @@ import {
   type BrowserStatus,
 } from "../contracts.js";
 import { createPublicPluginHarness } from "./public-plugin-harness.js";
+import { createSimulatedPrivilegedExecutor } from "../host-operations.js";
 import type { HostProbeSnapshot } from "../readiness.js";
 
 const preparedSnapshot: HostProbeSnapshot = {
@@ -297,6 +303,127 @@ describe("Browser public plugin contract", () => {
       "browser_script",
     ]);
     expect(capabilities.skills).toEqual(["browser"]);
+    await browser.dispose();
+  });
+
+  it("prints setup and purge plans before CLI consent and gates each mutation", async () => {
+    const executor = createSimulatedPrivilegedExecutor();
+    const browser = await createPublicPluginHarness({
+      privilegedExecutor: executor,
+    });
+
+    const setupPlanReply = await browser.runBrowserCli(["setup", "--json"]);
+    const setupPlan = browserSetupPlanSchema.parse(
+      JSON.parse(setupPlanReply.stdout),
+    );
+    expect(setupPlan.state).toBe("pending");
+    expect(setupPlan.nextStepId).toBe("dedicated-user");
+    expect(executor.attemptedOperations).toEqual([]);
+
+    const rejectedReply = await browser.runBrowserCli([
+      "setup",
+      "--step",
+      "dedicated-user",
+      "--confirm",
+      "wrong",
+      "--json",
+    ]);
+    const rejected = browserSetupResponseSchema.parse(
+      JSON.parse(rejectedReply.stdout),
+    );
+    expect(rejected.outcome).toBe("confirmation-required");
+    expect(executor.attemptedOperations).toEqual([]);
+
+    const appliedReply = await browser.runBrowserCli([
+      "setup",
+      "--step",
+      "dedicated-user",
+      "--confirm",
+      "Create bb-browser",
+      "--json",
+    ]);
+    expect(
+      browserSetupResponseSchema.parse(JSON.parse(appliedReply.stdout)),
+    ).toMatchObject({
+      outcome: "progressed",
+      plan: { nextStepId: "system-packages" },
+    });
+    expect(
+      executor.successfulOperations.map((operation) => operation.kind),
+    ).toEqual(["create-dedicated-user"]);
+
+    const purgePlanReply = await browser.runBrowserCli(["purge", "--json"]);
+    const purgePlan = browserPurgePlanSchema.parse(
+      JSON.parse(purgePlanReply.stdout),
+    );
+    expect(purgePlan.targets).toHaveLength(4);
+    expect(executor.successfulOperations).toHaveLength(1);
+
+    const rejectedDisable = await browser.runBrowserCli([
+      "disable",
+      "--confirm",
+      "wrong",
+      "--json",
+    ]);
+    expect(
+      browserLifecycleResponseSchema.parse(JSON.parse(rejectedDisable.stdout)),
+    ).toMatchObject({ outcome: "confirmation-required" });
+    expect(executor.successfulOperations).toHaveLength(1);
+
+    const stopped = await browser.runBrowserCli([
+      "disable",
+      "--confirm",
+      "Stop Browser processes",
+      "--json",
+    ]);
+    expect(
+      browserLifecycleResponseSchema.parse(JSON.parse(stopped.stdout)),
+    ).toMatchObject({ outcome: "stopped", profilesRetained: true });
+    expect(
+      executor.successfulOperations.map((operation) => operation.kind),
+    ).toContain("stop-owned-processes");
+    await browser.dispose();
+  });
+
+  it("shows Settings setup, lifecycle, and purge controls with consent gates", async () => {
+    const executor = createSimulatedPrivilegedExecutor();
+    const browser = await createPublicPluginHarness({
+      privilegedExecutor: executor,
+    });
+    const settings = browser.renderSettings();
+
+    await settings.findByText("Browser setup plan");
+    const setupConfirmation = await settings.findByRole("textbox", {
+      name: "Setup confirmation for dedicated-user",
+    });
+    const setupButton = await settings.findByRole("button", {
+      name: "Confirm Create bb-browser",
+    });
+    fireEvent.change(setupConfirmation, { target: { value: "wrong" } });
+    fireEvent.click(setupButton);
+    await settings.findByText("Type exactly: Create bb-browser");
+    expect(executor.attemptedOperations).toEqual([]);
+
+    fireEvent.change(setupConfirmation, {
+      target: { value: "Create bb-browser" },
+    });
+    fireEvent.click(setupButton);
+    await settings.findByText("Create the dedicated browser user is complete.");
+    expect(
+      executor.successfulOperations.map((operation) => operation.kind),
+    ).toEqual(["create-dedicated-user"]);
+
+    expect(
+      settings.getByRole("button", { name: "Disable Browser" }),
+    ).toBeTruthy();
+    expect(
+      settings.getByRole("button", { name: "Uninstall Browser" }),
+    ).toBeTruthy();
+    fireEvent.click(
+      settings.getByRole("button", { name: "Show destructive purge plan" }),
+    );
+    await settings.findByText("stop-owned-processes");
+    await settings.findByText(/PURGE Browser installation/);
     await browser.dispose();
   });
 });

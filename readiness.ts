@@ -4,6 +4,7 @@ import { access, lstat, readFile, stat, statfs } from "node:fs/promises";
 import { createServer } from "node:net";
 import { join, resolve } from "node:path";
 import { z } from "zod";
+import { browserHostStorageSegment } from "./contracts.js";
 import type {
   BrowserDiagnostics,
   BrowserHostTarget,
@@ -603,7 +604,7 @@ function hostStoragePath(
     "installations",
     installationId,
     "hosts",
-    encodeURIComponent(hostId),
+    browserHostStorageSegment(hostId),
   );
 }
 

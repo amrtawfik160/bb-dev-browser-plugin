@@ -17,8 +17,16 @@ import {
 import { experimental_createHostEntryHarness } from "@get-bb/plugin-sdk/testing/host";
 import {
   browserDiagnosticsSchema,
+  browserLifecycleRequestSchema,
+  browserLifecycleResponseSchema,
+  browserPurgeRequestSchema,
   browserScriptRequestSchema,
+  browserSetupRequestSchema,
   browserHostTargetSchema,
+  browserPurgePlanSchema,
+  browserPurgeResponseSchema,
+  browserSetupPlanSchema,
+  browserSetupResponseSchema,
   DEFAULT_PROFILE_ID,
   setupRequiredStatus,
   type BrowserHostTarget,
@@ -27,6 +35,11 @@ import {
   type rpcContract,
 } from "../contracts.js";
 import { createBrowserHostEntry, type HostSetupBoundary } from "../host.js";
+import {
+  createHostAdministrationBoundary,
+  type HostAdministrationStateStore,
+  type PrivilegedExecutor,
+} from "../host-operations.js";
 import {
   createHostReadinessBoundary,
   type HostProbeSnapshot,
@@ -117,6 +130,8 @@ export async function createPublicPluginHarness(options?: {
   hostConnection?: "connected" | "disconnected";
   probeFailure?: boolean;
   snapshot?: HostProbeSnapshot;
+  privilegedExecutor?: PrivilegedExecutor;
+  administrationStateStore?: HostAdministrationStateStore;
 }) {
   const setupInspectionTargets: BrowserHostTarget[] = [];
   const expectedStatus =
@@ -162,8 +177,17 @@ export async function createPublicPluginHarness(options?: {
       return fixtureBoundary.diagnostics(target);
     },
   };
+  const hostBoundary =
+    options?.privilegedExecutor === undefined
+      ? setupBoundary
+      : createHostAdministrationBoundary({
+          readiness: setupBoundary,
+          installationId: "installation-public-test",
+          executor: options.privilegedExecutor,
+          stateStore: options.administrationStateStore,
+        });
   const host = experimental_createHostEntryHarness(
-    createBrowserHostEntry(setupBoundary),
+    createBrowserHostEntry(hostBoundary),
   );
   const backend = createFakePluginHost({
     pluginId: "browser",
@@ -200,6 +224,41 @@ export async function createPublicPluginHarness(options?: {
           { signal },
         );
       }
+      if (method === "setupPlan") {
+        return host.experimental_call(
+          "setupPlan",
+          browserHostTargetSchema.parse(input),
+          { signal },
+        );
+      }
+      if (method === "setup") {
+        return host.experimental_call(
+          "setup",
+          browserSetupRequestSchema.parse(input),
+          { signal },
+        );
+      }
+      if (method === "disable" || method === "uninstall") {
+        return host.experimental_call(
+          method,
+          browserLifecycleRequestSchema.parse(input),
+          { signal },
+        );
+      }
+      if (method === "purgePlan") {
+        return host.experimental_call(
+          "purgePlan",
+          browserHostTargetSchema.parse(input),
+          { signal },
+        );
+      }
+      if (method === "purge") {
+        return host.experimental_call(
+          "purge",
+          browserPurgeRequestSchema.parse(input),
+          { signal },
+        );
+      }
       if (method === "browserScript") {
         return host.experimental_call(
           "browserScript",
@@ -233,6 +292,47 @@ export async function createPublicPluginHarness(options?: {
     }) =>
       backend.harness.behavior.callRpc("browser_diagnostics", input) as Promise<
         ReturnType<typeof browserDiagnosticsSchema.parse>
+      >,
+    browser_setup_plan: (input: { hostId: string; profileId: string }) =>
+      backend.harness.behavior.callRpc("browser_setup_plan", input) as Promise<
+        ReturnType<typeof browserSetupPlanSchema.parse>
+      >,
+    browser_setup: (input: {
+      hostId: string;
+      profileId: string;
+      stepId: "dedicated-user" | "system-packages" | "protected-storage";
+      confirmation: string;
+    }) =>
+      backend.harness.behavior.callRpc("browser_setup", input) as Promise<
+        ReturnType<typeof browserSetupResponseSchema.parse>
+      >,
+    browser_disable: (input: {
+      hostId: string;
+      profileId: string;
+      confirmation: string;
+    }) =>
+      backend.harness.behavior.callRpc("browser_disable", input) as Promise<
+        ReturnType<typeof browserLifecycleResponseSchema.parse>
+      >,
+    browser_uninstall: (input: {
+      hostId: string;
+      profileId: string;
+      confirmation: string;
+    }) =>
+      backend.harness.behavior.callRpc("browser_uninstall", input) as Promise<
+        ReturnType<typeof browserLifecycleResponseSchema.parse>
+      >,
+    browser_purge_plan: (input: { hostId: string; profileId: string }) =>
+      backend.harness.behavior.callRpc("browser_purge_plan", input) as Promise<
+        ReturnType<typeof browserPurgePlanSchema.parse>
+      >,
+    browser_purge: (input: {
+      hostId: string;
+      profileId: string;
+      confirmation: string;
+    }) =>
+      backend.harness.behavior.callRpc("browser_purge", input) as Promise<
+        ReturnType<typeof browserPurgeResponseSchema.parse>
       >,
   };
 
@@ -327,6 +427,13 @@ export async function createPublicPluginHarness(options?: {
     });
   }
 
+  function runBrowserCli(argv: string[]): Promise<PluginCliExecutionResult> {
+    return backend.harness.behavior.runCli(argv, {
+      threadId: THREAD_ID,
+      projectId: PROJECT_ID,
+    });
+  }
+
   function runBrowserStatus(input: BrowserStatusInput) {
     return rpc.browser_status(input);
   }
@@ -406,7 +513,9 @@ export async function createPublicPluginHarness(options?: {
     runStatusCli,
     runStatusCliText,
     runDiagnosticsCli,
+    runBrowserCli,
     runBrowserScript,
+    privilegedExecutor: options?.privilegedExecutor ?? null,
     resolveAgentCapabilities,
     dispose,
   };
