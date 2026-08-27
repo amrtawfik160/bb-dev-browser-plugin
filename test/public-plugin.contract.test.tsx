@@ -50,6 +50,26 @@ describe("Browser public plugin contract", () => {
     await browser.dispose();
   });
 
+  it("keeps a projectless New thread status request unassigned to a host", async () => {
+    const browser = await createPublicPluginHarness();
+
+    const status = await browser.runBrowserStatus({
+      surface: "new-thread",
+      projectId: null,
+      profileId: DEFAULT_PROFILE_ID,
+    });
+
+    expect(status).toEqual({
+      hostId: null,
+      profileId: DEFAULT_PROFILE_ID,
+      state: "setup-required",
+      code: "setup_required",
+      label: "Setup required",
+      message: "Browser host setup has not been completed.",
+    });
+    await browser.dispose();
+  });
+
   it("returns a typed setup-required tool failure without host mutation", async () => {
     const browser = await createPublicPluginHarness();
 
@@ -60,6 +80,9 @@ describe("Browser public plugin contract", () => {
 
     expect(toolReply.isError).toBe(true);
     expect(failure.error).toEqual(browser.expectedStatus);
+    expect(browser.setupInspectionTargets).toEqual([
+      { hostId: "host-browser-test", profileId: DEFAULT_PROFILE_ID },
+    ]);
     expect(browser.hostMutationCount).toBe(0);
     await browser.dispose();
   });

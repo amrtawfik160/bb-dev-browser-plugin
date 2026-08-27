@@ -19,6 +19,7 @@ import {
   browserHostTargetSchema,
   DEFAULT_PROFILE_ID,
   setupRequiredStatus,
+  type BrowserHostTarget,
   type BrowserStatus,
   type BrowserStatusInput,
   type rpcContract,
@@ -107,12 +108,16 @@ function panelKey(actionId: string, params: unknown) {
 
 export async function createPublicPluginHarness() {
   let hostMutationCount = 0;
+  const setupInspectionTargets: BrowserHostTarget[] = [];
   const expectedStatus = setupRequiredStatus({
     hostId: HOST_ID,
     profileId: DEFAULT_PROFILE_ID,
   });
   const setupBoundary: HostSetupBoundary = {
-    inspect: () => expectedStatus,
+    inspect: (target) => {
+      setupInspectionTargets.push(target);
+      return setupRequiredStatus(target);
+    },
     provision: () => {
       hostMutationCount += 1;
     },
@@ -233,6 +238,10 @@ export async function createPublicPluginHarness() {
     });
   }
 
+  function runBrowserStatus(input: BrowserStatusInput) {
+    return rpc.browser_status(input);
+  }
+
   async function runBrowserScript(): Promise<PublicToolFailure> {
     const reply = await backend.harness.behavior.callAgentTool(
       "browser_script",
@@ -292,8 +301,12 @@ export async function createPublicPluginHarness() {
     get hostMutationCount() {
       return hostMutationCount;
     },
+    get setupInspectionTargets() {
+      return setupInspectionTargets;
+    },
     openExistingThreadPanel,
     openNewThreadPanel,
+    runBrowserStatus,
     runStatusCli,
     runBrowserScript,
     resolveAgentCapabilities,

@@ -51,11 +51,6 @@ async function threadHostId(bb: BbPluginApi, threadId: string) {
   return environment.hostId;
 }
 
-async function fallbackHostId(bb: BbPluginApi) {
-  const hosts = await bb.sdk.hosts.list();
-  return hosts.find((host) => host.status === "connected")?.id ?? null;
-}
-
 async function resolvedHostId(bb: BbPluginApi, identity: BrowserIdentity) {
   if (identity.threadId !== undefined) {
     return threadHostId(bb, identity.threadId);
@@ -63,7 +58,7 @@ async function resolvedHostId(bb: BbPluginApi, identity: BrowserIdentity) {
   if (identity.projectId !== undefined) {
     return projectHostId(bb, identity.projectId);
   }
-  return fallbackHostId(bb);
+  return null;
 }
 
 export function panelIdentity(input: BrowserStatusInput): BrowserIdentity {

@@ -16,9 +16,9 @@ export function createBrowserHostEntry(setup: HostSetupBoundary) {
     contract: browserHostContract,
     handlers: {
       status: (target) => setup.inspect(target),
-      browserScript: async (request) => ({
+      browserScript: async ({ hostId, profileId }) => ({
         ok: false as const,
-        error: await setup.inspect(request),
+        error: await setup.inspect({ hostId, profileId }),
       }),
     },
   });
