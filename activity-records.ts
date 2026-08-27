@@ -11,8 +11,9 @@ import {
   type BrowserActivityEvent,
   type BrowserActivityExport,
   type BrowserActivityRecord,
-  type BrowserActivityOutboxItem,
 } from "./contracts.js";
+
+export { browserActivityEventFromOutboxItem as activityEventFromOutboxItem } from "./contracts.js";
 
 const legacyDatabaseMigrations = [
   `CREATE TABLE browser_preferences (
@@ -85,9 +86,21 @@ CREATE INDEX browser_activity_records_occurred_at
   ON browser_activity_records (occurred_at);
 `;
 
+const activityTombstonesMigration = `
+CREATE TABLE browser_activity_tombstones (
+  event_id TEXT PRIMARY KEY,
+  host_id TEXT NOT NULL,
+  profile_id TEXT NOT NULL,
+  cleared_at TEXT NOT NULL
+);
+CREATE INDEX browser_activity_tombstones_host
+  ON browser_activity_tombstones (host_id, cleared_at);
+`;
+
 export const BROWSER_DATABASE_MIGRATIONS = [
   ...legacyDatabaseMigrations,
   activityRecordsMigration,
+  activityTombstonesMigration,
 ] as const;
 
 const activityRowSchema = z
@@ -128,8 +141,37 @@ export interface ActivityRecordStore {
   list(target: { hostId: string; profileId: string }): BrowserActivityRecord[];
   export(target: { hostId: string; profileId: string }): BrowserActivityExport;
   clear(target: { hostId: string; profileId: string }): number;
+  acknowledgeClearedEvents(hostId: string, eventIds: readonly string[]): void;
   eventIds(hostId: string): string[];
   prune(): void;
+}
+
+export type ActivityProducerInput = Omit<BrowserActivityInput, "kind">;
+
+export type ActivityRecordProducers = {
+  record(input: BrowserActivityInput): BrowserActivityRecord;
+  agent(input: ActivityProducerInput): BrowserActivityRecord;
+  grant(input: ActivityProducerInput): BrowserActivityRecord;
+  control(input: ActivityProducerInput): BrowserActivityRecord;
+  mode(input: ActivityProducerInput): BrowserActivityRecord;
+  fileExport(input: ActivityProducerInput): BrowserActivityRecord;
+};
+
+export function createActivityRecordProducers(
+  store: Pick<ActivityRecordStore, "append">,
+): ActivityRecordProducers {
+  const forKind =
+    (kind: BrowserActivityRecord["kind"]) => (input: ActivityProducerInput) =>
+      store.append({ ...input, kind });
+
+  return {
+    record: (input) => store.append(input),
+    agent: forKind("agent-operation"),
+    grant: forKind("grant"),
+    control: forKind("control"),
+    mode: forKind("mode"),
+    fileExport: forKind("export"),
+  };
 }
 
 export function newActivityEventId(prefix: string) {
@@ -153,26 +195,6 @@ function activityRecordFromRow(activityRow: unknown): BrowserActivityRecord {
     interrupted: parsed.interrupted === 1,
     interruptionReason: parsed.interruption_reason,
     durationMs: parsed.duration_ms,
-  });
-}
-
-export function activityEventFromOutboxItem(
-  outboxItem: BrowserActivityOutboxItem,
-): BrowserActivityEvent {
-  return browserActivityEventSchema.parse({
-    eventId: outboxItem.eventId,
-    actor: outboxItem.actor,
-    projectId: outboxItem.projectId,
-    hostId: outboxItem.hostId,
-    profileId: outboxItem.profileId,
-    destinationOrigin: outboxItem.destinationOrigin,
-    occurredAt: outboxItem.occurredAt,
-    kind: outboxItem.kind,
-    action: outboxItem.action,
-    outcome: outboxItem.outcome,
-    interrupted: outboxItem.interrupted,
-    interruptionReason: outboxItem.interruptionReason,
-    durationMs: outboxItem.durationMs,
   });
 }
 
@@ -528,18 +550,41 @@ function clearActivityRecords(
   runtime: ActivityRecordStoreRuntime,
   target: { hostId: string; profileId: string },
 ) {
-  const remove = runtime.database.transaction(
-    () =>
-      runtime.database
-        .prepare(
-          `DELETE FROM browser_activity_records
+  const remove = runtime.database.transaction(() => {
+    runtime.database
+      .prepare(
+        `INSERT OR IGNORE INTO browser_activity_tombstones
+           (event_id, host_id, profile_id, cleared_at)
+         SELECT event_id, host_id, profile_id, ?
+         FROM browser_activity_records
          WHERE host_id = ? AND profile_id = ?`,
-        )
-        .run(target.hostId, target.profileId).changes,
-  );
+      )
+      .run(runtime.clock().toISOString(), target.hostId, target.profileId);
+    return runtime.database
+      .prepare(
+        `DELETE FROM browser_activity_records
+         WHERE host_id = ? AND profile_id = ?`,
+      )
+      .run(target.hostId, target.profileId).changes;
+  });
   const clearedCount = remove();
   runtime.recordCounts.set(activityStreamKey(target), 0);
   return clearedCount;
+}
+
+function acknowledgeClearedEvents(
+  database: Database.Database,
+  hostId: string,
+  eventIds: readonly string[],
+) {
+  if (eventIds.length === 0) return;
+  const placeholders = eventIds.map(() => "?").join(", ");
+  database
+    .prepare(
+      `DELETE FROM browser_activity_tombstones
+       WHERE host_id = ? AND event_id IN (${placeholders})`,
+    )
+    .run(hostId, ...eventIds);
 }
 
 function activityEventIdsForHost(database: Database.Database, hostId: string) {
@@ -548,9 +593,13 @@ function activityEventIdsForHost(database: Database.Database, hostId: string) {
       `SELECT event_id
        FROM browser_activity_records
        WHERE host_id = ?
-       ORDER BY id ASC`,
+       UNION
+       SELECT event_id
+       FROM browser_activity_tombstones
+       WHERE host_id = ?
+       ORDER BY event_id ASC`,
     )
-    .all(hostId)
+    .all(hostId, hostId)
     .map((activityRow) => activityEventIdRowSchema.parse(activityRow).event_id);
 }
 
@@ -569,6 +618,8 @@ export function createActivityRecordStore(
     list: (target) => listActivityRecords(runtime, target),
     export: (target) => exportActivityRecords(runtime, target),
     clear: (target) => clearActivityRecords(runtime, target),
+    acknowledgeClearedEvents: (hostId, eventIds) =>
+      acknowledgeClearedEvents(database, hostId, eventIds),
     eventIds: (hostId) => activityEventIdsForHost(database, hostId),
     prune: () => pruneActivityStore(runtime),
   };

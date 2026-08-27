@@ -84,6 +84,18 @@ type OpenedPanel = {
   panel: RenderedSlot;
 };
 
+type HostConnectionStatus = "connected" | "disconnected";
+type HostConnectionChange = "host-connected" | "host-disconnected";
+type HostConnectionEvent = {
+  type: "changed";
+  entity: "host";
+  id: string;
+  changes: readonly HostConnectionChange[];
+};
+type HostConnectionListener = (
+  event: HostConnectionEvent,
+) => void | Promise<void>;
+
 function projectFixture(hostIds: readonly string[] = [HOST_ID]) {
   return {
     id: PROJECT_ID,
@@ -150,7 +162,9 @@ function panelKey(actionId: string, params: unknown) {
 export async function createPublicPluginHarness(options?: {
   hostId?: string;
   status?: BrowserStatus;
-  hostConnection?: "connected" | "disconnected";
+  hostConnection?: HostConnectionStatus;
+  browserScriptResponse?: { ok: true; result: unknown };
+  browserScriptDelayMs?: number;
   hostIds?: readonly string[];
   projectHostIds?: readonly string[];
   probeFailure?: boolean;
@@ -163,6 +177,10 @@ export async function createPublicPluginHarness(options?: {
   const configuredProjectHostIds = options?.projectHostIds ?? [
     configuredHostId,
   ];
+  let hostConnectionStatus: HostConnectionStatus =
+    options?.hostConnection ?? "connected";
+  const hostConnectionListeners: HostConnectionListener[] = [];
+  const hostRpcFailures = new Map<string, string>();
   const setupInspectionTargets: BrowserHostTarget[] = [];
   const expectedStatus =
     options?.status ??
@@ -248,6 +266,17 @@ export async function createPublicPluginHarness(options?: {
     pluginId: "browser",
     agentSkillIds: ["browser"],
     sdk: {
+      subscribe: (args) => {
+        if (args.event !== "host:changed") {
+          throw new Error("public harness only supports host changes");
+        }
+        const listener = args.callback as HostConnectionListener;
+        hostConnectionListeners.push(listener);
+        return () => {
+          const index = hostConnectionListeners.indexOf(listener);
+          if (index >= 0) hostConnectionListeners.splice(index, 1);
+        };
+      },
       threads: {
         get: async () =>
           makeThreadResponse({
@@ -263,14 +292,22 @@ export async function createPublicPluginHarness(options?: {
       hosts: {
         list: async () =>
           (options?.hostIds ?? [configuredHostId]).map((hostId) =>
-            hostFixture(hostId, options?.hostConnection),
+            hostFixture(hostId, hostConnectionStatus),
           ),
       },
       projects: {
         get: async () => projectFixture(configuredProjectHostIds),
       },
     },
-    experimental_callHostRpc: ({ method, input, signal }) => {
+    experimental_callHostRpc: async ({ method, input, signal }) => {
+      const failure = hostRpcFailures.get(method);
+      if (failure !== undefined) throw new Error(failure);
+      if (
+        method === "browserScript" &&
+        options?.browserScriptResponse !== undefined
+      ) {
+        return options.browserScriptResponse;
+      }
       if (method === "status") {
         return host.experimental_call(
           "status",
@@ -323,6 +360,11 @@ export async function createPublicPluginHarness(options?: {
         );
       }
       if (method === "browserScript") {
+        if (options?.browserScriptDelayMs !== undefined) {
+          await new Promise<void>((resolve) => {
+            setTimeout(resolve, options.browserScriptDelayMs);
+          });
+        }
         return host.experimental_call(
           "browserScript",
           browserScriptRequestSchema.parse(input),
@@ -678,6 +720,50 @@ export async function createPublicPluginHarness(options?: {
     return rpc.browser_settings_status({ profileId: DEFAULT_PROFILE_ID });
   }
 
+  function setHostConnection(status: HostConnectionStatus) {
+    hostConnectionStatus = status;
+  }
+
+  function setHostRpcFailure(method: string, message?: string) {
+    if (message === undefined) {
+      hostRpcFailures.delete(method);
+      return;
+    }
+    hostRpcFailures.set(method, message);
+  }
+
+  async function emitHostConnection(
+    change: HostConnectionChange,
+    hostId = configuredHostId,
+  ) {
+    hostConnectionStatus =
+      change === "host-connected" ? "connected" : "disconnected";
+    const event: HostConnectionEvent = {
+      type: "changed",
+      entity: "host",
+      id: hostId,
+      changes: [change],
+    };
+    for (const listener of [...hostConnectionListeners]) {
+      await listener(event);
+    }
+  }
+
+  async function seedHostActivityEvent(eventId = "seeded-host-activity") {
+    await host.experimental_call("browserScript", {
+      purpose: "Seed host activity",
+      code: "return page.url();",
+      destinationOrigin: "https://app.example.test",
+      hostId: configuredHostId,
+      projectId: PROJECT_ID,
+      threadId: THREAD_ID,
+      activityEventId: eventId,
+      activityOccurredAt: new Date().toISOString(),
+      profileId: DEFAULT_PROFILE_ID,
+      timeoutMs: 30_000,
+    });
+  }
+
   async function runBrowserScript(): Promise<PublicToolFailure> {
     const reply = await backend.harness.behavior.callAgentTool(
       "browser_script",
@@ -700,6 +786,7 @@ export async function createPublicPluginHarness(options?: {
       purpose?: string;
       code?: string;
       destinationOrigin?: string;
+      signal?: AbortSignal;
     },
   ) {
     const reply = await backend.harness.behavior.callAgentTool(
@@ -712,7 +799,13 @@ export async function createPublicPluginHarness(options?: {
           : { destinationOrigin: overrides.destinationOrigin }),
         ...(profileId === undefined ? {} : { profileId }),
       },
-      { threadId: THREAD_ID, projectId: PROJECT_ID },
+      {
+        threadId: THREAD_ID,
+        projectId: PROJECT_ID,
+        ...(overrides?.signal === undefined
+          ? {}
+          : { signal: overrides.signal }),
+      },
     );
     if (typeof reply === "string" || reply.content[0]?.type !== "text") {
       throw new Error("browser_script did not return text output");
@@ -792,6 +885,10 @@ export async function createPublicPluginHarness(options?: {
     renderSettings,
     runBrowserStatus,
     runSettingsStatuses,
+    setHostConnection,
+    setHostRpcFailure,
+    emitHostConnection,
+    seedHostActivityEvent,
     runStatusCli,
     runStatusCliText,
     runDiagnosticsCli,

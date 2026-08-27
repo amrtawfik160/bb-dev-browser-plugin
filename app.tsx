@@ -1,4 +1,10 @@
-import { useEffect, useState, type FormEvent, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useState,
+  type FormEvent,
+  type ReactNode,
+} from "react";
 import { definePluginApp, useRpc } from "@get-bb/plugin-sdk/app";
 import type {
   PluginNewThreadPanelProps,
@@ -495,9 +501,11 @@ function ProfileCreateForm({
 function ProfileControls({
   hostId,
   available,
+  onProfileSelected,
 }: {
   hostId: string;
   available: boolean;
+  onProfileSelected: (hostId: string, profileId: string) => void;
 }) {
   const rpc = useRpc<typeof rpcContract>();
   const [inventory, setInventory] = useState<BrowserProfileInventory | null>(
@@ -516,6 +524,7 @@ function ProfileControls({
   function refreshProfiles() {
     return rpc.call("browser_profiles", { hostId }).then((nextInventory) => {
       setInventory(nextInventory);
+      onProfileSelected(hostId, nextInventory.selectedProfileId);
       return nextInventory;
     });
   }
@@ -527,11 +536,14 @@ function ProfileControls({
     }
     void rpc
       .call("browser_profiles", { hostId })
-      .then(setInventory)
+      .then((nextInventory) => {
+        setInventory(nextInventory);
+        onProfileSelected(hostId, nextInventory.selectedProfileId);
+      })
       .catch((requestError: unknown) =>
         setError(administrationErrorMessage(requestError)),
       );
-  }, [available, hostId, rpc]);
+  }, [available, hostId, onProfileSelected, rpc]);
 
   function createProfile(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -591,7 +603,10 @@ function ProfileControls({
         hostId,
         profileId: profile.profileId,
       })
-      .then(setInventory)
+      .then((nextInventory) => {
+        setInventory(nextInventory);
+        onProfileSelected(hostId, nextInventory.selectedProfileId);
+      })
       .catch((requestError: unknown) =>
         setError(administrationErrorMessage(requestError)),
       )
@@ -1134,8 +1149,18 @@ function HostAdministrationControls({ status }: { status: BrowserStatus }) {
 function BrowserSettings() {
   const rpc = useRpc<typeof rpcContract>();
   const [statuses, setStatuses] = useState<BrowserStatus[] | null>(null);
+  const [selectedProfileIds, setSelectedProfileIds] = useState<
+    Record<string, string>
+  >({});
   const [diagnostics, setDiagnostics] = useState<BrowserDiagnostics | null>(
     null,
+  );
+
+  const handleProfileSelected = useCallback(
+    (hostId: string, profileId: string) => {
+      setSelectedProfileIds((current) => ({ ...current, [hostId]: profileId }));
+    },
+    [],
   );
 
   useEffect(() => {
@@ -1161,11 +1186,16 @@ function BrowserSettings() {
             <ProfileControls
               hostId={status.hostId}
               available={status.state !== "host-offline"}
+              onProfileSelected={handleProfileSelected}
             />
           )}
           {status.hostId === null ? null : (
             <ActivityControls
-              target={{ hostId: status.hostId, profileId: status.profileId }}
+              target={{
+                hostId: status.hostId,
+                profileId:
+                  selectedProfileIds[status.hostId] ?? status.profileId,
+              }}
             />
           )}
           <HostAdministrationControls status={status} />

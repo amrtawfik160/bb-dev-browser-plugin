@@ -15,7 +15,7 @@ import {
   browserSetupPlanSchema,
   browserSetupRequestSchema,
   browserSetupResponseSchema,
-  browserScriptFailureSchema,
+  browserScriptResponseSchema,
   browserScriptRequestSchema,
   browserProfileCreateRequestSchema,
   browserProfileHostTargetSchema,
@@ -61,7 +61,7 @@ export const browserHostContract = defineRpcContract({
   },
   browserScript: {
     input: browserScriptRequestSchema,
-    output: browserScriptFailureSchema,
+    output: browserScriptResponseSchema,
   },
   activityOutbox: {
     input: browserActivityOutboxRequestSchema,

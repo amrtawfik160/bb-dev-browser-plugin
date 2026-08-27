@@ -18,6 +18,7 @@ import {
   rpcContract,
   setupStepIdSchema,
   type BrowserScriptFailure,
+  type BrowserScriptResponse,
   type BrowserPurgePlan,
   type BrowserPurgeResponse,
   type BrowserSetupPlan,
@@ -746,12 +747,28 @@ function toolFailure(failure: BrowserScriptFailure) {
   };
 }
 
+function toolSuccess(result: unknown) {
+  const serialized = JSON.stringify(result);
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: serialized === undefined ? "" : serialized,
+      },
+    ],
+  };
+}
+
 async function runBrowserScript(
   browser: BrowserService,
   parameters: BrowserScriptParameters,
   context: PluginAgentToolContext,
 ) {
-  return toolFailure(await browser.browserScript(parameters, context));
+  const response: BrowserScriptResponse = await browser.browserScript(
+    parameters,
+    context,
+  );
+  return response.ok ? toolSuccess(response.result) : toolFailure(response);
 }
 
 function registerCli(bb: BbPluginApi, browser: BrowserService) {

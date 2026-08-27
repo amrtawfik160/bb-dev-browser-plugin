@@ -692,6 +692,26 @@ export type BrowserActivityClearResponse = z.infer<
   typeof browserActivityClearResponseSchema
 >;
 
+export function browserActivityEventFromOutboxItem(
+  outboxItem: BrowserActivityOutboxItem,
+): BrowserActivityEvent {
+  return browserActivityEventSchema.parse({
+    eventId: outboxItem.eventId,
+    actor: outboxItem.actor,
+    projectId: outboxItem.projectId,
+    hostId: outboxItem.hostId,
+    profileId: outboxItem.profileId,
+    destinationOrigin: outboxItem.destinationOrigin,
+    occurredAt: outboxItem.occurredAt,
+    kind: outboxItem.kind,
+    action: outboxItem.action,
+    outcome: outboxItem.outcome,
+    interrupted: outboxItem.interrupted,
+    interruptionReason: outboxItem.interruptionReason,
+    durationMs: outboxItem.durationMs,
+  });
+}
+
 export function setupRequiredStatus(
   target: BrowserStatusTarget,
 ): BrowserStatus {
@@ -880,5 +900,18 @@ export const browserScriptFailureSchema = z
   })
   .strict();
 
+export const browserScriptSuccessSchema = z
+  .object({
+    ok: z.literal(true),
+    result: z.unknown(),
+  })
+  .strict();
+
+export const browserScriptResponseSchema = z.discriminatedUnion("ok", [
+  browserScriptSuccessSchema,
+  browserScriptFailureSchema,
+]);
+
 export type BrowserScriptRequest = z.infer<typeof browserScriptRequestSchema>;
 export type BrowserScriptFailure = z.infer<typeof browserScriptFailureSchema>;
+export type BrowserScriptResponse = z.infer<typeof browserScriptResponseSchema>;

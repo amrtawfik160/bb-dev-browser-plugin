@@ -8,6 +8,7 @@ import {
 } from "../contracts.js";
 import {
   BROWSER_DATABASE_MIGRATIONS,
+  createActivityRecordProducers,
   createActivityRecordStore,
 } from "../activity-records.js";
 
@@ -34,6 +35,24 @@ function activityEvent(
     interruptionReason: null,
     durationMs: 12,
     ...overrides,
+  };
+}
+
+function activityProducerInput(overrides: Partial<BrowserActivityEvent> = {}) {
+  const event = activityEvent(overrides);
+  return {
+    eventId: event.eventId,
+    actor: event.actor,
+    projectId: event.projectId,
+    hostId: event.hostId,
+    profileId: event.profileId,
+    destinationOrigin: event.destinationOrigin,
+    occurredAt: event.occurredAt,
+    action: event.action,
+    outcome: event.outcome,
+    interrupted: event.interrupted,
+    interruptionReason: event.interruptionReason,
+    durationMs: event.durationMs,
   };
 }
 
@@ -166,6 +185,54 @@ describe("Browser activity record persistence", () => {
       await disposeBackend(backend);
     }
   });
+
+  it.each([
+    {
+      action: "grant-created",
+      eventId: "grant-event",
+      kind: "grant",
+      producer: "grant",
+    },
+    {
+      action: "control-transferred",
+      eventId: "control-event",
+      kind: "control",
+      producer: "control",
+    },
+    {
+      action: "safe-login-entered",
+      eventId: "mode-event",
+      kind: "mode",
+      producer: "mode",
+    },
+    {
+      action: "file-export",
+      eventId: "file-export-event",
+      kind: "export",
+      producer: "fileExport",
+    },
+  ] as const)(
+    "provides the $producer producer for $kind activity records",
+    async ({ action, eventId, kind, producer }) => {
+      const { backend, store } = createStore();
+
+      try {
+        const activityProducer = createActivityRecordProducers(store)[producer];
+        const event = activityProducer(
+          activityProducerInput({ eventId, action }),
+        );
+
+        expect(event).toMatchObject({ kind, action });
+        expect(
+          store
+            .list({ hostId: HOST_ID, profileId: PROFILE_ID })
+            .map((record) => record.kind),
+        ).toEqual([kind]);
+      } finally {
+        await disposeBackend(backend);
+      }
+    },
+  );
 
   it("exports and clears only the authenticated target stream", async () => {
     const { backend, store } = createStore();

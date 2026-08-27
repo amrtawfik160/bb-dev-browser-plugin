@@ -6,6 +6,7 @@ import {
   ACTIVITY_OUTBOX_BATCH_LIMIT,
   ACTIVITY_RECORD_LIMIT,
   browserActivityEventIdSchema,
+  browserActivityEventFromOutboxItem,
   browserActivityEventSchema,
   browserActivityOutboxItemSchema,
   type BrowserActivityEvent,
@@ -98,26 +99,6 @@ async function writeState(filePath: string, state: ActivityOutboxState) {
   await chmod(filePath, 0o600);
 }
 
-function activityFromOutboxItem(
-  outboxItem: BrowserActivityOutboxItem,
-): BrowserActivityEvent {
-  return browserActivityEventSchema.parse({
-    eventId: outboxItem.eventId,
-    actor: outboxItem.actor,
-    projectId: outboxItem.projectId,
-    hostId: outboxItem.hostId,
-    profileId: outboxItem.profileId,
-    destinationOrigin: outboxItem.destinationOrigin,
-    occurredAt: outboxItem.occurredAt,
-    kind: outboxItem.kind,
-    action: outboxItem.action,
-    outcome: outboxItem.outcome,
-    interrupted: outboxItem.interrupted,
-    interruptionReason: outboxItem.interruptionReason,
-    durationMs: outboxItem.durationMs,
-  });
-}
-
 function activityEventKey(event: BrowserActivityEvent) {
   return JSON.stringify([
     event.eventId,
@@ -196,7 +177,7 @@ function assertMatchingDuplicate(
   existing: BrowserActivityOutboxItem,
   event: BrowserActivityEvent,
 ) {
-  if (!sameActivityEvent(activityFromOutboxItem(existing), event)) {
+  if (!sameActivityEvent(browserActivityEventFromOutboxItem(existing), event)) {
     throw new Error(
       `Activity event ${event.eventId} was received with conflicting metadata.`,
     );

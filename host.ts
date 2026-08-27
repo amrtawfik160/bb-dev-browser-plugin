@@ -27,6 +27,7 @@ import {
   browserProfileUnavailableStatus,
   type BrowserActivityEvent,
   type BrowserScriptRequest,
+  type BrowserScriptResponse,
 } from "./contracts.js";
 
 export type HostSetupBoundary = HostReadinessBoundary;
@@ -36,6 +37,7 @@ type ProfileStoreSource =
   BrowserProfileStore | ((dataDir: string) => BrowserProfileStore);
 
 type ScriptSignalContext = { signal: AbortSignal };
+type ScriptActivityOutcome = "succeeded" | "failed";
 
 function isAdministrationBoundary(
   boundary: HostBoundary,
@@ -54,7 +56,10 @@ async function requireReadyForProfileMutation(
 function scriptActivityEvent(
   request: BrowserScriptRequest,
   context: ScriptSignalContext,
+  outcome: ScriptActivityOutcome,
+  startedAt: number,
 ): BrowserActivityEvent {
+  const interrupted = context.signal.aborted;
   return {
     eventId: request.activityEventId,
     actor: "agent",
@@ -65,10 +70,10 @@ function scriptActivityEvent(
     occurredAt: request.activityOccurredAt,
     kind: "agent-operation",
     action: "browser-script",
-    outcome: "failed",
-    interrupted: context.signal.aborted,
-    interruptionReason: context.signal.aborted ? "request-aborted" : null,
-    durationMs: null,
+    outcome: interrupted ? "interrupted" : outcome,
+    interrupted,
+    interruptionReason: interrupted ? "request-aborted" : null,
+    durationMs: Math.min(Math.max(Date.now() - startedAt, 0), 30_000),
   };
 }
 
@@ -76,8 +81,12 @@ async function recordScriptActivity(
   outbox: ActivityOutbox,
   request: BrowserScriptRequest,
   context: ScriptSignalContext,
+  outcome: ScriptActivityOutcome,
+  startedAt: number,
 ) {
-  await outbox.enqueue(scriptActivityEvent(request, context));
+  await outbox.enqueue(
+    scriptActivityEvent(request, context, outcome, startedAt),
+  );
 }
 
 export function createBrowserHostEntry(
@@ -184,34 +193,48 @@ export function createBrowserHostEntry(
       browserScript: async (request, context) => {
         retainWorker(context);
         const dataDir = context.experimental_paths.dataDir;
+        const startedAt = Date.now();
         const target = {
           hostId: request.hostId,
           profileId: request.profileId,
         };
-        const readiness = await administration(dataDir).inspect(target);
-        if (readiness.state !== "healthy") {
-          await recordScriptActivity(outbox(dataDir), request, context);
-          return { ok: false as const, error: readiness };
-        }
-        const inventory = await profiles(dataDir).listProfiles(request.hostId);
-        if (
-          !inventory.profiles.some(
-            (profile) => profile.profileId === request.profileId,
-          )
-        ) {
-          await recordScriptActivity(outbox(dataDir), request, context);
-          return {
+        let response: BrowserScriptResponse | undefined;
+        try {
+          const readiness = await administration(dataDir).inspect(target);
+          if (readiness.state !== "healthy") {
+            response = { ok: false as const, error: readiness };
+            return response;
+          }
+          const inventory = await profiles(dataDir).listProfiles(
+            request.hostId,
+          );
+          if (
+            !inventory.profiles.some(
+              (profile) => profile.profileId === request.profileId,
+            )
+          ) {
+            response = {
+              ok: false as const,
+              error: browserProfileUnavailableStatus(target),
+            };
+            return response;
+          }
+          response = {
             ok: false as const,
-            error: browserProfileUnavailableStatus(target),
+            error: await administration(
+              context.experimental_paths.dataDir,
+            ).inspect(target),
           };
+          return response;
+        } finally {
+          await recordScriptActivity(
+            outbox(dataDir),
+            request,
+            context,
+            response?.ok === true ? "succeeded" : "failed",
+            startedAt,
+          );
         }
-        await recordScriptActivity(outbox(dataDir), request, context);
-        return {
-          ok: false as const,
-          error: await administration(
-            context.experimental_paths.dataDir,
-          ).inspect(target),
-        };
       },
       activityOutbox: async ({ limit }, context) => {
         retainWorker(context);

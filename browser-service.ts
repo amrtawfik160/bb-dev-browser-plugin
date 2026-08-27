@@ -4,6 +4,7 @@ import { z } from "zod";
 import {
   BROWSER_DATABASE_MIGRATIONS,
   createActivityRecordStore,
+  createActivityRecordProducers,
   activityEventFromOutboxItem,
   newActivityEventId,
   type ActivityRecordStore,
@@ -42,6 +43,7 @@ import {
   type BrowserDiagnostics,
   type BrowserStatus,
   type BrowserStatusInput,
+  type BrowserScriptResponse,
 } from "./contracts.js";
 import { browserHostContract } from "./host-contract.js";
 import { dependencyInventory } from "./dependency-inventory.js";
@@ -53,8 +55,8 @@ type AgentActivityInput = {
   hostId: string;
   profileId: string;
   destinationOrigin: string | null;
-  interrupted: boolean;
 };
+type AgentActivityOutcome = "succeeded" | "failed";
 type AgentScriptTarget = {
   hostId: string | null;
   profileId: string;
@@ -314,17 +316,24 @@ export function createBrowserService(bb: BbPluginApi) {
   bb.storage.migrate(database, [...BROWSER_DATABASE_MIGRATIONS]);
   const activityStore: ActivityRecordStore =
     createActivityRecordStore(database);
+  const activityProducers = createActivityRecordProducers(activityStore);
   const host = bb.hosts.experimental_client({ contract: browserHostContract });
 
-  function recordAgentActivity(input: AgentActivityInput) {
-    activityStore.append({
+  function recordAgentActivity(
+    input: AgentActivityInput,
+    signal: AbortSignal,
+    outcome: AgentActivityOutcome,
+    startedAt: number,
+  ) {
+    const interrupted = signal.aborted;
+    activityProducers.agent({
       ...input,
       actor: "agent",
-      kind: "agent-operation",
       action: "browser-script",
-      outcome: "failed",
-      interruptionReason: input.interrupted ? "request-aborted" : null,
-      durationMs: null,
+      outcome: interrupted ? "interrupted" : outcome,
+      interrupted,
+      interruptionReason: interrupted ? "request-aborted" : null,
+      durationMs: Math.min(Math.max(Date.now() - startedAt, 0), 30_000),
     });
   }
 
@@ -372,13 +381,14 @@ export function createBrowserService(bb: BbPluginApi) {
     eventIds: readonly string[],
     signal?: AbortSignal,
   ) {
-    await callActivityTransport(() =>
+    const response = await callActivityTransport(() =>
       host.call(
         "acknowledgeActivity",
         { hostId, eventIds: [...eventIds] },
         { hostId, signal },
       ),
     );
+    return response.acknowledgedEventIds;
   }
 
   function mergeActivityEventIds(
@@ -393,10 +403,21 @@ export function createBrowserService(bb: BbPluginApi) {
     acknowledgedEventIds: readonly string[],
     signal?: AbortSignal,
   ) {
-    const batch = await reconcileActivityBatch(
-      hostId,
-      acknowledgedEventIds,
-      signal,
+    await reconcileActivityBatch(hostId, acknowledgedEventIds, signal);
+    if (acknowledgedEventIds.length > 0) {
+      const acknowledged = await acknowledgeActivityBatch(
+        hostId,
+        acknowledgedEventIds,
+        signal,
+      );
+      activityStore.acknowledgeClearedEvents(hostId, acknowledged);
+    }
+    const batch = await callActivityTransport(() =>
+      host.call(
+        "activityOutbox",
+        { hostId, limit: ACTIVITY_OUTBOX_BATCH_LIMIT },
+        { hostId, signal },
+      ),
     );
     if (batch.length === 0) return [];
     const acceptedEventIds = activityStore.ingest(
@@ -432,6 +453,34 @@ export function createBrowserService(bb: BbPluginApi) {
     }
   }
 
+  async function syncConnectedHosts(signal?: AbortSignal) {
+    const hosts = await bb.sdk.hosts.list({ signal });
+    for (const candidate of hosts) {
+      if (candidate.status === "connected") {
+        await syncActivity(candidate.id, signal);
+      }
+    }
+  }
+
+  function subscribeToHostReconnects() {
+    const unsubscribe = bb.sdk.subscribe({
+      event: "host:changed",
+      callback: (event) => {
+        if (!event.changes.includes("host-connected")) return;
+        const synchronization =
+          event.id === undefined
+            ? syncConnectedHosts()
+            : syncActivity(event.id);
+        return synchronization.catch(() => {
+          bb.log.warn(
+            "Browser activity synchronization failed; pending events will retry.",
+          );
+        });
+      },
+    });
+    bb.onDispose(unsubscribe);
+  }
+
   async function resolveAgentScriptTarget(
     parameters: BrowserScriptParameters,
     context: PluginAgentToolContext,
@@ -450,23 +499,40 @@ export function createBrowserService(bb: BbPluginApi) {
     };
   }
 
-  function runWithAgentActivity<T>(
+  async function runWithAgentActivity(
     activity: AgentActivityInput,
     hostId: string,
     signal: AbortSignal,
-    operation: () => Promise<T>,
-  ): Promise<T> {
-    return operation().finally(async () => {
-      recordAgentActivity(activity);
+    operation: () => Promise<BrowserScriptResponse>,
+  ): Promise<BrowserScriptResponse> {
+    const startedAt = Date.now();
+    try {
+      const response = await operation();
+      recordAgentActivity(
+        activity,
+        signal,
+        response.ok ? "succeeded" : "failed",
+        startedAt,
+      );
+      return response;
+    } catch (error) {
+      recordAgentActivity(activity, signal, "failed", startedAt);
+      throw error;
+    } finally {
       await syncActivity(hostId, signal);
-    });
+    }
   }
 
   async function runAgentBrowserScriptCall(call: AgentScriptCall) {
     if (
       (await hostConnection(call.hostId, call.context.signal)) !== "connected"
     ) {
-      recordAgentActivity(call.activity);
+      recordAgentActivity(
+        call.activity,
+        call.context.signal,
+        "failed",
+        Date.now(),
+      );
       return offlineAgentScriptFailure(call);
     }
     return runWithAgentActivity(
@@ -747,7 +813,7 @@ export function createBrowserService(bb: BbPluginApi) {
     try {
       const response = await request.operation();
       const target = request.successTarget?.(response) ?? request.target;
-      activityStore.append({
+      activityProducers.record({
         eventId: newActivityEventId("server"),
         occurredAt,
         actor: "owner",
@@ -764,7 +830,7 @@ export function createBrowserService(bb: BbPluginApi) {
       });
       return response;
     } catch (error) {
-      activityStore.append({
+      activityProducers.record({
         eventId: newActivityEventId("server"),
         occurredAt,
         actor: "owner",
@@ -937,7 +1003,6 @@ export function createBrowserService(bb: BbPluginApi) {
       hostId: target.hostId,
       profileId: target.profileId,
       destinationOrigin: parameters.destinationOrigin ?? null,
-      interrupted: context.signal.aborted,
     };
     return runAgentBrowserScriptCall({
       parameters,
@@ -947,6 +1012,8 @@ export function createBrowserService(bb: BbPluginApi) {
       activity,
     });
   }
+
+  subscribeToHostReconnects();
 
   return {
     browserScript,
