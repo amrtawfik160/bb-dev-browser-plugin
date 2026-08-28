@@ -151,6 +151,49 @@ describe("production browser process boundary", () => {
     }
   });
 
+  it("issue #11 recovers an unmanifested owned browser from its profile launch arguments", async () => {
+    const rootDirectory = await mkdtemp(join(tmpdir(), "browser-orphan-"));
+    const fixtureExecutable = join(rootDirectory, "chrome");
+    const passwdPath = join(rootDirectory, "passwd");
+    const userId = process.getuid?.() === 0 ? 65534 : process.getuid!();
+    const groupId = process.getgid?.() === 0 ? 65534 : process.getgid!();
+    await chmod(rootDirectory, 0o755);
+    await writeFile(fixtureExecutable, browserFixtureSource);
+    await chmod(fixtureExecutable, 0o755);
+    await writeFile(
+      passwdPath,
+      `bb-browser:x:${userId}:${groupId}::${rootDirectory}:/usr/sbin/nologin\n`,
+    );
+    const request = {
+      kind: "playwright-chromium" as const,
+      executablePath: fixtureExecutable,
+      browserName: "bb-orphan-fixture",
+      profileDirectory: join(rootDirectory, "profile"),
+      runtimeDirectory: join(rootDirectory, "runtime"),
+      locale: "en-GB",
+      timezone: "Europe/London",
+      chromeArguments: [
+        `--user-data-dir=${join(rootDirectory, "profile")}`,
+        "--remote-debugging-address=127.0.0.1",
+        "--remote-debugging-port=0",
+      ],
+    };
+    const boundary = createProductionBrowserProcessBoundary({
+      devBrowserExecutable: "/bin/true",
+      passwdPath,
+    });
+    const launched = await boundary.launch(request);
+    try {
+      const recovered = await boundary.recover(request, null, null);
+      expect(recovered).not.toBeNull();
+      expect(recovered?.pid).toBe(launched.pid);
+      await recovered?.stop();
+    } finally {
+      await launched.stop();
+      await rm(rootDirectory, { recursive: true, force: true });
+    }
+  });
+
   it("runs the dev-browser attachment helper as the same unprivileged identity", async () => {
     const rootDirectory = await mkdtemp(join(tmpdir(), "browser-helper-"));
     const helperExecutable = join(rootDirectory, "dev-browser-fixture.mjs");

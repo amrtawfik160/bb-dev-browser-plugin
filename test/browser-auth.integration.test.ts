@@ -8,6 +8,7 @@ import { projectLoopbackAddress } from "../browser-navigation.js";
 import { profileStoragePaths } from "../profile-storage.js";
 import {
   createDefaultHostSnapshotReader,
+  createHostReadinessBoundary,
   hostInstallationId,
 } from "../readiness.js";
 
@@ -81,6 +82,14 @@ type WorkerReport = {
   gid: number;
   ownedProcesses: { pid: number; command: string; status: string }[];
   helperProcess: { pid: number; status: string; socketReady: boolean } | null;
+  navigation?: { before: { id?: unknown }[]; after: unknown[]; tabId: string };
+  recovery?: { crashedPid: number; recoveredPid: number } | null;
+  postStop?: {
+    ownedProcesses: { pid: number; command: string; status: string }[];
+    browserPresent: boolean;
+    helperPresent: boolean;
+    helperSocketPresent: boolean;
+  };
 };
 
 async function runWorker(environment: NodeJS.ProcessEnv) {
@@ -124,7 +133,46 @@ async function assertLoopbackSocket(endpoint: string) {
   expect(url.hostname).toBe("127.0.0.1");
   const port = Number(url.port).toString(16).toUpperCase().padStart(4, "0");
   const sockets = `${await readFile("/proc/net/tcp", "utf8")}\n${await readFile("/proc/net/tcp6", "utf8")}`;
-  expect(sockets).toContain(`0100007F:${port}`);
+  expect(hasLoopbackListener(sockets, port)).toBe(true);
+}
+
+function hasLoopbackListener(sockets: string, port: string) {
+  return sockets.split("\n").some((line) => {
+    const fields = line.trim().split(/\s+/u);
+    return fields[1] === `0100007F:${port}` && fields[3] === "0A";
+  });
+}
+
+async function assertLoopbackSocketClosed(endpoint: string) {
+  const url = new URL(endpoint);
+  const port = Number(url.port).toString(16).toUpperCase().padStart(4, "0");
+  await expect
+    .poll(async () => {
+      const sockets = `${await readFile("/proc/net/tcp", "utf8")}\n${await readFile("/proc/net/tcp6", "utf8")}`;
+      return hasLoopbackListener(sockets, port);
+    })
+    .toBe(false);
+}
+
+function assertCompleteReadiness(
+  readiness: Awaited<
+    ReturnType<ReturnType<typeof createHostReadinessBoundary>["inspect"]>
+  >,
+) {
+  expect(readiness.state).toBe("healthy");
+  expect(readiness.capabilities).toHaveLength(9);
+  expect(readiness.capabilities.every(({ status }) => status === "ready")).toBe(
+    true,
+  );
+}
+
+function assertStopped(report: WorkerReport) {
+  expect(report.postStop).toEqual({
+    ownedProcesses: [],
+    browserPresent: false,
+    helperPresent: false,
+    helperSocketPresent: false,
+  });
 }
 
 it.runIf(integrationEnabled)(
@@ -140,8 +188,11 @@ it.runIf(integrationEnabled)(
       process.env.BB_BROWSER_REAL_PROJECT_ID ?? "ci-browser-project";
     const installationId = hostInstallationId(dataDirectory);
     const target = { hostId, profileId };
-    const snapshot =
-      await createDefaultHostSnapshotReader(dataDirectory).snapshot(target);
+    const snapshotReader = createDefaultHostSnapshotReader(dataDirectory);
+    const snapshot = await snapshotReader.snapshot(target);
+    const readiness =
+      await createHostReadinessBoundary(snapshotReader).inspect(target);
+    assertCompleteReadiness(readiness);
     expect(snapshot.dedicatedUser.state).toBe("ready");
     expect(snapshot.protectedStorage.state).toBe("ready");
     expect(snapshot.browser?.compatible).toBe(true);
@@ -167,6 +218,9 @@ it.runIf(integrationEnabled)(
       BB_BROWSER_REAL_PROJECT_ID: projectId,
       BB_BROWSER_FIXTURE_ADDRESS: fixtureAddress,
     };
+    const crashHistoryPath = `${paths.runtimeManifestPath}.crashes.json`;
+    await rm(paths.profileDirectory, { recursive: true, force: true });
+    await rm(crashHistoryPath, { force: true });
     let cleanupRequired = false;
     try {
       cleanupRequired = true;
@@ -185,15 +239,25 @@ it.runIf(integrationEnabled)(
       );
       assertDedicatedIdentity(first);
       await assertLoopbackSocket(first.instance.automationEndpoint);
+      expect(first.navigation?.after).toHaveLength(
+        first.navigation?.before.length ?? -1,
+      );
+      expect(first.navigation?.before.map(({ id }) => id)).toContain(
+        first.navigation?.tabId,
+      );
       await expect(
         access(`${paths.runtimeManifestPath}.instance.lock`),
       ).resolves.toBeUndefined();
 
       const restored = await runWorker({
         ...workerEnvironment,
-        BB_BROWSER_WORKER_ACTION: "restore",
+        BB_BROWSER_WORKER_ACTION: "crash-recover",
       });
-      expect(restored.instance.pid).toBe(first.instance.pid);
+      expect(restored.recovery).toEqual({
+        crashedPid: first.instance.pid,
+        recoveredPid: restored.instance.pid,
+      });
+      expect(restored.instance.pid).not.toBe(first.instance.pid);
       expect(restored.instance.browser).toBe(first.instance.browser);
       expect(parsedScriptOutput(restored)).toMatchObject({
         heading: "Signed in",
@@ -204,6 +268,9 @@ it.runIf(integrationEnabled)(
         timezone: "Europe/London",
       });
       assertDedicatedIdentity(restored);
+      assertStopped(restored);
+      await assertLoopbackSocketClosed(first.instance.automationEndpoint);
+      await assertLoopbackSocketClosed(restored.instance.automationEndpoint);
       cleanupRequired = false;
       await expect(access(paths.runtimeManifestPath)).rejects.toMatchObject({
         code: "ENOENT",
@@ -220,6 +287,7 @@ it.runIf(integrationEnabled)(
       }
       await close(server);
       await rm(paths.profileDirectory, { recursive: true, force: true });
+      await rm(crashHistoryPath, { force: true });
     }
   },
   120_000,

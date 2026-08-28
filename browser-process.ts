@@ -8,6 +8,7 @@ import {
   cp,
   mkdir,
   readFile,
+  readdir,
   unlink,
   watch,
 } from "node:fs/promises";
@@ -235,6 +236,107 @@ async function processIdentity(pid: number): Promise<BrowserProcessIdentity> {
     startedAtTicks,
     commandHash: createHash("sha256").update(commandLine).digest("hex"),
   };
+}
+
+function processRunsAsBrowserUser(
+  status: string,
+  identity: ReturnType<typeof browserUserIdentity>,
+) {
+  return (
+    new RegExp(`^Uid:\\s+${identity.userId}\\s`, "mu").test(status) &&
+    new RegExp(`^Gid:\\s+${identity.groupId}\\s`, "mu").test(status)
+  );
+}
+
+async function discoverLaunchedBrowser(
+  request: BrowserLaunchRequest,
+  identity: ReturnType<typeof browserUserIdentity>,
+) {
+  const profileArgument = `--user-data-dir=${request.profileDirectory}`;
+  const loopbackArgument = "--remote-debugging-address=127.0.0.1";
+  const processIds = (await readdir("/proc"))
+    .filter((entry) => /^\d+$/u.test(entry))
+    .map(Number);
+  const candidates: BrowserProcessIdentity[] = [];
+  for (const pid of processIds) {
+    const candidate = await matchingBrowserIdentity(
+      pid,
+      profileArgument,
+      loopbackArgument,
+      identity,
+    );
+    if (candidate !== null) candidates.push(candidate);
+  }
+  if (candidates.length > 1) {
+    throw new Error("Multiple orphaned browsers claim one Browser Profile.");
+  }
+  return candidates[0] ?? null;
+}
+
+async function matchingBrowserIdentity(
+  pid: number,
+  profileArgument: string,
+  loopbackArgument: string,
+  identity: ReturnType<typeof browserUserIdentity>,
+) {
+  try {
+    const [commandLine, status] = await Promise.all([
+      readFile(`/proc/${pid}/cmdline`, "utf8"),
+      readFile(`/proc/${pid}/status`, "utf8"),
+    ]);
+    const arguments_ = commandLine.split("\0");
+    if (
+      !arguments_.includes(profileArgument) ||
+      !arguments_.includes(loopbackArgument) ||
+      !processRunsAsBrowserUser(status, identity)
+    ) {
+      return null;
+    }
+    return await processIdentity(pid);
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      return null;
+    }
+    throw error;
+  }
+}
+
+async function processMatchesIdentity(identity: BrowserProcessIdentity) {
+  try {
+    return sameProcessIdentity(identity, await processIdentity(identity.pid));
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      return false;
+    }
+    throw error;
+  }
+}
+
+async function recoveredAutomationEndpoint(
+  request: BrowserLaunchRequest,
+  identity: BrowserProcessIdentity,
+) {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    const endpoint = await activeDevToolsEndpoint(request.profileDirectory);
+    if (endpoint !== null) return endpoint;
+    if (!(await processMatchesIdentity(identity))) return null;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return null;
+}
+
+async function recoverableBrowserIdentity(
+  context: ProductionProcessContext,
+  request: BrowserLaunchRequest,
+  expectedIdentity: BrowserProcessIdentity | null,
+) {
+  if (expectedIdentity === null) {
+    const browserUser = browserUserIdentity(context.passwdPath);
+    return discoverLaunchedBrowser(request, browserUser);
+  }
+  return (await processMatchesIdentity(expectedIdentity))
+    ? expectedIdentity
+    : null;
 }
 
 function sameProcessIdentity(
@@ -571,21 +673,22 @@ async function launchProductionBrowser(
 async function recoverProductionBrowser(
   context: ProductionProcessContext,
   request: BrowserLaunchRequest,
-  expectedIdentity: BrowserProcessIdentity,
+  expectedIdentity: BrowserProcessIdentity | null,
   storedEndpoint: string | null,
 ): Promise<RunningBrowserProcess | null> {
-  let actualIdentity: BrowserProcessIdentity;
-  try {
-    actualIdentity = await processIdentity(expectedIdentity.pid);
-  } catch (error) {
-    if (error instanceof Error && "code" in error && error.code === "ENOENT")
-      return null;
-    throw error;
-  }
-  if (!sameProcessIdentity(expectedIdentity, actualIdentity)) return null;
+  expectedIdentity = await recoverableBrowserIdentity(
+    context,
+    request,
+    expectedIdentity,
+  );
+  if (expectedIdentity === null) return null;
   const automationEndpoint =
-    storedEndpoint ?? (await activeDevToolsEndpoint(request.profileDirectory));
-  if (automationEndpoint === null) return null;
+    storedEndpoint ??
+    (await recoveredAutomationEndpoint(request, expectedIdentity));
+  if (automationEndpoint === null) {
+    await stopRecoveredProcess(expectedIdentity.pid);
+    return null;
+  }
   const identity = browserUserIdentity(context.passwdPath);
   return {
     pid: expectedIdentity.pid,

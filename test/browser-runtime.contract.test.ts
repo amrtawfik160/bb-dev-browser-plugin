@@ -28,6 +28,7 @@ function launchFixture(
     runAsUser?: string;
     groupId?: number;
     recoveredPid?: number;
+    recoveredLaunchingPid?: number;
   } = {},
 ) {
   const launches: BrowserLaunchRequest[] = [];
@@ -35,6 +36,7 @@ function launchFixture(
     [];
   const stopped: number[] = [];
   const exits = new Map<number, (error?: Error) => void>();
+  const pages = new Set(["actual-active-tab"]);
   let nextPid = 4100;
   const boundary: BrowserLaunchBoundary = {
     runAsUser: options.runAsUser ?? "bb-browser",
@@ -67,20 +69,26 @@ function launchFixture(
       };
     },
     async recover(_request, identity, endpoint) {
-      if (identity.pid !== options.recoveredPid || endpoint === null)
+      const recoveredPid = identity?.pid ?? options.recoveredLaunchingPid;
+      if (
+        recoveredPid === undefined ||
+        (identity !== null && recoveredPid !== options.recoveredPid)
+      ) {
         return null;
+      }
       let reportExit!: (error?: Error) => void;
       const exited = new Promise<void>((resolve, reject) => {
         reportExit = (error) =>
           error === undefined ? resolve() : reject(error);
       });
-      exits.set(identity.pid, reportExit);
+      exits.set(recoveredPid, reportExit);
       return {
-        pid: identity.pid,
-        automationEndpoint: endpoint,
+        pid: recoveredPid,
+        automationEndpoint:
+          endpoint ?? "ws://127.0.0.1:14901/devtools/browser/launching-orphan",
         exited,
         async stop() {
-          stopped.push(identity.pid);
+          stopped.push(recoveredPid);
           reportExit();
         },
       };
@@ -94,6 +102,18 @@ function launchFixture(
     },
     async execute(request) {
       executions.push(request);
+      if (request.code.includes("document.visibilityState")) {
+        return JSON.stringify({
+          id: "actual-active-tab",
+          url: "about:blank",
+          title: "",
+          name: null,
+        });
+      }
+      const requestedPage = request.code.match(
+        /browser\.getPage\(("(?:[^"\\]|\\.)*")\)/u,
+      )?.[1];
+      if (requestedPage !== undefined) pages.add(JSON.parse(requestedPage));
       return { output: "attached" };
     },
     async configuredSearchUrl({ text }) {
@@ -104,6 +124,7 @@ function launchFixture(
     boundary,
     executions,
     launches,
+    pages,
     stopped,
     crash(pid: number) {
       exits.get(pid)?.();
@@ -476,6 +497,87 @@ describe("Browser Instance runtime", () => {
     }
   });
 
+  it("issue #11 publishes launch intent before crossing the process-spawn boundary", async () => {
+    const fixture = await runtimeFixture();
+    const paths = profileStoragePaths({
+      rootDirectory: fixture.rootDirectory,
+      installationId: "installation-a",
+      hostId: fixture.target.hostId,
+      profileId: fixture.target.profileId,
+    });
+    const launch = fixture.processFixture.boundary.launch;
+    fixture.processFixture.boundary.launch = async (request, onSpawn) => {
+      const manifest = JSON.parse(
+        await readFile(paths.runtimeManifestPath, "utf8"),
+      ) as { phase: string; identity: unknown };
+      expect(manifest).toMatchObject({ phase: "launching", identity: null });
+      return launch(request, onSpawn);
+    };
+    try {
+      await expect(
+        fixture.runtime.start(fixture.target),
+      ).resolves.toMatchObject({
+        state: "running",
+      });
+    } finally {
+      await fixture.runtime.dispose();
+      await rm(fixture.rootDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("issue #11 recovers a browser orphaned after spawn but before identity publication", async () => {
+    const fixture = await runtimeFixture();
+    const recoveredPid = 4901;
+    const recoveryBoundary = launchFixture({
+      recoveredLaunchingPid: recoveredPid,
+    });
+    const installationId = "installation-launching-recovery";
+    const runtime = createBrowserInstanceRuntime({
+      rootDirectory: fixture.rootDirectory,
+      installationId,
+      chromeStablePaths: [fixture.browserExecutable],
+      playwrightChromiumPath: join(fixture.rootDirectory, "fallback-chromium"),
+      launchBoundary: recoveryBoundary.boundary,
+    });
+    const paths = profileStoragePaths({
+      rootDirectory: fixture.rootDirectory,
+      installationId,
+      hostId: fixture.target.hostId,
+      profileId: fixture.target.profileId,
+    });
+    await mkdir(paths.runtimeManifestsDirectory, { recursive: true });
+    await writeFile(
+      `${paths.runtimeManifestPath}.instance.lock`,
+      JSON.stringify({
+        workerIdentity: {
+          pid: 2_147_000_000,
+          startedAtTicks: "dead-worker",
+          commandHash: "dead-worker-command",
+        },
+      }),
+    );
+    await writeFile(
+      paths.runtimeManifestPath,
+      JSON.stringify({
+        schemaVersion: 1,
+        phase: "launching",
+        identity: null,
+        automationEndpoint: null,
+        publicState: null,
+      }),
+    );
+    try {
+      await expect(runtime.start(fixture.target)).resolves.toMatchObject({
+        pid: recoveredPid,
+      });
+      expect(recoveryBoundary.launches).toHaveLength(0);
+    } finally {
+      await runtime.dispose();
+      await fixture.runtime.dispose();
+      await rm(fixture.rootDirectory, { recursive: true, force: true });
+    }
+  });
+
   it("navigates addresses directly and delegates search text to Chrome", async () => {
     const fixture = await runtimeFixture();
     try {
@@ -500,6 +602,22 @@ describe("Browser Instance runtime", () => {
       expect(fixture.processFixture.executions[1]?.code).toContain(
         'browser.getPage("tab-a")',
       );
+    } finally {
+      await fixture.runtime.dispose();
+      await rm(fixture.rootDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("issue #11 navigates the actual active tab when the panel omits a tab target", async () => {
+    const fixture = await runtimeFixture();
+    try {
+      const response = await fixture.runtime.navigate(
+        fixture.target,
+        "https://fixture.example/default-navigation",
+      );
+
+      expect([...fixture.processFixture.pages]).toEqual(["actual-active-tab"]);
+      expect(response.tabId).toBe("actual-active-tab");
     } finally {
       await fixture.runtime.dispose();
       await rm(fixture.rootDirectory, { recursive: true, force: true });
@@ -627,6 +745,47 @@ describe("Browser Instance runtime", () => {
     } finally {
       await fixture.runtime.dispose();
       await rm(fixture.rootDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("issue #11 requires repair after three crashes within five minutes", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-28T12:00:00.000Z"));
+    const fixture = await runtimeFixture();
+    try {
+      for (let crashNumber = 0; crashNumber < 3; crashNumber += 1) {
+        const instance = await fixture.runtime.start(fixture.target);
+        fixture.processFixture.crash(instance.pid);
+        await vi.advanceTimersByTimeAsync(50);
+      }
+      await fixture.runtime.dispose();
+      const restartedProcess = launchFixture();
+      const restartedRuntime = createBrowserInstanceRuntime({
+        rootDirectory: fixture.rootDirectory,
+        installationId: "installation-a",
+        chromeStablePaths: [fixture.browserExecutable],
+        playwrightChromiumPath: join(
+          fixture.rootDirectory,
+          "fallback-chromium",
+        ),
+        launchBoundary: restartedProcess.boundary,
+      });
+      await expect(
+        restartedRuntime.start(fixture.target),
+      ).rejects.toMatchObject({
+        code: "repair-required",
+        diagnostics: {
+          crashCount: 3,
+          windowMs: 300_000,
+        },
+      });
+      expect(fixture.processFixture.launches).toHaveLength(3);
+      expect(restartedProcess.launches).toHaveLength(0);
+      await restartedRuntime.dispose();
+    } finally {
+      await fixture.runtime.dispose();
+      await rm(fixture.rootDirectory, { recursive: true, force: true });
+      vi.useRealTimers();
     }
   });
 });

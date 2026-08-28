@@ -17,6 +17,7 @@ import { join } from "node:path";
 import { profileStoragePaths } from "./profile-storage.js";
 import type { ProfileStoragePaths } from "./profile-storage.js";
 import {
+  activeBrowserTabScript,
   browserNavigationScript,
   projectLoopbackAddress,
   resolveBrowserAddress,
@@ -80,7 +81,7 @@ export interface BrowserLaunchBoundary {
   ): Promise<RunningBrowserProcess>;
   recover(
     request: BrowserLaunchRequest,
-    identity: BrowserProcessIdentity,
+    identity: BrowserProcessIdentity | null,
     automationEndpoint: string | null,
   ): Promise<RunningBrowserProcess | null>;
   processIdentity(pid: number): Promise<BrowserProcessIdentity>;
@@ -100,14 +101,22 @@ export type BrowserInstance = {
   automationEndpoint: string;
 };
 
+export type BrowserRepairDiagnostics = {
+  crashCount: number;
+  windowMs: number;
+  crashTimestamps: readonly string[];
+};
+
 export class BrowserInstanceError extends Error {
   constructor(
     public readonly code:
       | "browser-unavailable"
       | "endpoint-not-loopback"
       | "profile-in-use"
+      | "repair-required"
       | "unsafe-launch",
     message: string,
+    public readonly diagnostics?: BrowserRepairDiagnostics,
   ) {
     super(message);
     this.name = "BrowserInstanceError";
@@ -209,16 +218,34 @@ type HeldBrowserInstance = {
   manifestPath: string;
   runtimeDirectory: string;
   profileDirectory: string;
+  crashHistoryPath: string;
+  stopRequested: boolean;
   cleanup?: Promise<void>;
 };
 
-type StoredBrowserInstance = {
+type BrowserCrashHistory = {
   schemaVersion: 1;
-  phase: "starting" | "running";
-  identity: BrowserProcessIdentity;
-  automationEndpoint: string | null;
-  publicState: BrowserInstance | null;
+  crashes: number[];
 };
+
+const CRASH_WINDOW_MS = 5 * 60 * 1_000;
+const CRASH_LIMIT = 3;
+
+type StoredBrowserInstance =
+  | {
+      schemaVersion: 1;
+      phase: "launching";
+      identity: null;
+      automationEndpoint: null;
+      publicState: null;
+    }
+  | {
+      schemaVersion: 1;
+      phase: "starting" | "running";
+      identity: BrowserProcessIdentity;
+      automationEndpoint: string | null;
+      publicState: BrowserInstance | null;
+    };
 
 type BrowserInstanceRuntimeOptions = {
   rootDirectory: string;
@@ -337,15 +364,26 @@ async function storedBrowserInstance(path: string) {
     const identity = stored.identity;
     if (
       stored.schemaVersion !== 1 ||
-      (stored.phase !== "starting" && stored.phase !== "running") ||
+      !["launching", "starting", "running"].includes(stored.phase ?? "") ||
+      (stored.automationEndpoint !== null &&
+        typeof stored.automationEndpoint !== "string")
+    ) {
+      return null;
+    }
+    if (stored.phase === "launching") {
+      return identity === null &&
+        stored.automationEndpoint === null &&
+        stored.publicState === null
+        ? (stored as StoredBrowserInstance)
+        : null;
+    }
+    if (
       typeof identity !== "object" ||
       identity === null ||
       !Number.isSafeInteger(identity.pid) ||
       Number(identity.pid) <= 0 ||
       typeof identity.startedAtTicks !== "string" ||
-      typeof identity.commandHash !== "string" ||
-      (stored.automationEndpoint !== null &&
-        typeof stored.automationEndpoint !== "string")
+      typeof identity.commandHash !== "string"
     ) {
       return null;
     }
@@ -561,12 +599,16 @@ async function persistBrowserInstance(
   manifestPath: string,
   instance: StoredBrowserInstance,
 ) {
-  const temporaryPath = `${manifestPath}.${process.pid}.${randomUUID()}.tmp`;
-  await writeFile(temporaryPath, JSON.stringify(instance), {
+  await persistRuntimeDocument(manifestPath, instance);
+}
+
+async function persistRuntimeDocument(path: string, document: unknown) {
+  const temporaryPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  await writeFile(temporaryPath, JSON.stringify(document), {
     mode: 0o600,
   });
   try {
-    await rename(temporaryPath, manifestPath);
+    await rename(temporaryPath, path);
   } finally {
     await unlink(temporaryPath).catch((error: unknown) => {
       if (
@@ -579,6 +621,73 @@ async function persistBrowserInstance(
       throw error;
     });
   }
+}
+
+function invalidCrashHistory() {
+  return new BrowserInstanceError(
+    "repair-required",
+    "Browser crash diagnostics are corrupt; repair this Browser Profile.",
+  );
+}
+
+function isBrowserCrashHistory(input: unknown): input is BrowserCrashHistory {
+  if (typeof input !== "object" || input === null) return false;
+  const candidate = input as Partial<BrowserCrashHistory>;
+  return (
+    candidate.schemaVersion === 1 &&
+    Array.isArray(candidate.crashes) &&
+    candidate.crashes.every(
+      (timestamp) => Number.isSafeInteger(timestamp) && timestamp >= 0,
+    )
+  );
+}
+
+async function browserCrashHistory(path: string): Promise<BrowserCrashHistory> {
+  try {
+    const parsedHistory = JSON.parse(await readFile(path, "utf8")) as unknown;
+    if (!isBrowserCrashHistory(parsedHistory)) throw invalidCrashHistory();
+    return parsedHistory;
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      return { schemaVersion: 1, crashes: [] };
+    }
+    if (error instanceof SyntaxError) throw invalidCrashHistory();
+    throw error;
+  }
+}
+
+function recentCrashTimestamps(history: BrowserCrashHistory, now: number) {
+  return history.crashes.filter(
+    (timestamp) => timestamp >= now - CRASH_WINDOW_MS,
+  );
+}
+
+async function assertCrashPolicy(path: string) {
+  const recentCrashes = recentCrashTimestamps(
+    await browserCrashHistory(path),
+    Date.now(),
+  );
+  if (recentCrashes.length < CRASH_LIMIT) return;
+  throw new BrowserInstanceError(
+    "repair-required",
+    "Three Browser crashes occurred within five minutes; repair is required before relaunch.",
+    {
+      crashCount: recentCrashes.length,
+      windowMs: CRASH_WINDOW_MS,
+      crashTimestamps: recentCrashes.map((timestamp) =>
+        new Date(timestamp).toISOString(),
+      ),
+    },
+  );
+}
+
+async function recordBrowserCrash(path: string) {
+  const now = Date.now();
+  const history = await browserCrashHistory(path);
+  await persistRuntimeDocument(path, {
+    schemaVersion: 1,
+    crashes: [...recentCrashTimestamps(history, now), now],
+  } satisfies BrowserCrashHistory);
 }
 
 function heldBrowserInstance(input: {
@@ -596,6 +705,8 @@ function heldBrowserInstance(input: {
     manifestPath: input.paths.runtimeManifestPath,
     runtimeDirectory: input.paths.runtimeManifestsDirectory,
     profileDirectory: input.paths.browserDataPath,
+    crashHistoryPath: `${input.paths.runtimeManifestPath}.crashes.json`,
+    stopRequested: false,
   };
 }
 
@@ -620,6 +731,23 @@ await __bbTargetPage.bringToFront();
 ${code}`;
 }
 
+function activeTabId(output: unknown) {
+  if (typeof output !== "string") {
+    throw new Error("Automation Mode returned an invalid active Browser Tab.");
+  }
+  const active = JSON.parse(output) as unknown;
+  if (
+    typeof active !== "object" ||
+    active === null ||
+    !("id" in active) ||
+    typeof active.id !== "string" ||
+    active.id === ""
+  ) {
+    throw new Error("Automation Mode returned an invalid active Browser Tab.");
+  }
+  return active.id;
+}
+
 async function recoverOrLaunchBrowser(
   options: BrowserInstanceRuntimeOptions,
   request: BrowserLaunchRequest,
@@ -635,6 +763,13 @@ async function recoverOrLaunchBrowser(
           stored.automationEndpoint,
         );
   if (recovered !== null) return recovered;
+  await persistBrowserInstance(manifestPath, {
+    schemaVersion: 1,
+    phase: "launching",
+    identity: null,
+    automationEndpoint: null,
+    publicState: null,
+  });
   return options.launchBoundary.launch(request, (identity) =>
     persistBrowserInstance(manifestPath, {
       schemaVersion: 1,
@@ -687,6 +822,7 @@ async function launchBrowserInstance(
     profileId: target.profileId,
   });
   const lockPath = `${paths.runtimeManifestPath}.instance.lock`;
+  await assertCrashPolicy(`${paths.runtimeManifestPath}.crashes.json`);
   const launch = await launchRequest(options, target, paths);
   const lock = await acquireProfileLock(lockPath);
   let browserProcess: RunningBrowserProcess | null | undefined;
@@ -738,6 +874,7 @@ export function createBrowserInstanceRuntime(
   const starts = new Map<string, Promise<HeldBrowserInstance>>();
   const activeTabs = new Map<string, string>();
   const cleanupFailures = new Map<string, unknown>();
+  const retirements = new Map<string, Promise<void>>();
 
   async function cleanupHeld(held: HeldBrowserInstance) {
     held.cleanup ??= (async () => {
@@ -767,16 +904,28 @@ export function createBrowserInstanceRuntime(
       starts.delete(key);
       activeTabs.delete(key);
       try {
+        if (!held.stopRequested) {
+          await recordBrowserCrash(held.crashHistoryPath);
+        }
         await cleanupHeld(held);
       } catch (error) {
         cleanupFailures.set(key, error);
       }
     };
-    void held.process.exited.then(retire, retire);
+    const beginRetirement = () => trackRetirement(key, retire());
+    void held.process.exited.then(beginRetirement, beginRetirement);
+  }
+
+  function trackRetirement(key: string, retirement: Promise<void>) {
+    retirements.set(key, retirement);
+    void retirement.finally(() => {
+      if (retirements.get(key) === retirement) retirements.delete(key);
+    });
   }
 
   async function heldInstance(target: BrowserRuntimeTarget) {
     const key = runtimeKey(target);
+    await retirements.get(key);
     const cleanupFailure = cleanupFailures.get(key);
     if (cleanupFailure !== undefined) {
       cleanupFailures.delete(key);
@@ -795,6 +944,7 @@ export function createBrowserInstanceRuntime(
   }
 
   async function stopHeld(key: string, held: HeldBrowserInstance) {
+    held.stopRequested = true;
     const processOutcome = await Promise.allSettled([held.process.stop()]);
     const cleanupOutcome = await Promise.allSettled([cleanupHeld(held)]);
     const outcomes = [...processOutcome, ...cleanupOutcome];
@@ -857,7 +1007,18 @@ export function createBrowserInstanceRuntime(
               ),
             };
       const key = runtimeKey(target);
-      const tabId = target.tabId ?? activeTabs.get(key) ?? "workspace";
+      let tabId = target.tabId ?? activeTabs.get(key);
+      if (tabId === undefined) {
+        const discovered = await options.launchBoundary.execute(
+          executionRequest(
+            held,
+            target.profileId,
+            activeBrowserTabScript(),
+            30_000,
+          ),
+        );
+        tabId = activeTabId(discovered);
+      }
       const location = await options.launchBoundary.execute(
         executionRequest(
           held,
@@ -878,6 +1039,7 @@ export function createBrowserInstanceRuntime(
             : [],
         ),
       );
+      await Promise.all(retirements.values());
     },
   };
 }

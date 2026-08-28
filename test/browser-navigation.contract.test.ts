@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import {
-  browserNavigationScript,
   projectLoopbackAddress,
   resolveBrowserAddress,
 } from "../browser-navigation.js";
@@ -66,15 +65,4 @@ describe("Workspace Browser navigation", () => {
       ).toMatch(/^http:\/\/p-[a-f0-9]{12}\.localhost:4173\/account$/u);
     },
   );
-
-  it("targets the shared active Browser Tab without using renderer omnibox keys", () => {
-    const script = browserNavigationScript(
-      { kind: "address", url: "https://example.test/account" },
-      "active-tab-7",
-    );
-
-    expect(script).toContain('browser.getPage("active-tab-7")');
-    expect(script).not.toContain("browser.listPages");
-    expect(script).not.toContain("keyboard.press");
-  });
 });

@@ -77,3 +77,17 @@ await page.bringToFront();
 await page.goto(${JSON.stringify(address.url)});
 console.log(JSON.stringify({ tabId: ${JSON.stringify(tabId)}, url: page.url() }));`;
 }
+
+export function activeBrowserTabScript() {
+  return `const pages = await browser.listPages();
+if (pages.length === 0) throw new Error("The Browser Profile has no open tabs");
+let active = null;
+for (const entry of pages) {
+  const candidate = await browser.getPage(entry.id);
+  if (await candidate.evaluate(() => document.visibilityState === "visible")) {
+    active = entry;
+    break;
+  }
+}
+console.log(JSON.stringify(active ?? pages[0]));`;
+}
