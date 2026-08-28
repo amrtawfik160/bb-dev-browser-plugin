@@ -4,6 +4,7 @@ import {
   createProfileGrantStore,
   projectLoopbackAlias,
 } from "../authorization.js";
+import { createBrowserService } from "../browser-service.js";
 import { BROWSER_DATABASE_MIGRATIONS } from "../activity-records.js";
 import {
   browserProfileGrantCreateRequestSchema,
@@ -21,6 +22,22 @@ function createStore() {
   return {
     backend,
     store: createProfileGrantStore(database, () => NOW),
+  };
+}
+
+function createClockedStore() {
+  const backend = createFakePluginHost({
+    pluginId: "authorization-clock-contract",
+  });
+  const database = backend.bb.storage.database();
+  backend.bb.storage.migrate(database, [...BROWSER_DATABASE_MIGRATIONS]);
+  let now = NOW;
+  return {
+    backend,
+    store: createProfileGrantStore(database, () => now),
+    advanceTo(next: Date) {
+      now = next;
+    },
   };
 }
 
@@ -175,6 +192,8 @@ describe("Browser Profile Grant public authorization contract", () => {
         "http://localhost.:3000",
         "http://127.0.0.2:3000",
         "http://[::1]:3000",
+        "http://[::ffff:127.0.0.1]:3000",
+        "http://[0:0:0:0:0:ffff:127.0.0.1]:3000",
         "http://0.0.0.0:3000",
         "http://[::]:3000",
       ]) {
@@ -256,6 +275,72 @@ describe("Browser Profile Grant public authorization contract", () => {
     }
   });
 
+  it("expires each temporary elevation after one hour and requires confirmation to persist it", async () => {
+    const { backend, store, advanceTo } = createClockedStore();
+
+    try {
+      const temporary = store.create({
+        ...grant({
+          grantId: "grant-temporary-elevation",
+          originScope: "*",
+          wholeWeb: true,
+          fileTransfer: true,
+          invalidCertificateOrigins: ["https://app.example.test"],
+        }),
+        persistentElevations: false,
+      });
+      expect(temporary).toMatchObject({
+        wholeWebExpiresAt: "2026-08-28T01:00:00.000Z",
+        fileTransferExpiresAt: "2026-08-28T01:00:00.000Z",
+        invalidCertificateExpiresAt: "2026-08-28T01:00:00.000Z",
+      });
+
+      advanceTo(new Date("2026-08-28T01:00:00.000Z"));
+      expect(
+        store.authorize({
+          projectId: "project-a",
+          hostId: "host-a",
+          installationId: "installation-a",
+          profileId: "profile-a",
+          origin: "https://app.example.test",
+        }),
+      ).toMatchObject({ allowed: false, code: "origin_denied" });
+
+      expect(() =>
+        store.create({
+          ...grant({
+            grantId: "grant-persistent-without-confirmation",
+            fileTransfer: true,
+          }),
+          persistentElevations: true,
+        }),
+      ).toThrow("second confirmation");
+
+      const persistent = store.create({
+        ...grant({
+          grantId: "grant-persistent-elevation",
+          fileTransfer: true,
+        }),
+        persistentElevations: true,
+        persistenceConfirmation: "Persist Browser elevated access",
+      });
+      expect(persistent.fileTransferExpiresAt).toBeNull();
+      advanceTo(new Date("2026-08-29T01:00:00.000Z"));
+      expect(
+        store.authorize({
+          projectId: "project-a",
+          hostId: "host-a",
+          installationId: "installation-a",
+          profileId: "profile-a",
+          origin: "https://app.example.test",
+          fileTransfer: true,
+        }),
+      ).toMatchObject({ allowed: true });
+    } finally {
+      await backend.harness.lifecycle.dispose();
+    }
+  });
+
   it("revokes a grant immediately without changing the owner-facing record", async () => {
     const { backend, store } = createStore();
 
@@ -332,52 +417,111 @@ describe("Browser Profile Grant public authorization contract", () => {
     ).toThrow();
   });
 
-  it("serializes concurrent grant edits and keeps every committed grant inspectable", async () => {
+  it("reports stable outcomes when a grant is revoked twice", async () => {
     const { backend, store } = createStore();
 
     try {
-      const grants = await Promise.all(
-        [3000, 3001, 3002].map((port) =>
-          Promise.resolve(
-            store.create(
-              grant({
-                grantId: `grant-${port}`,
-                originScope: `http://127.0.0.1:${port}`,
-              }),
-            ),
-          ),
-        ),
-      );
-
-      expect(grants).toHaveLength(3);
-      expect(store.list({ projectId: "project-a" })).toHaveLength(3);
-      const outcomes = await Promise.all(
-        grants.map((created) => Promise.resolve(store.revoke(created.grantId))),
-      );
-      expect(outcomes.map(({ outcome }) => outcome)).toEqual([
-        "revoked",
-        "revoked",
-        "revoked",
-      ]);
-      const raceGrant = store.create(
-        grant({
-          grantId: "grant-race",
-          originScope: "http://127.0.0.1:3003",
-        }),
-      );
-      const raceOutcomes = await Promise.all(
-        [0, 1].map(() =>
-          Promise.resolve().then(() => store.revoke(raceGrant.grantId)),
-        ),
-      );
-      expect(raceOutcomes.map(({ outcome }) => outcome)).toEqual([
-        "revoked",
-        "already-revoked",
-      ]);
+      const created = store.create(grant());
+      expect(store.revoke(created.grantId)).toMatchObject({
+        grantId: created.grantId,
+        outcome: "revoked",
+      });
+      expect(store.revoke(created.grantId)).toMatchObject({
+        grantId: created.grantId,
+        outcome: "already-revoked",
+      });
       expect(store.list({ projectId: "project-a" })).toEqual([]);
-      expect(store.inspect(grants[0]!.grantId)).toMatchObject({
+      expect(store.inspect(created.grantId)).toMatchObject({
         revokedAt: NOW.toISOString(),
       });
+    } finally {
+      await backend.harness.lifecycle.dispose();
+    }
+  });
+
+  it("rejects direct grant administration without the server-held owner authority", async () => {
+    const backend = createFakePluginHost({
+      pluginId: "authorization-owner-boundary",
+      sdk: { subscribe: () => () => {} },
+    });
+    const browser = Reflect.apply(createBrowserService, undefined, [
+      backend.bb,
+      Object.freeze({}),
+    ]);
+
+    try {
+      await expect(
+        Reflect.apply(browser.grants, browser, [Object.freeze({})]),
+      ).rejects.toThrow("owner Settings transport");
+      await expect(
+        Reflect.apply(browser.inspectGrant, browser, [
+          Object.freeze({}),
+          "grant-contract",
+        ]),
+      ).rejects.toThrow("owner Settings transport");
+    } finally {
+      await backend.harness.lifecycle.dispose();
+    }
+  });
+
+  it("blocks grant creation after a project deletion tombstone wins the interleaving", async () => {
+    const { backend, store } = createStore();
+
+    try {
+      expect(() =>
+        store.create(grant({ grantId: "grant-before-deletion" })),
+      ).not.toThrow();
+      expect(store.projectDeleted("project-a")).toHaveLength(1);
+      expect(() =>
+        store.create(
+          grant({
+            grantId: "grant-after-deletion",
+            originScope: "https://after-deletion.example.test",
+          }),
+        ),
+      ).toThrow("project-a");
+      expect(store.inspect("grant-after-deletion")).toBeNull();
+    } finally {
+      await backend.harness.lifecycle.dispose();
+    }
+  });
+
+  it("allows explicitly granted RFC1918 and IPv6-private origins without a blanket private-network block", async () => {
+    const { backend, store } = createStore();
+
+    try {
+      for (const [grantId, origin] of [
+        ["grant-rfc1918", "http://192.168.10.12:3000"],
+        ["grant-ula", "http://[fd12:3456:789a::12]:8080"],
+      ] as const) {
+        store.create(grant({ grantId, originScope: origin }));
+        expect(
+          store.authorize({
+            projectId: "project-a",
+            hostId: "host-a",
+            installationId: "installation-a",
+            profileId: "profile-a",
+            origin,
+          }),
+        ).toMatchObject({ allowed: true });
+      }
+
+      store.create(
+        grant({
+          grantId: "grant-whole-web-private",
+          originScope: "*",
+          wholeWeb: true,
+        }),
+      );
+      expect(
+        store.authorize({
+          projectId: "project-a",
+          hostId: "host-a",
+          installationId: "installation-a",
+          profileId: "profile-a",
+          origin: "http://10.20.30.40:9000",
+        }),
+      ).toMatchObject({ allowed: true });
     } finally {
       await backend.harness.lifecycle.dispose();
     }

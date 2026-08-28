@@ -15,6 +15,8 @@ import {
 } from "./authorization.js";
 import {
   browserProfileIdSchema,
+  browserProfileGrantSchema,
+  browserProfileGrantsSchema,
   browserScriptParametersSchema,
   ACTIVITY_OUTBOX_BATCH_LIMIT,
   CLEAR_ACTIVITY_CONFIRMATION,
@@ -52,6 +54,7 @@ import {
   type BrowserStatus,
   type BrowserStatusInput,
   type BrowserScriptResponse,
+  type BrowserActivityGrantMetadata,
   type BrowserProfileGrant,
   type BrowserProfileGrantCreateRequest,
   type BrowserProfileGrantQuery,
@@ -62,6 +65,8 @@ import { browserHostContract } from "./host-contract.js";
 import { dependencyInventory } from "./dependency-inventory.js";
 
 const PROFILE_IMPORT_ACTIVITY_ACTION = ["imp", "ort"].join("");
+const OWNER_SETTINGS_AUTHORITY_ERROR =
+  "Browser grant administration requires the owner Settings transport.";
 
 type BrowserScriptParameters = z.output<typeof browserScriptParametersSchema>;
 type AgentActivityInput = {
@@ -355,7 +360,11 @@ export function panelIdentity(input: BrowserStatusInput): BrowserIdentity {
     : { projectId: input.projectId ?? undefined, hostId: input.hostId };
 }
 
-export function createBrowserService(bb: BbPluginApi) {
+export function createBrowserService(
+  bb: BbPluginApi,
+  suppliedOwnerAuthority?: unknown,
+) {
+  const ownerAuthority = suppliedOwnerAuthority ?? Symbol("browser-owner");
   const database = bb.storage.database();
   bb.storage.migrate(database, [...BROWSER_DATABASE_MIGRATIONS]);
   const activityStore: ActivityRecordStore =
@@ -363,7 +372,23 @@ export function createBrowserService(bb: BbPluginApi) {
   const activityProducers = createActivityRecordProducers(activityStore);
   const grantStore = createProfileGrantStore(database);
   const activeGrantCalls = new Map<string, Set<AbortController>>();
+  let grantStateQueue: Promise<void> = Promise.resolve();
   const host = bb.hosts.experimental_client({ contract: browserHostContract });
+
+  function requireOwnerSettingsAuthority(candidate: unknown) {
+    if (candidate !== ownerAuthority) {
+      throw new Error(OWNER_SETTINGS_AUTHORITY_ERROR);
+    }
+  }
+
+  function withGrantStateSerialization<T>(operation: () => T | Promise<T>) {
+    const next = grantStateQueue.then(operation, operation);
+    grantStateQueue = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    return next;
+  }
 
   function trackGrantCall(grantId: string, controller: AbortController) {
     const calls = activeGrantCalls.get(grantId) ?? new Set<AbortController>();
@@ -541,7 +566,30 @@ export function createBrowserService(bb: BbPluginApi) {
       interrupted: false,
       interruptionReason: null,
       durationMs: null,
+      ...grantActivityMetadata(grant),
     });
+  }
+
+  function grantActivityMetadata(
+    grant: BrowserProfileGrant | null | undefined,
+  ): BrowserActivityGrantMetadata {
+    if (grant === null || grant === undefined) {
+      return {
+        grantId: null,
+        grantScope: null,
+        grantElevations: null,
+      };
+    }
+    return {
+      grantId: grant.grantId,
+      grantScope: grant.originScope,
+      grantElevations: {
+        wholeWeb: grant.wholeWeb,
+        fileTransfer: grant.fileTransfer,
+        invalidCertificateOrigins: grant.invalidCertificateOrigins,
+        persistentElevations: grant.persistentElevations === true,
+      },
+    };
   }
 
   function revokeDeletedProfileGrants(
@@ -607,17 +655,26 @@ export function createBrowserService(bb: BbPluginApi) {
     const unsubscribe = bb.sdk.subscribe({
       event: "project:changed",
       callback: (event) => {
+        if (event.id === undefined) return;
         if (
-          event.id === undefined ||
-          !event.changes.includes("project-deleted")
+          !event.changes.includes("project-deleted") &&
+          !event.changes.includes("project-created")
         ) {
           return;
         }
-        const revoked = grantStore.revokeProject(event.id);
-        for (const grant of revoked) {
-          abortGrantCalls(grant.grantId);
-          recordSystemGrantRevocation(grant, "project-deleted");
-        }
+        return withGrantStateSerialization(() => {
+          if (event.changes.includes("project-deleted")) {
+            grantStore.projectCreated(event.id!);
+            const revoked = grantStore.projectDeleted(event.id!);
+            for (const grant of revoked) {
+              abortGrantCalls(grant.grantId);
+              recordSystemGrantRevocation(grant, "project-deleted");
+            }
+          }
+          if (event.changes.includes("project-created")) {
+            grantStore.projectCreated(event.id!);
+          }
+        });
       },
     });
     bb.onDispose(unsubscribe);
@@ -937,6 +994,7 @@ export function createBrowserService(bb: BbPluginApi) {
     request: BrowserProfileGrantCreateRequest,
     signal?: AbortSignal,
   ) {
+    const projectGeneration = grantStore.projectGeneration(request.projectId);
     const resolution = await projectHostResolution(bb, request.projectId);
     if (!resolution.candidates.includes(request.hostId)) {
       throw new Error(
@@ -963,24 +1021,30 @@ export function createBrowserService(bb: BbPluginApi) {
         "The requested Browser Profile installation is no longer current.",
       );
     }
-    return { inventory, profile };
+    return { inventory, profile, projectGeneration };
   }
 
   async function grants(
+    authority: unknown,
     query: Partial<BrowserProfileGrantQuery> = {},
-  ): Promise<BrowserProfileGrant[]> {
-    return grantStore.list(query);
+  ) {
+    requireOwnerSettingsAuthority(authority);
+    return browserProfileGrantsSchema.parse(grantStore.list(query));
   }
 
-  async function inspectGrant(grantId: string) {
-    return grantStore.inspect(grantId);
+  async function inspectGrant(authority: unknown, grantId: string) {
+    requireOwnerSettingsAuthority(authority);
+    const grant = grantStore.inspect(grantId);
+    return grant === null ? null : browserProfileGrantSchema.parse(grant);
   }
 
   async function createGrant(
+    authority: unknown,
     request: BrowserProfileGrantCreateRequest,
     signal?: AbortSignal,
-  ): Promise<BrowserProfileGrant> {
-    const { inventory } = await grantTarget(request, signal);
+  ) {
+    requireOwnerSettingsAuthority(authority);
+    const { inventory, projectGeneration } = await grantTarget(request, signal);
     const target = {
       hostId: request.hostId,
       profileId: request.profileId,
@@ -990,20 +1054,37 @@ export function createBrowserService(bb: BbPluginApi) {
       kind: "grant",
       action: "create",
       projectId: request.projectId,
-      operation: async () =>
-        grantStore.create({
-          ...request,
-          installationId: inventory.installationId,
+      operation: () =>
+        withGrantStateSerialization(() => {
+          if (
+            grantStore.projectGeneration(request.projectId) !==
+            projectGeneration
+          ) {
+            throw new Error(
+              `Project ${request.projectId} changed while the Browser Profile Grant was being created.`,
+            );
+          }
+          return browserProfileGrantSchema.parse(
+            grantStore.create({
+              ...request,
+              installationId: inventory.installationId,
+            }),
+          );
         }),
+      grantMetadata: (grant) => grantActivityMetadata(grant),
       outcome: () => "succeeded",
     });
   }
 
   async function revokeGrant(
+    authority: unknown,
     request: BrowserProfileGrantRevokeRequest,
   ): Promise<BrowserProfileGrantRevokeResponse> {
+    requireOwnerSettingsAuthority(authority);
     const existing = grantStore.inspect(request.grantId);
-    const response = grantStore.revoke(request.grantId);
+    const response = await withGrantStateSerialization(() =>
+      grantStore.revoke(request.grantId),
+    );
     if (response.outcome === "revoked") abortGrantCalls(response.grantId);
     if (existing === null) return response;
     await recordActivity({
@@ -1013,6 +1094,7 @@ export function createBrowserService(bb: BbPluginApi) {
       projectId: existing.projectId,
       operation: async () => response,
       outcome: (grantResponse) => grantResponse.outcome,
+      grantMetadata: () => grantActivityMetadata(existing),
     });
     return response;
   }
@@ -1140,6 +1222,7 @@ export function createBrowserService(bb: BbPluginApi) {
     outcome: (response: T) => string;
     successTarget?: (response: T) => BrowserHostTarget;
     projectId?: string | null;
+    grantMetadata?: (response?: T) => BrowserActivityGrantMetadata;
   }): Promise<T> {
     const occurredAt = new Date().toISOString();
     try {
@@ -1159,6 +1242,7 @@ export function createBrowserService(bb: BbPluginApi) {
         interrupted: false,
         interruptionReason: null,
         durationMs: null,
+        ...(request.grantMetadata?.(response) ?? grantActivityMetadata(null)),
       });
       return response;
     } catch (error) {
@@ -1176,6 +1260,7 @@ export function createBrowserService(bb: BbPluginApi) {
         interrupted: false,
         interruptionReason: null,
         durationMs: null,
+        ...(request.grantMetadata?.() ?? grantActivityMetadata(null)),
       });
       throw error;
     }

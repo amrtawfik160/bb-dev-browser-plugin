@@ -198,6 +198,7 @@ export async function createPublicPluginHarness(options?: {
   administrationStateStore?: HostAdministrationStateStore;
   profileStore?: BrowserProfileStore;
   profileRecovery?: BrowserProfileRecovery;
+  deferProjectLookup?: boolean;
 }) {
   const configuredHostId = options?.hostId ?? HOST_ID;
   const configuredProjectHostIds = options?.projectHostIds ?? [
@@ -207,6 +208,20 @@ export async function createPublicPluginHarness(options?: {
     options?.hostConnection ?? "connected";
   const hostConnectionListeners: HostConnectionListener[] = [];
   const projectChangeListeners: ProjectChangeListener[] = [];
+  let resolveProjectLookupStarted: (() => void) | undefined;
+  let releaseProjectLookupGate: (() => void) | undefined;
+  const projectLookupStarted =
+    options?.deferProjectLookup === true
+      ? new Promise<void>((resolve) => {
+          resolveProjectLookupStarted = resolve;
+        })
+      : Promise.resolve();
+  const projectLookupGate =
+    options?.deferProjectLookup === true
+      ? new Promise<void>((resolve) => {
+          releaseProjectLookupGate = resolve;
+        })
+      : Promise.resolve();
   const hostRpcFailures = new Map<string, string>();
   const setupInspectionTargets: BrowserHostTarget[] = [];
   const expectedStatus =
@@ -347,7 +362,11 @@ export async function createPublicPluginHarness(options?: {
           ),
       },
       projects: {
-        get: async () => projectFixture(configuredProjectHostIds),
+        get: async () => {
+          resolveProjectLookupStarted?.();
+          await projectLookupGate;
+          return projectFixture(configuredProjectHostIds);
+        },
       },
     },
     experimental_callHostRpc: async ({ method, input, signal }) => {
@@ -625,6 +644,8 @@ export async function createPublicPluginHarness(options?: {
       wholeWeb?: boolean;
       fileTransfer?: boolean;
       invalidCertificateOrigins?: string[];
+      persistentElevations?: boolean;
+      persistenceConfirmation?: string;
     }) =>
       backend.harness.behavior.callRpc(
         "browser_grant_create",
@@ -901,6 +922,8 @@ export async function createPublicPluginHarness(options?: {
     wholeWeb?: boolean;
     fileTransfer?: boolean;
     invalidCertificateOrigins?: string[];
+    persistentElevations?: boolean;
+    persistenceConfirmation?: string;
   }) {
     return rpc.browser_grant_create(input);
   }
@@ -1141,6 +1164,10 @@ export async function createPublicPluginHarness(options?: {
     setHostRpcFailure,
     emitHostConnection,
     emitProjectChange,
+    projectLookupStarted,
+    releaseProjectLookup() {
+      releaseProjectLookupGate?.();
+    },
     seedHostActivityEvent,
     runStatusCli,
     runStatusCliText,

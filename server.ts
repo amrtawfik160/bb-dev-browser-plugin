@@ -11,7 +11,6 @@ import {
 } from "./browser-service.js";
 import {
   browserScriptParametersSchema,
-  type BrowserProfileGrant,
   type BrowserActivityRecord,
   type BrowserHostChoicesInput,
   type BrowserProfileBackupRequest,
@@ -29,12 +28,10 @@ import {
   type BrowserSetupPlan,
   type BrowserSetupResponse,
   type BrowserStatus,
-  type BrowserProfileGrantCreateRequest,
-  type BrowserProfileGrantQuery,
 } from "./contracts.js";
 
 const CLI_USAGE = [
-  "Usage: bb browser <status|diagnostics|activity|activity-export|activity-clear|list|create|rename|select|backup|restore|import|grant|setup|disable|uninstall|purge> [options]",
+  "Usage: bb browser <status|diagnostics|activity|activity-export|activity-clear|list|create|rename|select|backup|restore|import|setup|disable|uninstall|purge> [options]",
   "  setup [--profile <id>] [--step <id> --confirm <text>] [--json]",
   "  purge [--profile <id>] [--confirm <text>] [--json]",
   "  disable|uninstall [--profile <id>] --confirm <text> [--json]",
@@ -48,10 +45,6 @@ const CLI_USAGE = [
   "  backup --profile <id> --archive <path> [--host <id>] [--json]",
   "  restore --profile <id> --archive <path> [--host <id>] [--json]",
   "  import --name <name> --source <path> [--host <id>] [--json]",
-  "  grant list [--project <id>] [--host <id>] [--profile <id>] [--json]",
-  "  grant inspect --grant <id> [--json]",
-  "  grant create --profile <id> --origin <scope> [--project <id>] [--host <id>] [--whole-web] [--file-transfer] [--invalid-certificate-origin <origin>] [--json]",
-  "  grant revoke --grant <id> [--json]",
 ].join("\n");
 const PROFILE_IMPORT_COMMAND = ["imp", "ort"].join("");
 type BrowserScriptParameters = z.output<typeof browserScriptParametersSchema>;
@@ -72,15 +65,11 @@ const BROWSER_COMMANDS = [
   "disable",
   "uninstall",
   "purge",
-  "grant",
 ] as const;
 type BrowserCommand = (typeof BROWSER_COMMANDS)[number];
-const GRANT_ACTIONS = ["list", "inspect", "create", "revoke"] as const;
-type GrantAction = (typeof GRANT_ACTIONS)[number];
 
 type ParsedCliArguments = {
   command: BrowserCommand;
-  grantAction?: GrantAction;
   json: boolean;
   profileId?: string;
   hostId?: string;
@@ -89,12 +78,6 @@ type ParsedCliArguments = {
   timezone?: string;
   archivePath?: string;
   sourcePath?: string;
-  projectId?: string;
-  originScope?: string;
-  grantId?: string;
-  wholeWeb?: boolean;
-  fileTransfer?: boolean;
-  invalidCertificateOrigins?: string[];
   stepId?: z.output<typeof setupStepIdSchema>;
   confirmation?: string;
 };
@@ -187,24 +170,6 @@ function cliProfilesText(inventory: BrowserProfileInventory) {
   ].join("\n");
 }
 
-function cliGrantText(grant: BrowserProfileGrant) {
-  return [
-    `${grant.grantId} (${grant.projectId})`,
-    `Host: ${grant.hostId}`,
-    `Profile: ${grant.profileId}`,
-    `Origin scope: ${grant.originScope}`,
-    `Whole web: ${grant.wholeWeb}`,
-    `File transfer: ${grant.fileTransfer}`,
-    `Invalid certificates: ${grant.invalidCertificateOrigins.join(", ") || "none"}`,
-    `Revoked: ${grant.revokedAt ?? "no"}`,
-  ].join("\n");
-}
-
-function cliGrantsText(grants: readonly BrowserProfileGrant[]) {
-  if (grants.length === 0) return "No Browser Profile Grants.";
-  return grants.map(cliGrantText).join("\n\n");
-}
-
 function cliProfileRecoveryText(response: BrowserProfileRecoveryResponse) {
   const { phase, completedBytes, totalBytes, phases } = response.progress;
   return [
@@ -249,10 +214,6 @@ type CliOptionName =
   | "--timezone"
   | "--archive"
   | "--source"
-  | "--project"
-  | "--origin"
-  | "--grant"
-  | "--invalid-certificate-origin"
   | "confirmation";
 type ParsedCliOption = {
   name: CliOptionName;
@@ -268,11 +229,7 @@ function cliOptionName(argument: string): CliOptionName | null {
     argument === "--locale" ||
     argument === "--timezone" ||
     argument === "--archive" ||
-    argument === "--source" ||
-    argument === "--project" ||
-    argument === "--origin" ||
-    argument === "--grant" ||
-    argument === "--invalid-certificate-origin"
+    argument === "--source"
   ) {
     return argument;
   }
@@ -304,12 +261,6 @@ type CliParseState = {
   timezone?: string;
   archivePath?: string;
   sourcePath?: string;
-  projectId?: string;
-  originScope?: string;
-  grantId?: string;
-  wholeWeb: boolean;
-  fileTransfer: boolean;
-  invalidCertificateOrigins: string[];
   stepId?: ParsedCliArguments["stepId"];
   confirmation?: string;
 };
@@ -354,22 +305,6 @@ function applyCliOption(
     parseState.sourcePath = option.optionValue;
     return null;
   }
-  if (option.name === "--project") {
-    parseState.projectId = option.optionValue;
-    return null;
-  }
-  if (option.name === "--origin") {
-    parseState.originScope = option.optionValue;
-    return null;
-  }
-  if (option.name === "--grant") {
-    parseState.grantId = option.optionValue;
-    return null;
-  }
-  if (option.name === "--invalid-certificate-origin") {
-    parseState.invalidCertificateOrigins.push(option.optionValue);
-    return null;
-  }
   parseState.confirmation = option.optionValue;
   return null;
 }
@@ -384,17 +319,10 @@ function isBrowserCommand(
 
 function parsedCommand(
   positional: string[],
-): { command: BrowserCommand; grantAction?: GrantAction } | null {
+): { command: BrowserCommand } | null {
   if (positional.length === 1) {
     const command = positional[0];
     return isBrowserCommand(command) ? { command } : null;
-  }
-  if (
-    positional.length === 2 &&
-    positional[0] === "grant" &&
-    GRANT_ACTIONS.some((action) => action === positional[1])
-  ) {
-    return { command: "grant", grantAction: positional[1] as GrantAction };
   }
   return null;
 }
@@ -403,7 +331,6 @@ function validateCliCommandOptions(
   command: BrowserCommand,
   parseState: CliParseState,
 ): string | null {
-  if (command === "grant") return validateGrantCliOptions(parseState);
   if (command !== "setup" && parseState.stepId !== undefined) {
     return `--step is only valid for setup.\n${CLI_USAGE}`;
   }
@@ -492,98 +419,15 @@ function validateCliCommandOptions(
   return null;
 }
 
-function validateGrantCliOptions(parseState: CliParseState): string | null {
-  const action = parseState.positional[1] as GrantAction | undefined;
-  if (action === undefined) return `grant requires an action.\n${CLI_USAGE}`;
-  const commonError = validateGrantCommonOptions(parseState);
-  if (commonError !== null) return commonError;
-  if (action === "create") {
-    return validateGrantCreateOptions(parseState);
-  }
-  return validateGrantLookupOptions(parseState, action);
-}
-
-function validateGrantCommonOptions(parseState: CliParseState): string | null {
-  const invalidOption = [
-    ["--step", parseState.stepId !== undefined],
-    ["--confirm", parseState.confirmation !== undefined],
-    ["--name", parseState.name !== undefined],
-    ["--locale", parseState.locale !== undefined],
-    ["--timezone", parseState.timezone !== undefined],
-    ["--archive", parseState.archivePath !== undefined],
-    ["--source", parseState.sourcePath !== undefined],
-  ].find(([, present]) => present)?.[0];
-  return invalidOption === undefined
-    ? null
-    : `${invalidOption} is not valid for grant commands.\n${CLI_USAGE}`;
-}
-
-function validateGrantCreateOptions(parseState: CliParseState): string | null {
-  if (parseState.profileId === undefined) {
-    return `grant create requires --profile.\n${CLI_USAGE}`;
-  }
-  if (parseState.originScope === undefined) {
-    return `grant create requires --origin.\n${CLI_USAGE}`;
-  }
-  if (parseState.grantId !== undefined) {
-    return `--grant is only valid for grant inspect or revoke.\n${CLI_USAGE}`;
-  }
-  return null;
-}
-
-function validateGrantLookupOptions(
-  parseState: CliParseState,
-  action: Exclude<GrantAction, "create">,
-): string | null {
-  if (parseState.grantId === undefined && action !== "list") {
-    return `grant ${action} requires --grant.\n${CLI_USAGE}`;
-  }
-  if (action === "list" && parseState.grantId !== undefined) {
-    return `--grant is only valid for grant inspect or revoke.\n${CLI_USAGE}`;
-  }
-  if (
-    action !== "list" &&
-    (parseState.projectId !== undefined ||
-      parseState.hostId !== undefined ||
-      parseState.profileId !== undefined)
-  ) {
-    return `--project, --host, and --profile are only valid for grant list or create.\n${CLI_USAGE}`;
-  }
-  if (parseState.originScope !== undefined) {
-    return `--origin is only valid for grant create.\n${CLI_USAGE}`;
-  }
-  if (parseState.invalidCertificateOrigins.length > 0) {
-    return `--invalid-certificate-origin is only valid for grant create.\n${CLI_USAGE}`;
-  }
-  if (parseState.wholeWeb) {
-    return `--whole-web is only valid for grant create.\n${CLI_USAGE}`;
-  }
-  if (parseState.fileTransfer) {
-    return `--file-transfer is only valid for grant create.\n${CLI_USAGE}`;
-  }
-  return null;
-}
-
 function parseCliArguments(argv: string[]): CliArgumentParseResult {
   const parseState: CliParseState = {
     positional: [],
     json: false,
-    wholeWeb: false,
-    fileTransfer: false,
-    invalidCertificateOrigins: [],
   };
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index]!;
     if (argument === "--json") {
       parseState.json = true;
-      continue;
-    }
-    if (argument === "--whole-web") {
-      parseState.wholeWeb = true;
-      continue;
-    }
-    if (argument === "--file-transfer") {
-      parseState.fileTransfer = true;
       continue;
     }
     const option = readCliOption(argv, index, argument);
@@ -606,7 +450,6 @@ function parseCliArguments(argv: string[]): CliArgumentParseResult {
   return {
     arguments: {
       command: parsed.command,
-      grantAction: parsed.grantAction,
       json: parseState.json,
       profileId: parseState.profileId,
       hostId: parseState.hostId,
@@ -615,12 +458,6 @@ function parseCliArguments(argv: string[]): CliArgumentParseResult {
       timezone: parseState.timezone,
       archivePath: parseState.archivePath,
       sourcePath: parseState.sourcePath,
-      projectId: parseState.projectId,
-      originScope: parseState.originScope,
-      grantId: parseState.grantId,
-      wholeWeb: parseState.wholeWeb,
-      fileTransfer: parseState.fileTransfer,
-      invalidCertificateOrigins: parseState.invalidCertificateOrigins,
       stepId: parseState.stepId,
       confirmation: parseState.confirmation,
     },
@@ -969,117 +806,11 @@ async function runProfileImportCli(
   };
 }
 
-async function runGrantCreateCli(
-  browser: BrowserService,
-  cliArguments: ParsedCliArguments,
-  context: PluginCliContext,
-) {
-  const projectId = cliArguments.projectId ?? context.projectId;
-  if (projectId === undefined) {
-    throw new Error("grant create requires a project context or --project.");
-  }
-  const target = await browser.resolveTarget(
-    { projectId },
-    cliArguments.profileId,
-    cliArguments.hostId,
-  );
-  const request: BrowserProfileGrantCreateRequest = {
-    projectId,
-    hostId: target.hostId,
-    profileId: target.profileId,
-    originScope: cliArguments.originScope!,
-    wholeWeb: cliArguments.wholeWeb === true,
-    fileTransfer: cliArguments.fileTransfer === true,
-    invalidCertificateOrigins: cliArguments.invalidCertificateOrigins ?? [],
-  };
-  const grant = await browser.createGrant(request, context.signal);
-  return {
-    exitCode: 0,
-    stdout: cliJsonOrText(cliArguments.json, grant, cliGrantText(grant)),
-  };
-}
-
-async function runGrantListCli(
-  browser: BrowserService,
-  cliArguments: ParsedCliArguments,
-  context: PluginCliContext,
-) {
-  const projectId = cliArguments.projectId ?? context.projectId;
-  const query: BrowserProfileGrantQuery = {
-    includeRevoked: false,
-    ...(projectId === undefined ? {} : { projectId }),
-    ...(cliArguments.hostId === undefined
-      ? {}
-      : { hostId: cliArguments.hostId }),
-    ...(cliArguments.profileId === undefined
-      ? {}
-      : { profileId: cliArguments.profileId }),
-  };
-  const grants = await browser.grants(query);
-  return {
-    exitCode: 0,
-    stdout: cliJsonOrText(cliArguments.json, grants, cliGrantsText(grants)),
-  };
-}
-
-async function runGrantInspectCli(
-  browser: BrowserService,
-  cliArguments: ParsedCliArguments,
-) {
-  const grant = await browser.inspectGrant(cliArguments.grantId!);
-  if (grant === null) {
-    return {
-      exitCode: 1,
-      stderr: `Browser Profile Grant ${cliArguments.grantId} was not found.`,
-    };
-  }
-  return {
-    exitCode: 0,
-    stdout: cliJsonOrText(cliArguments.json, grant, cliGrantText(grant)),
-  };
-}
-
-async function runGrantRevokeCli(
-  browser: BrowserService,
-  cliArguments: ParsedCliArguments,
-) {
-  const response = await browser.revokeGrant({
-    grantId: cliArguments.grantId!,
-  });
-  return {
-    exitCode: response.outcome === "not-found" ? 1 : 0,
-    stdout: cliJsonOrText(cliArguments.json, response, response.outcome),
-  };
-}
-
-async function runGrantCli(
-  browser: BrowserService,
-  cliArguments: ParsedCliArguments,
-  context: PluginCliContext,
-) {
-  if (cliArguments.grantAction === "create") {
-    return runGrantCreateCli(browser, cliArguments, context);
-  }
-  if (cliArguments.grantAction === "list") {
-    return runGrantListCli(browser, cliArguments, context);
-  }
-  if (cliArguments.grantAction === "inspect") {
-    return runGrantInspectCli(browser, cliArguments);
-  }
-  if (cliArguments.grantAction === "revoke") {
-    return runGrantRevokeCli(browser, cliArguments);
-  }
-  throw new Error("grant requires an action.");
-}
-
 async function runAdministrationCli(
   browser: BrowserService,
   cliArguments: ParsedCliArguments,
   context: PluginCliContext,
 ) {
-  if (cliArguments.command === "grant") {
-    return runGrantCli(browser, cliArguments, context);
-  }
   if (cliArguments.command === "list") {
     return runProfileListCli(browser, cliArguments, context);
   }
@@ -1255,11 +986,6 @@ function registerCli(bb: BbPluginApi, browser: BrowserService) {
           "bb browser import --name <name> --source <path> [--host <id>] [--json]",
       },
       {
-        name: "grant",
-        summary: "Create, inspect, list, or revoke Browser Profile Grants",
-        usage: "bb browser grant <list|inspect|create|revoke> [grant options]",
-      },
-      {
         name: "setup",
         summary: "Show or apply the consent-gated Browser setup plan",
         usage: "bb browser setup [--step <id> --confirm <text>] [--json]",
@@ -1304,7 +1030,8 @@ function registerAgentTool(bb: BbPluginApi, browser: BrowserService) {
 }
 
 export default function plugin(bb: BbPluginApi) {
-  const browser = createBrowserService(bb);
+  const ownerAuthority = Symbol("browser-owner-settings");
+  const browser = createBrowserService(bb, ownerAuthority);
   bb.rpc.register(rpcContract, {
     browser_status: (input) =>
       input.profileSelection === "selected"
@@ -1323,10 +1050,11 @@ export default function plugin(bb: BbPluginApi) {
     browser_purge_plan: (input) => browser.purgePlan(input),
     browser_purge: (input) => browser.purge(input),
     browser_profiles: (input) => browser.profiles(input),
-    browser_grants: (input) => browser.grants(input),
-    browser_grant_create: (input) => browser.createGrant(input),
-    browser_grant_inspect: (input) => browser.inspectGrant(input.grantId),
-    browser_grant_revoke: (input) => browser.revokeGrant(input),
+    browser_grants: (input) => browser.grants(ownerAuthority, input),
+    browser_grant_create: (input) => browser.createGrant(ownerAuthority, input),
+    browser_grant_inspect: (input) =>
+      browser.inspectGrant(ownerAuthority, input.grantId),
+    browser_grant_revoke: (input) => browser.revokeGrant(ownerAuthority, input),
     browser_profile_create: (input) => browser.createProfile(input),
     browser_profile_rename: (input) => browser.renameProfile(input),
     browser_profile_select: (input) => browser.selectProfile(input),

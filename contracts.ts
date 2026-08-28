@@ -543,6 +543,9 @@ export const browserProfileGrantIdSchema = z
   .string()
   .regex(/^[A-Za-z0-9][A-Za-z0-9:_-]{0,127}$/u);
 
+export const PERSIST_BROWSER_ELEVATED_ACCESS_CONFIRMATION =
+  "Persist Browser elevated access";
+
 export const browserProfileGrantSchema = z
   .object({
     grantId: browserProfileGrantIdSchema,
@@ -554,6 +557,10 @@ export const browserProfileGrantSchema = z
     wholeWeb: z.boolean(),
     fileTransfer: z.boolean(),
     invalidCertificateOrigins: z.array(browserExactOriginSchema).max(100),
+    persistentElevations: z.boolean(),
+    wholeWebExpiresAt: z.string().datetime().nullable(),
+    fileTransferExpiresAt: z.string().datetime().nullable(),
+    invalidCertificateExpiresAt: z.string().datetime().nullable(),
     createdAt: z.string().datetime(),
     updatedAt: z.string().datetime(),
     revokedAt: z.string().datetime().nullable(),
@@ -569,7 +576,19 @@ export const browserProfileGrantSchema = z
     }
   });
 
-export type BrowserProfileGrant = z.output<typeof browserProfileGrantSchema>;
+type BrowserProfileGrantRecord = z.output<typeof browserProfileGrantSchema>;
+export type BrowserProfileGrant = Omit<
+  BrowserProfileGrantRecord,
+  | "persistentElevations"
+  | "wholeWebExpiresAt"
+  | "fileTransferExpiresAt"
+  | "invalidCertificateExpiresAt"
+> & {
+  persistentElevations?: boolean;
+  wholeWebExpiresAt?: string | null;
+  fileTransferExpiresAt?: string | null;
+  invalidCertificateExpiresAt?: string | null;
+};
 export const browserProfileGrantsSchema = z.array(browserProfileGrantSchema);
 
 export const browserProfileGrantCreateRequestSchema = z
@@ -585,17 +604,34 @@ export const browserProfileGrantCreateRequestSchema = z
       .array(browserExactOriginSchema)
       .max(100)
       .default([]),
+    persistentElevations: z.boolean().default(false),
+    persistenceConfirmation: z.string().optional(),
   })
   .strict()
-  .superRefine(({ originScope, wholeWeb }, context) => {
-    if (wholeWeb !== (originScope === "*")) {
-      context.addIssue({
-        code: "custom",
-        path: ["wholeWeb"],
-        message: "Whole-web grants must use the * origin scope.",
-      });
-    }
-  });
+  .superRefine(
+    (
+      { originScope, wholeWeb, persistentElevations, persistenceConfirmation },
+      context,
+    ) => {
+      if (wholeWeb !== (originScope === "*")) {
+        context.addIssue({
+          code: "custom",
+          path: ["wholeWeb"],
+          message: "Whole-web grants must use the * origin scope.",
+        });
+      }
+      if (
+        persistentElevations &&
+        persistenceConfirmation !== PERSIST_BROWSER_ELEVATED_ACCESS_CONFIRMATION
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["persistenceConfirmation"],
+          message: "Persistent elevated access requires a second confirmation.",
+        });
+      }
+    },
+  );
 
 export const browserProfileGrantQuerySchema = z
   .object({
@@ -799,12 +835,36 @@ export const browserActivityKindSchema = z.enum([
   "export",
 ]);
 
+export const browserActivityGrantElevationsSchema = z
+  .object({
+    wholeWeb: z.boolean(),
+    fileTransfer: z.boolean(),
+    invalidCertificateOrigins: z.array(browserExactOriginSchema).max(100),
+    persistentElevations: z.boolean(),
+  })
+  .strict();
+
+export const browserActivityGrantMetadataSchema = z
+  .object({
+    grantId: browserProfileGrantIdSchema.nullable(),
+    grantScope: browserOriginScopeSchema.nullable(),
+    grantElevations: browserActivityGrantElevationsSchema.nullable(),
+  })
+  .strict();
+
+export type BrowserActivityGrantMetadata = z.output<
+  typeof browserActivityGrantMetadataSchema
+>;
+
 const browserActivityMetadataShape = {
   eventId: browserActivityEventIdSchema,
   actor: browserActivityActorSchema,
   projectId: z.string().min(1).nullable(),
   hostId: z.string().min(1),
   profileId: z.string().min(1),
+  grantId: browserProfileGrantIdSchema.optional().nullable(),
+  grantScope: browserOriginScopeSchema.optional().nullable(),
+  grantElevations: browserActivityGrantElevationsSchema.optional().nullable(),
   destinationOrigin: browserActivityOriginSchema.nullable(),
   occurredAt: z.string().datetime(),
   kind: browserActivityKindSchema,
@@ -1037,6 +1097,9 @@ export function browserActivityEventFromOutboxItem(
     projectId: outboxItem.projectId,
     hostId: outboxItem.hostId,
     profileId: outboxItem.profileId,
+    grantId: outboxItem.grantId,
+    grantScope: outboxItem.grantScope,
+    grantElevations: outboxItem.grantElevations,
     destinationOrigin: outboxItem.destinationOrigin,
     occurredAt: outboxItem.occurredAt,
     kind: outboxItem.kind,

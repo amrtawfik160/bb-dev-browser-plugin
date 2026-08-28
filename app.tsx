@@ -13,6 +13,7 @@ import type {
 import {
   CLEAR_ACTIVITY_CONFIRMATION,
   DEFAULT_PROFILE_ID,
+  PERSIST_BROWSER_ELEVATED_ACCESS_CONFIRMATION,
   STOP_BROWSER_CONFIRMATION,
   type BrowserHostChoice,
   type BrowserHostChoicesInput,
@@ -1329,6 +1330,8 @@ type GrantDraft = {
   wholeWeb: boolean;
   fileTransfer: boolean;
   invalidCertificateOrigin: string;
+  persistentElevations: boolean;
+  persistenceConfirmation: string;
 };
 
 function GrantCreationForm({
@@ -1343,6 +1346,8 @@ function GrantCreationForm({
   const [invalidCertificateOrigin, setInvalidCertificateOrigin] = useState("");
   const [wholeWeb, setWholeWeb] = useState(false);
   const [fileTransfer, setFileTransfer] = useState(false);
+  const [persistentElevations, setPersistentElevations] = useState(false);
+  const [persistenceConfirmation, setPersistenceConfirmation] = useState("");
 
   function submitGrant(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -1352,6 +1357,8 @@ function GrantCreationForm({
       wholeWeb,
       fileTransfer,
       invalidCertificateOrigin,
+      persistentElevations,
+      persistenceConfirmation,
     }).then((createdGrant) => {
       if (createdGrant === null) return;
       setOriginScope("");
@@ -1398,6 +1405,27 @@ function GrantCreationForm({
         />
         File transfer elevation
       </label>
+      <label className="flex items-center gap-2 text-sm">
+        <input
+          type="checkbox"
+          aria-label="Persistent elevated Browser access"
+          checked={persistentElevations}
+          onChange={(event) => setPersistentElevations(event.target.checked)}
+        />
+        Persistent elevated Browser access
+      </label>
+      {persistentElevations ? (
+        <label className="block text-sm">
+          Type <code>{PERSIST_BROWSER_ELEVATED_ACCESS_CONFIRMATION}</code> to
+          persist elevated access
+          <input
+            aria-label="Persistent elevation confirmation"
+            className="mt-1 block w-full rounded border px-3 py-2 text-sm"
+            value={persistenceConfirmation}
+            onChange={(event) => setPersistenceConfirmation(event.target.value)}
+          />
+        </label>
+      ) : null}
       <label className="block text-sm">
         Invalid-certificate origin approval
         <input
@@ -1496,6 +1524,8 @@ function GrantControls({
           draft.invalidCertificateOrigin.trim().length === 0
             ? []
             : [draft.invalidCertificateOrigin],
+        persistentElevations: draft.persistentElevations,
+        persistenceConfirmation: draft.persistenceConfirmation,
       });
       setGrants((current) => [...(current ?? []), grant]);
       setMessage(`Created Browser Grant ${grant.grantId}.`);

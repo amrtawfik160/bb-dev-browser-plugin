@@ -28,6 +28,7 @@ import {
   browserProfileInventorySchema,
   browserProfileRecoveryResponseSchema,
   DEFAULT_PROFILE_ID,
+  PERSIST_BROWSER_ELEVATED_ACCESS_CONFIRMATION,
   setupRequiredStatus,
   type BrowserStatus,
 } from "../contracts.js";
@@ -101,17 +102,15 @@ async function grantDefaultProfileOrigin(
     hostId: "host-browser-test",
     name: `Grant ${origin}`,
   });
-  const response = await browser.runBrowserCli([
-    "grant",
-    "create",
-    "--profile",
-    DEFAULT_PROFILE_ID,
-    "--origin",
-    origin,
-    "--json",
-  ]);
-  expect(response.exitCode).toBe(0);
-  return JSON.parse(response.stdout);
+  return browser.createBrowserGrant({
+    projectId: "project-browser-test",
+    hostId: "host-browser-test",
+    profileId: DEFAULT_PROFILE_ID,
+    originScope: origin,
+    wholeWeb: false,
+    fileTransfer: false,
+    invalidCertificateOrigins: [],
+  });
 }
 
 describe("Browser public plugin contract", () => {
@@ -360,6 +359,39 @@ describe("Browser public plugin contract", () => {
     await browser.dispose();
   });
 
+  it("keeps grant administration off the agent-facing CLI and on Settings RPC", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+    });
+    await browser.createBrowserProfile({
+      hostId: "host-browser-test",
+      name: "Owner authority target",
+    });
+
+    const cli = await browser.runBrowserCli(["grant", "list"]);
+    expect(cli.exitCode).not.toBe(0);
+    expect(cli.stderr).toContain("Usage: bb browser");
+    expect(cli.stderr).not.toContain("|grant|");
+
+    const created = await browser.createBrowserGrant({
+      projectId: "project-browser-test",
+      hostId: "host-browser-test",
+      profileId: DEFAULT_PROFILE_ID,
+      originScope: "https://owner-settings.example.test",
+      wholeWeb: false,
+      fileTransfer: false,
+      invalidCertificateOrigins: [],
+    });
+    expect(await browser.inspectBrowserGrant(created.grantId)).toMatchObject(
+      created,
+    );
+    expect(await browser.revokeBrowserGrant(created.grantId)).toMatchObject({
+      grantId: created.grantId,
+      outcome: "revoked",
+    });
+    await browser.dispose();
+  });
+
   it("gates browser_script through the owner grant create, inspect, and revoke contract", async () => {
     const browser = await createPublicPluginHarness({
       snapshot: preparedSnapshot,
@@ -379,17 +411,15 @@ describe("Browser public plugin contract", () => {
     expect(beforeGrant.isError).toBe(true);
     expect(denied.error.code).toBe("origin_denied");
 
-    const create = await browser.runBrowserCli([
-      "grant",
-      "create",
-      "--profile",
-      DEFAULT_PROFILE_ID,
-      "--origin",
-      "HTTPS://APP.Example.test:443/",
-      "--json",
-    ]);
-    expect(create.exitCode).toBe(0);
-    const created = JSON.parse(create.stdout);
+    const created = await browser.createBrowserGrant({
+      projectId: "project-browser-test",
+      hostId: "host-browser-test",
+      profileId: DEFAULT_PROFILE_ID,
+      originScope: "HTTPS://APP.Example.test:443/",
+      wholeWeb: false,
+      fileTransfer: false,
+      invalidCertificateOrigins: [],
+    });
     expect(created).toMatchObject({
       projectId: "project-browser-test",
       hostId: "host-browser-test",
@@ -403,25 +433,11 @@ describe("Browser public plugin contract", () => {
     });
     expect(allowed.isError).toBe(false);
 
-    const inspected = await browser.runBrowserCli([
-      "grant",
-      "inspect",
-      "--grant",
-      created.grantId,
-      "--json",
-    ]);
-    expect(inspected.exitCode).toBe(0);
-    expect(JSON.parse(inspected.stdout)).toMatchObject(created);
+    expect(await browser.inspectBrowserGrant(created.grantId)).toMatchObject(
+      created,
+    );
 
-    const revoke = await browser.runBrowserCli([
-      "grant",
-      "revoke",
-      "--grant",
-      created.grantId,
-      "--json",
-    ]);
-    expect(revoke.exitCode).toBe(0);
-    expect(JSON.parse(revoke.stdout)).toEqual({
+    expect(await browser.revokeBrowserGrant(created.grantId)).toEqual({
       grantId: created.grantId,
       outcome: "revoked",
     });
@@ -446,28 +462,24 @@ describe("Browser public plugin contract", () => {
       hostId: "host-browser-test",
       name: "Elevation target",
     });
-    const baseArgs = [
-      "grant",
-      "create",
-      "--profile",
-      DEFAULT_PROFILE_ID,
-      "--origin",
-      "https://app.example.test",
-      "--json",
-    ];
-    const baseline = await browser.runBrowserCli(baseArgs);
-    expect(baseline.exitCode).toBe(0);
-    const wholeWeb = await browser.runBrowserCli([
-      "grant",
-      "create",
-      "--profile",
-      DEFAULT_PROFILE_ID,
-      "--origin",
-      "*",
-      "--whole-web",
-      "--json",
-    ]);
-    expect(wholeWeb.exitCode).toBe(0);
+    await browser.createBrowserGrant({
+      projectId: "project-browser-test",
+      hostId: "host-browser-test",
+      profileId: DEFAULT_PROFILE_ID,
+      originScope: "https://app.example.test",
+      wholeWeb: false,
+      fileTransfer: false,
+      invalidCertificateOrigins: [],
+    });
+    await browser.createBrowserGrant({
+      projectId: "project-browser-test",
+      hostId: "host-browser-test",
+      profileId: DEFAULT_PROFILE_ID,
+      originScope: "*",
+      wholeWeb: true,
+      fileTransfer: false,
+      invalidCertificateOrigins: [],
+    });
     const wholeWebAllowed = await browser.runBrowserScriptWithProfile(
       undefined,
       { destinationOrigin: "https://not-listed.other.test" },
@@ -489,12 +501,15 @@ describe("Browser public plugin contract", () => {
         .error.code,
     ).toBe("origin_denied");
 
-    const fileGrant = await browser.runBrowserCli([
-      ...baseArgs.slice(0, -1),
-      "--file-transfer",
-      "--json",
-    ]);
-    expect(fileGrant.exitCode).toBe(0);
+    await browser.createBrowserGrant({
+      projectId: "project-browser-test",
+      hostId: "host-browser-test",
+      profileId: DEFAULT_PROFILE_ID,
+      originScope: "https://app.example.test",
+      wholeWeb: false,
+      fileTransfer: true,
+      invalidCertificateOrigins: [],
+    });
     const fileAllowed = await browser.runBrowserScriptWithProfile(undefined, {
       destinationOrigin: "https://app.example.test",
       fileTransfer: true,
@@ -510,13 +525,15 @@ describe("Browser public plugin contract", () => {
     );
     expect(certificateDenied.isError).toBe(true);
 
-    const certificateGrant = await browser.runBrowserCli([
-      ...baseArgs.slice(0, -1),
-      "--invalid-certificate-origin",
-      "HTTPS://APP.Example.test:443/",
-      "--json",
-    ]);
-    expect(certificateGrant.exitCode).toBe(0);
+    await browser.createBrowserGrant({
+      projectId: "project-browser-test",
+      hostId: "host-browser-test",
+      profileId: DEFAULT_PROFILE_ID,
+      originScope: "https://app.example.test",
+      wholeWeb: false,
+      fileTransfer: false,
+      invalidCertificateOrigins: ["HTTPS://APP.Example.test:443/"],
+    });
     const certificateAllowed = await browser.runBrowserScriptWithProfile(
       undefined,
       {
@@ -547,16 +564,15 @@ describe("Browser public plugin contract", () => {
       hostId: "host-browser-test",
       name: "Lifecycle target",
     });
-    const created = await browser.runBrowserCli([
-      "grant",
-      "create",
-      "--profile",
-      DEFAULT_PROFILE_ID,
-      "--origin",
-      "https://app.example.test",
-      "--json",
-    ]);
-    const grant = JSON.parse(created.stdout);
+    const grant = await browser.createBrowserGrant({
+      projectId: "project-browser-test",
+      hostId: "host-browser-test",
+      profileId: DEFAULT_PROFILE_ID,
+      originScope: "https://app.example.test",
+      wholeWeb: false,
+      fileTransfer: false,
+      invalidCertificateOrigins: [],
+    });
 
     expect(
       (
@@ -568,15 +584,9 @@ describe("Browser public plugin contract", () => {
 
     await browser.emitProjectChange("project-deleted");
 
-    const inspected = await browser.runBrowserCli([
-      "grant",
-      "inspect",
-      "--grant",
-      grant.grantId,
-      "--json",
-    ]);
-    expect(inspected.exitCode).toBe(0);
-    expect(JSON.parse(inspected.stdout).revokedAt).toEqual(expect.any(String));
+    expect(
+      (await browser.inspectBrowserGrant(grant.grantId))?.revokedAt,
+    ).toEqual(expect.any(String));
 
     const afterDeletion = await browser.runBrowserScriptWithProfile(undefined, {
       destinationOrigin: "https://app.example.test",
@@ -598,6 +608,99 @@ describe("Browser public plugin contract", () => {
         }),
       ]),
     );
+    await browser.dispose();
+  });
+
+  it("blocks a deferred grant create when project deletion wins the generation barrier", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+      deferProjectLookup: true,
+    });
+    await browser.createBrowserProfile({
+      hostId: "host-browser-test",
+      name: "Deferred grant target",
+    });
+
+    const pendingGrant = browser.createBrowserGrant({
+      projectId: "project-browser-test",
+      hostId: "host-browser-test",
+      profileId: DEFAULT_PROFILE_ID,
+      originScope: "https://deferred.example.test",
+      wholeWeb: false,
+      fileTransfer: false,
+      invalidCertificateOrigins: [],
+    });
+    await browser.projectLookupStarted;
+    await browser.emitProjectChange("project-deleted");
+    browser.releaseProjectLookup();
+
+    await expect(pendingGrant).rejects.toThrow();
+    expect(
+      await browser.listBrowserGrants({ projectId: "project-browser-test" }),
+    ).toEqual([]);
+    await browser.dispose();
+  });
+
+  it("allows explicitly granted private-network origins at the public runtime seam", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+      browserScriptResponse: { ok: true, result: { title: "private" } },
+    });
+    await browser.createBrowserProfile({
+      hostId: "host-browser-test",
+      name: "Private network target",
+    });
+
+    const denied = await browser.runBrowserScriptWithProfile(undefined, {
+      destinationOrigin: "http://192.168.10.12:3000",
+    });
+    expect(denied.isError).toBe(true);
+
+    for (const origin of [
+      "http://192.168.10.12:3000",
+      "http://[fd12:3456:789a::12]:8080",
+    ]) {
+      await browser.createBrowserGrant({
+        projectId: "project-browser-test",
+        hostId: "host-browser-test",
+        profileId: DEFAULT_PROFILE_ID,
+        originScope: origin,
+        wholeWeb: false,
+        fileTransfer: false,
+        invalidCertificateOrigins: [],
+      });
+      expect(
+        (
+          await browser.runBrowserScriptWithProfile(undefined, {
+            destinationOrigin: origin,
+          })
+        ).isError,
+      ).toBe(false);
+    }
+
+    await browser.createBrowserGrant({
+      projectId: "project-browser-test",
+      hostId: "host-browser-test",
+      profileId: DEFAULT_PROFILE_ID,
+      originScope: "*",
+      wholeWeb: true,
+      fileTransfer: false,
+      invalidCertificateOrigins: [],
+    });
+    expect(
+      (
+        await browser.runBrowserScriptWithProfile(undefined, {
+          destinationOrigin: "http://10.20.30.40:9000",
+        })
+      ).isError,
+    ).toBe(false);
+    expect(
+      (
+        await browser.runBrowserScriptWithProfile(undefined, {
+          destinationOrigin: "http://[::ffff:127.0.0.1]:3000",
+        })
+      ).isError,
+    ).toBe(true);
     await browser.dispose();
   });
 
@@ -1666,6 +1769,77 @@ describe("Browser public plugin contract", () => {
     });
     fireEvent.click(revokeButton);
     await settings.findByText(/Browser Grant grant-.*: revoked\./);
+    const grantActivity = (await browser.runBrowserActivityRecords()).filter(
+      (record) => record.kind === "grant",
+    );
+    expect(grantActivity).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          actor: "owner",
+          destinationOrigin: null,
+          grantId: expect.any(String),
+          grantScope: "https://app.example.test",
+          grantElevations: {
+            wholeWeb: false,
+            fileTransfer: false,
+            invalidCertificateOrigins: [],
+            persistentElevations: false,
+          },
+        }),
+      ]),
+    );
+    await browser.dispose();
+  });
+
+  it("requires a second Settings confirmation before persistent grant elevations", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+    });
+    await browser.createBrowserProfile({
+      hostId: "host-browser-test",
+      name: "Persistent grant target",
+    });
+    const settings = browser.renderSettings();
+
+    await settings.findByText("Browser Profile Grants");
+    fireEvent.change(
+      settings.getByRole("textbox", { name: "Grant project ID" }),
+      { target: { value: "project-browser-test" } },
+    );
+    fireEvent.click(
+      settings.getByRole("checkbox", {
+        name: "Whole-web Browser access",
+      }),
+    );
+    fireEvent.click(
+      settings.getByRole("checkbox", {
+        name: "Persistent elevated Browser access",
+      }),
+    );
+    fireEvent.click(
+      settings.getByRole("button", { name: "Create Browser Profile Grant" }),
+    );
+    await settings.findByText(/second confirmation/);
+
+    fireEvent.change(
+      settings.getByRole("textbox", {
+        name: "Persistent elevation confirmation",
+      }),
+      { target: { value: PERSIST_BROWSER_ELEVATED_ACCESS_CONFIRMATION } },
+    );
+    fireEvent.click(
+      settings.getByRole("button", { name: "Create Browser Profile Grant" }),
+    );
+    await settings.findByText(/Created Browser Grant grant-/);
+
+    await expect(browser.listBrowserGrants()).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          persistentElevations: true,
+          wholeWebExpiresAt: null,
+        }),
+      ]),
+    );
     await browser.dispose();
   });
 
