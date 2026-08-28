@@ -44,6 +44,12 @@ import {
   browserProfileRestoreRequestSchema,
   browserProfileSchema,
   browserProfileSelectRequestSchema,
+  browserProfileGrantCreateRequestSchema,
+  browserProfileGrantQuerySchema,
+  browserProfileGrantRevokeRequestSchema,
+  browserProfileGrantRevokeResponseSchema,
+  browserProfileGrantSchema,
+  browserProfileGrantsSchema,
   browserHostChoicesSchema,
   browserSetupPlanSchema,
   browserSetupResponseSchema,
@@ -102,6 +108,16 @@ type HostConnectionEvent = {
 };
 type HostConnectionListener = (
   event: HostConnectionEvent,
+) => void | Promise<void>;
+type ProjectChange = "project-created" | "project-deleted";
+type ProjectChangeEvent = {
+  type: "changed";
+  entity: "project";
+  id?: string;
+  changes: readonly ProjectChange[];
+};
+type ProjectChangeListener = (
+  event: ProjectChangeEvent,
 ) => void | Promise<void>;
 
 function projectFixture(hostIds: readonly string[] = [HOST_ID]) {
@@ -173,6 +189,7 @@ export async function createPublicPluginHarness(options?: {
   hostConnection?: HostConnectionStatus;
   browserScriptResponse?: { ok: true; result: unknown };
   browserScriptDelayMs?: number;
+  browserScriptStarted?: () => void;
   hostIds?: readonly string[];
   projectHostIds?: readonly string[];
   probeFailure?: boolean;
@@ -189,6 +206,7 @@ export async function createPublicPluginHarness(options?: {
   let hostConnectionStatus: HostConnectionStatus =
     options?.hostConnection ?? "connected";
   const hostConnectionListeners: HostConnectionListener[] = [];
+  const projectChangeListeners: ProjectChangeListener[] = [];
   const hostRpcFailures = new Map<string, string>();
   const setupInspectionTargets: BrowserHostTarget[] = [];
   const expectedStatus =
@@ -290,8 +308,18 @@ export async function createPublicPluginHarness(options?: {
     agentSkillIds: ["browser"],
     sdk: {
       subscribe: (args) => {
+        if (args.event === "project:changed") {
+          const listener = args.callback as ProjectChangeListener;
+          projectChangeListeners.push(listener);
+          return () => {
+            const index = projectChangeListeners.indexOf(listener);
+            if (index >= 0) projectChangeListeners.splice(index, 1);
+          };
+        }
         if (args.event !== "host:changed") {
-          throw new Error("public harness only supports host changes");
+          throw new Error(
+            "public harness only supports host and project changes",
+          );
         }
         const listener = args.callback as HostConnectionListener;
         hostConnectionListeners.push(listener);
@@ -325,6 +353,7 @@ export async function createPublicPluginHarness(options?: {
     experimental_callHostRpc: async ({ method, input, signal }) => {
       const failure = hostRpcFailures.get(method);
       if (failure !== undefined) throw new Error(failure);
+      if (method === "browserScript") options?.browserScriptStarted?.();
       if (
         method === "browserScript" &&
         options?.browserScriptResponse !== undefined
@@ -384,8 +413,24 @@ export async function createPublicPluginHarness(options?: {
       }
       if (method === "browserScript") {
         if (options?.browserScriptDelayMs !== undefined) {
-          await new Promise<void>((resolve) => {
-            setTimeout(resolve, options.browserScriptDelayMs);
+          const scriptSignal = signal ?? new AbortController().signal;
+          await new Promise<void>((resolve, reject) => {
+            const finish = () => {
+              clearTimeout(timer);
+              scriptSignal.removeEventListener("abort", abort);
+              resolve();
+            };
+            const abort = () => {
+              clearTimeout(timer);
+              scriptSignal.removeEventListener("abort", abort);
+              reject(new Error("browser script aborted"));
+            };
+            const timer = setTimeout(finish, options.browserScriptDelayMs);
+            if (scriptSignal.aborted) {
+              abort();
+              return;
+            }
+            scriptSignal.addEventListener("abort", abort, { once: true });
           });
         }
         return host.experimental_call(
@@ -558,6 +603,44 @@ export async function createPublicPluginHarness(options?: {
     }) =>
       backend.harness.behavior.callRpc("browser_profiles", input) as Promise<
         ReturnType<typeof browserProfileInventorySchema.parse>
+      >,
+    browser_grants: (input: {
+      grantId?: string;
+      projectId?: string;
+      hostId?: string;
+      installationId?: string;
+      profileId?: string;
+      includeRevoked?: boolean;
+    }) =>
+      backend.harness.behavior.callRpc(
+        "browser_grants",
+        browserProfileGrantQuerySchema.parse(input),
+      ) as Promise<ReturnType<typeof browserProfileGrantsSchema.parse>>,
+    browser_grant_create: (input: {
+      projectId: string;
+      hostId: string;
+      profileId: string;
+      installationId?: string;
+      originScope: string;
+      wholeWeb?: boolean;
+      fileTransfer?: boolean;
+      invalidCertificateOrigins?: string[];
+    }) =>
+      backend.harness.behavior.callRpc(
+        "browser_grant_create",
+        browserProfileGrantCreateRequestSchema.parse(input),
+      ) as Promise<ReturnType<typeof browserProfileGrantSchema.parse>>,
+    browser_grant_inspect: (input: { grantId: string }) =>
+      backend.harness.behavior.callRpc(
+        "browser_grant_inspect",
+        input,
+      ) as Promise<ReturnType<typeof browserProfileGrantSchema.parse> | null>,
+    browser_grant_revoke: (input: { grantId: string }) =>
+      backend.harness.behavior.callRpc(
+        "browser_grant_revoke",
+        browserProfileGrantRevokeRequestSchema.parse(input),
+      ) as Promise<
+        ReturnType<typeof browserProfileGrantRevokeResponseSchema.parse>
       >,
     browser_profile_create: (input: {
       hostId: string;
@@ -809,6 +892,39 @@ export async function createPublicPluginHarness(options?: {
     return rpc.browser_profile_import(input);
   }
 
+  function createBrowserGrant(input: {
+    projectId: string;
+    hostId: string;
+    profileId: string;
+    installationId?: string;
+    originScope: string;
+    wholeWeb?: boolean;
+    fileTransfer?: boolean;
+    invalidCertificateOrigins?: string[];
+  }) {
+    return rpc.browser_grant_create(input);
+  }
+
+  function listBrowserGrants(
+    input: {
+      projectId?: string;
+      hostId?: string;
+      installationId?: string;
+      profileId?: string;
+      includeRevoked?: boolean;
+    } = {},
+  ) {
+    return rpc.browser_grants(input);
+  }
+
+  function inspectBrowserGrant(grantId: string) {
+    return rpc.browser_grant_inspect({ grantId });
+  }
+
+  function revokeBrowserGrant(grantId: string) {
+    return rpc.browser_grant_revoke({ grantId });
+  }
+
   function runBrowserHostChoices(input: BrowserHostChoicesInput) {
     return rpc.browser_host_choices(input);
   }
@@ -850,6 +966,21 @@ export async function createPublicPluginHarness(options?: {
     }
   }
 
+  async function emitProjectChange(
+    change: ProjectChange,
+    projectId = PROJECT_ID,
+  ) {
+    const event: ProjectChangeEvent = {
+      type: "changed",
+      entity: "project",
+      id: projectId,
+      changes: [change],
+    };
+    for (const listener of [...projectChangeListeners]) {
+      await listener(event);
+    }
+  }
+
   async function seedHostActivityEvent(eventId = "seeded-host-activity") {
     await host.experimental_call("browserScript", {
       purpose: "Seed host activity",
@@ -887,6 +1018,9 @@ export async function createPublicPluginHarness(options?: {
       purpose?: string;
       code?: string;
       destinationOrigin?: string;
+      fileTransfer?: boolean;
+      invalidCertificate?: boolean;
+      projectId?: string;
       signal?: AbortSignal;
     },
   ) {
@@ -898,11 +1032,17 @@ export async function createPublicPluginHarness(options?: {
         ...(overrides?.destinationOrigin === undefined
           ? {}
           : { destinationOrigin: overrides.destinationOrigin }),
+        ...(overrides?.fileTransfer === undefined
+          ? {}
+          : { fileTransfer: overrides.fileTransfer }),
+        ...(overrides?.invalidCertificate === undefined
+          ? {}
+          : { invalidCertificate: overrides.invalidCertificate }),
         ...(profileId === undefined ? {} : { profileId }),
       },
       {
         threadId: THREAD_ID,
-        projectId: PROJECT_ID,
+        projectId: overrides?.projectId ?? PROJECT_ID,
         ...(overrides?.signal === undefined
           ? {}
           : { signal: overrides.signal }),
@@ -1000,6 +1140,7 @@ export async function createPublicPluginHarness(options?: {
     setHostConnection,
     setHostRpcFailure,
     emitHostConnection,
+    emitProjectChange,
     seedHostActivityEvent,
     runStatusCli,
     runStatusCliText,
@@ -1016,6 +1157,10 @@ export async function createPublicPluginHarness(options?: {
     backupBrowserProfile,
     restoreBrowserProfile,
     importBrowserProfile,
+    createBrowserGrant,
+    listBrowserGrants,
+    inspectBrowserGrant,
+    revokeBrowserGrant,
     runBrowserHostChoices,
     runBrowserScript,
     runBrowserScriptWithProfile,

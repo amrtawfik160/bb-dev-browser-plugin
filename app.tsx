@@ -20,6 +20,7 @@ import {
   type BrowserActivityExport,
   type BrowserActivityRecord,
   type BrowserProfile,
+  type BrowserProfileGrant,
   type BrowserProfileInventory,
   type BrowserProfileRecoveryResponse,
   type BrowserPurgePlan,
@@ -1285,6 +1286,290 @@ function ActivityControls({ target }: { target: BrowserAdministrationTarget }) {
   );
 }
 
+function GrantRow({
+  grant,
+  pendingAction,
+  onRevoke,
+}: {
+  grant: BrowserProfileGrant;
+  pendingAction: string | null;
+  onRevoke: (grantId: string) => void;
+}) {
+  return (
+    <li className="rounded border p-2 text-sm">
+      <div className="flex flex-wrap items-baseline justify-between gap-2">
+        <code>{grant.grantId}</code>
+        <span>{grant.revokedAt === null ? "Active" : "Revoked"}</span>
+      </div>
+      <p className="mt-1">{grant.originScope}</p>
+      <p className="text-xs text-muted-foreground">
+        Whole web: {String(grant.wholeWeb)} · File transfer:{" "}
+        {String(grant.fileTransfer)}
+      </p>
+      {grant.invalidCertificateOrigins.length === 0 ? null : (
+        <p className="text-xs text-muted-foreground">
+          Invalid certificates: {grant.invalidCertificateOrigins.join(", ")}
+        </p>
+      )}
+      <button
+        type="button"
+        className="mt-2 rounded border px-3 py-2 text-sm"
+        disabled={pendingAction !== null || grant.revokedAt !== null}
+        onClick={() => onRevoke(grant.grantId)}
+      >
+        Revoke Browser Grant {grant.grantId}
+      </button>
+    </li>
+  );
+}
+
+type GrantDraft = {
+  projectId: string;
+  originScope: string;
+  wholeWeb: boolean;
+  fileTransfer: boolean;
+  invalidCertificateOrigin: string;
+};
+
+function GrantCreationForm({
+  pendingAction,
+  onCreate,
+}: {
+  pendingAction: string | null;
+  onCreate: (draft: GrantDraft) => Promise<BrowserProfileGrant | null>;
+}) {
+  const [projectId, setProjectId] = useState("");
+  const [originScope, setOriginScope] = useState("");
+  const [invalidCertificateOrigin, setInvalidCertificateOrigin] = useState("");
+  const [wholeWeb, setWholeWeb] = useState(false);
+  const [fileTransfer, setFileTransfer] = useState(false);
+
+  function submitGrant(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    void onCreate({
+      projectId,
+      originScope,
+      wholeWeb,
+      fileTransfer,
+      invalidCertificateOrigin,
+    }).then((createdGrant) => {
+      if (createdGrant === null) return;
+      setOriginScope("");
+      setInvalidCertificateOrigin("");
+    });
+  }
+
+  return (
+    <form className="mt-3 space-y-2" onSubmit={submitGrant}>
+      <label className="block text-sm">
+        Grant project ID
+        <input
+          aria-label="Grant project ID"
+          className="mt-1 block w-full rounded border px-3 py-2 text-sm"
+          value={projectId}
+          onChange={(event) => setProjectId(event.target.value)}
+        />
+      </label>
+      <label className="block text-sm">
+        Origin scope
+        <input
+          aria-label="Grant origin scope"
+          className="mt-1 block w-full rounded border px-3 py-2 text-sm"
+          value={originScope}
+          onChange={(event) => setOriginScope(event.target.value)}
+          disabled={wholeWeb}
+        />
+      </label>
+      <label className="flex items-center gap-2 text-sm">
+        <input
+          type="checkbox"
+          aria-label="Whole-web Browser access"
+          checked={wholeWeb}
+          onChange={(event) => setWholeWeb(event.target.checked)}
+        />
+        Whole-web Browser access
+      </label>
+      <label className="flex items-center gap-2 text-sm">
+        <input
+          type="checkbox"
+          aria-label="File transfer elevation"
+          checked={fileTransfer}
+          onChange={(event) => setFileTransfer(event.target.checked)}
+        />
+        File transfer elevation
+      </label>
+      <label className="block text-sm">
+        Invalid-certificate origin approval
+        <input
+          aria-label="Invalid-certificate origin approval"
+          className="mt-1 block w-full rounded border px-3 py-2 text-sm"
+          value={invalidCertificateOrigin}
+          onChange={(event) => setInvalidCertificateOrigin(event.target.value)}
+        />
+      </label>
+      <button
+        type="submit"
+        className="rounded border px-3 py-2 text-sm"
+        disabled={
+          pendingAction !== null ||
+          projectId.trim().length === 0 ||
+          (!wholeWeb && originScope.trim().length === 0)
+        }
+      >
+        Create Browser Profile Grant
+      </button>
+    </form>
+  );
+}
+
+function GrantList({
+  grants,
+  pendingAction,
+  onRevoke,
+}: {
+  grants: readonly BrowserProfileGrant[];
+  pendingAction: string | null;
+  onRevoke: (grantId: string) => void;
+}) {
+  return (
+    <ul aria-label="Browser Profile Grant list" className="mt-3 space-y-2">
+      {grants.length === 0 ? (
+        <li className="text-sm">No active Browser Profile Grants.</li>
+      ) : (
+        grants.map((grant) => (
+          <GrantRow
+            key={grant.grantId}
+            grant={grant}
+            pendingAction={pendingAction}
+            onRevoke={onRevoke}
+          />
+        ))
+      )}
+    </ul>
+  );
+}
+
+function GrantControls({
+  target,
+  available,
+}: {
+  target: BrowserAdministrationTarget;
+  available: boolean;
+}) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [grants, setGrants] = useState<BrowserProfileGrant[] | null>(null);
+  const [pendingAction, setPendingAction] = useState<string | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  function inspectGrants() {
+    setPendingAction("inspect");
+    setError(null);
+    void rpc
+      .call("browser_grants", {
+        hostId: target.hostId,
+        profileId: target.profileId,
+        includeRevoked: false,
+      })
+      .then(setGrants)
+      .catch((requestError: unknown) =>
+        setError(administrationErrorMessage(requestError)),
+      )
+      .finally(() => setPendingAction(null));
+  }
+
+  async function createGrant(
+    draft: GrantDraft,
+  ): Promise<BrowserProfileGrant | null> {
+    setPendingAction("create");
+    setMessage(null);
+    setError(null);
+    try {
+      const grant = await rpc.call("browser_grant_create", {
+        projectId: draft.projectId,
+        hostId: target.hostId,
+        profileId: target.profileId,
+        originScope: draft.wholeWeb ? "*" : draft.originScope,
+        wholeWeb: draft.wholeWeb,
+        fileTransfer: draft.fileTransfer,
+        invalidCertificateOrigins:
+          draft.invalidCertificateOrigin.trim().length === 0
+            ? []
+            : [draft.invalidCertificateOrigin],
+      });
+      setGrants((current) => [...(current ?? []), grant]);
+      setMessage(`Created Browser Grant ${grant.grantId}.`);
+      return grant;
+    } catch (requestError: unknown) {
+      setError(administrationErrorMessage(requestError));
+      return null;
+    } finally {
+      setPendingAction(null);
+    }
+  }
+
+  function revokeGrant(grantId: string) {
+    setPendingAction(grantId);
+    setMessage(null);
+    setError(null);
+    void rpc
+      .call("browser_grant_revoke", { grantId })
+      .then((response) => {
+        setMessage(`Browser Grant ${response.grantId}: ${response.outcome}.`);
+        setGrants(
+          (current) =>
+            current?.filter((grant) => grant.grantId !== response.grantId) ??
+            current,
+        );
+      })
+      .catch((requestError: unknown) =>
+        setError(administrationErrorMessage(requestError)),
+      )
+      .finally(() => setPendingAction(null));
+  }
+
+  return (
+    <section
+      aria-label={`Browser Profile Grants for ${target.profileId}`}
+      className="border-t pt-5 text-left"
+    >
+      <h4 className="font-semibold">Browser Profile Grants</h4>
+      <p className="mt-2 text-sm text-muted-foreground">
+        Agent access is denied until this project grants a normalized exact
+        origin or explicit subdomain scope. Elevations are independent.
+      </p>
+      {!available ? (
+        <p className="mt-3 text-sm">
+          Grants are unavailable while this host is offline.
+        </p>
+      ) : (
+        <>
+          <GrantCreationForm
+            pendingAction={pendingAction}
+            onCreate={createGrant}
+          />
+          <button
+            type="button"
+            className="mt-3 rounded border px-3 py-2 text-sm"
+            disabled={pendingAction !== null}
+            onClick={inspectGrants}
+          >
+            Inspect Browser Grants
+          </button>
+          {grants === null ? null : (
+            <GrantList
+              grants={grants}
+              pendingAction={pendingAction}
+              onRevoke={revokeGrant}
+            />
+          )}
+        </>
+      )}
+      <AdministrationFeedback message={message} error={error} />
+    </section>
+  );
+}
+
 function HostAdministrationControls({ status }: { status: BrowserStatus }) {
   if (
     status.hostId === null ||
@@ -1360,6 +1645,16 @@ function BrowserSettings() {
                 profileId:
                   selectedProfileIds[status.hostId] ?? status.profileId,
               }}
+            />
+          )}
+          {status.hostId === null ? null : (
+            <GrantControls
+              target={{
+                hostId: status.hostId,
+                profileId:
+                  selectedProfileIds[status.hostId] ?? status.profileId,
+              }}
+              available={status.state !== "host-offline"}
             />
           )}
           <HostAdministrationControls status={status} />

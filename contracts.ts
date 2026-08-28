@@ -388,6 +388,261 @@ export type BrowserHostChoicesInput = z.infer<
   typeof browserHostChoicesInputSchema
 >;
 
+const BROWSER_ORIGIN_PATH_ERROR =
+  "Browser origin scopes cannot contain paths or credentials.";
+
+type ParsedBrowserOrigin = { trimmed: string; url: URL };
+
+function parseBrowserHttpOrigin(candidate: string): ParsedBrowserOrigin {
+  const trimmed = candidate.trim();
+  if (trimmed.length === 0) {
+    throw new Error("Browser origins cannot be empty.");
+  }
+  let origin: URL;
+  try {
+    origin = new URL(trimmed);
+  } catch {
+    throw new Error("Browser origins must be valid HTTP or HTTPS origins.");
+  }
+  if (origin.protocol !== "http:" && origin.protocol !== "https:") {
+    throw new Error("Browser origins must use HTTP or HTTPS.");
+  }
+  return { trimmed, url: origin };
+}
+
+function assertRootBrowserOriginPath(trimmed: string) {
+  const authority = trimmed.slice(trimmed.indexOf("://") + 3);
+  const suffixIndex = authority.search(/[/?#]/u);
+  if (suffixIndex >= 0 && authority.slice(suffixIndex) !== "/") {
+    throw new Error(BROWSER_ORIGIN_PATH_ERROR);
+  }
+}
+
+function assertExactBrowserOrigin(url: URL) {
+  if (
+    url.username !== "" ||
+    url.password !== "" ||
+    url.pathname !== "/" ||
+    url.search !== "" ||
+    url.hash !== ""
+  ) {
+    throw new Error(BROWSER_ORIGIN_PATH_ERROR);
+  }
+  if (url.hostname.includes("*")) {
+    throw new Error("Wildcard hosts require an explicit subdomain scope.");
+  }
+}
+
+export function normalizeBrowserOrigin(candidate: string): string {
+  const { trimmed, url } = parseBrowserHttpOrigin(candidate);
+  assertRootBrowserOriginPath(trimmed);
+  assertExactBrowserOrigin(url);
+  return url.origin;
+}
+
+function subdomainScopeParts(candidate: string) {
+  const match = /^(https?):\/\/\*\.(.+)$/iu.exec(candidate.trim());
+  if (match === null) {
+    throw new Error(
+      "Subdomain scopes must use an explicit https://*.example.test pattern.",
+    );
+  }
+  const protocol = match[1]!.toLowerCase();
+  const rawHostPort = match[2]!;
+  const hostPort = rawHostPort.endsWith("/")
+    ? rawHostPort.slice(0, -1)
+    : rawHostPort;
+  if (/[/?#@]/u.test(hostPort)) {
+    throw new Error(BROWSER_ORIGIN_PATH_ERROR);
+  }
+  return { protocol, hostPort };
+}
+
+function parseSubdomainBase(protocol: string, hostPort: string): URL {
+  let base: URL;
+  try {
+    base = new URL(`${protocol}://${hostPort}`);
+  } catch {
+    throw new Error("Subdomain scopes must contain a valid host and port.");
+  }
+  return base;
+}
+
+function assertDnsSubdomainBase(base: URL) {
+  if (
+    base.username !== "" ||
+    base.password !== "" ||
+    base.pathname !== "/" ||
+    base.search !== "" ||
+    base.hash !== "" ||
+    base.hostname.includes(":") ||
+    !base.hostname.includes(".") ||
+    /^\d+(?:\.\d+){3}$/u.test(base.hostname)
+  ) {
+    throw new Error("Subdomain scopes must target a DNS host without a path.");
+  }
+}
+
+function normalizeBrowserSubdomainPattern(candidate: string): string {
+  const { protocol, hostPort } = subdomainScopeParts(candidate);
+  const base = parseSubdomainBase(protocol, hostPort);
+  assertDnsSubdomainBase(base);
+  return `${protocol}://*.${base.hostname}${
+    base.port.length === 0 ? "" : `:${base.port}`
+  }`;
+}
+
+export function normalizeBrowserOriginScope(candidate: string): string {
+  const trimmed = candidate.trim();
+  return trimmed === "*"
+    ? trimmed
+    : trimmed.startsWith("*.") || /:\/\/\*\./u.test(trimmed)
+      ? normalizeBrowserSubdomainPattern(trimmed)
+      : normalizeBrowserOrigin(trimmed);
+}
+
+export const browserOriginScopeSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(2048)
+  .superRefine((candidate, context) => {
+    try {
+      normalizeBrowserOriginScope(candidate);
+    } catch (error) {
+      context.addIssue({
+        code: "custom",
+        message:
+          error instanceof Error ? error.message : "Invalid origin scope.",
+      });
+    }
+  })
+  .transform(normalizeBrowserOriginScope);
+
+export type BrowserOriginScope = z.output<typeof browserOriginScopeSchema>;
+
+export const browserExactOriginSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(2048)
+  .superRefine((candidate, context) => {
+    try {
+      normalizeBrowserOrigin(candidate);
+    } catch (error) {
+      context.addIssue({
+        code: "custom",
+        message:
+          error instanceof Error ? error.message : "Invalid browser origin.",
+      });
+    }
+  })
+  .transform(normalizeBrowserOrigin);
+
+export const browserProfileGrantIdSchema = z
+  .string()
+  .regex(/^[A-Za-z0-9][A-Za-z0-9:_-]{0,127}$/u);
+
+export const browserProfileGrantSchema = z
+  .object({
+    grantId: browserProfileGrantIdSchema,
+    projectId: z.string().min(1),
+    hostId: z.string().min(1),
+    installationId: z.string().min(1),
+    profileId: browserProfileIdSchema,
+    originScope: browserOriginScopeSchema,
+    wholeWeb: z.boolean(),
+    fileTransfer: z.boolean(),
+    invalidCertificateOrigins: z.array(browserExactOriginSchema).max(100),
+    createdAt: z.string().datetime(),
+    updatedAt: z.string().datetime(),
+    revokedAt: z.string().datetime().nullable(),
+  })
+  .strict()
+  .superRefine(({ originScope, wholeWeb }, context) => {
+    if (wholeWeb !== (originScope === "*")) {
+      context.addIssue({
+        code: "custom",
+        path: ["wholeWeb"],
+        message: "Whole-web grants must use the * origin scope.",
+      });
+    }
+  });
+
+export type BrowserProfileGrant = z.output<typeof browserProfileGrantSchema>;
+export const browserProfileGrantsSchema = z.array(browserProfileGrantSchema);
+
+export const browserProfileGrantCreateRequestSchema = z
+  .object({
+    projectId: z.string().min(1),
+    hostId: z.string().min(1),
+    profileId: browserProfileIdSchema,
+    installationId: z.string().min(1).optional(),
+    originScope: browserOriginScopeSchema,
+    wholeWeb: z.boolean().default(false),
+    fileTransfer: z.boolean().default(false),
+    invalidCertificateOrigins: z
+      .array(browserExactOriginSchema)
+      .max(100)
+      .default([]),
+  })
+  .strict()
+  .superRefine(({ originScope, wholeWeb }, context) => {
+    if (wholeWeb !== (originScope === "*")) {
+      context.addIssue({
+        code: "custom",
+        path: ["wholeWeb"],
+        message: "Whole-web grants must use the * origin scope.",
+      });
+    }
+  });
+
+export const browserProfileGrantQuerySchema = z
+  .object({
+    grantId: browserProfileGrantIdSchema.optional(),
+    projectId: z.string().min(1).optional(),
+    hostId: z.string().min(1).optional(),
+    installationId: z.string().min(1).optional(),
+    profileId: browserProfileIdSchema.optional(),
+    includeRevoked: z.boolean().default(false),
+  })
+  .strict();
+
+export const browserProfileGrantRevokeRequestSchema = z
+  .object({ grantId: browserProfileGrantIdSchema })
+  .strict();
+
+export const browserProfileGrantRevokeResponseSchema = z
+  .object({
+    grantId: browserProfileGrantIdSchema,
+    outcome: z.enum(["revoked", "already-revoked", "not-found"]),
+  })
+  .strict();
+
+export type BrowserProfileGrantCreateRequest = z.output<
+  typeof browserProfileGrantCreateRequestSchema
+>;
+export type BrowserProfileGrantQuery = z.output<
+  typeof browserProfileGrantQuerySchema
+>;
+export type BrowserProfileGrantRevokeRequest = z.output<
+  typeof browserProfileGrantRevokeRequestSchema
+>;
+export type BrowserProfileGrantRevokeResponse = z.output<
+  typeof browserProfileGrantRevokeResponseSchema
+>;
+
+export const browserOriginDeniedErrorSchema = z
+  .object({
+    state: z.literal("origin-denied"),
+    code: z.literal("origin_denied"),
+    label: z.literal("Origin denied"),
+    hostId: z.string().min(1).nullable(),
+    profileId: z.string().min(1),
+    message: z.string().min(1),
+  })
+  .strict();
+
 const browserProfileRecoveryPathSchema = z
   .string()
   .trim()
@@ -530,23 +785,7 @@ export const browserActivityEventIdSchema = z
   .string()
   .regex(/^[A-Za-z0-9][A-Za-z0-9:_-]{0,127}$/u);
 
-export const browserActivityOriginSchema = z
-  .string()
-  .min(1)
-  .max(2048)
-  .refine((candidate) => {
-    try {
-      const origin = new URL(candidate);
-      return (
-        (origin.protocol === "http:" || origin.protocol === "https:") &&
-        origin.origin === candidate &&
-        origin.username === "" &&
-        origin.password === ""
-      );
-    } catch {
-      return false;
-    }
-  }, "Activity destination must be an exact HTTP origin.");
+export const browserActivityOriginSchema = browserExactOriginSchema;
 
 export const browserActivityActorSchema = z.enum(["owner", "agent", "system"]);
 export const browserActivityKindSchema = z.enum([
@@ -950,6 +1189,22 @@ export const rpcContract = defineRpcContract({
     input: browserProfileQuerySchema,
     output: browserProfileInventorySchema,
   },
+  browser_grants: {
+    input: browserProfileGrantQuerySchema,
+    output: browserProfileGrantsSchema,
+  },
+  browser_grant_create: {
+    input: browserProfileGrantCreateRequestSchema,
+    output: browserProfileGrantSchema,
+  },
+  browser_grant_inspect: {
+    input: z.object({ grantId: browserProfileGrantIdSchema }).strict(),
+    output: browserProfileGrantSchema.nullable(),
+  },
+  browser_grant_revoke: {
+    input: browserProfileGrantRevokeRequestSchema,
+    output: browserProfileGrantRevokeResponseSchema,
+  },
   browser_profile_create: {
     input: browserProfileCreateRequestSchema,
     output: browserProfileSchema,
@@ -985,6 +1240,8 @@ export const browserScriptParametersSchema = z
     purpose: z.string().trim().min(1).max(200),
     code: z.string().min(1),
     destinationOrigin: browserActivityOriginSchema.optional(),
+    fileTransfer: z.boolean().default(false),
+    invalidCertificate: z.boolean().default(false),
     profileId: z.string().min(1).optional(),
     tabId: z.string().min(1).optional(),
     timeoutMs: z.number().int().positive().max(30_000).default(30_000),
@@ -1005,7 +1262,7 @@ export const browserScriptRequestSchema = browserScriptParametersSchema
 export const browserScriptFailureSchema = z
   .object({
     ok: z.literal(false),
-    error: browserStatusSchema,
+    error: z.union([browserStatusSchema, browserOriginDeniedErrorSchema]),
   })
   .strict();
 

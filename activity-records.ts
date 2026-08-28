@@ -12,6 +12,7 @@ import {
   type BrowserActivityExport,
   type BrowserActivityRecord,
 } from "./contracts.js";
+import { BROWSER_AUTHORIZATION_MIGRATIONS } from "./authorization.js";
 
 export { browserActivityEventFromOutboxItem as activityEventFromOutboxItem } from "./contracts.js";
 
@@ -101,6 +102,7 @@ export const BROWSER_DATABASE_MIGRATIONS = [
   ...legacyDatabaseMigrations,
   activityRecordsMigration,
   activityTombstonesMigration,
+  ...BROWSER_AUTHORIZATION_MIGRATIONS,
 ] as const;
 
 const activityRowSchema = z
