@@ -9,6 +9,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { compileFunction } from "node:vm";
 import { describe, expect, it, vi } from "vitest";
 import {
   BrowserInstanceError,
@@ -21,6 +22,7 @@ import {
 import { fallbackBrowserPaths } from "../browser-fallback.js";
 import { PINNED_BROWSER_RUNTIME } from "../dependency-inventory.js";
 import { profileStoragePaths } from "../profile-storage.js";
+import { BROWSER_SCRIPT_RESULT_LIMIT_BYTES } from "../contracts.js";
 
 function launchFixture(
   options: {
@@ -102,6 +104,9 @@ function launchFixture(
     },
     async execute(request) {
       executions.push(request);
+      if (request.screenshot !== undefined) {
+        compileFunction(`return async function () {\n${request.code}\n}`);
+      }
       if (request.code.includes("document.visibilityState")) {
         return JSON.stringify({
           id: "actual-active-tab",
@@ -981,6 +986,104 @@ describe("Browser Instance runtime", () => {
       await fixture.dispose();
     }
   });
+
+  it("captures an explicitly targeted tab without redeclaring its binding", async () => {
+    const fixture = await runtimeFixture();
+    try {
+      await expect(
+        fixture.runtime.execute(
+          {
+            ...fixture.target,
+            projectId: "project-a",
+            tabId: "tab-screenshot",
+          },
+          "console.log('capture')",
+          5_000,
+          { screenshot: true },
+        ),
+      ).resolves.toEqual({ output: "attached" });
+    } finally {
+      await fixture.dispose();
+    }
+  });
+
+  it("rejects an opaque tab identifier after its Browser runtime restarts", async () => {
+    const fixture = await runtimeFixture();
+    const originalExecute = fixture.processFixture.boundary.execute;
+    fixture.processFixture.boundary.execute = async (request) => {
+      if (
+        request.code.includes('entry.id === "tab-before-restart"') &&
+        !fixture.processFixture.pages.has("tab-before-restart")
+      ) {
+        throw new Error(
+          "Browser Tab is invalid or belongs to a previous runtime",
+        );
+      }
+      return originalExecute(request);
+    };
+    try {
+      fixture.processFixture.pages.add("tab-before-restart");
+      const running = await fixture.runtime.start(fixture.target);
+      await fixture.runtime.execute(
+        { ...fixture.target, tabId: "tab-before-restart" },
+        "return page.url()",
+        5_000,
+      );
+
+      fixture.processFixture.pages.delete("tab-before-restart");
+      fixture.processFixture.crash(running.pid);
+      await vi.waitFor(() => {
+        expect(fixture.processFixture.launches).toHaveLength(2);
+      });
+
+      await expect(
+        fixture.runtime.execute(
+          { ...fixture.target, tabId: "tab-before-restart" },
+          "return page.url()",
+          5_000,
+        ),
+      ).rejects.toThrow("previous runtime");
+    } finally {
+      await fixture.dispose();
+    }
+  });
+
+  it("bounds text results before they leave the Browser runtime", async () => {
+    const fixture = await runtimeFixture();
+    fixture.processFixture.boundary.execute = async () =>
+      "x".repeat(BROWSER_SCRIPT_RESULT_LIMIT_BYTES + 1);
+    try {
+      await expect(
+        fixture.runtime.execute(fixture.target, "return page.url()", 5_000),
+      ).rejects.toThrow("256 KiB");
+    } finally {
+      await fixture.dispose();
+    }
+  });
+
+  it.each([
+    ["text", "x".repeat(BROWSER_SCRIPT_RESULT_LIMIT_BYTES)],
+    [
+      "structured text",
+      {
+        output: "x".repeat(BROWSER_SCRIPT_RESULT_LIMIT_BYTES),
+        screenshots: [],
+      },
+    ],
+  ] as const)(
+    "accepts %s at the exact result boundary",
+    async (_kind, result) => {
+      const fixture = await runtimeFixture();
+      fixture.processFixture.boundary.execute = async () => result;
+      try {
+        await expect(
+          fixture.runtime.execute(fixture.target, "return page.url()", 5_000),
+        ).resolves.toEqual(result);
+      } finally {
+        await fixture.dispose();
+      }
+    },
+  );
 
   it("releases profile ownership when graceful process cleanup reports a failure", async () => {
     const fixture = await runtimeFixture();

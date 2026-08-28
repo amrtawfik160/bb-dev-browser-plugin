@@ -100,7 +100,7 @@ type AgentActivityInput = {
   profileId: string;
   destinationOrigin: string | null;
 };
-type AgentActivityOutcome = "succeeded" | "failed";
+type AgentActivityOutcome = "succeeded" | "failed" | "interrupted";
 type AgentScriptTarget = {
   hostId: string | null;
   profileId: string;
@@ -197,6 +197,7 @@ function agentBrowserScriptRequest(
       : { destinationOrigin: call.parameters.destinationOrigin }),
     fileTransfer: call.parameters.fileTransfer,
     invalidCertificate: call.parameters.invalidCertificate,
+    screenshot: call.parameters.screenshot,
     profileId: call.profileId,
     ...(call.parameters.tabId === undefined
       ? {}
@@ -583,14 +584,18 @@ export function createBrowserService(
     outcome: AgentActivityOutcome,
     startedAt: number,
   ) {
-    const interrupted = signal.aborted;
+    const interrupted = signal.aborted || outcome === "interrupted";
     activityProducers.agent({
       ...input,
       actor: "agent",
       action: "browser-script",
       outcome: interrupted ? "interrupted" : outcome,
       interrupted,
-      interruptionReason: interrupted ? "request-aborted" : null,
+      interruptionReason: signal.aborted
+        ? "request-aborted"
+        : interrupted
+          ? "control-lease-revoked"
+          : null,
       durationMs: Math.min(Math.max(Date.now() - startedAt, 0), 30_000),
     });
   }
@@ -990,7 +995,12 @@ export function createBrowserService(
       recordAgentActivity(
         activity,
         signal,
-        response.ok ? "succeeded" : "failed",
+        response.ok
+          ? "succeeded"
+          : response.error.state === "runtime-error" &&
+              response.error.code === "lease_revoked"
+            ? "interrupted"
+            : "failed",
         startedAt,
       );
       return response;

@@ -1,35 +1,68 @@
 ---
 name: browser
-description: Use the host-local Workspace Browser through browser_script or inspect its setup state with bb browser status. Use for browser automation, webpage interaction, screenshots, or Browser setup diagnostics.
+description: Use the host-local Workspace Browser for authorized webpage interaction, bounded Playwright automation, native screenshots, or setup and diagnostics checks.
 ---
 
 # Browser
 
-Run `bb browser status --json` before diagnosing Browser availability.
+Check readiness with `bb browser status --json` before diagnosing availability. Use
+`bb browser diagnostics --json` when the status asks for repair details.
 
-Use `browser_script` for browser automation. Supply:
+## Agent tool
 
-- `purpose`: a short owner-visible reason for the action.
-- `code`: QuickJS-compatible Playwright code without Node or filesystem access.
-- `timeoutMs`: at most 30000 when the default is unsuitable.
-- `profileId`: optional stable Browser Profile ID. Omit it to use the selected
-  host-local profile, or pass an ID returned by `bb browser list --json` to
-  target another profile explicitly.
-- `destinationOrigin`: the exact HTTP(S) origin being automated. Agent access
-  is denied by default until the owner grants that origin to this project,
-  host installation, and profile.
-- `fileTransfer` and `invalidCertificate`: optional elevation requests. Each
-  requires its own owner grant; invalid-certificate approval is per exact
-  origin and is never a global bypass.
+Use the statically registered `browser_script` tool. Supply:
+
+- `purpose`: required, human-readable reason shown to the owner only while the
+  Control Lease is live.
+- `code`: QuickJS Playwright code. It has no Node, modules, process access, or
+  arbitrary host-filesystem or workspace access.
+- `profileId`: optional host-local Browser Profile ID. Omit it to use the
+  selected profile.
+- `tabId`: optional opaque ID from `browser.listPages()`. Omit it to use the
+  active tab; list tabs again after a Browser runtime restart because tab IDs
+  are runtime-only.
+- `destinationOrigin`: the exact HTTP(S) origin being automated. Access is
+  denied until the owner grants that origin to this project, installation, and
+  profile. Grant changes apply to the next call and never resume a denied call.
+- `timeoutMs`: optional integer from 1 through 30000; the default is 30000.
+- `screenshot`: set `true` to request native screenshot output explicitly.
+- `fileTransfer` and `invalidCertificate`: separate optional elevation
+  requests; each needs its own owner grant, and certificate approval is per
+  exact origin.
+
+Return text or bounded JSON from the tool. An explicitly requested screenshot
+is ordinary thread image output; the plugin does not persist a second copy.
+
+## Equivalent CLI
+
+Run the same boundary from a project thread:
+
+```text
+bb browser script --purpose "Read the checkout total" --code "..." [--profile <id>] [--tab <id>] [--origin <origin>] [--timeout <ms>] [--screenshot] [--file-transfer] [--invalid-certificate] [--json]
+```
+
+The CLI derives project and host from BB context and does not accept `--host`.
+Without `--json`, text results are printed directly. Use `--json` for a JSON
+result or the screenshot envelope. `bb browser status` and
+`bb browser diagnostics` expose the same host readiness and live lease state.
+
+## Control and records
+
+Every script holds one atomic Control Lease for its host and profile. Owner
+navigation takes priority immediately. A competing agent waits at most five
+seconds, then receives typed `browser_busy`; queued work is never retained.
+Timeout and revocation are typed runtime failures. The live actor and purpose
+appear in status, diagnostics, and the Browser Panel only while the lease is
+active. Activity Records retain metadata and interruption status, never the
+purpose, source code, page contents, or screenshots.
 
 Use `bb browser list`, `bb browser create`, `bb browser rename`, and `bb browser
 select` to manage profiles. Profiles and authenticated state stay on the
 workspace host and are not synchronized through BB server storage.
 
-Owners manage access with `bb browser grant create`, `bb browser grant list`,
-`bb browser grant inspect`, and `bb browser grant revoke`. Grant exact origins
-or explicit subdomain patterns such as `https://*.example.test`; paths are
-not grantable. Project loopback aliases are project-specific. Raw
+Owners manage grants in authenticated Browser Settings. Grant exact origins or
+explicit subdomain patterns such as `https://*.example.test`; paths are not
+grantable. Project loopback aliases are project-specific. Raw
 `http://localhost:<port>` is available only when explicitly granted as a
 fallback.
 

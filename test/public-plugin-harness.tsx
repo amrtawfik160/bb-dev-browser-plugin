@@ -79,8 +79,10 @@ import {
   type BrowserGrantRequest,
   type BrowserStatusInput,
   type rpcContract,
+  type BrowserScriptResponse,
 } from "../contracts.js";
 import { createBrowserHostEntry, type HostSetupBoundary } from "../host.js";
+import type { BrowserInstanceRuntime } from "../browser-runtime.js";
 import {
   createHostAdministrationBoundary,
   type HostAdministrationStateStore,
@@ -110,8 +112,15 @@ const persistedGrantRequestEventSchema = z.object({
   event_at: z.string(),
 });
 
+type PublicToolContent =
+  | { type: "text"; text: string }
+  | { type: "image"; data: string; mimeType: string };
+type PublicToolReply = {
+  content: [{ type: "text"; text: string }, ...PublicToolContent[]];
+  isError?: boolean;
+};
 type PublicToolFailure = {
-  content: [{ type: "text"; text: string }];
+  content: PublicToolReply["content"];
   isError: true;
 };
 
@@ -211,7 +220,8 @@ export async function createPublicPluginHarness(options?: {
   hostId?: string;
   status?: BrowserStatus;
   hostConnection?: HostConnectionStatus;
-  browserScriptResponse?: { ok: true; result: unknown };
+  browserScriptResponse?: BrowserScriptResponse;
+  browserRuntime?: BrowserInstanceRuntime;
   browserScriptDelayMs?: number;
   browserScriptStarted?: () => void;
   navigationResponse?: {
@@ -380,7 +390,12 @@ export async function createPublicPluginHarness(options?: {
     });
   const hostDataRoot = await mkdtemp(join(tmpdir(), "bb-browser-host-"));
   const host = experimental_createHostEntryHarness(
-    createBrowserHostEntry(hostBoundary, profileStore, profileRecovery),
+    createBrowserHostEntry(
+      hostBoundary,
+      profileStore,
+      profileRecovery,
+      options?.browserRuntime,
+    ),
     {
       experimental_paths: {
         dataDir: hostDataRoot,
@@ -1063,6 +1078,21 @@ export async function createPublicPluginHarness(options?: {
     });
   }
 
+  function runBrowserNavigation(
+    input: string,
+    tabId?: string,
+  ): Promise<ReturnType<typeof browserNavigationResponseSchema.parse>> {
+    return rpc.browser_navigate({
+      surface: "thread",
+      threadId: THREAD_ID,
+      profileId: DEFAULT_PROFILE_ID,
+      hostId: configuredHostId,
+      input,
+      ...(tabId === undefined ? {} : { tabId }),
+      rawLocalhost: false,
+    });
+  }
+
   function registeredBrowserCliCommands() {
     return backend.harness.inspection.registrations.cli?.commands ?? [];
   }
@@ -1333,7 +1363,11 @@ export async function createPublicPluginHarness(options?: {
     ) {
       throw new Error("browser_script did not return its typed text failure");
     }
-    return { content: [reply.content[0]], isError: true };
+    const [first, ...rest] = reply.content;
+    if (first?.type !== "text") {
+      throw new Error("browser_script did not return its typed text failure");
+    }
+    return { content: [first, ...rest], isError: true };
   }
 
   async function runBrowserScriptWithProfile(
@@ -1344,11 +1378,14 @@ export async function createPublicPluginHarness(options?: {
       destinationOrigin?: string;
       fileTransfer?: boolean;
       invalidCertificate?: boolean;
+      screenshot?: boolean;
+      tabId?: string;
+      timeoutMs?: number;
       projectId?: string;
       threadId?: string | null;
       signal?: AbortSignal;
     },
-  ) {
+  ): Promise<PublicToolReply> {
     const reply = await backend.harness.behavior.callAgentTool(
       "browser_script",
       {
@@ -1363,6 +1400,13 @@ export async function createPublicPluginHarness(options?: {
         ...(overrides?.invalidCertificate === undefined
           ? {}
           : { invalidCertificate: overrides.invalidCertificate }),
+        ...(overrides?.screenshot === undefined
+          ? {}
+          : { screenshot: overrides.screenshot }),
+        ...(overrides?.tabId === undefined ? {} : { tabId: overrides.tabId }),
+        ...(overrides?.timeoutMs === undefined
+          ? {}
+          : { timeoutMs: overrides.timeoutMs }),
         ...(profileId === undefined ? {} : { profileId }),
       },
       {
@@ -1375,10 +1419,17 @@ export async function createPublicPluginHarness(options?: {
           : { signal: overrides.signal }),
       },
     );
-    if (typeof reply === "string" || reply.content[0]?.type !== "text") {
+    if (typeof reply === "string") {
       throw new Error("browser_script did not return text output");
     }
-    return { content: [reply.content[0]], isError: reply.isError === true };
+    const [first, ...rest] = reply.content;
+    if (first?.type !== "text") {
+      throw new Error("browser_script did not return text output");
+    }
+    return {
+      content: [first, ...(rest as PublicToolContent[])],
+      isError: reply.isError === true,
+    };
   }
 
   function resolveAgentCapabilities() {
@@ -1492,6 +1543,7 @@ export async function createPublicPluginHarness(options?: {
     runStatusCliText,
     runDiagnosticsCli,
     runBrowserCli,
+    runBrowserNavigation,
     registeredBrowserCliCommands,
     runBrowserActivityRecords,
     persistedActivityRows,

@@ -75,6 +75,17 @@ function ReadinessView({
           {status.label}
         </h2>
         <p className="mt-2 text-sm text-muted-foreground">{status.message}</p>
+        {status.controlLease === undefined ? null : (
+          <p
+            aria-label="Active Browser Control Lease"
+            className="mt-3 text-sm text-muted-foreground"
+          >
+            {status.controlLease.actor === "owner" ? "Owner" : "Agent"} control
+            {status.controlLease.purpose === null
+              ? " is active."
+              : `: ${status.controlLease.purpose}`}
+          </p>
+        )}
         <p className="mt-3 font-mono text-xs text-muted-foreground">
           {status.profileId}
         </p>

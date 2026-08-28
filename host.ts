@@ -43,11 +43,19 @@ import {
   type BrowserActivityEvent,
   type BrowserScriptRequest,
   type BrowserScriptResponse,
+  type BrowserScriptRuntimeError,
   type BrowserNavigationRequest,
   type BrowserPanelVisibilityRequest,
   type BrowserStatus,
 } from "./contracts.js";
 import {
+  ControlLeaseError,
+  createControlLeaseManager,
+  type ControlLease,
+  type ControlLeaseManager,
+} from "./control-lease.js";
+import {
+  assertBrowserScriptResultWithinBounds,
   BrowserInstanceError,
   createBrowserInstanceRuntime,
   type BrowserInstanceRuntime,
@@ -70,7 +78,89 @@ type BrowserRuntimeSource =
   BrowserInstanceRuntime | ((dataDir: string) => BrowserInstanceRuntime);
 
 type ScriptSignalContext = { signal: AbortSignal };
-type ScriptActivityOutcome = "succeeded" | "failed";
+type ScriptActivityOutcome = "succeeded" | "failed" | "interrupted";
+
+function controlLeaseKey(target: { hostId: string; profileId: string }) {
+  return `${target.hostId}\0${target.profileId}`;
+}
+
+function scriptRuntimeErrorCode(
+  request: BrowserScriptRequest,
+  error: unknown,
+): BrowserScriptRuntimeError["code"] {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/timed out|timeout/iu.test(message)) return "browser_timeout";
+  if (/(?:result|screenshot).*(?:exceed|large|limit)/iu.test(message)) {
+    return "result_too_large";
+  }
+  if (
+    request.tabId !== undefined &&
+    /(?:tab|page|target|browser\.getPage|open tabs).*(?:invalid|not found|closed|no )/iu.test(
+      message,
+    )
+  ) {
+    return "tab_invalid";
+  }
+  if (
+    /(?:process|require|module|deno|bun|node:|filesystem|file system|path traversal|outside.*(?:home|temporary|sandbox)|not defined)/iu.test(
+      message,
+    )
+  ) {
+    return "sandbox_violation";
+  }
+  return "script_failed";
+}
+
+const scriptRuntimeErrorLabels: Record<
+  BrowserScriptRuntimeError["code"],
+  string
+> = {
+  browser_busy: "Browser busy",
+  browser_timeout: "Browser script timed out",
+  result_too_large: "Browser result too large",
+  lease_revoked: "Browser Control Lease revoked",
+  tab_invalid: "Browser Tab invalid",
+  sandbox_violation: "Browser sandbox violation",
+  script_failed: "Browser script failed",
+};
+
+function scriptRuntimeFailure(
+  request: BrowserScriptRequest,
+  error: unknown,
+  lease?: ControlLease,
+): BrowserScriptResponse {
+  const code =
+    lease?.signal.aborted === true
+      ? "lease_revoked"
+      : error instanceof ControlLeaseError
+        ? error.code
+        : scriptRuntimeErrorCode(request, error);
+  const message =
+    error instanceof Error && error.message.length > 0
+      ? error.message
+      : "The Browser script failed.";
+  const boundedMessage =
+    message.trim().slice(0, 500) || "The Browser script failed.";
+  return {
+    ok: false,
+    error: {
+      state: "runtime-error",
+      code,
+      label: scriptRuntimeErrorLabels[code],
+      hostId: request.hostId,
+      profileId: request.profileId,
+      message: boundedMessage,
+    },
+  };
+}
+
+function scriptWasInterrupted(response: BrowserScriptResponse | undefined) {
+  return (
+    response?.ok === false &&
+    response.error.state === "runtime-error" &&
+    response.error.code === "lease_revoked"
+  );
+}
 
 function isAdministrationBoundary(
   boundary: HostBoundary,
@@ -96,7 +186,7 @@ function scriptActivityEvent(
   outcome: ScriptActivityOutcome,
   startedAt: number,
 ): BrowserActivityEvent {
-  const interrupted = context.signal.aborted;
+  const interrupted = context.signal.aborted || outcome === "interrupted";
   return {
     eventId: request.activityEventId,
     actor: "agent",
@@ -109,7 +199,11 @@ function scriptActivityEvent(
     action: "browser-script",
     outcome: interrupted ? "interrupted" : outcome,
     interrupted,
-    interruptionReason: interrupted ? "request-aborted" : null,
+    interruptionReason: interrupted
+      ? context.signal.aborted
+        ? "request-aborted"
+        : "control-lease-revoked"
+      : null,
     durationMs: Math.min(Math.max(Date.now() - startedAt, 0), 30_000),
   };
 }
@@ -153,24 +247,56 @@ async function recordExpiredProfiles(
 async function runtimeBrowserStatus(
   readiness: BrowserStatus,
   browserRuntime: BrowserInstanceRuntime | undefined,
+  controlLeases?: ControlLeaseManager,
 ) {
+  const visibleReadiness = statusWithControlLease(readiness, controlLeases);
   if (readiness.state !== "healthy" || browserRuntime === undefined) {
-    return readiness;
+    return visibleReadiness;
   }
-  if (readiness.hostId === null) return readiness;
+  if (readiness.hostId === null) return visibleReadiness;
   const lifecycle = await browserRuntime.status({
     hostId: readiness.hostId,
     profileId: readiness.profileId,
   });
-  if (lifecycle.state === "sleeping") return sleepingBrowserStatus(readiness);
-  if (lifecycle.state === "waking") return wakingBrowserStatus(readiness);
+  if (lifecycle.state === "sleeping") {
+    return statusWithControlLease(
+      sleepingBrowserStatus(readiness),
+      controlLeases,
+    );
+  }
+  if (lifecycle.state === "waking") {
+    return statusWithControlLease(
+      wakingBrowserStatus(readiness),
+      controlLeases,
+    );
+  }
   if (lifecycle.state === "host-offline") {
-    return hostOfflineStatus(readiness);
+    return statusWithControlLease(hostOfflineStatus(readiness), controlLeases);
   }
   if (lifecycle.state === "repair-required") {
-    return crashRepairStatus(readiness, lifecycle.diagnostics.crashCount);
+    return statusWithControlLease(
+      crashRepairStatus(readiness, lifecycle.diagnostics.crashCount),
+      controlLeases,
+    );
   }
-  return readiness;
+  return visibleReadiness;
+}
+
+function statusWithControlLease(
+  readiness: BrowserStatus,
+  controlLeases: ControlLeaseManager | undefined,
+) {
+  if (controlLeases === undefined || readiness.hostId === null)
+    return readiness;
+  const controlLease = controlLeases.state(
+    controlLeaseKey({
+      hostId: readiness.hostId,
+      profileId: readiness.profileId,
+    }),
+  );
+  return controlLease === undefined
+    ? readiness
+    : { ...readiness, controlLease };
 }
 
 function crashRepairStatus(readiness: BrowserStatus, crashCount: number) {
@@ -193,6 +319,7 @@ export function createBrowserHostEntry(
   let retainedOutbox: ActivityOutbox | undefined;
   let retainedRuntime: BrowserInstanceRuntime | undefined =
     typeof runtimeSource === "object" ? runtimeSource : undefined;
+  const controlLeases = createControlLeaseManager();
   const hostConnectionGenerations = new Map<string, number>();
   function administration(dataDir: string) {
     if (retainedBoundary !== undefined) return retainedBoundary;
@@ -209,6 +336,7 @@ export function createBrowserHostEntry(
   function profileLifecycle(dataDir: string): BrowserProfileLifecycleBoundary {
     return {
       async stopProfile(hostId, profileId) {
+        controlLeases.revoke(controlLeaseKey({ hostId, profileId }));
         try {
           await runtime(dataDir)?.stop({ hostId, profileId });
         } finally {
@@ -227,6 +355,7 @@ export function createBrowserHostEntry(
     return retainedRuntime;
   }
   async function disposeRuntime() {
+    controlLeases.revokeAll();
     const current = retainedRuntime;
     retainedRuntime = undefined;
     await current?.dispose();
@@ -257,6 +386,9 @@ export function createBrowserHostEntry(
   ) {
     if (!hostConnectionGenerationIsNewer(request.hostId, request.generation)) {
       return { ...request, applied: false };
+    }
+    if (request.state === "disconnected") {
+      controlLeases.revokeHost(request.hostId);
     }
     const browserRuntime = runtime(dataDir);
     if (browserRuntime === undefined) return { ...request, applied: false };
@@ -320,6 +452,7 @@ export function createBrowserHostEntry(
   async function navigateBrowser(
     request: BrowserNavigationRequest,
     dataDir: string,
+    signal?: AbortSignal,
   ) {
     const target = { hostId: request.hostId, profileId: request.profileId };
     const readiness = await administration(dataDir).inspect(target);
@@ -337,17 +470,28 @@ export function createBrowserHostEntry(
     if (browserRuntime === undefined) {
       throw new Error("The Workspace Browser runtime is unavailable.");
     }
-    return browserRuntime.navigate(
-      {
-        ...target,
-        projectId: request.projectId,
-        ...(request.tabId === undefined ? {} : { tabId: request.tabId }),
-        loopbackMode: request.rawLocalhost ? "raw-localhost" : "project-alias",
-        locale: profile.locale,
-        timezone: profile.timezone,
-      },
-      request.input,
+    const lease = await controlLeases.acquireOwner(
+      controlLeaseKey(target),
+      signal,
     );
+    try {
+      return await browserRuntime.navigate(
+        {
+          ...target,
+          projectId: request.projectId,
+          ...(request.tabId === undefined ? {} : { tabId: request.tabId }),
+          loopbackMode: request.rawLocalhost
+            ? "raw-localhost"
+            : "project-alias",
+          locale: profile.locale,
+          timezone: profile.timezone,
+        },
+        request.input,
+        { signal, leaseSignal: lease.signal },
+      );
+    } finally {
+      lease.release();
+    }
   }
   async function setPanelVisibility(
     request: BrowserPanelVisibilityRequest,
@@ -366,7 +510,7 @@ export function createBrowserHostEntry(
     if (request.visibility === "visible")
       return pinVisiblePanel(request, target, readiness, browserRuntime);
     await browserRuntime.unpinPanel(target, request.panelId);
-    return runtimeBrowserStatus(readiness, browserRuntime);
+    return runtimeBrowserStatus(readiness, browserRuntime, controlLeases);
   }
   async function panelRuntimeTarget(
     request: BrowserPanelVisibilityRequest,
@@ -399,11 +543,11 @@ export function createBrowserHostEntry(
         error instanceof BrowserInstanceError &&
         error.code === "repair-required"
       ) {
-        return runtimeBrowserStatus(readiness, browserRuntime);
+        return runtimeBrowserStatus(readiness, browserRuntime, controlLeases);
       }
       throw error;
     }
-    return runtimeBrowserStatus(readiness, browserRuntime);
+    return runtimeBrowserStatus(readiness, browserRuntime, controlLeases);
   }
   function retainWorker(context: {
     experimental_retainWorker(): { dispose(): Promise<void> };
@@ -426,13 +570,20 @@ export function createBrowserHostEntry(
         return runtimeBrowserStatus(
           await administration(dataDir).inspect(target),
           runtime(dataDir),
+          controlLeases,
         );
       },
       diagnostics: (target, context) => {
         retainWorker(context);
-        return administration(context.experimental_paths.dataDir).diagnostics(
-          target,
-        );
+        return (async () => {
+          const diagnostics = await administration(
+            context.experimental_paths.dataDir,
+          ).diagnostics(target);
+          const controlLease = controlLeases.state(controlLeaseKey(target));
+          return controlLease === undefined
+            ? diagnostics
+            : { ...diagnostics, controlLease };
+        })();
       },
       setupPlan: (target, context) => {
         retainWorker(context);
@@ -487,6 +638,8 @@ export function createBrowserHostEntry(
           hostId: request.hostId,
           profileId: request.profileId,
         };
+        const leaseKey = controlLeaseKey(target);
+        let lease: ControlLease | undefined;
         let response: BrowserScriptResponse | undefined;
         try {
           const readiness = await administration(dataDir).inspect(target);
@@ -511,24 +664,63 @@ export function createBrowserHostEntry(
           }
           const browserRuntime = runtime(dataDir);
           if (browserRuntime !== undefined) {
-            response = {
-              ok: true as const,
-              result: await browserRuntime.execute(
-                {
-                  hostId: request.hostId,
-                  profileId: request.profileId,
-                  projectId: request.projectId,
-                  ...(request.tabId === undefined
-                    ? {}
-                    : { tabId: request.tabId }),
-                  locale: profile.locale,
-                  timezone: profile.timezone,
-                },
-                request.code,
-                request.timeoutMs,
-              ),
-            };
-            return response;
+            try {
+              lease = await controlLeases.acquireAgent(
+                leaseKey,
+                request.purpose,
+                context.signal,
+              );
+            } catch (error) {
+              if (!(error instanceof ControlLeaseError)) throw error;
+              response = scriptRuntimeFailure(request, error);
+              return response;
+            }
+            try {
+              const browserResult = assertBrowserScriptResultWithinBounds(
+                await browserRuntime.execute(
+                  {
+                    hostId: request.hostId,
+                    profileId: request.profileId,
+                    projectId: request.projectId,
+                    ...(request.tabId === undefined
+                      ? {}
+                      : { tabId: request.tabId }),
+                    locale: profile.locale,
+                    timezone: profile.timezone,
+                  },
+                  request.code,
+                  request.timeoutMs,
+                  {
+                    signal: context.signal,
+                    leaseSignal: lease.signal,
+                    screenshot: request.screenshot,
+                  },
+                ),
+              );
+              if (lease.signal.aborted) {
+                throw new ControlLeaseError(
+                  "lease_revoked",
+                  "The Browser Control Lease was revoked before the script completed.",
+                );
+              }
+              response = {
+                ok: true as const,
+                result: browserResult,
+              };
+              return response;
+            } catch (error) {
+              if (
+                (context.signal.aborted && !lease.signal.aborted) ||
+                (error instanceof BrowserInstanceError && !lease.signal.aborted)
+              ) {
+                throw error;
+              }
+              response = scriptRuntimeFailure(request, error, lease);
+              return response;
+            } finally {
+              lease.release();
+              lease = undefined;
+            }
           }
           response = {
             ok: false as const,
@@ -542,14 +734,22 @@ export function createBrowserHostEntry(
             outbox(dataDir),
             request,
             context,
-            response?.ok === true ? "succeeded" : "failed",
+            scriptWasInterrupted(response)
+              ? "interrupted"
+              : response?.ok === true
+                ? "succeeded"
+                : "failed",
             startedAt,
           );
         }
       },
       navigate: async (request, context) => {
         retainWorker(context);
-        return navigateBrowser(request, context.experimental_paths.dataDir);
+        return navigateBrowser(
+          request,
+          context.experimental_paths.dataDir,
+          context.signal,
+        );
       },
       panelVisibility: async (request, context) => {
         retainWorker(context);
@@ -672,6 +872,7 @@ export function createBrowserHostEntry(
     },
     dispose: async () => {
       try {
+        controlLeases.dispose();
         await disposeRuntime();
       } finally {
         await workerLease?.dispose();

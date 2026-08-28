@@ -25,6 +25,14 @@ import {
 import type { LoopbackAddressMode } from "./browser-navigation.js";
 import { isBrowserLoopbackHostname } from "./authorization.js";
 import { inspectFallbackBrowser } from "./browser-fallback.js";
+import {
+  BROWSER_SCRIPT_MAX_SCREENSHOT_BYTES,
+  BROWSER_SCRIPT_MAX_SCREENSHOT_BASE64_LENGTH,
+  BROWSER_SCRIPT_MAX_SCREENSHOTS,
+  BROWSER_SCRIPT_RESULT_LIMIT_BYTES,
+  browserScriptResultSchema,
+  type BrowserScriptResult,
+} from "./contracts.js";
 
 export type BrowserExecutable = {
   kind: "chrome-stable" | "playwright-chromium";
@@ -72,6 +80,18 @@ export type BrowserExecutionRequest = {
   code: string;
   timeoutMs: number;
   runtimeDirectory: string;
+  signal?: AbortSignal;
+  screenshot?: {
+    fileName: string;
+    marker: string;
+    mimeType: "image/png";
+  };
+};
+
+export type BrowserOperationOptions = {
+  signal?: AbortSignal;
+  leaseSignal?: AbortSignal;
+  screenshot?: boolean;
 };
 
 export interface BrowserLaunchBoundary {
@@ -742,6 +762,8 @@ function executionRequest(
   profileId: string,
   code: string,
   timeoutMs: number,
+  signal?: AbortSignal,
+  screenshot?: BrowserExecutionRequest["screenshot"],
 ): BrowserExecutionRequest {
   return {
     endpoint: held.publicState.automationEndpoint,
@@ -749,20 +771,82 @@ function executionRequest(
     code,
     timeoutMs,
     runtimeDirectory: held.runtimeDirectory,
+    ...(signal === undefined ? {} : { signal }),
+    ...(screenshot === undefined ? {} : { screenshot }),
   };
 }
 
+function targetedTabPreamble(tabId: string) {
+  return `const __bbTargetPages = await browser.listPages();
+if (!__bbTargetPages.some((entry) => entry.id === ${JSON.stringify(tabId)})) throw new Error("Browser Tab is invalid or belongs to a previous runtime");
+const __bbTargetPage = await browser.getPage(${JSON.stringify(tabId)});
+await __bbTargetPage.bringToFront();`;
+}
+
 function activateTargetedTab(tabId: string, code: string) {
-  return `const __bbTargetPage = await browser.getPage(${JSON.stringify(tabId)});
-await __bbTargetPage.bringToFront();
+  return `${targetedTabPreamble(tabId)}
 ${code}`;
 }
 
-function activeTabId(output: unknown) {
-  if (typeof output !== "string") {
+function appendNativeScreenshot(
+  code: string,
+  tabId: string | undefined,
+  screenshot: NonNullable<BrowserExecutionRequest["screenshot"]>,
+) {
+  const suffix = screenshot.marker.replace(/[^A-Za-z0-9]/gu, "");
+  const pageVariable = `__bbScreenshotPage${suffix}`;
+  const entryVariable = `__bbScreenshotEntry${suffix}`;
+  const pagesVariable = `__bbScreenshotPages${suffix}`;
+  const markerLine = JSON.stringify({ __bbScreenshot: screenshot.marker });
+  const pageSelection =
+    tabId === undefined
+      ? `const ${pagesVariable} = await browser.listPages();
+if (${pagesVariable}.length === 0) throw new Error("The Browser Profile has no open tabs");
+let ${pageVariable} = await browser.getPage(${pagesVariable}[0].id);
+for (const ${entryVariable} of ${pagesVariable}) {
+  const candidate = await browser.getPage(${entryVariable}.id);
+  if (await candidate.evaluate(() => document.visibilityState === "visible")) {
+    ${pageVariable} = candidate;
+    break;
+  }
+}`
+      : `const ${pageVariable} = __bbTargetPage;`;
+  return `try {
+${code}
+} finally {
+${pageSelection}
+await saveScreenshot(await ${pageVariable}.screenshot({ type: "png" }), ${JSON.stringify(screenshot.fileName)});
+console.log(${JSON.stringify(markerLine)});
+}`;
+}
+
+function linkedOperationSignal(options: BrowserOperationOptions) {
+  const signals = [options.signal, options.leaseSignal].filter(
+    (signal): signal is AbortSignal => signal !== undefined,
+  );
+  if (signals.length === 0) return { signal: undefined, dispose: () => {} };
+  if (signals.length === 1) {
+    return { signal: signals[0], dispose: () => {} };
+  }
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  for (const signal of signals) {
+    if (signal.aborted) controller.abort();
+    else signal.addEventListener("abort", abort, { once: true });
+  }
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      for (const signal of signals) signal.removeEventListener("abort", abort);
+    },
+  };
+}
+
+function activeTabId(activeTabOutput: unknown) {
+  if (typeof activeTabOutput !== "string") {
     throw new Error("Automation Mode returned an invalid active Browser Tab.");
   }
-  const active = JSON.parse(output) as unknown;
+  const active = JSON.parse(activeTabOutput) as unknown;
   if (
     typeof active !== "object" ||
     active === null ||
@@ -773,6 +857,101 @@ function activeTabId(output: unknown) {
     throw new Error("Automation Mode returned an invalid active Browser Tab.");
   }
   return active.id;
+}
+
+function assertScreenshotWithinBounds(screenshot: { data: string }) {
+  if (screenshot.data.length > BROWSER_SCRIPT_MAX_SCREENSHOT_BASE64_LENGTH) {
+    throw new Error(
+      `Browser Screenshot exceeds ${BROWSER_SCRIPT_MAX_SCREENSHOT_BYTES / 1024 / 1024} MiB limit.`,
+    );
+  }
+  if (
+    Buffer.from(screenshot.data, "base64").length >
+    BROWSER_SCRIPT_MAX_SCREENSHOT_BYTES
+  ) {
+    throw new Error(
+      `Browser Screenshot exceeds ${BROWSER_SCRIPT_MAX_SCREENSHOT_BYTES / 1024 / 1024} MiB limit.`,
+    );
+  }
+}
+
+function assertStructuredBrowserResultWithinBounds(
+  structured: BrowserScriptResult,
+) {
+  const outputBytes = Buffer.byteLength(structured.output, "utf8");
+  if (outputBytes > BROWSER_SCRIPT_RESULT_LIMIT_BYTES) {
+    throw browserResultLimitError();
+  }
+  for (const screenshot of structured.screenshots) {
+    assertScreenshotWithinBounds(screenshot);
+  }
+}
+
+function browserResultLimitError() {
+  return new Error(
+    `Browser Result exceeds ${BROWSER_SCRIPT_RESULT_LIMIT_BYTES / 1024} KiB limit.`,
+  );
+}
+
+function assertSerializedBrowserResultWithinBounds(browserResult: unknown) {
+  let serialized: string | undefined;
+  try {
+    serialized = JSON.stringify(browserResult);
+  } catch {
+    throw new Error("Browser Result is not JSON-serializable.");
+  }
+  if (serialized === undefined) {
+    throw new Error("Browser Result is not JSON-serializable.");
+  }
+  const resultBytes =
+    typeof browserResult === "string"
+      ? Buffer.byteLength(browserResult, "utf8")
+      : Buffer.byteLength(serialized, "utf8");
+  if (resultBytes > BROWSER_SCRIPT_RESULT_LIMIT_BYTES) {
+    throw browserResultLimitError();
+  }
+}
+
+export function assertBrowserScriptResultWithinBounds(browserResult: unknown) {
+  const structured = browserScriptResultSchema.safeParse(browserResult);
+  const hasScreenshotEnvelope =
+    typeof browserResult === "object" &&
+    browserResult !== null &&
+    "screenshots" in browserResult;
+  if (hasScreenshotEnvelope && !structured.success) {
+    const screenshots = (browserResult as { screenshots?: unknown })
+      .screenshots;
+    if (
+      Array.isArray(screenshots) &&
+      screenshots.length > BROWSER_SCRIPT_MAX_SCREENSHOTS
+    ) {
+      throw new Error(
+        `Browser Screenshot exceeds the ${BROWSER_SCRIPT_MAX_SCREENSHOTS}-image limit.`,
+      );
+    }
+    if (
+      Array.isArray(screenshots) &&
+      screenshots.some(
+        (screenshot) =>
+          typeof screenshot === "object" &&
+          screenshot !== null &&
+          "data" in screenshot &&
+          typeof screenshot.data === "string" &&
+          screenshot.data.length > BROWSER_SCRIPT_MAX_SCREENSHOT_BASE64_LENGTH,
+      )
+    ) {
+      throw new Error(
+        `Browser Screenshot exceeds ${BROWSER_SCRIPT_MAX_SCREENSHOT_BYTES / 1024 / 1024} MiB limit.`,
+      );
+    }
+    throw new Error("Browser Screenshot output is invalid.");
+  }
+  if (structured.success) {
+    assertStructuredBrowserResultWithinBounds(structured.data);
+    return browserResult;
+  }
+  assertSerializedBrowserResultWithinBounds(browserResult);
+  return browserResult;
 }
 
 async function recoverOrLaunchBrowser(
@@ -1232,28 +1411,54 @@ export function createBrowserInstanceRuntime(
       target: BrowserRuntimeTarget,
       code: string,
       timeoutMs: number,
+      operationOptions: BrowserOperationOptions = {},
     ) {
       const held = await heldInstance(target);
       const key = runtimeKey(target);
       held.activeLeases += 1;
       noteActivity(key, held);
+      const screenshot = operationOptions.screenshot
+        ? {
+            fileName: `bb-screenshot-${randomUUID()}.png`,
+            marker: `bb-screenshot-${randomUUID()}`,
+            mimeType: "image/png" as const,
+          }
+        : undefined;
       const codeForTarget =
         target.tabId === undefined
           ? code
           : activateTargetedTab(target.tabId, code);
-      if (target.tabId !== undefined) {
-        activeTabs.set(runtimeKey(target), target.tabId);
-      }
+      const executionCode =
+        screenshot === undefined
+          ? codeForTarget
+          : appendNativeScreenshot(codeForTarget, target.tabId, screenshot);
+      const operationSignal = linkedOperationSignal(operationOptions);
       try {
-        return await options.launchBoundary.execute(
-          executionRequest(held, target.profileId, codeForTarget, timeoutMs),
+        const browserResult = assertBrowserScriptResultWithinBounds(
+          await options.launchBoundary.execute(
+            executionRequest(
+              held,
+              target.profileId,
+              executionCode,
+              timeoutMs,
+              operationSignal.signal,
+              screenshot,
+            ),
+          ),
         );
+        if (target.tabId !== undefined) activeTabs.set(key, target.tabId);
+        return browserResult;
       } finally {
+        operationSignal.dispose();
         held.activeLeases -= 1;
         noteActivity(key, held);
       }
     },
-    async navigate(target: BrowserRuntimeTarget, input: string) {
+    async navigate(
+      target: BrowserRuntimeTarget,
+      input: string,
+      operationOptions: BrowserOperationOptions = {},
+    ) {
       const requestedAddress = resolveBrowserAddress(input);
       const held = await heldInstance(target);
       const address =
@@ -1274,29 +1479,36 @@ export function createBrowserInstanceRuntime(
               ),
             };
       const key = runtimeKey(target);
+      const operationSignal = linkedOperationSignal(operationOptions);
       let tabId = target.tabId ?? activeTabs.get(key);
-      if (tabId === undefined) {
-        const discovered = await options.launchBoundary.execute(
+      try {
+        if (tabId === undefined) {
+          const discovered = await options.launchBoundary.execute(
+            executionRequest(
+              held,
+              target.profileId,
+              activeBrowserTabScript(),
+              30_000,
+              operationSignal.signal,
+            ),
+          );
+          tabId = activeTabId(discovered);
+        }
+        const location = await options.launchBoundary.execute(
           executionRequest(
             held,
             target.profileId,
-            activeBrowserTabScript(),
+            browserNavigationScript(address, tabId),
             30_000,
+            operationSignal.signal,
           ),
         );
-        tabId = activeTabId(discovered);
+        activeTabs.set(key, tabId);
+        noteActivity(key, held);
+        return { address, location, tabId };
+      } finally {
+        operationSignal.dispose();
       }
-      const location = await options.launchBoundary.execute(
-        executionRequest(
-          held,
-          target.profileId,
-          browserNavigationScript(address, tabId),
-          30_000,
-        ),
-      );
-      activeTabs.set(key, tabId);
-      noteActivity(key, held);
-      return { address, location, tabId };
     },
     async dispose() {
       disposed = true;
