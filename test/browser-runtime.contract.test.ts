@@ -164,6 +164,307 @@ async function runtimeFixture() {
 }
 
 describe("Browser Instance runtime", () => {
+  it("issue #12 sleeps an idle instance while a visible panel pins its profile", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-28T12:00:00.000Z"));
+    const fixture = await runtimeFixture();
+    try {
+      await fixture.runtime.start(fixture.target);
+      await fixture.runtime.pinPanel(fixture.target, "panel-a");
+
+      await vi.advanceTimersByTimeAsync(30 * 60 * 1_000);
+      expect(await fixture.runtime.status(fixture.target)).toMatchObject({
+        state: "running",
+      });
+
+      await fixture.runtime.unpinPanel(fixture.target, "panel-a");
+      await vi.advanceTimersByTimeAsync(30 * 60 * 1_000);
+      expect(await fixture.runtime.status(fixture.target)).toEqual({
+        state: "sleeping",
+        hostId: "host-a",
+        profileId: "profile-a",
+      });
+      expect(fixture.processFixture.stopped).toEqual([4100]);
+    } finally {
+      await fixture.runtime.dispose();
+      vi.useRealTimers();
+      await rm(fixture.rootDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("issue #12 exposes Waking while a lazy browser launch is in progress", async () => {
+    const fixture = await runtimeFixture();
+    const launch = fixture.processFixture.boundary.launch;
+    let releaseLaunch!: () => void;
+    const launchReleased = new Promise<void>((resolve) => {
+      releaseLaunch = resolve;
+    });
+    const launchStarted = vi.fn();
+    fixture.processFixture.boundary.launch = async (request, onSpawn) => {
+      launchStarted();
+      await launchReleased;
+      return launch(request, onSpawn);
+    };
+    try {
+      const waking = fixture.runtime.start(fixture.target);
+      await vi.waitFor(() => expect(launchStarted).toHaveBeenCalledOnce());
+      expect(await fixture.runtime.status(fixture.target)).toMatchObject({
+        state: "waking",
+      });
+
+      releaseLaunch();
+      await expect(waking).resolves.toMatchObject({ state: "running" });
+    } finally {
+      releaseLaunch();
+      await fixture.runtime.dispose();
+      await rm(fixture.rootDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("issue #12 evicts the least-recently-used hidden profile at the default awake limit", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-28T12:00:00.000Z"));
+    const fixture = await runtimeFixture();
+    const target = (profileId: string) => ({ ...fixture.target, profileId });
+    try {
+      await fixture.runtime.start(target("profile-a"));
+      await vi.advanceTimersByTimeAsync(1);
+      await fixture.runtime.start(target("profile-b"));
+      await vi.advanceTimersByTimeAsync(1);
+      await fixture.runtime.start(target("profile-c"));
+      await vi.advanceTimersByTimeAsync(1);
+      await fixture.runtime.start(target("profile-d"));
+
+      expect(await fixture.runtime.status(target("profile-a"))).toMatchObject({
+        state: "sleeping",
+      });
+      expect(await fixture.runtime.status(target("profile-d"))).toMatchObject({
+        state: "running",
+      });
+      expect(fixture.processFixture.stopped).toEqual([4100]);
+    } finally {
+      await fixture.runtime.dispose();
+      vi.useRealTimers();
+      await rm(fixture.rootDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("issue #12 refuses a fourth wake when panels pin every awake profile", async () => {
+    const fixture = await runtimeFixture();
+    const target = (profileId: string) => ({ ...fixture.target, profileId });
+    try {
+      for (const profileId of ["profile-a", "profile-b", "profile-c"]) {
+        await fixture.runtime.pinPanel(target(profileId), `panel-${profileId}`);
+      }
+
+      await expect(
+        fixture.runtime.start(target("profile-d")),
+      ).rejects.toMatchObject({ code: "awake-limit" });
+      expect(fixture.processFixture.launches).toHaveLength(3);
+    } finally {
+      await fixture.runtime.dispose();
+      await rm(fixture.rootDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("issue #12 keeps an active agent Control Lease awake across the idle deadline", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-28T12:00:00.000Z"));
+    const fixture = await runtimeFixture();
+    let releaseExecution!: () => void;
+    const executionReleased = new Promise<void>((resolve) => {
+      releaseExecution = resolve;
+    });
+    const executionStarted = vi.fn();
+    fixture.processFixture.boundary.execute = async () => {
+      executionStarted();
+      await executionReleased;
+      return "lease-complete";
+    };
+    try {
+      const operation = fixture.runtime.execute(
+        fixture.target,
+        "return page.url()",
+        30_000,
+      );
+      await vi.waitFor(() => expect(executionStarted).toHaveBeenCalledOnce());
+      await vi.advanceTimersByTimeAsync(30 * 60 * 1_000);
+      expect(await fixture.runtime.status(fixture.target)).toMatchObject({
+        state: "running",
+      });
+
+      releaseExecution();
+      await expect(operation).resolves.toBe("lease-complete");
+      await vi.advanceTimersByTimeAsync(30 * 60 * 1_000);
+      expect(await fixture.runtime.status(fixture.target)).toMatchObject({
+        state: "sleeping",
+      });
+    } finally {
+      releaseExecution();
+      await fixture.runtime.dispose();
+      vi.useRealTimers();
+      await rm(fixture.rootDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("issue #12 serializes simultaneous wakes at the default capacity", async () => {
+    const fixture = await runtimeFixture();
+    const target = (profileId: string) => ({ ...fixture.target, profileId });
+    try {
+      await Promise.all([
+        fixture.runtime.start(target("profile-a")),
+        fixture.runtime.start(target("profile-b")),
+        fixture.runtime.start(target("profile-c")),
+      ]);
+      await Promise.all([
+        fixture.runtime.start(target("profile-d")),
+        fixture.runtime.start(target("profile-e")),
+      ]);
+
+      const states = await Promise.all(
+        ["profile-a", "profile-b", "profile-c", "profile-d", "profile-e"].map(
+          async (profileId) =>
+            (await fixture.runtime.status(target(profileId))).state,
+        ),
+      );
+      expect(states.filter((state) => state === "running")).toHaveLength(3);
+      expect(fixture.processFixture.stopped).toHaveLength(2);
+    } finally {
+      await fixture.runtime.dispose();
+      await rm(fixture.rootDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("issue #12 restarts an isolated crash and enters repair after a three-crash loop", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-28T12:00:00.000Z"));
+    const fixture = await runtimeFixture();
+    try {
+      for (let crashNumber = 0; crashNumber < 3; crashNumber += 1) {
+        const running = await fixture.runtime.start(fixture.target);
+        fixture.processFixture.crash(running.pid);
+        await vi.advanceTimersByTimeAsync(25);
+      }
+
+      await vi.waitFor(async () => {
+        expect(await fixture.runtime.status(fixture.target)).toMatchObject({
+          state: "repair-required",
+          diagnostics: { crashCount: 3, windowMs: 5 * 60 * 1_000 },
+        });
+      });
+      expect(fixture.processFixture.launches).toHaveLength(3);
+    } finally {
+      await fixture.runtime.dispose();
+      vi.useRealTimers();
+      await rm(fixture.rootDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("issue #12 freezes a disconnected host and reconciles the retained generation", async () => {
+    const fixture = await runtimeFixture();
+    try {
+      const running = await fixture.runtime.start(fixture.target);
+      fixture.runtime.hostDisconnected(fixture.target.hostId);
+
+      await expect(
+        fixture.runtime.execute(fixture.target, "return page.url()", 5_000),
+      ).rejects.toMatchObject({ code: "host-offline" });
+      expect(fixture.processFixture.stopped).toEqual([]);
+
+      await fixture.runtime.hostReconnected(fixture.target.hostId);
+      expect(await fixture.runtime.start(fixture.target)).toMatchObject({
+        pid: running.pid,
+      });
+      expect(fixture.processFixture.launches).toHaveLength(1);
+    } finally {
+      await fixture.runtime.dispose();
+      await rm(fixture.rootDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("issue #12 defers crash recovery while the host is disconnected", async () => {
+    const fixture = await runtimeFixture();
+    try {
+      const running = await fixture.runtime.start(fixture.target);
+      fixture.runtime.hostDisconnected(fixture.target.hostId);
+      fixture.processFixture.crash(running.pid);
+      const paths = profileStoragePaths({
+        rootDirectory: fixture.rootDirectory,
+        installationId: "installation-a",
+        hostId: fixture.target.hostId,
+        profileId: fixture.target.profileId,
+      });
+      await vi.waitFor(async () => {
+        await expect(
+          readFile(paths.runtimeManifestPath, "utf8"),
+        ).rejects.toMatchObject({
+          code: "ENOENT",
+        });
+      });
+      expect(await fixture.runtime.status(fixture.target)).toMatchObject({
+        state: "host-offline",
+      });
+      expect(fixture.processFixture.launches).toHaveLength(1);
+
+      await fixture.runtime.hostReconnected(fixture.target.hostId);
+      await expect(
+        fixture.runtime.start(fixture.target),
+      ).resolves.toMatchObject({
+        state: "running",
+      });
+      expect(fixture.processFixture.launches).toHaveLength(2);
+    } finally {
+      await fixture.runtime.dispose();
+      await rm(fixture.rootDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("issue #12 disposes owned children without restarting the retired worker generation", async () => {
+    const fixture = await runtimeFixture();
+    const running = await fixture.runtime.start(fixture.target);
+    await fixture.runtime.dispose();
+
+    expect(fixture.processFixture.stopped).toEqual([running.pid]);
+    await expect(fixture.runtime.start(fixture.target)).rejects.toMatchObject({
+      code: "browser-unavailable",
+    });
+    expect(fixture.processFixture.launches).toHaveLength(1);
+    await rm(fixture.rootDirectory, { recursive: true, force: true });
+  });
+
+  it("issue #12 stays lazy after worker restart and fails closed on a corrupt manifest", async () => {
+    const fixture = await runtimeFixture();
+    const installationId = "installation-corrupt";
+    const paths = profileStoragePaths({
+      rootDirectory: fixture.rootDirectory,
+      installationId,
+      hostId: fixture.target.hostId,
+      profileId: fixture.target.profileId,
+    });
+    await mkdir(paths.runtimeManifestsDirectory, { recursive: true });
+    await writeFile(paths.runtimeManifestPath, "{not-json");
+    const runtime = createBrowserInstanceRuntime({
+      rootDirectory: fixture.rootDirectory,
+      installationId,
+      chromeStablePaths: [fixture.browserExecutable],
+      playwrightChromiumPath: join(fixture.rootDirectory, "fallback-chromium"),
+      launchBoundary: fixture.processFixture.boundary,
+    });
+    try {
+      expect(fixture.processFixture.launches).toHaveLength(0);
+      expect(await runtime.status(fixture.target)).toMatchObject({
+        state: "sleeping",
+      });
+      await expect(runtime.start(fixture.target)).rejects.toMatchObject({
+        code: "repair-required",
+      });
+      expect(fixture.processFixture.launches).toHaveLength(0);
+    } finally {
+      await runtime.dispose();
+      await fixture.runtime.dispose();
+      await rm(fixture.rootDirectory, { recursive: true, force: true });
+    }
+  });
   it("coalesces starts and holds an exclusive installation/host/profile lock", async () => {
     const fixture = await runtimeFixture();
     const competingFixture = launchFixture();
@@ -690,23 +991,13 @@ describe("Browser Instance runtime", () => {
     }
   });
 
-  it("retires a crashed Browser Instance and repairs it on the next operation", async () => {
+  it("retires a crashed Browser Instance and automatically starts a clean replacement", async () => {
     const fixture = await runtimeFixture();
     try {
       const first = await fixture.runtime.start(fixture.target);
       fixture.processFixture.crash(first.pid);
-      const paths = profileStoragePaths({
-        rootDirectory: fixture.rootDirectory,
-        installationId: "installation-a",
-        hostId: fixture.target.hostId,
-        profileId: fixture.target.profileId,
-      });
-      await vi.waitFor(async () => {
-        await expect(
-          readFile(paths.runtimeManifestPath, "utf8"),
-        ).rejects.toMatchObject({
-          code: "ENOENT",
-        });
+      await vi.waitFor(() => {
+        expect(fixture.processFixture.launches).toHaveLength(2);
       });
 
       const repaired = await fixture.runtime.start(fixture.target);
@@ -719,21 +1010,13 @@ describe("Browser Instance runtime", () => {
     }
   });
 
-  it("retires ownership when the browser exit observer reports an error", async () => {
+  it("recovers ownership when the browser exit observer reports an error", async () => {
     const fixture = await runtimeFixture();
     try {
       const first = await fixture.runtime.start(fixture.target);
       fixture.processFixture.fail(first.pid);
-      const paths = profileStoragePaths({
-        rootDirectory: fixture.rootDirectory,
-        installationId: "installation-a",
-        hostId: fixture.target.hostId,
-        profileId: fixture.target.profileId,
-      });
-      await vi.waitFor(async () => {
-        await expect(
-          readFile(paths.runtimeManifestPath, "utf8"),
-        ).rejects.toMatchObject({ code: "ENOENT" });
+      await vi.waitFor(() => {
+        expect(fixture.processFixture.launches).toHaveLength(2);
       });
 
       await expect(

@@ -104,14 +104,15 @@ export type BrowserInstance = {
 export type BrowserRepairDiagnostics = {
   crashCount: number;
   windowMs: number;
-  crashTimestamps: readonly string[];
 };
 
 export class BrowserInstanceError extends Error {
   constructor(
     public readonly code:
       | "browser-unavailable"
+      | "awake-limit"
       | "endpoint-not-loopback"
+      | "host-offline"
       | "profile-in-use"
       | "repair-required"
       | "unsafe-launch",
@@ -211,6 +212,7 @@ function assertLoopbackEndpoint(endpoint: string) {
 }
 
 type HeldBrowserInstance = {
+  target: BrowserRuntimeTarget;
   publicState: BrowserInstance;
   process: RunningBrowserProcess;
   lock: FileHandle;
@@ -220,6 +222,10 @@ type HeldBrowserInstance = {
   profileDirectory: string;
   crashHistoryPath: string;
   stopRequested: boolean;
+  panelIds: Set<string>;
+  activeLeases: number;
+  lastActivityAt: number;
+  idleTimer?: ReturnType<typeof setTimeout>;
   cleanup?: Promise<void>;
 };
 
@@ -230,6 +236,8 @@ type BrowserCrashHistory = {
 
 const CRASH_WINDOW_MS = 5 * 60 * 1_000;
 const CRASH_LIMIT = 3;
+export const DEFAULT_IDLE_SLEEP_MS = 30 * 60 * 1_000;
+export const DEFAULT_AWAKE_INSTANCE_LIMIT = 3;
 
 type StoredBrowserInstance =
   | {
@@ -253,6 +261,8 @@ type BrowserInstanceRuntimeOptions = {
   chromeStablePaths: readonly string[];
   playwrightChromiumPath?: string;
   launchBoundary: BrowserLaunchBoundary;
+  idleSleepMs?: number;
+  awakeInstanceLimit?: number;
 };
 
 function runtimeKey(
@@ -359,7 +369,9 @@ async function storedWorkerIdentity(path: string) {
 async function storedBrowserInstance(path: string) {
   try {
     const document = JSON.parse(await readFile(path, "utf8")) as unknown;
-    if (typeof document !== "object" || document === null) return null;
+    if (typeof document !== "object" || document === null) {
+      throw invalidRuntimeManifest();
+    }
     const stored = document as Partial<StoredBrowserInstance>;
     const identity = stored.identity;
     if (
@@ -368,7 +380,7 @@ async function storedBrowserInstance(path: string) {
       (stored.automationEndpoint !== null &&
         typeof stored.automationEndpoint !== "string")
     ) {
-      return null;
+      throw invalidRuntimeManifest();
     }
     if (stored.phase === "launching") {
       return identity === null &&
@@ -385,15 +397,22 @@ async function storedBrowserInstance(path: string) {
       typeof identity.startedAtTicks !== "string" ||
       typeof identity.commandHash !== "string"
     ) {
-      return null;
+      throw invalidRuntimeManifest();
     }
     return stored as StoredBrowserInstance;
   } catch (error) {
     if (error instanceof Error && "code" in error && error.code === "ENOENT")
       return null;
-    if (error instanceof SyntaxError) return null;
+    if (error instanceof SyntaxError) throw invalidRuntimeManifest();
     throw error;
   }
+}
+
+function invalidRuntimeManifest() {
+  return new BrowserInstanceError(
+    "repair-required",
+    "Browser runtime metadata is corrupt; repair this Browser Profile before relaunch.",
+  );
 }
 
 async function removeStaleProfileLock(path: string) {
@@ -674,9 +693,6 @@ async function assertCrashPolicy(path: string) {
     {
       crashCount: recentCrashes.length,
       windowMs: CRASH_WINDOW_MS,
-      crashTimestamps: recentCrashes.map((timestamp) =>
-        new Date(timestamp).toISOString(),
-      ),
     },
   );
 }
@@ -691,6 +707,7 @@ async function recordBrowserCrash(path: string) {
 }
 
 function heldBrowserInstance(input: {
+  target: BrowserRuntimeTarget;
   paths: ProfileStoragePaths;
   lockPath: string;
   lock: FileHandle;
@@ -698,6 +715,7 @@ function heldBrowserInstance(input: {
   publicState: BrowserInstance;
 }): HeldBrowserInstance {
   return {
+    target: input.target,
     publicState: input.publicState,
     process: input.process,
     lock: input.lock,
@@ -707,6 +725,9 @@ function heldBrowserInstance(input: {
     profileDirectory: input.paths.browserDataPath,
     crashHistoryPath: `${input.paths.runtimeManifestPath}.crashes.json`,
     stopRequested: false,
+    panelIds: new Set(),
+    activeLeases: 0,
+    lastActivityAt: Date.now(),
   };
 }
 
@@ -845,6 +866,7 @@ async function launchBrowserInstance(
       publicState,
     );
     return heldBrowserInstance({
+      target,
       paths,
       lockPath,
       lock,
@@ -875,6 +897,51 @@ export function createBrowserInstanceRuntime(
   const activeTabs = new Map<string, string>();
   const cleanupFailures = new Map<string, unknown>();
   const retirements = new Map<string, Promise<void>>();
+  const lifecycleStates = new Map<
+    string,
+    "sleeping" | "waking" | "running" | "repair-required"
+  >();
+  const disconnectedHosts = new Set<string>();
+  let capacityChanges = Promise.resolve();
+  let disposed = false;
+
+  function assertHostConnected(hostId: string) {
+    if (!disconnectedHosts.has(hostId)) return;
+    throw new BrowserInstanceError(
+      "host-offline",
+      "The workspace host disconnected; Browser work is frozen until it reconnects.",
+    );
+  }
+
+  function cancelIdleSleep(held: HeldBrowserInstance) {
+    if (held.idleTimer !== undefined) clearTimeout(held.idleTimer);
+    held.idleTimer = undefined;
+  }
+
+  function isPinned(held: HeldBrowserInstance) {
+    return held.panelIds.size > 0 || held.activeLeases > 0;
+  }
+
+  function scheduleIdleSleep(key: string, held: HeldBrowserInstance) {
+    cancelIdleSleep(held);
+    if (isPinned(held)) return;
+    const remaining = Math.max(
+      (options.idleSleepMs ?? DEFAULT_IDLE_SLEEP_MS) -
+        (Date.now() - held.lastActivityAt),
+      0,
+    );
+    held.idleTimer = setTimeout(() => {
+      if (isPinned(held) || starts.get(key) === undefined) return;
+      void stopHeld(key, held).catch((error: unknown) => {
+        cleanupFailures.set(key, error);
+      });
+    }, remaining);
+  }
+
+  function noteActivity(key: string, held: HeldBrowserInstance) {
+    held.lastActivityAt = Date.now();
+    scheduleIdleSleep(key, held);
+  }
 
   async function cleanupHeld(held: HeldBrowserInstance) {
     held.cleanup ??= (async () => {
@@ -899,20 +966,54 @@ export function createBrowserInstanceRuntime(
     return held.cleanup;
   }
 
-  function watchBrowserExit(key: string, held: HeldBrowserInstance) {
-    const retire = async () => {
-      starts.delete(key);
-      activeTabs.delete(key);
-      try {
-        if (!held.stopRequested) {
-          await recordBrowserCrash(held.crashHistoryPath);
-        }
-        await cleanupHeld(held);
-      } catch (error) {
-        cleanupFailures.set(key, error);
+  async function retireExitedBrowser(key: string, held: HeldBrowserInstance) {
+    starts.delete(key);
+    activeTabs.delete(key);
+    cancelIdleSleep(held);
+    try {
+      if (!held.stopRequested) await recordBrowserCrash(held.crashHistoryPath);
+      await cleanupHeld(held);
+      lifecycleStates.set(key, "sleeping");
+    } catch (error) {
+      cleanupFailures.set(key, error);
+    }
+  }
+
+  function recordRestartFailure(key: string, error: unknown) {
+    if (error instanceof BrowserInstanceError) {
+      if (error.code === "repair-required") {
+        lifecycleStates.set(key, "repair-required");
+        return;
       }
+      if (error.code === "host-offline") {
+        lifecycleStates.set(key, "sleeping");
+        return;
+      }
+    }
+    cleanupFailures.set(key, error);
+  }
+
+  async function restartExitedBrowser(
+    key: string,
+    held: HeldBrowserInstance,
+    retirement: Promise<void>,
+  ) {
+    await retirement;
+    if (disposed) return;
+    try {
+      await heldInstance(held.target);
+    } catch (error) {
+      recordRestartFailure(key, error);
+    }
+  }
+
+  function watchBrowserExit(key: string, held: HeldBrowserInstance) {
+    const beginRetirement = () => {
+      const retirement = retireExitedBrowser(key, held);
+      trackRetirement(key, retirement);
+      if (held.stopRequested) return;
+      void restartExitedBrowser(key, held, retirement);
     };
-    const beginRetirement = () => trackRetirement(key, retire());
     void held.process.exited.then(beginRetirement, beginRetirement);
   }
 
@@ -924,27 +1025,102 @@ export function createBrowserInstanceRuntime(
   }
 
   async function heldInstance(target: BrowserRuntimeTarget) {
+    if (disposed) {
+      throw new BrowserInstanceError(
+        "browser-unavailable",
+        "This Browser worker generation has been disposed.",
+      );
+    }
+    assertHostConnected(target.hostId);
     const key = runtimeKey(target);
     await retirements.get(key);
+    assertNoCleanupFailure(key);
+    const existingStart = starts.get(key);
+    if (existingStart !== undefined) return existingStart;
+    const awakeLimit =
+      options.awakeInstanceLimit ?? DEFAULT_AWAKE_INSTANCE_LIMIT;
+    if (starts.size < awakeLimit) return beginStart(target, key);
+    return serializedCapacityStart(target, key);
+  }
+
+  function assertNoCleanupFailure(key: string) {
     const cleanupFailure = cleanupFailures.get(key);
-    if (cleanupFailure !== undefined) {
-      cleanupFailures.delete(key);
-      throw cleanupFailure;
-    }
-    let start = starts.get(key);
-    if (start === undefined) {
-      start = launchBrowserInstance(options, target).then((held) => {
+    if (cleanupFailure === undefined) return;
+    cleanupFailures.delete(key);
+    throw cleanupFailure;
+  }
+
+  function failedStart(key: string, error: unknown): never {
+    starts.delete(key);
+    lifecycleStates.set(
+      key,
+      error instanceof BrowserInstanceError && error.code === "repair-required"
+        ? "repair-required"
+        : "sleeping",
+    );
+    throw error;
+  }
+
+  function beginStart(target: BrowserRuntimeTarget, key: string) {
+    lifecycleStates.set(key, "waking");
+    const start = launchBrowserInstance(options, target).then(
+      (held) => {
         watchBrowserExit(key, held);
+        lifecycleStates.set(key, "running");
+        scheduleIdleSleep(key, held);
         return held;
-      });
-      starts.set(key, start);
-      void start.catch(() => starts.delete(key));
-    }
+      },
+      (error: unknown) => failedStart(key, error),
+    );
+    starts.set(key, start);
     return start;
+  }
+
+  async function serializedCapacityStart(
+    target: BrowserRuntimeTarget,
+    key: string,
+  ) {
+    const reservation = capacityChanges.then(async () => {
+      const existingStart = starts.get(key);
+      if (existingStart !== undefined) return { start: existingStart };
+      await makeAwakeCapacity(key);
+      return { start: beginStart(target, key) };
+    });
+    capacityChanges = reservation.then(
+      () => undefined,
+      () => undefined,
+    );
+    return (await reservation).start;
+  }
+
+  async function makeAwakeCapacity(requestedKey: string) {
+    if (starts.has(requestedKey)) return;
+    const awakeLimit =
+      options.awakeInstanceLimit ?? DEFAULT_AWAKE_INSTANCE_LIMIT;
+    if (starts.size < awakeLimit) return;
+    const candidates = await Promise.all(
+      [...starts.entries()].map(
+        async ([key, start]) => [key, await start] as const,
+      ),
+    );
+    const evictable = candidates
+      .filter(([, held]) => !isPinned(held))
+      .sort(
+        (left, right) => left[1].lastActivityAt - right[1].lastActivityAt,
+      )[0];
+    if (evictable === undefined) {
+      throw new BrowserInstanceError(
+        "awake-limit",
+        `All ${awakeLimit} awake Browser Instances are pinned by a visible panel or active Control Lease.`,
+      );
+    }
+    await stopHeld(evictable[0], evictable[1]);
   }
 
   async function stopHeld(key: string, held: HeldBrowserInstance) {
     held.stopRequested = true;
+    cancelIdleSleep(held);
+    lifecycleStates.set(key, "sleeping");
     const processOutcome = await Promise.allSettled([held.process.stop()]);
     const cleanupOutcome = await Promise.allSettled([cleanupHeld(held)]);
     const outcomes = [...processOutcome, ...cleanupOutcome];
@@ -959,6 +1135,43 @@ export function createBrowserInstanceRuntime(
     }
   }
 
+  async function repairLifecycleStatus(
+    target: Pick<BrowserRuntimeTarget, "hostId" | "profileId">,
+  ) {
+    const paths = profileStoragePaths({
+      rootDirectory: options.rootDirectory,
+      installationId: options.installationId,
+      hostId: target.hostId,
+      profileId: target.profileId,
+    });
+    const crashes = recentCrashTimestamps(
+      await browserCrashHistory(`${paths.runtimeManifestPath}.crashes.json`),
+      Date.now(),
+    );
+    return {
+      state: "repair-required" as const,
+      hostId: target.hostId,
+      profileId: target.profileId,
+      diagnostics: { crashCount: crashes.length, windowMs: CRASH_WINDOW_MS },
+    };
+  }
+
+  async function lifecycleStatus(
+    target: Pick<BrowserRuntimeTarget, "hostId" | "profileId">,
+  ) {
+    if (disconnectedHosts.has(target.hostId)) {
+      return {
+        state: "host-offline" as const,
+        hostId: target.hostId,
+        profileId: target.profileId,
+      };
+    }
+    const state = lifecycleStates.get(runtimeKey(target)) ?? "sleeping";
+    return state === "repair-required"
+      ? repairLifecycleStatus(target)
+      : { state, hostId: target.hostId, profileId: target.profileId };
+  }
+
   return {
     async start(target: BrowserRuntimeTarget) {
       return (await heldInstance(target)).publicState;
@@ -969,12 +1182,45 @@ export function createBrowserInstanceRuntime(
       if (start === undefined) return;
       await stopHeld(key, await start);
     },
+    status: lifecycleStatus,
+    hostDisconnected(hostId: string) {
+      disconnectedHosts.add(hostId);
+    },
+    async hostReconnected(hostId: string) {
+      disconnectedHosts.delete(hostId);
+      await Promise.all(
+        [...retirements.entries()]
+          .filter(([key]) => key.startsWith(`${hostId}\0`))
+          .map(([, retirement]) => retirement),
+      );
+    },
+    async pinPanel(target: BrowserRuntimeTarget, panelId: string) {
+      const key = runtimeKey(target);
+      const held = await heldInstance(target);
+      held.panelIds.add(panelId);
+      noteActivity(key, held);
+      return held.publicState;
+    },
+    async unpinPanel(
+      target: Pick<BrowserRuntimeTarget, "hostId" | "profileId">,
+      panelId: string,
+    ) {
+      const key = runtimeKey(target);
+      const start = starts.get(key);
+      if (start === undefined) return;
+      const held = await start;
+      held.panelIds.delete(panelId);
+      noteActivity(key, held);
+    },
     async execute(
       target: BrowserRuntimeTarget,
       code: string,
       timeoutMs: number,
     ) {
       const held = await heldInstance(target);
+      const key = runtimeKey(target);
+      held.activeLeases += 1;
+      noteActivity(key, held);
       const codeForTarget =
         target.tabId === undefined
           ? code
@@ -982,9 +1228,14 @@ export function createBrowserInstanceRuntime(
       if (target.tabId !== undefined) {
         activeTabs.set(runtimeKey(target), target.tabId);
       }
-      return options.launchBoundary.execute(
-        executionRequest(held, target.profileId, codeForTarget, timeoutMs),
-      );
+      try {
+        return await options.launchBoundary.execute(
+          executionRequest(held, target.profileId, codeForTarget, timeoutMs),
+        );
+      } finally {
+        held.activeLeases -= 1;
+        noteActivity(key, held);
+      }
     },
     async navigate(target: BrowserRuntimeTarget, input: string) {
       const requestedAddress = resolveBrowserAddress(input);
@@ -1028,9 +1279,12 @@ export function createBrowserInstanceRuntime(
         ),
       );
       activeTabs.set(key, tabId);
+      noteActivity(key, held);
       return { address, location, tabId };
     },
     async dispose() {
+      disposed = true;
+      await capacityChanges;
       const instances = await Promise.allSettled(starts.values());
       await Promise.all(
         instances.flatMap((instance) =>

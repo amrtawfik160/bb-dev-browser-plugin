@@ -124,6 +124,37 @@ function deferred<T>() {
 }
 
 describe("Browser public plugin contract", () => {
+  it.each([
+    ["sleeping", "sleeping", "Sleeping"],
+    ["waking", "waking", "Waking"],
+  ] as const)(
+    "issue #12 exposes the %s transition through the Browser Panel and CLI",
+    async (state, code, label) => {
+      const browser = await createPublicPluginHarness({
+        status: browserStatusSchema.parse({
+          ...healthyStatus,
+          state,
+          code,
+          label,
+        }),
+      });
+      try {
+        const panel = await browser.openExistingThreadPanel();
+        const cli = await browser.runStatusCli();
+
+        await panel.panel.findByRole("status", { name: label });
+        expect(browserStatusSchema.parse(JSON.parse(cli.stdout))).toMatchObject(
+          {
+            state,
+            code,
+            label,
+          },
+        );
+      } finally {
+        await browser.dispose();
+      }
+    },
+  );
   it("reports a healthy supported host through the panel and CLI", async () => {
     const browser = await createPublicPluginHarness({
       snapshot: preparedSnapshot,

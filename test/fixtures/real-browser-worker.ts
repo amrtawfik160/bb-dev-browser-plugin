@@ -1,4 +1,11 @@
-import { access, lstat, readdir, readFile } from "node:fs/promises";
+import {
+  access,
+  lstat,
+  mkdir,
+  readdir,
+  readFile,
+  writeFile,
+} from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { createRequire } from "node:module";
 import { createProductionBrowserProcessBoundary } from "../../browser-process.js";
@@ -56,7 +63,7 @@ async function waitForProcessExit(pid: number) {
 }
 
 const action = requiredEnvironment("BB_BROWSER_WORKER_ACTION");
-if (!new Set(["start", "crash-recover", "cleanup"]).has(action)) {
+if (!new Set(["start", "crash-recover", "lifecycle", "cleanup"]).has(action)) {
   throw new Error(
     "Provisioned-host fixture received an invalid worker action.",
   );
@@ -78,7 +85,7 @@ const target = {
   locale: "en-GB",
   timezone: "Europe/London",
 };
-const runtime = createBrowserInstanceRuntime({
+const runtimeOptions = {
   rootDirectory,
   installationId: requiredEnvironment("BB_BROWSER_REAL_INSTALLATION_ID"),
   chromeStablePaths: [
@@ -86,7 +93,9 @@ const runtime = createBrowserInstanceRuntime({
     "/usr/bin/google-chrome",
   ],
   launchBoundary: boundary,
-});
+  ...(action === "lifecycle" ? { idleSleepMs: 250 } : {}),
+};
+const runtime = createBrowserInstanceRuntime(runtimeOptions);
 const storagePaths = profileStoragePaths({
   rootDirectory,
   installationId: requiredEnvironment("BB_BROWSER_REAL_INSTALLATION_ID"),
@@ -135,12 +144,130 @@ console.log(JSON.stringify({
   timezone: await page.evaluate(() => Intl.DateTimeFormat().resolvedOptions().timeZone),
 }));`;
 
+async function waitForRuntimeState(
+  targetProfile: typeof target,
+  expected: "running" | "sleeping" | "repair-required",
+) {
+  const deadline = Date.now() + 20_000;
+  while (Date.now() < deadline) {
+    const status = await runtime.status(targetProfile);
+    if (status.state === expected) return status;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(
+    `Browser Profile ${targetProfile.profileId} did not reach ${expected}.`,
+  );
+}
+
+async function lifecycleAcceptance(initialPid: number) {
+  const profile = (suffix: string) => ({
+    ...target,
+    profileId: `${target.profileId}-${suffix}`,
+  });
+  await runtime.pinPanel(target, "real-panel");
+  const profileB = profile("lru-b");
+  const profileC = profile("lru-c");
+  const profileD = profile("lru-d");
+  await runtime.start(profileB);
+  await runtime.start(profileC);
+  await runtime.start(profileD);
+  const lruState = await runtime.status(profileB);
+
+  await runtime.pinPanel(profileC, "real-panel-c");
+  await runtime.pinPanel(profileD, "real-panel-d");
+  let pinnedLimitCode: string | null = null;
+  try {
+    await runtime.start(profile("pinned-refused"));
+  } catch (error) {
+    pinnedLimitCode =
+      error instanceof Error && "code" in error ? String(error.code) : null;
+  }
+
+  runtime.hostDisconnected(target.hostId);
+  let disconnectedCode: string | null = null;
+  try {
+    await runtime.execute(target, "return page.url()", 5_000);
+  } catch (error) {
+    disconnectedCode =
+      error instanceof Error && "code" in error ? String(error.code) : null;
+  }
+  await runtime.hostReconnected(target.hostId);
+  const reconciled = await runtime.start(target);
+
+  await Promise.all([
+    runtime.unpinPanel(target, "real-panel"),
+    runtime.unpinPanel(profileC, "real-panel-c"),
+    runtime.unpinPanel(profileD, "real-panel-d"),
+  ]);
+  await Promise.all([
+    waitForRuntimeState(target, "sleeping"),
+    waitForRuntimeState(profileC, "sleeping"),
+    waitForRuntimeState(profileD, "sleeping"),
+  ]);
+
+  const crashTarget = profile("crash-loop");
+  const crashPids: number[] = [];
+  for (let crashNumber = 0; crashNumber < 3; crashNumber += 1) {
+    const running = await runtime.start(crashTarget);
+    crashPids.push(running.pid);
+    process.kill(running.pid, "SIGKILL");
+    await waitForProcessExit(running.pid);
+    await waitForRuntimeState(
+      crashTarget,
+      crashNumber === 2 ? "repair-required" : "running",
+    );
+  }
+  const crashLoopState = await runtime.status(crashTarget);
+
+  const corruptTarget = profile("corrupt");
+  const corruptPaths = profileStoragePaths({
+    rootDirectory,
+    installationId: runtimeOptions.installationId,
+    hostId: corruptTarget.hostId,
+    profileId: corruptTarget.profileId,
+  });
+  await mkdir(corruptPaths.runtimeManifestsDirectory, { recursive: true });
+  await writeFile(corruptPaths.runtimeManifestPath, "{corrupt");
+  let corruptCode: string | null = null;
+  try {
+    await runtime.start(corruptTarget);
+  } catch (error) {
+    corruptCode =
+      error instanceof Error && "code" in error ? String(error.code) : null;
+  }
+
+  const reloadTarget = profile("reload");
+  const beforeReload = await runtime.start(reloadTarget);
+  await runtime.dispose();
+  await waitForProcessExit(beforeReload.pid);
+  const reloadedRuntime = createBrowserInstanceRuntime(runtimeOptions);
+  const lazyState = await reloadedRuntime.status(reloadTarget);
+  const afterReload = await reloadedRuntime.start(reloadTarget);
+  await reloadedRuntime.dispose();
+  await waitForProcessExit(afterReload.pid);
+
+  return {
+    initialPid,
+    lruState: lruState.state,
+    pinnedLimitCode,
+    disconnectedCode,
+    reconciledPid: reconciled.pid,
+    idleStates: ["sleeping", "sleeping", "sleeping"],
+    crashPids,
+    crashLoopState,
+    corruptCode,
+    lazyState: lazyState.state,
+    reloadPids: [beforeReload.pid, afterReload.pid],
+  };
+}
+
 const initialInstance = await runtime.start(target);
 let instance = initialInstance;
 let crashedPid: number | null = null;
 let scriptOutput = "{}";
 let navigation:
   { before: unknown[]; after: unknown[]; tabId: string } | undefined;
+let lifecycle: Awaited<ReturnType<typeof lifecycleAcceptance>> | undefined;
 if (action === "start") {
   scriptOutput = String(await runtime.execute(target, signInScript, 20_000));
   const before = JSON.parse(
@@ -158,9 +285,11 @@ if (action === "start") {
   await new Promise((resolve) => setTimeout(resolve, 300));
   instance = await runtime.start(target);
   scriptOutput = String(await runtime.execute(target, restoreScript, 20_000));
+} else if (action === "lifecycle") {
+  lifecycle = await lifecycleAcceptance(initialInstance.pid);
 }
 const automationHelperPid =
-  action === "cleanup"
+  action === "cleanup" || action === "lifecycle"
     ? null
     : Number(
         await readFile(join(helperHome, ".dev-browser", "daemon.pid"), "utf8"),
@@ -169,6 +298,7 @@ const runningState = {
   instance,
   scriptOutput,
   navigation,
+  lifecycle,
   uid: boundary.effectiveUserId,
   gid: boundary.effectiveGroupId,
   ownedProcesses: await ownedProcesses(rootDirectory),

@@ -1142,6 +1142,24 @@ export const browserStatusSchema = z.discriminatedUnion("state", [
   z
     .object({
       ...browserStatusFields,
+      state: z.literal("sleeping"),
+      code: z.literal("sleeping"),
+      label: z.literal("Sleeping"),
+      message: z.string().min(1),
+    })
+    .strict(),
+  z
+    .object({
+      ...browserStatusFields,
+      state: z.literal("waking"),
+      code: z.literal("waking"),
+      label: z.literal("Waking"),
+      message: z.string().min(1),
+    })
+    .strict(),
+  z
+    .object({
+      ...browserStatusFields,
       state: z.literal("host-offline"),
       code: z.literal("host_offline"),
       label: z.literal("Host offline"),
@@ -1387,6 +1405,26 @@ export function hostOfflineStatus(target: BrowserStatusTarget): BrowserStatus {
   };
 }
 
+export function sleepingBrowserStatus(ready: BrowserStatus): BrowserStatus {
+  return {
+    ...ready,
+    state: "sleeping",
+    code: "sleeping",
+    label: "Sleeping",
+    message: "This Browser Profile is asleep and will wake when used.",
+  };
+}
+
+export function wakingBrowserStatus(ready: BrowserStatus): BrowserStatus {
+  return {
+    ...ready,
+    state: "waking",
+    code: "waking",
+    label: "Waking",
+    message: "This Browser Profile is restoring its Browser Instance.",
+  };
+}
+
 export function hostProbeFailedStatus(
   target: BrowserStatusTarget,
 ): BrowserStatus {
@@ -1470,6 +1508,19 @@ export const browserNavigationRequestSchema = z
   })
   .strict();
 
+export const browserPanelVisibilityRequestSchema = z
+  .object({
+    hostId: z.string().min(1),
+    profileId: z.string().min(1),
+    panelId: z.string().min(1),
+    visibility: z.enum(["visible", "hidden"]),
+  })
+  .strict();
+
+export type BrowserPanelVisibilityRequest = z.infer<
+  typeof browserPanelVisibilityRequestSchema
+>;
+
 export const browserNavigationResponseSchema = z
   .object({
     address: z.object({ kind: z.literal("address"), url: z.string().url() }),
@@ -1499,6 +1550,10 @@ export const rpcContract = defineRpcContract({
   browser_navigate: {
     input: browserPanelNavigationRequestSchema,
     output: browserNavigationResponseSchema,
+  },
+  browser_panel_visibility: {
+    input: browserPanelVisibilityRequestSchema,
+    output: browserStatusSchema,
   },
   browser_settings_status: {
     input: z.object({ profileId: z.string().min(1) }).strict(),

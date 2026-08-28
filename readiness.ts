@@ -164,7 +164,10 @@ const PROTECTED_STORAGE_EVALUATIONS: Record<
   },
 };
 
-type OverallReadinessState = Exclude<BrowserStatus["state"], "host-offline">;
+type OverallReadinessState = Exclude<
+  BrowserStatus["state"],
+  "host-offline" | "sleeping" | "waking"
+>;
 
 function overallReadinessState(
   platformSupported: boolean,

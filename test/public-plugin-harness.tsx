@@ -10,6 +10,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
+import { act } from "@testing-library/react";
 import {
   createFakePluginHost,
   makeThreadResponse,
@@ -32,6 +33,7 @@ import {
   browserLifecycleResponseSchema,
   browserNavigationRequestSchema,
   browserNavigationResponseSchema,
+  browserPanelVisibilityRequestSchema,
   browserPurgeRequestSchema,
   browserScriptRequestSchema,
   browserSetupRequestSchema,
@@ -455,6 +457,13 @@ export async function createPublicPluginHarness(options?: {
           },
         );
       }
+      if (method === "panelVisibility") {
+        return host.experimental_call(
+          "panelVisibility",
+          browserPanelVisibilityRequestSchema.parse(input),
+          { signal },
+        );
+      }
       if (method === "diagnostics") {
         return host.experimental_call(
           "diagnostics",
@@ -662,6 +671,16 @@ export async function createPublicPluginHarness(options?: {
       backend.harness.behavior.callRpc("browser_navigate", input) as Promise<
         ReturnType<typeof browserNavigationResponseSchema.parse>
       >,
+    browser_panel_visibility: (input: {
+      hostId: string;
+      profileId: string;
+      panelId: string;
+      visibility: "visible" | "hidden";
+    }) =>
+      backend.harness.behavior.callRpc(
+        "browser_panel_visibility",
+        input,
+      ) as Promise<BrowserStatus>,
     browser_settings_status: (input: { profileId: string }) =>
       backend.harness.behavior.callRpc(
         "browser_settings_status",
@@ -1392,6 +1411,7 @@ export async function createPublicPluginHarness(options?: {
       for (const panel of threadPanels.values()) panel.lifecycle.unmount();
       for (const panel of newThreadPanels.values()) panel.lifecycle.unmount();
       for (const panel of settingsPanels) panel.lifecycle.unmount();
+      await act(async () => undefined);
       await backend.harness.lifecycle.dispose();
       await host.experimental_dispose();
     } finally {

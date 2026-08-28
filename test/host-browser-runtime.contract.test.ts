@@ -33,6 +33,94 @@ function healthyStatus(): BrowserStatus {
 }
 
 describe("Browser host runtime boundary", () => {
+  it("issue #12 exposes lifecycle state and pins a visible Browser Panel", async () => {
+    const rootDirectory = await mkdtemp(join(tmpdir(), "host-panel-runtime-"));
+    let lifecycleState: "sleeping" | "running" = "sleeping";
+    const runtime = {
+      start: async () => {
+        throw new Error("not used");
+      },
+      stop: async () => {},
+      execute: async () => {
+        throw new Error("not used");
+      },
+      navigate: async () => {
+        throw new Error("not used");
+      },
+      status: async ({
+        hostId,
+        profileId,
+      }: {
+        hostId: string;
+        profileId: string;
+      }) => ({
+        state: lifecycleState,
+        hostId,
+        profileId,
+      }),
+      pinPanel: async () => {
+        lifecycleState = "running";
+        return {} as never;
+      },
+      unpinPanel: async () => {
+        lifecycleState = "sleeping";
+      },
+      hostDisconnected: () => {},
+      hostReconnected: async () => {},
+      dispose: async () => {},
+    };
+    const profiles = createFileBrowserProfileStore({
+      rootDirectory,
+      installationId: "installation-panel-runtime",
+    });
+    await profiles.initialize(HOST_ID);
+    const host = experimental_createHostEntryHarness(
+      createBrowserHostEntry(
+        {
+          inspect: healthyStatus,
+          diagnostics: () => {
+            throw new Error("not used");
+          },
+        },
+        profiles,
+        undefined,
+        runtime,
+      ),
+      {
+        experimental_paths: {
+          dataDir: rootDirectory,
+          tempDir: join(rootDirectory, "tmp"),
+        },
+      },
+    );
+    try {
+      await expect(
+        host.experimental_call("status", {
+          hostId: HOST_ID,
+          profileId: DEFAULT_PROFILE_ID,
+        }),
+      ).resolves.toMatchObject({ state: "sleeping", label: "Sleeping" });
+      await expect(
+        host.experimental_call("panelVisibility", {
+          hostId: HOST_ID,
+          profileId: DEFAULT_PROFILE_ID,
+          panelId: "panel-visible",
+          visibility: "visible",
+        }),
+      ).resolves.toMatchObject({ state: "healthy" });
+      await expect(
+        host.experimental_call("panelVisibility", {
+          hostId: HOST_ID,
+          profileId: DEFAULT_PROFILE_ID,
+          panelId: "panel-visible",
+          visibility: "hidden",
+        }),
+      ).resolves.toMatchObject({ state: "sleeping" });
+    } finally {
+      await host.experimental_dispose();
+      await rm(rootDirectory, { recursive: true, force: true });
+    }
+  });
   it("wakes the selected Browser Profile and returns the attached dev-browser result", async () => {
     const rootDirectory = await mkdtemp(join(tmpdir(), "host-runtime-"));
     const profiles = createFileBrowserProfileStore({
@@ -129,6 +217,23 @@ describe("Browser host runtime boundary", () => {
         navigate: async () => {
           throw new Error("not used");
         },
+        status: async ({
+          hostId,
+          profileId,
+        }: {
+          hostId: string;
+          profileId: string;
+        }) => ({
+          state: "sleeping" as const,
+          hostId,
+          profileId,
+        }),
+        pinPanel: async () => {
+          throw new Error("not used");
+        },
+        unpinPanel: async () => {},
+        hostDisconnected: () => {},
+        hostReconnected: async () => {},
         dispose: async () => {
           calls.push("runtime-disposed");
         },

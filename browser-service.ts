@@ -81,6 +81,7 @@ import {
   type BrowserProfileGrantRevokeRequest,
   type BrowserProfileGrantRevokeResponse,
   type BrowserPanelNavigationInput,
+  type BrowserPanelVisibilityRequest,
   type BrowserNavigationResponse,
 } from "./contracts.js";
 import { browserHostContract } from "./host-contract.js";
@@ -2194,12 +2195,24 @@ export function createBrowserService(
     );
   }
 
+  async function panelVisibility(
+    request: BrowserPanelVisibilityRequest,
+    signal?: AbortSignal,
+  ) {
+    await requireConnectedHost(request.hostId, signal);
+    return host.call("panelVisibility", request, {
+      hostId: request.hostId,
+      signal,
+    });
+  }
+
   subscribeToHostReconnects();
   subscribeToProjectDeletion();
 
   return {
     browserScript,
     navigate,
+    panelVisibility,
     grants,
     createGrant,
     inspectGrant,
