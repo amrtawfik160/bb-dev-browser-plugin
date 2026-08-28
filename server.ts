@@ -171,10 +171,10 @@ function cliProfilesText(inventory: BrowserProfileInventory) {
 }
 
 function cliProfileRecoveryText(response: BrowserProfileRecoveryResponse) {
-  const { phase, completedBytes, totalBytes } = response.progress;
+  const { phase, completedBytes, totalBytes, phases } = response.progress;
   return [
     response.message,
-    `Progress: ${phase} (${completedBytes}/${totalBytes} bytes)`,
+    `Progress: ${(phases ?? [phase]).join(" → ")} (${completedBytes}/${totalBytes} bytes)`,
   ].join("\n");
 }
 

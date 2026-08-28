@@ -427,6 +427,10 @@ export const browserProfileRecoveryProgressSchema = z
     phase: z.enum(["validating", "copying", "promoting", "completed"]),
     completedBytes: z.number().int().nonnegative(),
     totalBytes: z.number().int().nonnegative(),
+    phases: z
+      .array(z.enum(["validating", "copying", "promoting", "completed"]))
+      .min(1)
+      .optional(),
   })
   .strict();
 

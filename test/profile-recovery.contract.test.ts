@@ -3,6 +3,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  readdir,
   rm,
   stat,
   writeFile,
@@ -27,6 +28,7 @@ describe("Browser Profile recovery", () => {
     let profileStopped = false;
     const recoveryState: BrowserProfileRecoveryState = {
       isProfileStopped: async () => profileStopped,
+      isDevBrowserProfileStopped: async () => true,
     };
 
     try {
@@ -119,7 +121,10 @@ describe("Browser Profile recovery", () => {
       const recovery = createFileBrowserProfileRecovery({
         rootDirectory,
         installationId: "installation-test",
-        state: { isProfileStopped: async () => true },
+        state: {
+          isProfileStopped: async () => true,
+          isDevBrowserProfileStopped: async () => true,
+        },
       });
 
       await recovery.backupProfile({
@@ -176,7 +181,10 @@ describe("Browser Profile recovery", () => {
       const recovery = createFileBrowserProfileRecovery({
         rootDirectory,
         installationId: "installation-test",
-        state: { isProfileStopped: async () => true },
+        state: {
+          isProfileStopped: async () => true,
+          isDevBrowserProfileStopped: async () => true,
+        },
       });
       await recovery.backupProfile({
         hostId: "host-a",
@@ -224,7 +232,10 @@ describe("Browser Profile recovery", () => {
       const recovery = createFileBrowserProfileRecovery({
         rootDirectory,
         installationId: "installation-test",
-        state: { isProfileStopped: async () => true },
+        state: {
+          isProfileStopped: async () => true,
+          isDevBrowserProfileStopped: async () => true,
+        },
       });
       await recovery.backupProfile({
         hostId: "host-a",
@@ -259,6 +270,187 @@ describe("Browser Profile recovery", () => {
     }
   });
 
+  it("R7-03 rejects encrypted staged content even when archive encryption metadata is plain", async () => {
+    const rootDirectory = await mkdtemp(join(tmpdir(), "bb-browser-recovery-"));
+    const archivePath = join(rootDirectory, "profile.bb-backup");
+    try {
+      const store = createFileBrowserProfileStore({
+        rootDirectory,
+        installationId: "installation-test",
+      });
+      await store.initialize("host-a");
+      const targetPaths = profileStoragePaths({
+        rootDirectory,
+        installationId: "installation-test",
+        hostId: "host-a",
+        profileId: DEFAULT_PROFILE_ID,
+      });
+      await writeFile(
+        join(targetPaths.browserDataPath, "Local State"),
+        JSON.stringify({ os_crypt: { encrypted_key: "encrypted" } }),
+        { mode: 0o600 },
+      );
+      const recovery = createFileBrowserProfileRecovery({
+        rootDirectory,
+        installationId: "installation-test",
+        state: {
+          isProfileStopped: async () => true,
+          isDevBrowserProfileStopped: async () => true,
+        },
+      });
+      await recovery.backupProfile({
+        hostId: "host-a",
+        profileId: DEFAULT_PROFILE_ID,
+        archivePath,
+      });
+      const archiveContents = await readFile(archivePath, "utf8");
+      await writeFile(
+        archivePath,
+        archiveContents.replace(
+          '"encryptionState":"encrypted"',
+          '"encryptionState":"plain"',
+        ),
+        { mode: 0o600 },
+      );
+      const plainLocalState = JSON.stringify({ os_crypt: {} });
+      await writeFile(
+        join(targetPaths.browserDataPath, "Local State"),
+        plainLocalState,
+        { mode: 0o600 },
+      );
+
+      await expect(
+        recovery.restoreProfile({
+          hostId: "host-a",
+          profileId: DEFAULT_PROFILE_ID,
+          archivePath,
+        }),
+      ).rejects.toMatchObject({ code: "recovery-incompatible-encryption" });
+      await expect(
+        readFile(join(targetPaths.browserDataPath, "Local State"), "utf8"),
+      ).resolves.toBe(plainLocalState);
+    } finally {
+      await rm(rootDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("R7-04 checks free space on the backup archive destination filesystem", async () => {
+    const rootDirectory = await mkdtemp(join(tmpdir(), "bb-browser-recovery-"));
+    const archivePath = join(rootDirectory, "profile.bb-backup");
+    let checkedPath: string | undefined;
+    try {
+      const store = createFileBrowserProfileStore({
+        rootDirectory,
+        installationId: "installation-test",
+      });
+      await store.initialize("host-a");
+      const targetPaths = profileStoragePaths({
+        rootDirectory,
+        installationId: "installation-test",
+        hostId: "host-a",
+        profileId: DEFAULT_PROFILE_ID,
+      });
+      await writeFile(join(targetPaths.browserDataPath, "Cookies"), "session", {
+        mode: 0o600,
+      });
+      const recovery = createFileBrowserProfileRecovery({
+        rootDirectory,
+        installationId: "installation-test",
+        state: {
+          isProfileStopped: async () => true,
+          isDevBrowserProfileStopped: async () => true,
+        },
+        disk: {
+          freeBytes: async (path) => {
+            checkedPath = path;
+            return path === rootDirectory ? 1 : 6 * 1024 ** 3;
+          },
+        },
+      });
+
+      await expect(
+        recovery.backupProfile({
+          hostId: "host-a",
+          profileId: DEFAULT_PROFILE_ID,
+          archivePath,
+        }),
+      ).rejects.toMatchObject({ code: "recovery-insufficient-disk" });
+      expect(checkedPath).toBe(rootDirectory);
+      await expect(stat(archivePath)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(rootDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("R7-04 checks cumulative archive payload size before extracting staged data", async () => {
+    const rootDirectory = await mkdtemp(join(tmpdir(), "bb-browser-recovery-"));
+    const archivePath = join(rootDirectory, "profile.bb-backup");
+    try {
+      const store = createFileBrowserProfileStore({
+        rootDirectory,
+        installationId: "installation-test",
+      });
+      await store.initialize("host-a");
+      const targetPaths = profileStoragePaths({
+        rootDirectory,
+        installationId: "installation-test",
+        hostId: "host-a",
+        profileId: DEFAULT_PROFILE_ID,
+      });
+      await writeFile(join(targetPaths.browserDataPath, "Cookies"), "session", {
+        mode: 0o600,
+      });
+      const recovery = createFileBrowserProfileRecovery({
+        rootDirectory,
+        installationId: "installation-test",
+        state: {
+          isProfileStopped: async () => true,
+          isDevBrowserProfileStopped: async () => true,
+        },
+      });
+      await recovery.backupProfile({
+        hostId: "host-a",
+        profileId: DEFAULT_PROFILE_ID,
+        archivePath,
+      });
+      const archiveLines = (await readFile(archivePath, "utf8")).split("\n");
+      const archiveHeader = JSON.parse(archiveLines[1]!) as {
+        totalBytes: number;
+      };
+      archiveHeader.totalBytes = 0;
+      archiveLines[1] = JSON.stringify(archiveHeader);
+      await writeFile(archivePath, archiveLines.join("\n"), { mode: 0o600 });
+      const plainTargetContents = "changed";
+      await writeFile(
+        join(targetPaths.browserDataPath, "Cookies"),
+        plainTargetContents,
+        { mode: 0o600 },
+      );
+      const restore = createFileBrowserProfileRecovery({
+        rootDirectory,
+        installationId: "installation-test",
+        state: {
+          isProfileStopped: async () => true,
+          isDevBrowserProfileStopped: async () => true,
+        },
+        disk: { freeBytes: async () => 5 * 1024 ** 3 + 1 },
+      });
+
+      await expect(
+        restore.restoreProfile({
+          hostId: "host-a",
+          profileId: DEFAULT_PROFILE_ID,
+          archivePath,
+        }),
+      ).rejects.toMatchObject({ code: "recovery-insufficient-disk" });
+      await expect(
+        readFile(join(targetPaths.browserDataPath, "Cookies"), "utf8"),
+      ).resolves.toBe(plainTargetContents);
+    } finally {
+      await rm(rootDirectory, { recursive: true, force: true });
+    }
+  });
+
   it("rejects corrupt archive data before replacing the target", async () => {
     const rootDirectory = await mkdtemp(join(tmpdir(), "bb-browser-recovery-"));
     const archivePath = join(rootDirectory, "profile.bb-backup");
@@ -280,7 +472,10 @@ describe("Browser Profile recovery", () => {
       const recovery = createFileBrowserProfileRecovery({
         rootDirectory,
         installationId: "installation-test",
-        state: { isProfileStopped: async () => true },
+        state: {
+          isProfileStopped: async () => true,
+          isDevBrowserProfileStopped: async () => true,
+        },
       });
       await recovery.backupProfile({
         hostId: "host-a",
@@ -331,7 +526,10 @@ describe("Browser Profile recovery", () => {
       const recovery = createFileBrowserProfileRecovery({
         rootDirectory,
         installationId: "installation-test",
-        state: { isProfileStopped: async () => true },
+        state: {
+          isProfileStopped: async () => true,
+          isDevBrowserProfileStopped: async () => true,
+        },
       });
 
       await recovery.backupProfile({
@@ -433,7 +631,10 @@ describe("Browser Profile recovery", () => {
       const recovery = createFileBrowserProfileRecovery({
         rootDirectory,
         installationId: "installation-test",
-        state: { isProfileStopped: async () => true },
+        state: {
+          isProfileStopped: async () => true,
+          isDevBrowserProfileStopped: async () => true,
+        },
         disk: { freeBytes: async () => 1 },
       });
 
@@ -527,7 +728,10 @@ describe("Browser Profile recovery", () => {
       const recovery = createFileBrowserProfileRecovery({
         rootDirectory,
         installationId: "installation-test",
-        state: { isProfileStopped: async () => true },
+        state: {
+          isProfileStopped: async () => true,
+          isDevBrowserProfileStopped: async () => true,
+        },
         ownership,
       });
       await recovery.backupProfile({
@@ -581,7 +785,10 @@ describe("Browser Profile recovery", () => {
       const recovery = createFileBrowserProfileRecovery({
         rootDirectory,
         installationId: "installation-test",
-        state: { isProfileStopped: async () => true },
+        state: {
+          isProfileStopped: async () => true,
+          isDevBrowserProfileStopped: async () => true,
+        },
       });
 
       await recovery.backupProfile({
@@ -589,6 +796,302 @@ describe("Browser Profile recovery", () => {
         profileId: DEFAULT_PROFILE_ID,
         archivePath,
       });
+      await expect(stat(abandonedPath)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    } finally {
+      await rm(rootDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("R7-01 fails closed when the dev-browser stop authority is absent", async () => {
+    const rootDirectory = await mkdtemp(join(tmpdir(), "bb-browser-recovery-"));
+    const sourcePath = join(rootDirectory, "dev-browser-default");
+    try {
+      await mkdir(sourcePath, { recursive: true, mode: 0o700 });
+      await writeFile(join(sourcePath, "Cookies"), "source-session", {
+        mode: 0o600,
+      });
+      const store = createFileBrowserProfileStore({
+        rootDirectory,
+        installationId: "installation-test",
+      });
+      await store.initialize("host-a");
+      const recovery = createFileBrowserProfileRecovery({
+        rootDirectory,
+        installationId: "installation-test",
+        idFactory: () => "missing-stop-authority",
+        state: {
+          isProfileStopped: async () => true,
+        } as unknown as BrowserProfileRecoveryState,
+      });
+
+      await expect(
+        recovery.importDevBrowserProfile({
+          hostId: "host-a",
+          name: "Unadmitted dev-browser profile",
+          sourcePath,
+        }),
+      ).rejects.toMatchObject({ code: "profile-running" });
+      await expect(store.listProfiles("host-a")).resolves.toMatchObject({
+        profiles: [expect.objectContaining({ profileId: DEFAULT_PROFILE_ID })],
+      });
+    } finally {
+      await rm(rootDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("R7-01 rejects an encrypted or overlapping dev-browser source before publication", async () => {
+    const rootDirectory = await mkdtemp(join(tmpdir(), "bb-browser-recovery-"));
+    const sourcePath = join(rootDirectory, "dev-browser-default");
+    try {
+      await mkdir(sourcePath, { recursive: true, mode: 0o700 });
+      await writeFile(
+        join(sourcePath, "Local State"),
+        JSON.stringify({ os_crypt: { encrypted_key: "encrypted" } }),
+        { mode: 0o600 },
+      );
+      const store = createFileBrowserProfileStore({
+        rootDirectory,
+        installationId: "installation-test",
+      });
+      await store.initialize("host-a");
+      const recovery = createFileBrowserProfileRecovery({
+        rootDirectory,
+        installationId: "installation-test",
+        idFactory: () => "incompatible-source",
+        state: {
+          isProfileStopped: async () => true,
+          isDevBrowserProfileStopped: async () => true,
+        },
+      });
+
+      await expect(
+        recovery.importDevBrowserProfile({
+          hostId: "host-a",
+          name: "Encrypted source",
+          sourcePath,
+        }),
+      ).rejects.toMatchObject({ code: "recovery-incompatible-encryption" });
+
+      const profilePaths = profileStoragePaths({
+        rootDirectory,
+        installationId: "installation-test",
+        hostId: "host-a",
+        profileId: DEFAULT_PROFILE_ID,
+      });
+      const sourceEntriesBefore = await readdir(profilePaths.profilesDirectory);
+      await expect(
+        recovery.importDevBrowserProfile({
+          hostId: "host-a",
+          name: "Overlapping source",
+          sourcePath: profilePaths.profilesDirectory,
+        }),
+      ).rejects.toMatchObject({ code: "recovery-archive-invalid" });
+      await expect(readdir(profilePaths.profilesDirectory)).resolves.toEqual(
+        sourceEntriesBefore,
+      );
+    } finally {
+      await rm(rootDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("R7-02 keeps an imported profile invisible until its data publishes atomically", async () => {
+    const rootDirectory = await mkdtemp(join(tmpdir(), "bb-browser-recovery-"));
+    const sourcePath = join(rootDirectory, "dev-browser-default");
+    let releaseCopy!: () => void;
+    let signalCopyStarted!: () => void;
+    const copyStarted = new Promise<void>((resolve) => {
+      signalCopyStarted = resolve;
+    });
+    const copyReleased = new Promise<void>((resolve) => {
+      releaseCopy = resolve;
+    });
+    try {
+      await mkdir(sourcePath, { recursive: true, mode: 0o700 });
+      await writeFile(join(sourcePath, "Cookies"), "source-session", {
+        mode: 0o600,
+      });
+      const store = createFileBrowserProfileStore({
+        rootDirectory,
+        installationId: "installation-test",
+      });
+      await store.initialize("host-a");
+      const recovery = createFileBrowserProfileRecovery({
+        rootDirectory,
+        installationId: "installation-test",
+        idFactory: () => "atomic-publication",
+        state: {
+          isProfileStopped: async () => true,
+          isDevBrowserProfileStopped: async () => true,
+        },
+        copy: {
+          copyFile: async (sourceFilePath, targetFilePath) => {
+            signalCopyStarted();
+            await copyReleased;
+            await writeFile(targetFilePath, await readFile(sourceFilePath), {
+              mode: 0o600,
+            });
+          },
+        },
+      });
+
+      const importOperation = recovery.importDevBrowserProfile({
+        hostId: "host-a",
+        name: "Atomic imported profile",
+        sourcePath,
+      });
+      await copyStarted;
+      const visibleInventory = await store.listProfiles("host-a");
+      expect(
+        visibleInventory.profiles.some(
+          (profile) => profile.name === "Atomic imported profile",
+        ),
+      ).toBe(false);
+      releaseCopy();
+      await expect(importOperation).resolves.toMatchObject({
+        outcome: "imported",
+        profileId: "profile-atomic-publication",
+      });
+    } finally {
+      releaseCopy();
+      await rm(rootDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("R7-05 serializes imports so concurrent recovery cannot delete active staging", async () => {
+    const rootDirectory = await mkdtemp(join(tmpdir(), "bb-browser-recovery-"));
+    const sourceA = join(rootDirectory, "dev-browser-a");
+    const sourceB = join(rootDirectory, "dev-browser-b");
+    let releaseA!: () => void;
+    let releaseB!: () => void;
+    let signalA!: () => void;
+    let signalB!: () => void;
+    const startedA = new Promise<void>((resolve) => {
+      signalA = resolve;
+    });
+    const startedB = new Promise<void>((resolve) => {
+      signalB = resolve;
+    });
+    const copyReleasedA = new Promise<void>((resolve) => {
+      releaseA = resolve;
+    });
+    const copyReleasedB = new Promise<void>((resolve) => {
+      releaseB = resolve;
+    });
+    try {
+      await mkdir(sourceA, { recursive: true, mode: 0o700 });
+      await mkdir(sourceB, { recursive: true, mode: 0o700 });
+      await writeFile(join(sourceA, "Cookies"), "session-a", { mode: 0o600 });
+      await writeFile(join(sourceB, "Cookies"), "session-b", { mode: 0o600 });
+      const store = createFileBrowserProfileStore({
+        rootDirectory,
+        installationId: "installation-test",
+      });
+      await store.initialize("host-a");
+      const recoveryA = createFileBrowserProfileRecovery({
+        rootDirectory,
+        installationId: "installation-test",
+        idFactory: () => "concurrent-a",
+        state: {
+          isProfileStopped: async () => true,
+          isDevBrowserProfileStopped: async () => true,
+        },
+        copy: {
+          copyFile: async (sourcePath, targetPath) => {
+            signalA();
+            await copyReleasedA;
+            await writeFile(targetPath, await readFile(sourcePath), {
+              mode: 0o600,
+            });
+          },
+        },
+      });
+      const recoveryB = createFileBrowserProfileRecovery({
+        rootDirectory,
+        installationId: "installation-test",
+        idFactory: () => "concurrent-b",
+        state: {
+          isProfileStopped: async () => true,
+          isDevBrowserProfileStopped: async () => true,
+        },
+        copy: {
+          copyFile: async (sourcePath, targetPath) => {
+            signalB();
+            await copyReleasedB;
+            await writeFile(targetPath, await readFile(sourcePath), {
+              mode: 0o600,
+            });
+          },
+        },
+      });
+
+      const importA = recoveryA.importDevBrowserProfile({
+        hostId: "host-a",
+        name: "Concurrent A",
+        sourcePath: sourceA,
+      });
+      await startedA;
+      const importB = recoveryB.importDevBrowserProfile({
+        hostId: "host-a",
+        name: "Concurrent B",
+        sourcePath: sourceB,
+      });
+      releaseA();
+      await expect(importA).resolves.toMatchObject({
+        outcome: "imported",
+        profileId: "profile-concurrent-a",
+      });
+      await startedB;
+      releaseB();
+      await expect(importB).resolves.toMatchObject({
+        outcome: "imported",
+        profileId: "profile-concurrent-b",
+      });
+      await expect(store.listProfiles("host-a")).resolves.toMatchObject({
+        profiles: expect.arrayContaining([
+          expect.objectContaining({ name: "Concurrent A" }),
+          expect.objectContaining({ name: "Concurrent B" }),
+        ]),
+      });
+    } finally {
+      releaseA();
+      releaseB();
+      await rm(rootDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("R7-05 cleans abandoned staging when recovery is reconstructed after a restart", async () => {
+    const rootDirectory = await mkdtemp(join(tmpdir(), "bb-browser-recovery-"));
+    try {
+      const store = createFileBrowserProfileStore({
+        rootDirectory,
+        installationId: "installation-test",
+      });
+      await store.initialize("host-a");
+      const profilePaths = profileStoragePaths({
+        rootDirectory,
+        installationId: "installation-test",
+        hostId: "host-a",
+        profileId: DEFAULT_PROFILE_ID,
+      });
+      const abandonedPath = join(
+        profilePaths.hostStoragePath,
+        ".recovery-import-restarted.tmp",
+      );
+      await mkdir(abandonedPath, { recursive: true, mode: 0o700 });
+      await writeFile(join(abandonedPath, "Cookies"), "orphan", {
+        mode: 0o600,
+      });
+      const recovery = createFileBrowserProfileRecovery({
+        rootDirectory,
+        installationId: "installation-test",
+        state: {
+          isProfileStopped: async () => true,
+          isDevBrowserProfileStopped: async () => true,
+        },
+      });
+      await recovery.ready;
       await expect(stat(abandonedPath)).rejects.toMatchObject({
         code: "ENOENT",
       });

@@ -38,6 +38,10 @@ import {
   profileStoragePaths,
 } from "../profile-storage.js";
 import type { HostProbeSnapshot } from "../readiness.js";
+import type {
+  BrowserProfileBackupResult,
+  BrowserProfileRecovery,
+} from "../profile-recovery.js";
 
 const preparedSnapshot: HostProbeSnapshot = {
   operatingSystem: {
@@ -431,7 +435,7 @@ describe("Browser public plugin contract", () => {
     await browser.dispose();
   });
 
-  it("backs up and restores a stopped profile through RPC and CLI", async () => {
+  it("R7-06 backs up and restores a stopped profile through RPC and CLI", async () => {
     const browser = await createPublicPluginHarness({
       snapshot: preparedSnapshot,
     });
@@ -472,6 +476,80 @@ describe("Browser public plugin contract", () => {
           JSON.parse(cliRestore.stdout),
         ),
       ).toMatchObject({ outcome: "restored", credentialEquivalent: true });
+      expect(cliRestore.stdout).toContain("credential-equivalent");
+      const cliRestoreText = await browser.runBrowserCli([
+        "restore",
+        "--profile",
+        profile.profileId,
+        "--archive",
+        archivePath,
+      ]);
+      expect(cliRestoreText.stdout).toContain(
+        "Progress: validating → copying → promoting → completed",
+      );
+    } finally {
+      await rm(recoveryRoot, { recursive: true, force: true });
+      await browser.dispose();
+    }
+  });
+
+  it("R7-06 shows an operation-specific recovery status while Settings waits for completion", async () => {
+    let releaseBackup!: (result: BrowserProfileBackupResult) => void;
+    const backupResult = new Promise<BrowserProfileBackupResult>((resolve) => {
+      releaseBackup = resolve;
+    });
+    let backupStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      backupStarted = resolve;
+    });
+    const profileRecovery: BrowserProfileRecovery = {
+      backupProfile: async () => {
+        backupStarted();
+        return backupResult;
+      },
+      restoreProfile: async () => {
+        throw new Error("restore is not used in this test");
+      },
+      importDevBrowserProfile: async () => {
+        throw new Error("import is not used in this test");
+      },
+    };
+    const browser = await createPublicPluginHarness({
+      profileRecovery,
+      snapshot: preparedSnapshot,
+    });
+    const recoveryRoot = await mkdtemp(
+      join(tmpdir(), "bb-browser-public-pending-recovery-"),
+    );
+    try {
+      await browser.createBrowserProfile({
+        hostId: "host-browser-test",
+        name: "Pending recovery profile",
+      });
+      const settings = browser.renderSettings();
+      const archivePath = join(recoveryRoot, "pending.bb-backup");
+      await settings.findByText("Browser Profile recovery");
+      fireEvent.change(
+        settings.getByLabelText("Browser Profile archive path"),
+        { target: { value: archivePath } },
+      );
+      fireEvent.click(
+        settings.getByRole("button", { name: "Backup Browser Profile" }),
+      );
+      await started;
+      await settings.findByText(/Browser Profile backup in progress/);
+      releaseBackup({
+        outcome: "backed-up",
+        message: "Backup completed.",
+        archivePath,
+        credentialEquivalent: true,
+        progress: {
+          phase: "completed",
+          completedBytes: 10,
+          totalBytes: 10,
+        },
+      });
+      await settings.findByText(/Progress: .*completed \(/);
     } finally {
       await rm(recoveryRoot, { recursive: true, force: true });
       await browser.dispose();
@@ -516,7 +594,7 @@ describe("Browser public plugin contract", () => {
       fireEvent.click(
         settings.getByRole("button", { name: "Backup Browser Profile" }),
       );
-      await settings.findByText(/Progress: completed \(/);
+      await settings.findByText(/Progress: .*completed \(/);
     } finally {
       await rm(recoveryRoot, { recursive: true, force: true });
       await browser.dispose();

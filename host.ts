@@ -59,6 +59,10 @@ async function requireReadyForProfileMutation(
   if (status.state !== "healthy") throw new Error(status.message);
 }
 
+function unverifiedDevBrowserProfileIsStopped() {
+  return false;
+}
+
 function scriptActivityEvent(
   request: BrowserScriptRequest,
   context: ScriptSignalContext,
@@ -148,6 +152,7 @@ export function createBrowserHostEntry(
             state: {
               isProfileStopped: async (hostId) =>
                 (await stateStore.read(hostId))?.processesStopped === true,
+              isDevBrowserProfileStopped: unverifiedDevBrowserProfileIsStopped,
             },
             ownership: createBrowserUserProfileOwnershipBoundary(),
           })
@@ -360,6 +365,7 @@ export default createBrowserHostEntry(
         isProfileStopped: async (hostId) =>
           (await createFileHostAdministrationStateStore(dataDir).read(hostId))
             ?.processesStopped === true,
+        isDevBrowserProfileStopped: unverifiedDevBrowserProfileIsStopped,
       },
       ownership: createBrowserUserProfileOwnershipBoundary(),
     }),

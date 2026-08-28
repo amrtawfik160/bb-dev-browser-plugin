@@ -707,11 +707,23 @@ function AdministrationFeedback({
 }
 
 function recoveryProgressText(response: BrowserProfileRecoveryResponse) {
-  const { phase, completedBytes, totalBytes } = response.progress;
-  return `Progress: ${phase} (${completedBytes}/${totalBytes} bytes)`;
+  const { phase, completedBytes, totalBytes, phases } = response.progress;
+  return `Progress: ${(phases ?? [phase]).join(" → ")} (${completedBytes}/${totalBytes} bytes)`;
 }
 
 const PROFILE_IMPORT_ACTION = ["imp", "ort"].join("");
+
+function recoveryPendingText(
+  action: "backup" | "restore" | typeof PROFILE_IMPORT_ACTION,
+) {
+  const operation =
+    action === "backup"
+      ? "backup"
+      : action === "restore"
+        ? "restore"
+        : PROFILE_IMPORT_ACTION;
+  return `Browser Profile ${operation} in progress…`;
+}
 
 function ProfileRecoveryControls({
   target,
@@ -737,13 +749,14 @@ function ProfileRecoveryControls({
     operation: () => Promise<BrowserProfileRecoveryResponse>,
   ) {
     setPendingAction(action);
-    setMessage(null);
+    setMessage(recoveryPendingText(action));
     setError(null);
     void operation()
       .then(showResponse)
-      .catch((requestError: unknown) =>
-        setError(administrationErrorMessage(requestError)),
-      )
+      .catch((requestError: unknown) => {
+        setMessage(null);
+        setError(administrationErrorMessage(requestError));
+      })
       .finally(() => setPendingAction(null));
   }
 

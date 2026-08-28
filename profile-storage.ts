@@ -752,7 +752,7 @@ function profileIdFromFactory(factory: ProfileIdFactory): string {
 
 export function createFileBrowserProfileStore(
   options: FileBrowserProfileStoreOptions,
-): BrowserProfileStore {
+) {
   const clock = options.clock ?? (() => new Date());
   const idFactory = options.idFactory ?? randomUUID;
   const ownership =
@@ -963,6 +963,60 @@ export function createFileBrowserProfileStore(
     });
   }
 
+  async function publishStagedProfile(
+    request: BrowserProfileCreateRequest,
+    stagedProfileDirectory: string,
+  ): Promise<BrowserProfile> {
+    return withMutationLock(options, request.hostId, ownership, async () => {
+      await ensureDefaultProfile(request.hostId);
+      const inventory = await listProfilesUnlocked(request.hostId);
+      if (profileNameConflict(inventory.profiles, request.name)) {
+        throw new BrowserProfileError(
+          "profile-name-conflict",
+          `A Browser Profile named "${request.name.trim()}" already exists on host ${request.hostId}.`,
+        );
+      }
+      const profileId = profileIdFromFactory(idFactory);
+      const paths = profilePaths(
+        options.rootDirectory,
+        options.installationId,
+        request.hostId,
+        profileId,
+      );
+      if (await pathExists(paths.profileDirectory)) {
+        throw new BrowserProfileError(
+          "profile-id-conflict",
+          `Browser Profile identifier ${profileId} already exists on host ${request.hostId}.`,
+        );
+      }
+      await verifyProfileDirectory(stagedProfileDirectory, ownership);
+      await verifyProfileDirectory(
+        join(stagedProfileDirectory, "chrome-data"),
+        ownership,
+      );
+      const manifest = profileManifest(
+        {
+          profileId,
+          name: request.name,
+          hostId: request.hostId,
+          installationId: options.installationId,
+          ...profileSettings(
+            request.locale ?? PROFILE_DEFAULT_LOCALE,
+            request.timezone ?? PROFILE_DEFAULT_TIMEZONE,
+          ),
+        },
+        clock,
+      );
+      await writeJson(
+        join(stagedProfileDirectory, "manifest.json"),
+        manifest,
+        ownership,
+      );
+      await rename(stagedProfileDirectory, paths.profileDirectory);
+      return profileFromManifest(manifest, inventory.selectedProfileId);
+    });
+  }
+
   async function renameProfile(
     request: BrowserProfileRenameRequest,
   ): Promise<BrowserProfile> {
@@ -1035,6 +1089,7 @@ export function createFileBrowserProfileStore(
     listProfiles,
     initialize,
     createProfile,
+    publishStagedProfile,
     renameProfile,
     selectProfile,
   };

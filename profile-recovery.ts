@@ -4,8 +4,10 @@ import {
   lstat,
   mkdir,
   open,
+  readFile,
   readdir,
   rename,
+  realpath,
   rm,
   statfs,
 } from "node:fs/promises";
@@ -61,6 +63,16 @@ const archiveEntrySchema = z
 
 type ArchiveHeader = z.infer<typeof archiveHeaderSchema>;
 type ArchiveEntry = z.infer<typeof archiveEntrySchema>;
+const recoveryJournalSchema = z
+  .object({
+    profileDirectory: z.string().min(1).max(4096),
+    stagingDirectory: z.string().min(1).max(4096),
+    rollbackDirectory: z.string().min(1).max(4096),
+    phase: z.enum(["prepared", "old-profile-moved", "new-profile-moved"]),
+  })
+  .strict();
+type RecoveryJournal = z.infer<typeof recoveryJournalSchema>;
+const recoveryQueues = new Map<string, Promise<void>>();
 export type BrowserProfileRecoveryTarget = {
   hostId: string;
   profileId: string;
@@ -76,7 +88,7 @@ export interface BrowserProfileRecoveryState {
     hostId: string,
     profileId: string,
   ): boolean | Promise<boolean>;
-  isDevBrowserProfileStopped?(sourcePath: string): boolean | Promise<boolean>;
+  isDevBrowserProfileStopped(sourcePath: string): boolean | Promise<boolean>;
 }
 
 export interface ProfileRecoveryDiskBoundary {
@@ -87,10 +99,14 @@ export interface ProfileRecoveryCopyBoundary {
   copyFile(sourcePath: string, targetPath: string): void | Promise<void>;
 }
 
+export type ProfileRecoveryPhase =
+  "validating" | "copying" | "promoting" | "completed";
+
 export interface ProfileRecoveryProgress {
-  phase: "validating" | "copying" | "promoting" | "completed";
+  phase: ProfileRecoveryPhase;
   completedBytes: number;
   totalBytes: number;
+  phases?: ProfileRecoveryPhase[];
 }
 
 export interface BrowserProfileBackupResult {
@@ -274,6 +290,188 @@ function safeArchiveRelativePath(path: string) {
 function pathIsWithin(path: string, parentDirectory: string) {
   const child = relative(resolve(parentDirectory), resolve(path));
   return child === "" || (!child.startsWith("..") && !child.startsWith("/"));
+}
+
+async function pathExists(path: string) {
+  try {
+    await lstat(path);
+    return true;
+  } catch (error) {
+    if (isMissingPath(error)) return false;
+    throw error;
+  }
+}
+
+async function acquireRecoveryLock(
+  lockPath: string,
+  ownership: ProfileStorageOwnershipBoundary,
+) {
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    try {
+      const lockFile = await open(lockPath, "wx", ARCHIVE_FILE_MODE);
+      try {
+        await lockFile.writeFile(`${process.pid}\n`, "utf8");
+        await lockFile.sync();
+      } finally {
+        await lockFile.close();
+      }
+      await chmod(lockPath, ARCHIVE_FILE_MODE);
+      await ownership.ensureOwned(lockPath, ARCHIVE_FILE_MODE);
+      return;
+    } catch (error) {
+      if (!(error instanceof Error) || !("code" in error)) throw error;
+      if (error.code !== "EEXIST") throw error;
+      if (await removeStaleRecoveryLock(lockPath)) continue;
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    }
+  }
+  throw new BrowserProfileRecoveryError(
+    "recovery-copy-failed",
+    "Timed out waiting for another Browser Profile recovery operation.",
+  );
+}
+
+async function removeStaleRecoveryLock(lockPath: string) {
+  let lockContents: string;
+  try {
+    lockContents = await readFile(lockPath, "utf8");
+  } catch (error) {
+    if (isMissingPath(error)) return true;
+    throw error;
+  }
+  const ownerPid = Number(lockContents.trim());
+  if (!Number.isInteger(ownerPid) || ownerPid <= 0) return false;
+  try {
+    process.kill(ownerPid, 0);
+    return false;
+  } catch (error) {
+    if (!(error instanceof Error) || !("code" in error)) throw error;
+    if (error.code !== "ESRCH") return false;
+    await rm(lockPath, { force: true });
+    return true;
+  }
+}
+
+async function withRecoveryLock<T>(
+  hostStoragePath: string,
+  ownership: ProfileStorageOwnershipBoundary,
+  operation: () => Promise<T>,
+) {
+  const key = hostStoragePath;
+  const previous = recoveryQueues.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  recoveryQueues.set(key, current);
+  await previous;
+  const lockPath = join(hostStoragePath, ".recovery.lock");
+  let lockAcquired = false;
+  try {
+    await ensureRecoveryDirectory(hostStoragePath, ownership);
+    await acquireRecoveryLock(lockPath, ownership);
+    lockAcquired = true;
+    return await operation();
+  } finally {
+    try {
+      if (lockAcquired) await rm(lockPath, { force: true });
+    } finally {
+      release();
+      if (recoveryQueues.get(key) === current) recoveryQueues.delete(key);
+    }
+  }
+}
+
+async function writeRecoveryJournal(
+  journalPath: string,
+  journal: RecoveryJournal,
+  ownership: ProfileStorageOwnershipBoundary,
+) {
+  const temporaryPath = `${journalPath}.${randomUUID()}.tmp`;
+  const journalFile = await open(temporaryPath, "wx", ARCHIVE_FILE_MODE);
+  let closed = false;
+  let promoted = false;
+  try {
+    await journalFile.writeFile(JSON.stringify(journal), "utf8");
+    await journalFile.sync();
+    await journalFile.close();
+    closed = true;
+    await chmod(temporaryPath, ARCHIVE_FILE_MODE);
+    await ownership.ensureOwned(temporaryPath, ARCHIVE_FILE_MODE);
+    await rename(temporaryPath, journalPath);
+    promoted = true;
+  } finally {
+    if (!closed) await journalFile.close().catch(() => undefined);
+    if (!promoted) await rm(temporaryPath, { force: true });
+  }
+}
+
+async function recoverPromotionJournal(
+  journalPath: string,
+  journal: RecoveryJournal,
+) {
+  const journalDirectory = dirname(journalPath);
+  if (
+    !pathIsWithin(journal.profileDirectory, journalDirectory) ||
+    !pathIsWithin(journal.stagingDirectory, journalDirectory) ||
+    !pathIsWithin(journal.rollbackDirectory, journalDirectory)
+  ) {
+    throw new BrowserProfileRecoveryError(
+      "recovery-rollback-failed",
+      "Browser Profile recovery journal contains an unsafe path.",
+    );
+  }
+  const profileExists = await pathExists(journal.profileDirectory);
+  const rollbackExists = await pathExists(journal.rollbackDirectory);
+  if (rollbackExists && profileExists) {
+    if (journal.phase === "new-profile-moved") {
+      await rm(journal.rollbackDirectory, { recursive: true, force: true });
+    } else {
+      await rm(journal.profileDirectory, { recursive: true, force: true });
+      await rename(journal.rollbackDirectory, journal.profileDirectory);
+    }
+  } else if (rollbackExists) {
+    await rename(journal.rollbackDirectory, journal.profileDirectory);
+  } else if (!profileExists) {
+    throw new BrowserProfileRecoveryError(
+      "recovery-rollback-failed",
+      "Browser Profile recovery cannot find the prior profile to restore.",
+    );
+  }
+  await rm(journal.stagingDirectory, { recursive: true, force: true });
+  await rm(journalPath, { force: true });
+}
+
+async function readRecoveryJournal(
+  journalPath: string,
+  ownership: ProfileStorageOwnershipBoundary,
+) {
+  await verifyRecoveryOwnership(
+    ownership,
+    journalPath,
+    ARCHIVE_FILE_MODE,
+    "recovery-archive-invalid",
+    "Browser Profile recovery journal is not available.",
+    "Browser Profile recovery journal ownership or permissions are invalid.",
+  );
+  let serializedJournal: string;
+  try {
+    serializedJournal = await readFile(journalPath, "utf8");
+  } catch (error) {
+    throw recoveryError(
+      "recovery-archive-invalid",
+      "Browser Profile recovery journal is not available.",
+      error,
+    );
+  }
+  try {
+    return recoveryJournalSchema.parse(JSON.parse(serializedJournal));
+  } catch {
+    throw new BrowserProfileRecoveryError(
+      "recovery-archive-invalid",
+      "Browser Profile recovery journal is invalid.",
+    );
+  }
 }
 
 function archiveEntryMode(kind: ArchiveEntry["kind"]) {
@@ -608,6 +806,22 @@ class RecoveryArchiveReader {
     return digest.digest("hex");
   }
 
+  async skipPayload(size: number) {
+    let remainingBytes = size;
+    while (remainingBytes > 0) {
+      const chunk = this.bufferedBytes.subarray(
+        0,
+        Math.min(remainingBytes, this.bufferedBytes.length),
+      );
+      if (chunk.length > 0) {
+        this.bufferedBytes = this.bufferedBytes.subarray(chunk.length);
+        remainingBytes -= chunk.length;
+        continue;
+      }
+      await this.readChunk();
+    }
+  }
+
   get hasRemainingBytes() {
     return this.bufferedBytes.length > 0 || this.offset < this.archiveSize;
   }
@@ -762,6 +976,59 @@ async function cleanRecoveryStaging(hostStoragePath: string) {
   }
 }
 
+async function recoverRecoveryState(
+  hostStoragePath: string,
+  ownership: ProfileStorageOwnershipBoundary,
+) {
+  let storageEntries;
+  try {
+    storageEntries = await readdir(hostStoragePath, { withFileTypes: true });
+  } catch (error) {
+    if (isMissingPath(error)) return;
+    throw error;
+  }
+  for (const storageEntry of storageEntries) {
+    if (
+      !storageEntry.isFile() ||
+      !storageEntry.name.startsWith(".recovery-") ||
+      !storageEntry.name.endsWith(".journal")
+    ) {
+      continue;
+    }
+    const journalPath = join(hostStoragePath, storageEntry.name);
+    const journal = await readRecoveryJournal(journalPath, ownership);
+    await recoverPromotionJournal(journalPath, journal);
+  }
+  await cleanRecoveryStaging(hostStoragePath);
+}
+
+async function recoverAllHostStorage(
+  rootDirectory: string,
+  installationId: string,
+  ownership: ProfileStorageOwnershipBoundary,
+) {
+  const hostsDirectory = join(
+    rootDirectory,
+    "installations",
+    installationId,
+    "hosts",
+  );
+  let hostEntries;
+  try {
+    hostEntries = await readdir(hostsDirectory, { withFileTypes: true });
+  } catch (error) {
+    if (isMissingPath(error)) return;
+    throw error;
+  }
+  for (const hostEntry of hostEntries) {
+    if (!hostEntry.isDirectory() || hostEntry.isSymbolicLink()) continue;
+    const hostStoragePath = join(hostsDirectory, hostEntry.name);
+    await withRecoveryLock(hostStoragePath, ownership, async () => {
+      await recoverRecoveryState(hostStoragePath, ownership);
+    });
+  }
+}
+
 async function requireRecoveryCapacity(
   disk: ProfileRecoveryDiskBoundary,
   capacityPath: string,
@@ -812,6 +1079,36 @@ function parseArchiveHeader(serializedHeader: string | null): ArchiveHeader {
     );
   }
   return parsedHeader.data;
+}
+
+async function inspectArchiveEntries(
+  reader: RecoveryArchiveReader,
+  header: ArchiveHeader,
+) {
+  const archiveEntries: ArchiveEntry[] = [];
+  const archivePaths = new Set<string>();
+  let totalBytes = 0;
+  while (archiveEntries.length < header.entryCount) {
+    const archiveEntry = parseArchiveJson(
+      await reader.readLine(),
+      archiveEntrySchema,
+      "The Browser Profile backup contains invalid entry metadata.",
+    );
+    validateArchiveEntry(archiveEntry);
+    if (archivePaths.has(archiveEntry.path)) {
+      throw new BrowserProfileRecoveryError(
+        "recovery-archive-invalid",
+        "The Browser Profile backup contains a duplicate entry.",
+      );
+    }
+    archivePaths.add(archiveEntry.path);
+    if (archiveEntry.kind === "file") {
+      await reader.skipPayload(archiveEntry.size);
+      totalBytes += archiveEntry.size;
+    }
+    archiveEntries.push(archiveEntry);
+  }
+  return { archiveEntries, totalBytes };
 }
 
 async function extractArchive(
@@ -868,25 +1165,53 @@ async function extractArchive(
         "The Browser Profile backup belongs to another Browser installation, host, or profile.",
       );
     }
-    await requireRecoveryCapacity(disk, capacityPath, header.totalBytes);
+    const archiveContents = await inspectArchiveEntries(reader, header);
+    await requireRecoveryCapacity(
+      disk,
+      capacityPath,
+      archiveContents.totalBytes,
+    );
+    if (
+      reader.hasRemainingBytes ||
+      archiveContents.totalBytes !== header.totalBytes
+    ) {
+      throw new BrowserProfileRecoveryError(
+        "recovery-archive-invalid",
+        "The Browser Profile backup contains unexpected data.",
+      );
+    }
     await ensureRecoveryDirectory(stagingDirectory, ownership);
-    let extractedEntryCount = 0;
-    let extractedBytes = 0;
-    const extractedPaths = new Set<string>();
-    while (extractedEntryCount < header.entryCount) {
+    const extractionReader = new RecoveryArchiveReader(
+      archiveFile,
+      archiveStats.size,
+    );
+    if ((await extractionReader.readLine()) !== PROFILE_ARCHIVE_MAGIC) {
+      throw new BrowserProfileRecoveryError(
+        "recovery-archive-invalid",
+        "The Browser Profile backup format is not recognized.",
+      );
+    }
+    if (
+      JSON.stringify(parseArchiveHeader(await extractionReader.readLine())) !==
+      JSON.stringify(header)
+    ) {
+      throw new BrowserProfileRecoveryError(
+        "recovery-archive-invalid",
+        "The Browser Profile backup metadata changed during validation.",
+      );
+    }
+    for (const expectedEntry of archiveContents.archiveEntries) {
       const archiveEntry = parseArchiveJson(
-        await reader.readLine(),
+        await extractionReader.readLine(),
         archiveEntrySchema,
         "The Browser Profile backup contains invalid entry metadata.",
       );
-      validateArchiveEntry(archiveEntry);
-      if (extractedPaths.has(archiveEntry.path)) {
+      if (JSON.stringify(archiveEntry) !== JSON.stringify(expectedEntry)) {
         throw new BrowserProfileRecoveryError(
           "recovery-archive-invalid",
-          "The Browser Profile backup contains a duplicate entry.",
+          "The Browser Profile backup metadata changed during validation.",
         );
       }
-      extractedPaths.add(archiveEntry.path);
       const entryPath = join(stagingDirectory, archiveEntry.path);
       if (archiveEntry.kind === "directory") {
         await ensureRecoveryDirectory(entryPath, ownership);
@@ -894,7 +1219,7 @@ async function extractArchive(
         await ensureRecoveryDirectory(dirname(entryPath), ownership);
         const targetFile = await open(entryPath, "wx", ARCHIVE_FILE_MODE);
         try {
-          const sha256 = await reader.readPayload(
+          const sha256 = await extractionReader.readPayload(
             archiveEntry.size,
             targetFile,
           );
@@ -909,11 +1234,9 @@ async function extractArchive(
         }
         await chmod(entryPath, ARCHIVE_FILE_MODE);
         await ownership.ensureOwned(entryPath, ARCHIVE_FILE_MODE);
-        extractedBytes += archiveEntry.size;
       }
-      extractedEntryCount += 1;
     }
-    if (reader.hasRemainingBytes || extractedBytes !== header.totalBytes) {
+    if (extractionReader.hasRemainingBytes) {
       throw new BrowserProfileRecoveryError(
         "recovery-archive-invalid",
         "The Browser Profile backup contains unexpected data.",
@@ -926,6 +1249,18 @@ async function extractArchive(
       header,
       ownership,
     );
+    const archiveEncryptionState = requireKnownEncryptionState(
+      header.encryptionState,
+    );
+    const stagedEncryptionState = requireKnownEncryptionState(
+      await readEncryptionState(join(stagingDirectory, "chrome-data")),
+    );
+    if (stagedEncryptionState !== archiveEncryptionState) {
+      throw new BrowserProfileRecoveryError(
+        "recovery-incompatible-encryption",
+        "The Browser Profile backup content uses incompatible encryption state.",
+      );
+    }
     return header;
   } finally {
     await archiveFile.close();
@@ -1031,24 +1366,31 @@ async function promoteRestoredProfile(
   stagingDirectory: string,
   ownership: ProfileStorageOwnershipBoundary,
 ) {
+  const journalPath = `${stagingDirectory}.journal`;
   const rollbackDirectory = `${profileDirectory}.${randomUUID()}.rollback`;
-  let oldProfileMoved = false;
-  let newProfileMoved = false;
-  let preserveRollback = false;
+  let phase: RecoveryJournal["phase"] = "prepared";
+  const journal = () => ({
+    profileDirectory,
+    stagingDirectory,
+    rollbackDirectory,
+    phase,
+  });
+  await writeRecoveryJournal(journalPath, journal(), ownership);
   try {
     await rename(profileDirectory, rollbackDirectory);
-    oldProfileMoved = true;
+    phase = "old-profile-moved";
+    await writeRecoveryJournal(journalPath, journal(), ownership);
     await rename(stagingDirectory, profileDirectory);
-    newProfileMoved = true;
     await ownership.ensureOwned(profileDirectory, PROFILE_DIRECTORY_MODE);
+    phase = "new-profile-moved";
+    await writeRecoveryJournal(journalPath, journal(), ownership);
+    await rm(rollbackDirectory, { recursive: true, force: true });
+    await rm(journalPath, { force: true });
     return;
   } catch (error) {
     try {
-      if (newProfileMoved)
-        await rm(profileDirectory, { recursive: true, force: true });
-      if (oldProfileMoved) await rename(rollbackDirectory, profileDirectory);
+      await recoverPromotionJournal(journalPath, journal());
     } catch (rollbackError) {
-      preserveRollback = true;
       throw recoveryError(
         "recovery-rollback-failed",
         "Browser Profile restore failed and rollback could not be completed.",
@@ -1060,10 +1402,6 @@ async function promoteRestoredProfile(
       "Browser Profile restore failed; the prior profile remains usable.",
       error,
     );
-  } finally {
-    if (!preserveRollback) {
-      await rm(rollbackDirectory, { recursive: true, force: true });
-    }
   }
 }
 
@@ -1074,8 +1412,20 @@ function recoveryMessage(
   return outcome === "backed-up"
     ? `Browser Profile backup created at ${archivePath}. Treat this archive as credential-equivalent.`
     : outcome === "restored"
-      ? `Browser Profile restored from ${archivePath}.`
+      ? `Browser Profile restored from ${archivePath}. Treat this archive as credential-equivalent.`
       : "The dev-browser profile was imported into a new Browser Profile.";
+}
+
+function completedRecoveryProgress(
+  phases: readonly ProfileRecoveryPhase[],
+  totalBytes: number,
+): ProfileRecoveryProgress {
+  return {
+    phase: "completed",
+    completedBytes: totalBytes,
+    totalBytes,
+    phases: [...phases],
+  };
 }
 
 export function createFileBrowserProfileRecovery(
@@ -1096,6 +1446,16 @@ export function createFileBrowserProfileRecovery(
     idFactory: options.idFactory,
     clock: options.clock,
   });
+  const startupReady = recoverAllHostStorage(
+    options.rootDirectory,
+    options.installationId,
+    ownership,
+  );
+  void startupReady.catch(() => undefined);
+
+  async function requireStartupCleanup() {
+    await startupReady;
+  }
 
   async function requireStopped(target: BrowserProfileRecoveryTarget) {
     if (await options.state.isProfileStopped(target.hostId, target.profileId))
@@ -1107,8 +1467,13 @@ export function createFileBrowserProfileRecovery(
   }
 
   async function requireSourceStopped(sourcePath: string) {
-    if (options.state.isDevBrowserProfileStopped === undefined) return;
-    if (await options.state.isDevBrowserProfileStopped(sourcePath)) return;
+    const stopAuthority = options.state.isDevBrowserProfileStopped;
+    if (
+      typeof stopAuthority === "function" &&
+      (await stopAuthority(sourcePath))
+    ) {
+      return;
+    }
     throw new BrowserProfileRecoveryError(
       "profile-running",
       "Stop the dev-browser profile before importing it.",
@@ -1140,6 +1505,31 @@ export function createFileBrowserProfileRecovery(
     }
   }
 
+  async function requireImportSourceOutsideStorage(
+    sourcePath: string,
+    hostStoragePath: string,
+  ) {
+    const canonicalSourcePath = await realpath(sourcePath);
+    const canonicalRootDirectory = await realpath(options.rootDirectory);
+    const protectedRelativePath = relative(
+      resolve(options.rootDirectory),
+      resolve(hostStoragePath),
+    );
+    const canonicalHostStoragePath = join(
+      canonicalRootDirectory,
+      protectedRelativePath,
+    );
+    if (
+      pathIsWithin(canonicalSourcePath, canonicalHostStoragePath) ||
+      pathIsWithin(canonicalHostStoragePath, canonicalSourcePath)
+    ) {
+      throw new BrowserProfileRecoveryError(
+        "recovery-archive-invalid",
+        "The dev-browser profile source overlaps protected Browser Profile storage.",
+      );
+    }
+  }
+
   async function backupProfile(
     input: BrowserProfileRecoveryTarget & { archivePath: string },
   ) {
@@ -1151,58 +1541,65 @@ export function createFileBrowserProfileRecovery(
           options.installationId,
           input,
         );
-        if (pathIsWithin(input.archivePath, paths.profileDirectory)) {
-          throw new BrowserProfileRecoveryError(
-            "recovery-archive-invalid",
-            "The Browser Profile backup destination cannot be inside the source profile.",
+        await requireStartupCleanup();
+        return withRecoveryLock(paths.hostStoragePath, ownership, async () => {
+          await recoverRecoveryState(paths.hostStoragePath, ownership);
+          if (pathIsWithin(input.archivePath, paths.profileDirectory)) {
+            throw new BrowserProfileRecoveryError(
+              "recovery-archive-invalid",
+              "The Browser Profile backup destination cannot be inside the source profile.",
+            );
+          }
+          await requireStopped(input);
+          const manifest = await readProfileManifest(
+            paths,
+            input,
+            options.installationId,
+            ownership,
           );
-        }
-        await cleanRecoveryStaging(paths.hostStoragePath);
-        await requireStopped(input);
-        const manifest = await readProfileManifest(
-          paths,
-          input,
-          options.installationId,
-          ownership,
-        );
-        const archiveFiles = await listArchiveFiles(
-          paths.profileDirectory,
-          paths.profileDirectory,
-          ownership,
-        );
-        const header: ArchiveHeader = {
-          format: PROFILE_ARCHIVE_MAGIC,
-          version: PROFILE_ARCHIVE_VERSION,
-          installationId: options.installationId,
-          hostId: input.hostId,
-          profileId: input.profileId,
-          manifest,
-          encryptionState: requireKnownEncryptionState(
-            await readEncryptionState(paths.browserDataPath),
-          ),
-          entryCount: archiveFiles.length,
-          totalBytes: archiveFiles.reduce(
-            (totalBytes, archiveEntry) => totalBytes + archiveEntry.size,
-            0,
-          ),
-        };
-        await requireRecoveryCapacity(
-          disk,
-          paths.hostStoragePath,
-          header.totalBytes,
-        );
-        await writeArchive(input.archivePath, header, archiveFiles, ownership);
-        return {
-          outcome: "backed-up" as const,
-          message: recoveryMessage("backed-up", input.archivePath),
-          archivePath: input.archivePath,
-          credentialEquivalent: true as const,
-          progress: {
-            phase: "completed" as const,
-            completedBytes: header.totalBytes,
-            totalBytes: header.totalBytes,
-          },
-        };
+          const archiveFiles = await listArchiveFiles(
+            paths.profileDirectory,
+            paths.profileDirectory,
+            ownership,
+          );
+          const header: ArchiveHeader = {
+            format: PROFILE_ARCHIVE_MAGIC,
+            version: PROFILE_ARCHIVE_VERSION,
+            installationId: options.installationId,
+            hostId: input.hostId,
+            profileId: input.profileId,
+            manifest,
+            encryptionState: requireKnownEncryptionState(
+              await readEncryptionState(paths.browserDataPath),
+            ),
+            entryCount: archiveFiles.length,
+            totalBytes: archiveFiles.reduce(
+              (totalBytes, archiveEntry) => totalBytes + archiveEntry.size,
+              0,
+            ),
+          };
+          await requireRecoveryCapacity(
+            disk,
+            dirname(input.archivePath),
+            header.totalBytes,
+          );
+          await writeArchive(
+            input.archivePath,
+            header,
+            archiveFiles,
+            ownership,
+          );
+          return {
+            outcome: "backed-up" as const,
+            message: recoveryMessage("backed-up", input.archivePath),
+            archivePath: input.archivePath,
+            credentialEquivalent: true as const,
+            progress: completedRecoveryProgress(
+              ["validating", "copying", "completed"],
+              header.totalBytes,
+            ),
+          };
+        });
       },
     );
   }
@@ -1218,66 +1615,68 @@ export function createFileBrowserProfileRecovery(
           options.installationId,
           input,
         );
-        await cleanRecoveryStaging(paths.hostStoragePath);
-        await requireStopped(input);
-        const manifest = await readProfileManifest(
-          paths,
-          input,
-          options.installationId,
-          ownership,
-        );
-        const currentEncryptionState = await readEncryptionState(
-          paths.browserDataPath,
-        );
-        requireKnownEncryptionState(currentEncryptionState);
-        const stagingDirectory = join(
-          paths.hostStoragePath,
-          `.recovery-${input.profileId}-${randomUUID()}.tmp`,
-        );
-        try {
-          const header = await extractArchive(
-            input.archivePath,
-            stagingDirectory,
+        await requireStartupCleanup();
+        return withRecoveryLock(paths.hostStoragePath, ownership, async () => {
+          await recoverRecoveryState(paths.hostStoragePath, ownership);
+          await requireStopped(input);
+          const manifest = await readProfileManifest(
+            paths,
             input,
             options.installationId,
             ownership,
-            disk,
+          );
+          const currentEncryptionState = await readEncryptionState(
+            paths.browserDataPath,
+          );
+          requireKnownEncryptionState(currentEncryptionState);
+          const stagingDirectory = join(
             paths.hostStoragePath,
+            `.recovery-${input.profileId}-${randomUUID()}.tmp`,
           );
-          if (
-            requireKnownEncryptionState(header.encryptionState) !==
-            currentEncryptionState
-          ) {
-            throw new BrowserProfileRecoveryError(
-              "recovery-incompatible-encryption",
-              "The Browser Profile backup uses incompatible encryption state.",
+          try {
+            const header = await extractArchive(
+              input.archivePath,
+              stagingDirectory,
+              input,
+              options.installationId,
+              ownership,
+              disk,
+              paths.hostStoragePath,
             );
-          }
-          if (manifest.version !== PROFILE_MANIFEST_VERSION) {
-            throw new BrowserProfileRecoveryError(
-              "recovery-incompatible-version",
-              "The Browser Profile uses an unsupported profile version.",
+            if (
+              requireKnownEncryptionState(header.encryptionState) !==
+              currentEncryptionState
+            ) {
+              throw new BrowserProfileRecoveryError(
+                "recovery-incompatible-encryption",
+                "The Browser Profile backup uses incompatible encryption state.",
+              );
+            }
+            if (manifest.version !== PROFILE_MANIFEST_VERSION) {
+              throw new BrowserProfileRecoveryError(
+                "recovery-incompatible-version",
+                "The Browser Profile uses an unsupported profile version.",
+              );
+            }
+            await promoteRestoredProfile(
+              paths.profileDirectory,
+              stagingDirectory,
+              ownership,
             );
+            return {
+              outcome: "restored" as const,
+              message: recoveryMessage("restored", input.archivePath),
+              archivePath: input.archivePath,
+              credentialEquivalent: true as const,
+              progress: completedRecoveryProgress(
+                ["validating", "copying", "promoting", "completed"],
+                header.totalBytes,
+              ),
+            };
+          } finally {
+            await rm(stagingDirectory, { recursive: true, force: true });
           }
-          await promoteRestoredProfile(
-            paths.profileDirectory,
-            stagingDirectory,
-            ownership,
-          );
-          return {
-            outcome: "restored" as const,
-            message: recoveryMessage("restored", input.archivePath),
-            archivePath: input.archivePath,
-            credentialEquivalent: true as const,
-            progress: {
-              phase: "completed" as const,
-              completedBytes: header.totalBytes,
-              totalBytes: header.totalBytes,
-            },
-          };
-        } finally {
-          await rm(stagingDirectory, { recursive: true, force: true });
-        }
+        });
       },
     );
   }
@@ -1286,8 +1685,6 @@ export function createFileBrowserProfileRecovery(
     return withRecoveryFailure(
       "dev-browser profile import could not be completed.",
       async () => {
-        await requireSourceStopped(input.sourcePath);
-        await requirePlainSource(input.sourcePath);
         const hostPaths = profileArchivePath(
           options.rootDirectory,
           options.installationId,
@@ -1296,64 +1693,75 @@ export function createFileBrowserProfileRecovery(
             profileId: DEFAULT_PROFILE_ID,
           },
         );
-        await cleanRecoveryStaging(hostPaths.hostStoragePath);
-        const sourceBytes = await directoryByteSize(input.sourcePath);
-        await requireRecoveryCapacity(disk, options.rootDirectory, sourceBytes);
-        const importedProfile = await profileStore.createProfile({
-          hostId: input.hostId,
-          name: input.name,
-        });
-        const importedPaths = profileArchivePath(
-          options.rootDirectory,
-          options.installationId,
-          {
-            hostId: input.hostId,
-            profileId: importedProfile.profileId,
+        await requireSourceStopped(input.sourcePath);
+        await requirePlainSource(input.sourcePath);
+        await requireImportSourceOutsideStorage(
+          input.sourcePath,
+          hostPaths.hostStoragePath,
+        );
+        await requireStartupCleanup();
+        return withRecoveryLock(
+          hostPaths.hostStoragePath,
+          ownership,
+          async () => {
+            await recoverRecoveryState(hostPaths.hostStoragePath, ownership);
+            const sourceBytes = await directoryByteSize(input.sourcePath);
+            await requireRecoveryCapacity(
+              disk,
+              hostPaths.hostStoragePath,
+              sourceBytes,
+            );
+            const stagingDirectory = join(
+              hostPaths.hostStoragePath,
+              `.recovery-import-${randomUUID()}.tmp`,
+            );
+            try {
+              await ensureRecoveryDirectory(stagingDirectory, ownership);
+              const importedBrowserDataPath = join(
+                stagingDirectory,
+                "chrome-data",
+              );
+              const copiedBytes = await copyDirectoryTree(
+                input.sourcePath,
+                importedBrowserDataPath,
+                ownership,
+                copy,
+              );
+              const importedProfile = await profileStore.publishStagedProfile(
+                {
+                  hostId: input.hostId,
+                  name: input.name,
+                },
+                stagingDirectory,
+              );
+              return {
+                outcome: "imported" as const,
+                message: recoveryMessage("imported", input.sourcePath),
+                profileId: importedProfile.profileId,
+                progress: completedRecoveryProgress(
+                  ["validating", "copying", "promoting", "completed"],
+                  copiedBytes,
+                ),
+              };
+            } catch (error) {
+              throw recoveryError(
+                "recovery-copy-failed",
+                "dev-browser profile import failed; no partial Browser Profile was kept.",
+                error,
+              );
+            } finally {
+              await rm(stagingDirectory, { recursive: true, force: true });
+            }
           },
         );
-        const stagingDirectory = join(
-          importedPaths.hostStoragePath,
-          `.recovery-${importedProfile.profileId}-${randomUUID()}.tmp`,
-        );
-        try {
-          const importedBrowserDataPath = join(stagingDirectory, "chrome-data");
-          const copiedBytes = await copyDirectoryTree(
-            input.sourcePath,
-            importedBrowserDataPath,
-            ownership,
-            copy,
-          );
-          await promoteRestoredProfile(
-            importedPaths.browserDataPath,
-            importedBrowserDataPath,
-            ownership,
-          );
-          return {
-            outcome: "imported" as const,
-            message: recoveryMessage("imported", input.sourcePath),
-            profileId: importedProfile.profileId,
-            progress: {
-              phase: "completed" as const,
-              completedBytes: copiedBytes,
-              totalBytes: copiedBytes,
-            },
-          };
-        } catch (error) {
-          await rm(importedPaths.profileDirectory, {
-            recursive: true,
-            force: true,
-          });
-          throw recoveryError(
-            "recovery-copy-failed",
-            "dev-browser profile import failed; no partial Browser Profile was kept.",
-            error,
-          );
-        } finally {
-          await rm(stagingDirectory, { recursive: true, force: true });
-        }
       },
     );
   }
 
-  return { backupProfile, restoreProfile, importDevBrowserProfile };
+  return {
+    backupProfile,
+    restoreProfile,
+    importDevBrowserProfile,
+    ready: startupReady,
+  };
 }
