@@ -1,6 +1,8 @@
 import { experimental_defineHostEntry } from "@get-bb/plugin-sdk/host";
 import { randomUUID } from "node:crypto";
-import { join } from "node:path";
+import { createRequire } from "node:module";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import {
   createActivityOutbox,
   type ActivityOutbox,
@@ -37,6 +39,12 @@ import {
   type BrowserScriptRequest,
   type BrowserScriptResponse,
 } from "./contracts.js";
+import {
+  createBrowserInstanceRuntime,
+  type BrowserInstanceRuntime,
+} from "./browser-runtime.js";
+import { createProductionBrowserProcessBoundary } from "./browser-process.js";
+import { PINNED_BROWSER_RUNTIME } from "./dependency-inventory.js";
 
 export type HostSetupBoundary = HostReadinessBoundary;
 type HostBoundary = HostReadinessBoundary | HostAdministrationBoundary;
@@ -49,6 +57,8 @@ type ProfileStoreSource =
     ) => BrowserProfileStore);
 type ProfileRecoverySource =
   BrowserProfileRecovery | ((dataDir: string) => BrowserProfileRecovery);
+type BrowserRuntimeSource =
+  BrowserInstanceRuntime | ((dataDir: string) => BrowserInstanceRuntime);
 
 type ScriptSignalContext = { signal: AbortSignal };
 type ScriptActivityOutcome = "succeeded" | "failed";
@@ -135,12 +145,14 @@ export function createBrowserHostEntry(
   source: HostBoundarySource,
   profileSource?: ProfileStoreSource,
   recoverySource?: ProfileRecoverySource,
+  runtimeSource?: BrowserRuntimeSource,
 ) {
   let workerLease: { dispose(): Promise<void> } | undefined;
   let retainedBoundary: HostAdministrationBoundary | undefined;
   let retainedProfiles: BrowserProfileStore | undefined;
   let retainedRecovery: BrowserProfileRecovery | undefined;
   let retainedOutbox: ActivityOutbox | undefined;
+  let retainedRuntime: BrowserInstanceRuntime | undefined;
   function administration(dataDir: string) {
     if (retainedBoundary !== undefined) return retainedBoundary;
     const boundary = typeof source === "function" ? source(dataDir) : source;
@@ -156,9 +168,22 @@ export function createBrowserHostEntry(
   function profileLifecycle(dataDir: string): BrowserProfileLifecycleBoundary {
     return {
       async stopProfile(hostId, profileId) {
-        await administration(dataDir).stopProfile({ hostId, profileId });
+        try {
+          await runtime(dataDir)?.stop({ hostId, profileId });
+        } finally {
+          await administration(dataDir).stopProfile({ hostId, profileId });
+        }
       },
     };
+  }
+  function runtime(dataDir: string) {
+    if (retainedRuntime !== undefined) return retainedRuntime;
+    if (runtimeSource === undefined) return undefined;
+    retainedRuntime =
+      typeof runtimeSource === "function"
+        ? runtimeSource(dataDir)
+        : runtimeSource;
+    return retainedRuntime;
   }
   function profiles(dataDir: string) {
     if (retainedProfiles !== undefined) return retainedProfiles;
@@ -282,16 +307,32 @@ export function createBrowserHostEntry(
           const inventory = await profiles(dataDir).listProfiles(
             request.hostId,
           );
-          if (
-            !inventory.profiles.some(
-              (profile) =>
-                profile.profileId === request.profileId &&
-                profile.state === "active",
-            )
-          ) {
+          const profile = inventory.profiles.find(
+            (candidate) =>
+              candidate.profileId === request.profileId &&
+              candidate.state === "active",
+          );
+          if (profile === undefined) {
             response = {
               ok: false as const,
               error: browserProfileUnavailableStatus(target),
+            };
+            return response;
+          }
+          const browserRuntime = runtime(dataDir);
+          if (browserRuntime !== undefined) {
+            response = {
+              ok: true as const,
+              result: await browserRuntime.execute(
+                {
+                  hostId: request.hostId,
+                  profileId: request.profileId,
+                  locale: profile.locale,
+                  timezone: profile.timezone,
+                },
+                request.code,
+                request.timeoutMs,
+              ),
             };
             return response;
           }
@@ -427,9 +468,34 @@ export function createBrowserHostEntry(
         return recovery(dataDir).importDevBrowserProfile(request);
       },
     },
-    dispose: async () => workerLease?.dispose(),
+    dispose: async () => {
+      try {
+        await retainedRuntime?.dispose();
+      } finally {
+        await workerLease?.dispose();
+      }
+    },
   });
 }
+
+const require = createRequire(import.meta.url);
+const devBrowserPackageDirectory = dirname(
+  require.resolve("dev-browser/package.json"),
+);
+const devBrowserExecutable = join(
+  devBrowserPackageDirectory,
+  "bin",
+  "dev-browser.js",
+);
+const playwrightBrowserRoot =
+  process.env.PLAYWRIGHT_BROWSERS_PATH ??
+  join(homedir(), ".cache", "ms-playwright");
+const playwrightChromiumPath = join(
+  playwrightBrowserRoot,
+  `chromium-${PINNED_BROWSER_RUNTIME.chromiumRevision}`,
+  "chrome-linux64",
+  "chrome",
+);
 
 export default createBrowserHostEntry(
   (dataDir) =>
@@ -465,5 +531,19 @@ export default createBrowserHostEntry(
         isDevBrowserProfileStopped: unverifiedDevBrowserProfileIsStopped,
       },
       ownership: createBrowserUserProfileOwnershipBoundary(),
+    }),
+  (dataDir) =>
+    createBrowserInstanceRuntime({
+      rootDirectory: BROWSER_STORAGE_ROOT,
+      installationId: hostInstallationId(dataDir),
+      chromeStablePaths: [
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/google-chrome",
+      ],
+      playwrightChromiumPath,
+      launchBoundary: createProductionBrowserProcessBoundary({
+        devBrowserExecutable,
+        devBrowserPackageDirectory,
+      }),
     }),
 );
