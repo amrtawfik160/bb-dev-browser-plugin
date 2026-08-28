@@ -20,6 +20,7 @@ import {
   type BrowserDiagnostics,
   type BrowserActivityExport,
   type BrowserActivityRecord,
+  type BrowserGrantRequest,
   type BrowserProfile,
   type BrowserProfileGrant,
   type BrowserProfileInventory,
@@ -159,6 +160,37 @@ function PanelProfilePicker({
   );
 }
 
+function PanelGrantRequestNotices({
+  requests,
+}: {
+  requests: readonly BrowserGrantRequest[];
+}) {
+  if (requests.length === 0) return null;
+  return (
+    <section
+      aria-label="Browser Grant Request notices"
+      className="mt-6 border-t pt-5 text-left"
+    >
+      <h3 className="font-semibold">Browser Grant Requests</h3>
+      <ul className="mt-3 space-y-3">
+        {requests.map((request) => (
+          <li key={request.requestId} className="text-sm">
+            <p>
+              Browser Grant Request <code>{request.requestId}</code>{" "}
+              <strong>{request.status}</strong>
+            </p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              The denied script will not resume automatically. After an owner
+              decision, the agent must explicitly retry against current page
+              state.
+            </p>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
 function BrowserPanel({ request }: { request: BrowserStatusInput }) {
   const rpc = useRpc<typeof rpcContract>();
   const [status, setStatus] = useState<BrowserStatus | null>(null);
@@ -167,6 +199,7 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
   const [profiles, setProfiles] = useState<BrowserProfileInventory | null>(
     null,
   );
+  const [grantRequests, setGrantRequests] = useState<BrowserGrantRequest[]>([]);
   const [profileError, setProfileError] = useState<string | null>(null);
 
   const statusRequest: BrowserStatusInput =
@@ -183,6 +216,24 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
       ? { threadId: request.threadId }
       : { projectId: request.projectId };
   }
+
+  useEffect(() => {
+    const currentStatus = status;
+    const hostId = currentStatus?.hostId;
+    if (currentStatus === null || hostId === undefined || hostId === null) {
+      setGrantRequests([]);
+      return;
+    }
+    void rpc
+      .call("browser_grant_requests", {
+        hostId,
+        profileId: currentStatus.profileId,
+      })
+      .then(setGrantRequests)
+      .catch((error: unknown) =>
+        setProfileError(administrationErrorMessage(error)),
+      );
+  }, [rpc, status?.hostId, status?.profileId]);
 
   useEffect(() => {
     setStatus(null);
@@ -260,6 +311,7 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
       {profiles === null || status.hostId === null ? null : (
         <PanelProfilePicker inventory={profiles} onChange={selectProfile} />
       )}
+      <PanelGrantRequestNotices requests={grantRequests} />
       {profileError === null ? null : <p role="alert">{profileError}</p>}
     </ReadinessView>
   );
@@ -1600,6 +1652,324 @@ function GrantControls({
   );
 }
 
+type GrantRequestDecision = "deny" | "retry" | "one-hour" | "persist";
+
+const GRANT_REQUEST_DECISIONS: readonly GrantRequestDecision[] = [
+  "deny",
+  "retry",
+  "one-hour",
+];
+
+function grantRequestDecisionLabel(
+  requestId: string,
+  decision: GrantRequestDecision,
+) {
+  if (decision === "deny") {
+    return "Deny Browser Grant Request " + requestId;
+  }
+  const duration = decision === "retry" ? "one retry" : "one hour";
+  return "Approve Browser Grant Request " + requestId + " for " + duration;
+}
+
+function GrantRequestDecisionButton({
+  requestId,
+  decision,
+  pendingAction,
+  onDecision,
+}: {
+  requestId: string;
+  decision: GrantRequestDecision;
+  pendingAction: string | null;
+  onDecision: (requestId: string, decision: GrantRequestDecision) => void;
+}) {
+  return (
+    <button
+      type="button"
+      className="rounded border px-2 py-1"
+      disabled={pendingAction !== null}
+      onClick={() => onDecision(requestId, decision)}
+    >
+      {grantRequestDecisionLabel(requestId, decision)}
+    </button>
+  );
+}
+
+function GrantRequestDecisionControls({
+  requestId,
+  pendingAction,
+  onDecision,
+}: {
+  requestId: string;
+  pendingAction: string | null;
+  onDecision: (requestId: string, decision: GrantRequestDecision) => void;
+}) {
+  return (
+    <div className="flex flex-wrap gap-2">
+      {GRANT_REQUEST_DECISIONS.map((decision) => (
+        <GrantRequestDecisionButton
+          key={decision}
+          requestId={requestId}
+          decision={decision}
+          pendingAction={pendingAction}
+          onDecision={onDecision}
+        />
+      ))}
+    </div>
+  );
+}
+
+function GrantRequestPersistenceControl({
+  requestId,
+  confirmationText,
+  pendingAction,
+  onConfirmationChange,
+  onDecision,
+}: {
+  requestId: string;
+  confirmationText: string;
+  pendingAction: string | null;
+  onConfirmationChange: (requestId: string, confirmationText: string) => void;
+  onDecision: (requestId: string, decision: GrantRequestDecision) => void;
+}) {
+  return (
+    <div className="space-y-2">
+      <label
+        className="block text-xs"
+        htmlFor={"grant-request-confirm-" + requestId}
+      >
+        Persistent Browser Grant confirmation {requestId}
+      </label>
+      <input
+        id={"grant-request-confirm-" + requestId}
+        aria-label={"Persistent Browser Grant confirmation " + requestId}
+        className="w-full rounded border px-2 py-1 text-sm"
+        value={confirmationText}
+        onChange={(event) =>
+          onConfirmationChange(requestId, event.target.value)
+        }
+      />
+      <button
+        type="button"
+        className="rounded border px-2 py-1"
+        disabled={pendingAction !== null}
+        onClick={() => onDecision(requestId, "persist")}
+      >
+        Persist Browser Grant Request {requestId}
+      </button>
+    </div>
+  );
+}
+
+function GrantRequestRow({
+  request,
+  pendingAction,
+  confirmationText,
+  onConfirmationChange,
+  onDecision,
+  onRevoke,
+}: {
+  request: BrowserGrantRequest;
+  pendingAction: string | null;
+  confirmationText: string;
+  onConfirmationChange: (requestId: string, confirmationText: string) => void;
+  onDecision: (requestId: string, decision: GrantRequestDecision) => void;
+  onRevoke: (requestId: string) => void;
+}) {
+  const isActionable =
+    request.status === "pending" || request.status === "approved";
+  return (
+    <li className="space-y-2 rounded border p-3 text-sm">
+      <p>
+        <code>{request.requestId}</code> — <strong>{request.status}</strong>
+      </p>
+      <p className="text-muted-foreground">{request.origin}</p>
+      <p className="text-xs text-muted-foreground">
+        Elevations:{" "}
+        {request.requestedElevations.fileTransfer
+          ? "file transfer"
+          : "standard"}{" "}
+        {request.requestedElevations.invalidCertificate
+          ? "· invalid certificate"
+          : ""}
+      </p>
+      {request.status === "pending" ? (
+        <>
+          <GrantRequestDecisionControls
+            requestId={request.requestId}
+            pendingAction={pendingAction}
+            onDecision={onDecision}
+          />
+          <GrantRequestPersistenceControl
+            requestId={request.requestId}
+            confirmationText={confirmationText}
+            pendingAction={pendingAction}
+            onConfirmationChange={onConfirmationChange}
+            onDecision={onDecision}
+          />
+        </>
+      ) : null}
+      {isActionable ? (
+        <button
+          type="button"
+          className="rounded border px-2 py-1"
+          disabled={pendingAction !== null}
+          onClick={() => onRevoke(request.requestId)}
+        >
+          Revoke Browser Grant Request {request.requestId}
+        </button>
+      ) : null}
+    </li>
+  );
+}
+
+function GrantRequestList({
+  requests,
+  pendingAction,
+  confirmations,
+  onConfirmationChange,
+  onDecision,
+  onRevoke,
+}: {
+  requests: readonly BrowserGrantRequest[];
+  pendingAction: string | null;
+  confirmations: Readonly<Record<string, string>>;
+  onConfirmationChange: (requestId: string, confirmationText: string) => void;
+  onDecision: (requestId: string, decision: GrantRequestDecision) => void;
+  onRevoke: (requestId: string) => void;
+}) {
+  return (
+    <ul aria-label="Browser Grant Request list" className="mt-3 space-y-2">
+      {requests.length === 0 ? (
+        <li className="text-sm">No Browser Grant Requests.</li>
+      ) : (
+        requests.map((request) => (
+          <GrantRequestRow
+            key={request.requestId}
+            request={request}
+            pendingAction={pendingAction}
+            confirmationText={confirmations[request.requestId] ?? ""}
+            onConfirmationChange={onConfirmationChange}
+            onDecision={onDecision}
+            onRevoke={onRevoke}
+          />
+        ))
+      )}
+    </ul>
+  );
+}
+
+function GrantRequestControls() {
+  const rpc = useRpc<typeof rpcContract>();
+  const [requests, setRequests] = useState<BrowserGrantRequest[] | null>(null);
+  const [pendingAction, setPendingAction] = useState<string | null>(null);
+  const [confirmations, setConfirmations] = useState<Record<string, string>>(
+    {},
+  );
+  const [message, setMessage] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  function inspectRequests() {
+    setPendingAction("inspect");
+    setError(null);
+    void rpc
+      .call("browser_grant_requests", {})
+      .then(setRequests)
+      .catch((requestError: unknown) =>
+        setError(administrationErrorMessage(requestError)),
+      )
+      .finally(() => setPendingAction(null));
+  }
+
+  async function decideRequest(
+    requestId: string,
+    decision: GrantRequestDecision,
+  ) {
+    setPendingAction(requestId + ":" + decision);
+    setMessage(null);
+    setError(null);
+    try {
+      const response = await rpc.call("browser_grant_request_decide", {
+        requestId,
+        decision,
+        ...(decision === "persist"
+          ? {
+              persistenceConfirmation: confirmations[requestId] ?? "",
+            }
+          : {}),
+      });
+      setRequests(
+        (current) =>
+          current?.map((request) =>
+            request.requestId === requestId ? response.request : request,
+          ) ?? current,
+      );
+      setMessage(requestId + ": " + response.outcome);
+    } catch (requestError: unknown) {
+      setError(administrationErrorMessage(requestError));
+    } finally {
+      setPendingAction(null);
+    }
+  }
+
+  async function revokeRequest(requestId: string) {
+    setPendingAction(requestId + ":revoke");
+    setMessage(null);
+    setError(null);
+    try {
+      const response = await rpc.call("browser_grant_request_revoke", {
+        requestId,
+      });
+      setRequests(
+        (current) =>
+          current?.map((request) =>
+            request.requestId === requestId ? response.request : request,
+          ) ?? current,
+      );
+      setMessage(requestId + ": " + response.outcome);
+    } catch (requestError: unknown) {
+      setError(administrationErrorMessage(requestError));
+    } finally {
+      setPendingAction(null);
+    }
+  }
+
+  return (
+    <section
+      aria-label="Browser Grant Requests"
+      className="border-t pt-5 text-left"
+    >
+      <h4 className="font-semibold">Browser Grant Requests</h4>
+      <p className="mt-2 text-sm text-muted-foreground">
+        Review exact, non-blocking requests created when agent access is denied.
+      </p>
+      <button
+        type="button"
+        className="mt-3 rounded border px-3 py-2 text-sm"
+        disabled={pendingAction !== null}
+        onClick={inspectRequests}
+      >
+        Inspect Browser Grant Requests
+      </button>
+      {requests === null ? null : (
+        <GrantRequestList
+          requests={requests}
+          pendingAction={pendingAction}
+          confirmations={confirmations}
+          onConfirmationChange={(requestId, value) =>
+            setConfirmations((current) => ({
+              ...current,
+              [requestId]: value,
+            }))
+          }
+          onDecision={decideRequest}
+          onRevoke={revokeRequest}
+        />
+      )}
+      <AdministrationFeedback message={message} error={error} />
+    </section>
+  );
+}
+
 function HostAdministrationControls({ status }: { status: BrowserStatus }) {
   if (
     status.hostId === null ||
@@ -1649,13 +2019,23 @@ function BrowserSettings() {
   }, [rpc]);
 
   if (statuses === null) {
-    return <p role="status">Checking Browser hosts…</p>;
+    return (
+      <>
+        <p role="status">Checking Browser hosts…</p>
+      </>
+    );
   }
   if (statuses.length === 0) {
-    return <p>No workspace hosts are enrolled.</p>;
+    return (
+      <>
+        <GrantRequestControls />
+        <p>No workspace hosts are enrolled.</p>
+      </>
+    );
   }
   return (
     <div className="space-y-6">
+      <GrantRequestControls />
       {statuses.map((status) => (
         <section key={status.hostId} aria-label={`Host ${status.hostId}`}>
           <h3 className="font-semibold">{status.label}</h3>

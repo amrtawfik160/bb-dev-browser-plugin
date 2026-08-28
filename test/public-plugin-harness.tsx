@@ -50,6 +50,11 @@ import {
   browserProfileGrantRevokeResponseSchema,
   browserProfileGrantSchema,
   browserProfileGrantsSchema,
+  browserGrantRequestDecisionRequestSchema,
+  browserGrantRequestDecisionResponseSchema,
+  browserGrantRequestQuerySchema,
+  browserGrantRequestSchema,
+  browserGrantRequestsSchema,
   browserHostChoicesSchema,
   browserSetupPlanSchema,
   browserSetupResponseSchema,
@@ -663,6 +668,42 @@ export async function createPublicPluginHarness(options?: {
       ) as Promise<
         ReturnType<typeof browserProfileGrantRevokeResponseSchema.parse>
       >,
+    browser_grant_requests: (input: {
+      requestId?: string;
+      projectId?: string;
+      hostId?: string;
+      installationId?: string;
+      profileId?: string;
+      status?:
+        "pending" | "denied" | "approved" | "consumed" | "expired" | "revoked";
+    }) =>
+      backend.harness.behavior.callRpc(
+        "browser_grant_requests",
+        browserGrantRequestQuerySchema.parse(input),
+      ) as Promise<ReturnType<typeof browserGrantRequestsSchema.parse>>,
+    browser_grant_request_inspect: (input: { requestId: string }) =>
+      backend.harness.behavior.callRpc(
+        "browser_grant_request_inspect",
+        input,
+      ) as Promise<ReturnType<typeof browserGrantRequestSchema.parse> | null>,
+    browser_grant_request_decide: (input: {
+      requestId: string;
+      decision?: "deny" | "retry" | "one-hour" | "persist";
+      persistenceConfirmation?: string;
+    }) =>
+      backend.harness.behavior.callRpc(
+        "browser_grant_request_decide",
+        browserGrantRequestDecisionRequestSchema.parse(input),
+      ) as Promise<
+        ReturnType<typeof browserGrantRequestDecisionResponseSchema.parse>
+      >,
+    browser_grant_request_revoke: (input: { requestId: string }) =>
+      backend.harness.behavior.callRpc(
+        "browser_grant_request_revoke",
+        input,
+      ) as Promise<
+        ReturnType<typeof browserGrantRequestDecisionResponseSchema.parse>
+      >,
     browser_profile_create: (input: {
       hostId: string;
       name: string;
@@ -948,6 +989,35 @@ export async function createPublicPluginHarness(options?: {
     return rpc.browser_grant_revoke({ grantId });
   }
 
+  function listBrowserGrantRequests(
+    input: {
+      projectId?: string;
+      hostId?: string;
+      installationId?: string;
+      profileId?: string;
+      status?:
+        "pending" | "denied" | "approved" | "consumed" | "expired" | "revoked";
+    } = {},
+  ) {
+    return rpc.browser_grant_requests(input);
+  }
+
+  function inspectBrowserGrantRequest(requestId: string) {
+    return rpc.browser_grant_request_inspect({ requestId });
+  }
+
+  function decideBrowserGrantRequest(input: {
+    requestId: string;
+    decision?: "deny" | "retry" | "one-hour" | "persist";
+    persistenceConfirmation?: string;
+  }) {
+    return rpc.browser_grant_request_decide(input);
+  }
+
+  function revokeBrowserGrantRequest(requestId: string) {
+    return rpc.browser_grant_request_revoke({ requestId });
+  }
+
   function runBrowserHostChoices(input: BrowserHostChoicesInput) {
     return rpc.browser_host_choices(input);
   }
@@ -1188,6 +1258,10 @@ export async function createPublicPluginHarness(options?: {
     listBrowserGrants,
     inspectBrowserGrant,
     revokeBrowserGrant,
+    listBrowserGrantRequests,
+    inspectBrowserGrantRequest,
+    decideBrowserGrantRequest,
+    revokeBrowserGrantRequest,
     runBrowserHostChoices,
     runBrowserScript,
     runBrowserScriptWithProfile,

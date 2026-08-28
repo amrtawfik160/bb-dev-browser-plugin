@@ -7,8 +7,21 @@ import {
   browserProfileGrantSchema,
   normalizeBrowserOrigin,
   PERSIST_BROWSER_ELEVATED_ACCESS_CONFIRMATION,
+  type BrowserAuthorizationRequest,
+  type BrowserGrantRequest,
+  type BrowserGrantRequestDecisionRequest,
+  type BrowserGrantRequestDecisionResponse,
+  type BrowserGrantRequestQuery,
   type BrowserProfileGrant,
+  type BrowserTemporaryGrant,
 } from "./contracts.js";
+import {
+  createGrantRequestStore,
+  GRANT_REQUEST_MIGRATION,
+  type GrantRequestAuthorizationDecision,
+  type GrantRequestEvent,
+  type GrantRequestStore,
+} from "./grant-requests.js";
 
 const GRANT_ID_PREFIX = "grant-";
 const PROJECT_ALIAS_LENGTH = 12;
@@ -76,27 +89,23 @@ export const BROWSER_AUTHORIZATION_MIGRATIONS = [
   authorizationMigration,
   authorizationElevationMigration,
   authorizationProjectMigration,
+  GRANT_REQUEST_MIGRATION,
 ] as const;
 
-export type BrowserAuthorizationRequest = {
-  projectId: string;
-  hostId: string;
-  installationId: string;
-  profileId: string;
-  origin: string;
-  fileTransfer?: boolean;
-  invalidCertificate?: boolean;
-};
+export type { BrowserAuthorizationRequest } from "./contracts.js";
 
 export type BrowserAuthorizationFailure = {
   allowed: false;
   code: "origin_denied";
   message: string;
+  grantRequest: BrowserGrantRequest | null;
 };
 
 export type BrowserAuthorizationSuccess = {
   allowed: true;
   grant: BrowserProfileGrant;
+  temporaryGrant?: BrowserTemporaryGrant;
+  grantRequest: BrowserGrantRequest | null;
 };
 
 export type BrowserAuthorizationDecision =
@@ -137,6 +146,7 @@ export type BrowserProfileGrantInput = Omit<
 export type ProfileGrantStoreOptions = {
   clock?: () => Date;
   idFactory?: () => string;
+  onGrantRequestEvent?: (event: GrantRequestEvent) => void;
 };
 
 type GrantRow = {
@@ -164,6 +174,13 @@ type GrantStore = {
   inspect(grantId: string): BrowserProfileGrant | null;
   revoke(grantId: string): BrowserProfileGrantRevokeResult;
   authorize(request: BrowserAuthorizationRequest): BrowserAuthorizationDecision;
+  listRequests(query?: BrowserGrantRequestQuery): BrowserGrantRequest[];
+  inspectRequest(requestId: string): BrowserGrantRequest | null;
+  inspectTemporaryGrant(grantId: string): BrowserTemporaryGrant | null;
+  decideRequest(
+    input: BrowserGrantRequestDecisionRequest,
+  ): BrowserGrantRequestDecisionResponse;
+  revokeRequest(requestId: string): BrowserGrantRequestDecisionResponse;
   revokeProject(projectId: string): BrowserProfileGrant[];
   projectDeleted(projectId: string): BrowserProfileGrant[];
   projectGeneration(projectId: string): number;
@@ -365,8 +382,11 @@ function isIpv6Loopback(hostname: string) {
   return hextets[6]! >= 0x7f00 && hextets[6]! <= 0x7fff;
 }
 
-function denial(message: string): BrowserAuthorizationFailure {
-  return { allowed: false, code: "origin_denied", message };
+function denial(
+  message: string,
+  grantRequest: BrowserGrantRequest | null = null,
+): BrowserAuthorizationFailure {
+  return { allowed: false, code: "origin_denied", message, grantRequest };
 }
 
 function queryWhere(query: BrowserProfileGrantQuery) {
@@ -649,7 +669,7 @@ function authorizeAgainstGrants(
       `The Browser Profile Grant does not allow elevated access to ${origin}.`,
     );
   }
-  return { allowed: true, grant: permitted };
+  return { allowed: true, grant: permitted, grantRequest: null };
 }
 
 function inspectStoredGrant(
@@ -707,6 +727,7 @@ function authorizeStoredRequest(
   database: Database.Database,
   clock: () => Date,
   request: BrowserAuthorizationRequest,
+  grantRequests: GrantRequestStore,
 ) {
   const grants = activeGrantRows(database, {
     projectId: request.projectId,
@@ -714,7 +735,46 @@ function authorizeStoredRequest(
     installationId: request.installationId,
     profileId: request.profileId,
   }).map((row) => grantFromRow(row));
-  return authorizeAgainstGrants(grants, request, clock());
+  const now = clock();
+  const decision = authorizeAgainstGrants(grants, request, now);
+  if (decision.allowed) return decision;
+  const requestDecision: GrantRequestAuthorizationDecision =
+    grantRequests.authorize(request, decision.message, now);
+  if (!requestDecision.allowed) return requestDecision;
+  return {
+    allowed: true as const,
+    grant: temporaryGrantAsProfileGrant(requestDecision.temporaryGrant),
+    temporaryGrant: requestDecision.temporaryGrant,
+    grantRequest: null,
+  };
+}
+
+function temporaryGrantAsProfileGrant(
+  temporaryGrant: BrowserTemporaryGrant,
+): BrowserProfileGrant {
+  return browserProfileGrantSchema.parse({
+    grantId: temporaryGrant.grantId,
+    projectId: temporaryGrant.projectId,
+    hostId: temporaryGrant.hostId,
+    installationId: temporaryGrant.installationId,
+    profileId: temporaryGrant.profileId,
+    originScope: temporaryGrant.originScope,
+    wholeWeb: false,
+    fileTransfer: temporaryGrant.fileTransfer,
+    invalidCertificateOrigins: temporaryGrant.invalidCertificateOrigins,
+    persistentElevations: false,
+    wholeWebExpiresAt: null,
+    fileTransferExpiresAt: temporaryGrant.fileTransfer
+      ? temporaryGrant.expiresAt
+      : null,
+    invalidCertificateExpiresAt:
+      temporaryGrant.invalidCertificateOrigins.length > 0
+        ? temporaryGrant.expiresAt
+        : null,
+    createdAt: temporaryGrant.createdAt,
+    updatedAt: temporaryGrant.createdAt,
+    revokedAt: temporaryGrant.revokedAt,
+  });
 }
 
 function storedProjectGeneration(
@@ -803,21 +863,50 @@ export function createProfileGrantStore(
       : clockOrOptions;
   const clock = options.clock ?? (() => new Date());
   const idFactory = options.idFactory ?? randomUUID;
+  const grantRequests = createGrantRequestStore(database, {
+    clock,
+    idFactory,
+    createPersistentGrant: (input) =>
+      insertGrant(database, input, clock, idFactory),
+    revokePersistentGrant: (grantId) => {
+      const existing = storedGrantRevokedAt(database, grantId);
+      if (existing === null) updateGrantRevocation(database, clock, grantId);
+    },
+    onEvent: options.onGrantRequestEvent,
+  });
   return {
     create: (input) => insertGrant(database, input, clock, idFactory),
     list: (query = {}) =>
       activeGrantRows(database, query).map((row) => grantFromRow(row)),
     inspect: (grantId) => inspectStoredGrant(database, grantId),
     revoke: (grantId) => revokeStoredGrant(database, clock, grantId),
-    authorize: (request) => authorizeStoredRequest(database, clock, request),
+    authorize: (request) =>
+      authorizeStoredRequest(database, clock, request, grantRequests),
+    listRequests: (query = {}) => grantRequests.listRequests(query),
+    inspectRequest: (requestId) => grantRequests.inspectRequest(requestId),
+    inspectTemporaryGrant: (grantId) =>
+      grantRequests.inspectTemporaryGrant(grantId),
+    decideRequest: (input) => grantRequests.decideRequest(input),
+    revokeRequest: (requestId) => grantRequests.revokeRequest(requestId),
     revokeProject: (projectId) =>
-      revokeMatchingGrants(database, clock, { projectId }),
-    projectDeleted: (projectId) =>
-      markProjectDeleted(database, clock, projectId),
+      (() => {
+        const grants = revokeMatchingGrants(database, clock, { projectId });
+        grantRequests.revokeProject(projectId);
+        return grants;
+      })(),
+    projectDeleted: (projectId) => {
+      const grants = markProjectDeleted(database, clock, projectId);
+      grantRequests.revokeProject(projectId);
+      return grants;
+    },
     projectGeneration: (projectId) =>
       storedProjectGeneration(database, projectId),
     projectCreated: (projectId) => markProjectCreated(database, projectId),
-    revokeProfile: (target) => revokeMatchingGrants(database, clock, target),
+    revokeProfile: (target) => {
+      const grants = revokeMatchingGrants(database, clock, target);
+      grantRequests.revokeProfile(target);
+      return grants;
+    },
   };
 }
 

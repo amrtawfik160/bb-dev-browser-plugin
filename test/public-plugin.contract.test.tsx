@@ -10,7 +10,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   browserActivityRecordsSchema,
   browserActivityOutboxSchema,
@@ -453,6 +453,484 @@ describe("Browser public plugin contract", () => {
     await browser.dispose();
   });
 
+  it("returns one exact non-blocking request across browser_script, Settings RPC, and safe CLI status", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+      browserScriptResponse: { ok: true, result: { title: "retried" } },
+    });
+    await browser.createBrowserProfile({
+      hostId: "host-browser-test",
+      name: "Grant request target",
+    });
+
+    const denied = await browser.runBrowserScriptWithProfile(undefined, {
+      purpose: "Do not retain this purpose",
+      code: "return 'do not resume';",
+      destinationOrigin: "HTTPS://APP.Example.test:443/",
+      fileTransfer: true,
+    });
+    const failure = browserScriptFailureSchema.parse(
+      JSON.parse(denied.content[0]!.text),
+    );
+    if (failure.error.state !== "origin-denied") {
+      throw new Error("expected an origin denial");
+    }
+    const request = failure.error.grantRequest;
+    expect(request).toMatchObject({
+      projectId: "project-browser-test",
+      hostId: "host-browser-test",
+      profileId: DEFAULT_PROFILE_ID,
+      origin: "https://app.example.test",
+      requestedElevations: { fileTransfer: true, invalidCertificate: false },
+      status: "pending",
+    });
+    expect(JSON.stringify(request)).not.toContain("Do not retain");
+    expect(JSON.stringify(request)).not.toContain("do not resume");
+    expect(await browser.listBrowserGrantRequests()).toContainEqual(request);
+
+    const cli = await browser.runBrowserCli(["requests", "--json"]);
+    expect(cli.exitCode).toBe(0);
+    expect(JSON.parse(cli.stdout!)).toContainEqual(request);
+
+    const settings = browser.renderSettings();
+    await settings.findByText("Browser Grant Requests");
+    fireEvent.click(
+      await settings.findByRole("button", {
+        name: "Inspect Browser Grant Requests",
+      }),
+    );
+    await settings.findByRole("list", { name: "Browser Grant Request list" });
+    await browser.dispose();
+  });
+
+  it("keeps approval non-resuming and requires an explicit current-state retry", async () => {
+    let hostCalls = 0;
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+      browserScriptResponse: { ok: true, result: { title: "retried" } },
+      browserScriptStarted: () => {
+        hostCalls += 1;
+      },
+    });
+    await browser.createBrowserProfile({
+      hostId: "host-browser-test",
+      name: "Retry target",
+    });
+    const denied = await browser.runBrowserScriptWithProfile(undefined, {
+      destinationOrigin: "https://retry.example.test",
+    });
+    const requestId = browserScriptFailureSchema.parse(
+      JSON.parse(denied.content[0]!.text),
+    ).error.grantRequest!.requestId;
+
+    expect(hostCalls).toBe(0);
+    const approval = await browser.decideBrowserGrantRequest({
+      requestId,
+      decision: "retry",
+    });
+    expect(approval.outcome).toBe("retry-approved");
+    expect(hostCalls).toBe(0);
+
+    const retry = await browser.runBrowserScriptWithProfile(undefined, {
+      purpose: "Fresh state retry",
+      code: "return page.url();",
+      destinationOrigin: "https://retry.example.test",
+    });
+    expect(retry.isError).toBe(false);
+    expect(hostCalls).toBe(1);
+    expect((await browser.inspectBrowserGrantRequest(requestId))?.status).toBe(
+      "consumed",
+    );
+    await browser.dispose();
+  });
+
+  it("shows owner request decisions and revocation in Settings and CLI without exposing grant administration", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+      browserScriptResponse: { ok: true, result: { title: "done" } },
+    });
+    await browser.createBrowserProfile({
+      hostId: "host-browser-test",
+      name: "Request lifecycle target",
+    });
+    const denied = await browser.runBrowserScriptWithProfile(undefined, {
+      destinationOrigin: "https://lifecycle-request.example.test",
+    });
+    const requestId = browserScriptFailureSchema.parse(
+      JSON.parse(denied.content[0]!.text),
+    ).error.grantRequest!.requestId;
+    const deniedDecision = await browser.decideBrowserGrantRequest({
+      requestId,
+      decision: "deny",
+    });
+    expect(deniedDecision.request.status).toBe("denied");
+    expect(await browser.runBrowserCli(["grant", "list"])).toMatchObject({
+      exitCode: 1,
+    });
+    expect(
+      JSON.parse(
+        (
+          await browser.runBrowserCli([
+            "request-status",
+            "--request",
+            requestId,
+            "--json",
+          ])
+        ).stdout!,
+      ),
+    ).toMatchObject({ requestId, status: "denied" });
+    await browser.dispose();
+  });
+
+  it("gives Settings an owner-only request inspector with deny and every decision control", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+    });
+    try {
+      await browser.createBrowserProfile({
+        hostId: "host-browser-test",
+        name: "Settings request controls",
+      });
+      const denied = await browser.runBrowserScriptWithProfile(undefined, {
+        destinationOrigin: "https://settings-request.example.test",
+        fileTransfer: true,
+      });
+      const request = browserScriptFailureSchema.parse(
+        JSON.parse(denied.content[0]!.text),
+      ).error.grantRequest!;
+      const settings = browser.renderSettings();
+
+      fireEvent.click(
+        await settings.findByRole("button", {
+          name: "Inspect Browser Grant Requests",
+        }),
+      );
+      const list = await settings.findByRole("list", {
+        name: "Browser Grant Request list",
+      });
+      expect(list.textContent).toContain(request.requestId);
+      expect(list.textContent).toContain("pending");
+      expect(list.textContent).toContain(request.origin);
+      expect(
+        settings.getByRole("button", {
+          name: `Deny Browser Grant Request ${request.requestId}`,
+        }),
+      ).toBeDefined();
+      expect(
+        settings.getByRole("button", {
+          name: `Approve Browser Grant Request ${request.requestId} for one retry`,
+        }),
+      ).toBeDefined();
+      expect(
+        settings.getByRole("button", {
+          name: `Approve Browser Grant Request ${request.requestId} for one hour`,
+        }),
+      ).toBeDefined();
+      expect(
+        settings.getByRole("button", {
+          name: `Persist Browser Grant Request ${request.requestId}`,
+        }),
+      ).toBeDefined();
+      expect(
+        settings.getByRole("button", {
+          name: `Revoke Browser Grant Request ${request.requestId}`,
+        }),
+      ).toBeDefined();
+
+      fireEvent.click(
+        settings.getByRole("button", {
+          name: `Deny Browser Grant Request ${request.requestId}`,
+        }),
+      );
+      await settings.findByText(
+        new RegExp(`${request.requestId}.*denied`, "i"),
+      );
+      expect(
+        (await browser.inspectBrowserGrantRequest(request.requestId))?.status,
+      ).toBe("denied");
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("approves one retry from Settings without resuming the denied script and shows consumed state after an explicit retry", async () => {
+    let hostCalls = 0;
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+      browserScriptResponse: { ok: true, result: { title: "retried" } },
+      browserScriptStarted: () => {
+        hostCalls += 1;
+      },
+    });
+    try {
+      await browser.createBrowserProfile({
+        hostId: "host-browser-test",
+        name: "Settings retry target",
+      });
+      const denied = await browser.runBrowserScriptWithProfile(undefined, {
+        destinationOrigin: "https://settings-retry.example.test",
+      });
+      const requestId = browserScriptFailureSchema.parse(
+        JSON.parse(denied.content[0]!.text),
+      ).error.grantRequest!.requestId;
+      const settings = browser.renderSettings();
+      fireEvent.click(
+        await settings.findByRole("button", {
+          name: "Inspect Browser Grant Requests",
+        }),
+      );
+      fireEvent.click(
+        await settings.findByRole("button", {
+          name: `Approve Browser Grant Request ${requestId} for one retry`,
+        }),
+      );
+      await settings.findByText(
+        new RegExp(`${requestId}.*retry-approved`, "i"),
+      );
+      expect(hostCalls).toBe(0);
+
+      const retry = await browser.runBrowserScriptWithProfile(undefined, {
+        purpose: "Fresh current-state retry",
+        code: "return page.url();",
+        destinationOrigin: "https://settings-retry.example.test",
+      });
+      expect(retry.isError).toBe(false);
+      expect(hostCalls).toBe(1);
+      fireEvent.click(
+        settings.getByRole("button", {
+          name: "Inspect Browser Grant Requests",
+        }),
+      );
+      const list = await settings.findByRole("list", {
+        name: "Browser Grant Request list",
+      });
+      expect(list.textContent).toMatch(
+        new RegExp(`${requestId}.*consumed`, "i"),
+      );
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("approves one hour, requires a second confirmation for persistence, and revokes from Settings", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+    });
+    try {
+      await browser.createBrowserProfile({
+        hostId: "host-browser-test",
+        name: "Settings duration target",
+      });
+
+      const oneHourDenied = await browser.runBrowserScriptWithProfile(
+        undefined,
+        {
+          destinationOrigin: "https://settings-hour.example.test",
+        },
+      );
+      const oneHourId = browserScriptFailureSchema.parse(
+        JSON.parse(oneHourDenied.content[0]!.text),
+      ).error.grantRequest!.requestId;
+      const hourSettings = browser.renderSettings();
+      fireEvent.click(
+        await hourSettings.findByRole("button", {
+          name: "Inspect Browser Grant Requests",
+        }),
+      );
+      fireEvent.click(
+        await hourSettings.findByRole("button", {
+          name: `Approve Browser Grant Request ${oneHourId} for one hour`,
+        }),
+      );
+      await hourSettings.findByText(
+        new RegExp(`${oneHourId}.*one-hour-approved`, "i"),
+      );
+      fireEvent.click(
+        hourSettings.getByRole("button", {
+          name: `Revoke Browser Grant Request ${oneHourId}`,
+        }),
+      );
+      await hourSettings.findByText(new RegExp(`${oneHourId}.*revoked`, "i"));
+
+      const persistentDenied = await browser.runBrowserScriptWithProfile(
+        undefined,
+        {
+          destinationOrigin: "https://settings-persist.example.test",
+          fileTransfer: true,
+        },
+      );
+      const persistentId = browserScriptFailureSchema.parse(
+        JSON.parse(persistentDenied.content[0]!.text),
+      ).error.grantRequest!.requestId;
+      const persistentSettings = browser.renderSettings();
+      fireEvent.click(
+        await persistentSettings.findByRole("button", {
+          name: "Inspect Browser Grant Requests",
+        }),
+      );
+      fireEvent.click(
+        await persistentSettings.findByRole("button", {
+          name: `Persist Browser Grant Request ${persistentId}`,
+        }),
+      );
+      await persistentSettings.findByText(/second confirmation/i);
+      fireEvent.change(
+        persistentSettings.getByRole("textbox", {
+          name: `Persistent Browser Grant confirmation ${persistentId}`,
+        }),
+        { target: { value: "Persist Browser elevated access" } },
+      );
+      fireEvent.click(
+        persistentSettings.getByRole("button", {
+          name: `Persist Browser Grant Request ${persistentId}`,
+        }),
+      );
+      await persistentSettings.findByText(
+        new RegExp(`${persistentId}.*persisted`, "i"),
+      );
+      expect(
+        (await browser.inspectBrowserGrantRequest(persistentId))?.status,
+      ).toBe("approved");
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("renders expired requests and keeps request identity plus explicit retry guidance on the panel and browser_script", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-08-28T00:00:00.000Z"));
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+    });
+    try {
+      await browser.createBrowserProfile({
+        hostId: "host-browser-test",
+        name: "Expired request target",
+      });
+      const denied = await browser.runBrowserScriptWithProfile(undefined, {
+        purpose: "Secret denied purpose",
+        code: "return 'secret denied script';",
+        destinationOrigin: "https://expired-request.example.test",
+      });
+      const failure = browserScriptFailureSchema.parse(
+        JSON.parse(denied.content[0]!.text),
+      );
+      const requestId = failure.error.grantRequest!.requestId;
+      expect(failure.error.message).toContain(requestId);
+      expect(failure.error.message).toMatch(/explicitly retry/i);
+      expect(failure.error.message).toMatch(/current page state/i);
+      expect(failure.error.message).not.toContain("Secret denied purpose");
+      expect(failure.error.message).not.toContain("secret denied script");
+
+      const panel = await browser.openExistingThreadPanel();
+      await panel.panel.findByText(requestId);
+      await panel.panel.findByText(/explicitly retry.*current page state/i);
+
+      vi.setSystemTime(new Date("2026-08-28T00:16:00.000Z"));
+      const settings = browser.renderSettings();
+      fireEvent.click(
+        await settings.findByRole("button", {
+          name: "Inspect Browser Grant Requests",
+        }),
+      );
+      const list = await settings.findByRole("list", {
+        name: "Browser Grant Request list",
+      });
+      expect(list.textContent).toMatch(
+        new RegExp(`${requestId}.*expired`, "i"),
+      );
+    } finally {
+      await browser.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps CLI request inspection safe and fails closed for agent-facing decisions while recording metadata-only request lifecycle", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+    });
+    try {
+      await browser.createBrowserProfile({
+        hostId: "host-browser-test",
+        name: "CLI request target",
+      });
+      const denied = await browser.runBrowserScriptWithProfile(undefined, {
+        purpose: "Do not store this purpose",
+        code: "return 'do not store this script';",
+        destinationOrigin: "https://cli-request.example.test",
+        fileTransfer: true,
+      });
+      const requestId = browserScriptFailureSchema.parse(
+        JSON.parse(denied.content[0]!.text),
+      ).error.grantRequest!.requestId;
+      const statusText = await browser.runBrowserCli([
+        "request-status",
+        "--request",
+        requestId,
+      ]);
+      expect(statusText.exitCode).toBe(0);
+      expect(statusText.stdout).toContain(requestId);
+      expect(statusText.stdout).toContain("pending");
+
+      const cliDecision = await browser.runBrowserCli([
+        "request-decide",
+        "--request",
+        requestId,
+        "--decision",
+        "one-hour",
+        "--json",
+      ]);
+      expect(cliDecision.exitCode).toBe(1);
+      expect(cliDecision.stderr).toContain("owner Settings");
+      expect(
+        (await browser.inspectBrowserGrantRequest(requestId))?.status,
+      ).toBe("pending");
+      const cliRevoke = await browser.runBrowserCli([
+        "request-revoke",
+        "--request",
+        requestId,
+        "--json",
+      ]);
+      expect(cliRevoke.exitCode).toBe(1);
+      expect(cliRevoke.stderr).toContain("owner Settings");
+
+      const approved = await browser.decideBrowserGrantRequest({
+        requestId,
+        decision: "retry",
+      });
+      expect(approved.outcome).toBe("retry-approved");
+      const activity = await browser.runBrowserActivityRecords();
+      const requestActivity = activity.filter(
+        (record) => "requestId" in record,
+      );
+      expect(requestActivity).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            requestId,
+            action: "grant-request-created",
+            grantScope: "https://cli-request.example.test",
+            outcome: "pending",
+          }),
+          expect.objectContaining({
+            requestId,
+            action: "grant-request-approved",
+            outcome: "retry-approved",
+          }),
+        ]),
+      );
+      const serialized = JSON.stringify({
+        statusText,
+        cliDecision,
+        cliRevoke,
+        activity,
+      });
+      expect(serialized).not.toContain("Do not store this purpose");
+      expect(serialized).not.toContain("do not store this script");
+    } finally {
+      await browser.dispose();
+    }
+  });
+
   it("keeps whole-web, file-transfer, and invalid-certificate elevations independent", async () => {
     const browser = await createPublicPluginHarness({
       snapshot: preparedSnapshot,
@@ -849,6 +1327,63 @@ describe("Browser public plugin contract", () => {
       interruptionReason: "request-aborted",
     });
     await browser.dispose();
+  });
+
+  it("interrupts an in-flight temporary request call when its project is deleted", async () => {
+    let signalHostCallStarted!: () => void;
+    const hostCallStarted = new Promise<void>((resolve) => {
+      signalHostCallStarted = resolve;
+    });
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+      browserScriptDelayMs: 100,
+      browserScriptStarted: signalHostCallStarted,
+    });
+
+    try {
+      await browser.createBrowserProfile({
+        hostId: "host-browser-test",
+        name: "Temporary lifecycle target",
+      });
+      const denied = await browser.runBrowserScriptWithProfile(undefined, {
+        destinationOrigin: "https://temporary-lifecycle.example.test",
+      });
+      const requestId = browserScriptFailureSchema.parse(
+        JSON.parse(denied.content[0]!.text),
+      ).error.grantRequest!.requestId;
+      expect(
+        (
+          await browser.decideBrowserGrantRequest({
+            requestId,
+            decision: "one-hour",
+          })
+        ).outcome,
+      ).toBe("one-hour-approved");
+
+      const operation = browser.runBrowserScriptWithProfile(undefined, {
+        destinationOrigin: "https://temporary-lifecycle.example.test",
+      });
+      await hostCallStarted;
+      await browser.emitProjectChange("project-deleted");
+
+      await expect(operation).rejects.toThrow("browser script aborted");
+      expect(await browser.runBrowserActivityRecords()).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            requestId,
+            action: "grant-request-revoked",
+            outcome: "revoked",
+          }),
+          expect.objectContaining({
+            action: "browser-script",
+            outcome: "interrupted",
+            interrupted: true,
+          }),
+        ]),
+      );
+    } finally {
+      await browser.dispose();
+    }
   });
 
   it("selects the static browser_script tool and bundled Browser skill", async () => {

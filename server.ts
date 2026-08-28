@@ -10,9 +10,11 @@ import {
   type BrowserService,
 } from "./browser-service.js";
 import {
+  browserGrantRequestDecisionSchema,
   browserScriptParametersSchema,
   type BrowserActivityRecord,
   type BrowserHostChoicesInput,
+  type BrowserGrantRequest,
   type BrowserProfileBackupRequest,
   type BrowserProfile,
   type BrowserProfileImportRequest,
@@ -31,13 +33,17 @@ import {
 } from "./contracts.js";
 
 const CLI_USAGE = [
-  "Usage: bb browser <status|diagnostics|activity|activity-export|activity-clear|list|create|rename|select|backup|restore|import|setup|disable|uninstall|purge> [options]",
+  "Usage: bb browser <status|diagnostics|activity|activity-export|activity-clear|requests|request-status|request-decide|request-revoke|list|create|rename|select|backup|restore|import|setup|disable|uninstall|purge> [options]",
   "  setup [--profile <id>] [--step <id> --confirm <text>] [--json]",
   "  purge [--profile <id>] [--confirm <text>] [--json]",
   "  disable|uninstall [--profile <id>] --confirm <text> [--json]",
   "  activity [--profile <id>] [--json]",
   `  activity-export [--profile <id>] [--json]`,
   `  activity-clear [--profile <id>] --confirm "Clear Browser activity records" [--json]`,
+  "  requests [--json]",
+  "  request-status --request <id> [--json]",
+  "  request-decide --request <id> [--decision <deny|retry|one-hour|persist>] [--confirm <text>] [--json]",
+  "  request-revoke --request <id> [--json]",
   "  list [--host <id>] [--json]",
   "  create --name <name> [--locale <locale>] [--timezone <zone>] [--host <id>] [--json]",
   "  rename --profile <id> --name <name> [--locale <locale>] [--timezone <zone>] [--host <id>] [--json]",
@@ -47,6 +53,8 @@ const CLI_USAGE = [
   "  import --name <name> --source <path> [--host <id>] [--json]",
 ].join("\n");
 const PROFILE_IMPORT_COMMAND = ["imp", "ort"].join("");
+const OWNER_SETTINGS_CLI_ERROR =
+  "Browser Grant Request decisions and revocation require the owner Settings transport; the agent-facing CLI cannot approve or revoke Browser Grant Requests.";
 type BrowserScriptParameters = z.output<typeof browserScriptParametersSchema>;
 const BROWSER_COMMANDS = [
   "status",
@@ -54,6 +62,10 @@ const BROWSER_COMMANDS = [
   "activity",
   "activity-export",
   "activity-clear",
+  "requests",
+  "request-status",
+  "request-decide",
+  "request-revoke",
   "list",
   "create",
   "rename",
@@ -80,6 +92,8 @@ type ParsedCliArguments = {
   sourcePath?: string;
   stepId?: z.output<typeof setupStepIdSchema>;
   confirmation?: string;
+  requestId?: string;
+  decision?: z.output<typeof browserGrantRequestDecisionSchema>;
 };
 
 type CliArgumentParseResult =
@@ -214,6 +228,8 @@ type CliOptionName =
   | "--timezone"
   | "--archive"
   | "--source"
+  | "--request"
+  | "--decision"
   | "confirmation";
 type ParsedCliOption = {
   name: CliOptionName;
@@ -229,7 +245,9 @@ function cliOptionName(argument: string): CliOptionName | null {
     argument === "--locale" ||
     argument === "--timezone" ||
     argument === "--archive" ||
-    argument === "--source"
+    argument === "--source" ||
+    argument === "--request" ||
+    argument === "--decision"
   ) {
     return argument;
   }
@@ -263,6 +281,8 @@ type CliParseState = {
   sourcePath?: string;
   stepId?: ParsedCliArguments["stepId"];
   confirmation?: string;
+  requestId?: string;
+  decision?: ParsedCliArguments["decision"];
 };
 
 function applyCliOption(
@@ -305,6 +325,22 @@ function applyCliOption(
     parseState.sourcePath = option.optionValue;
     return null;
   }
+  if (option.name === "--request") {
+    parseState.requestId = option.optionValue;
+    return null;
+  }
+  if (option.name === "--decision") {
+    const parsedDecision = browserGrantRequestDecisionSchema.safeParse(
+      option.optionValue,
+    );
+    if (!parsedDecision.success) {
+      return (
+        "Unknown request decision: " + option.optionValue + ".\n" + CLI_USAGE
+      );
+    }
+    parseState.decision = parsedDecision.data;
+    return null;
+  }
   parseState.confirmation = option.optionValue;
   return null;
 }
@@ -341,6 +377,27 @@ function validateCliCommandOptions(
     parseState.confirmation !== undefined
   ) {
     return `Confirmation is not valid for ${command}.\n${CLI_USAGE}`;
+  }
+  if (
+    !["request-status", "request-decide", "request-revoke"].includes(command) &&
+    parseState.requestId !== undefined
+  ) {
+    return (
+      "--request is only valid for request inspection, decision, or revocation.\n" +
+      CLI_USAGE
+    );
+  }
+  if (command === "request-status" && parseState.requestId === undefined) {
+    return `request-status requires --request.\n${CLI_USAGE}`;
+  }
+  if (
+    ["request-decide", "request-revoke"].includes(command) &&
+    parseState.requestId === undefined
+  ) {
+    return command + " requires --request.\n" + CLI_USAGE;
+  }
+  if (command !== "request-decide" && parseState.decision !== undefined) {
+    return "--decision is only valid for request-decide.\n" + CLI_USAGE;
   }
   if (
     command === "setup" &&
@@ -460,6 +517,8 @@ function parseCliArguments(argv: string[]): CliArgumentParseResult {
       sourcePath: parseState.sourcePath,
       stepId: parseState.stepId,
       confirmation: parseState.confirmation,
+      requestId: parseState.requestId,
+      decision: parseState.decision,
     },
   };
 }
@@ -542,6 +601,56 @@ async function runActivityClearCli(
   return {
     exitCode: 0,
     stdout: json ? JSON.stringify(response) : response.message,
+  };
+}
+
+async function runGrantRequestsCli(
+  browser: BrowserService,
+  authority: unknown,
+  json: boolean,
+) {
+  const requests = await browser.listGrantRequests(authority);
+  return {
+    exitCode: 0,
+    stdout: json
+      ? JSON.stringify(requests)
+      : requests.map(cliGrantRequestText).join("\n\n"),
+  };
+}
+
+function cliGrantRequestText(request: BrowserGrantRequest) {
+  return [
+    "Browser Grant Request " + request.requestId,
+    "Status: " + request.status,
+    "Origin: " + request.origin,
+    "Requested elevations: " +
+      (request.requestedElevations.fileTransfer
+        ? "file transfer"
+        : "standard") +
+      (request.requestedElevations.invalidCertificate
+        ? ", invalid certificate"
+        : ""),
+    "Decision: " + (request.decision ?? "none"),
+    "Expires: " + request.expiresAt,
+  ].join("\n");
+}
+
+async function runGrantRequestStatusCli(
+  browser: BrowserService,
+  authority: unknown,
+  requestId: string,
+  json: boolean,
+) {
+  const request = await browser.inspectGrantRequest(authority, requestId);
+  if (request === null) {
+    return {
+      exitCode: 1,
+      stderr: `Browser Grant Request ${requestId} was not found.`,
+    };
+  }
+  return {
+    exitCode: 0,
+    stdout: json ? JSON.stringify(request) : cliGrantRequestText(request),
   };
 }
 
@@ -862,18 +971,33 @@ async function runAdministrationCli(
 
 async function runCli(
   browser: BrowserService,
+  authority: unknown,
   argv: string[],
   context: PluginCliContext,
 ) {
   const parsed = parseCliArguments(argv);
   if ("error" in parsed) return { exitCode: 1, stderr: parsed.error };
-  const { command, json, profileId, hostId } = parsed.arguments;
+  const { command, json, profileId, hostId, requestId } = parsed.arguments;
   try {
     if (command === "status") {
       return await runStatusCli(browser, profileId, hostId, json, context);
     }
     if (command === "diagnostics") {
       return await runDiagnosticsCli(browser, profileId, hostId, json, context);
+    }
+    if (command === "requests") {
+      return await runGrantRequestsCli(browser, authority, json);
+    }
+    if (command === "request-status") {
+      return await runGrantRequestStatusCli(
+        browser,
+        authority,
+        requestId!,
+        json,
+      );
+    }
+    if (command === "request-decide" || command === "request-revoke") {
+      return { exitCode: 1, stderr: OWNER_SETTINGS_CLI_ERROR };
     }
     return await runAdministrationCli(browser, parsed.arguments, context);
   } catch (error) {
@@ -913,7 +1037,11 @@ async function runBrowserScript(
   return response.ok ? toolSuccess(response.result) : toolFailure(response);
 }
 
-function registerCli(bb: BbPluginApi, browser: BrowserService) {
+function registerCli(
+  bb: BbPluginApi,
+  browser: BrowserService,
+  ownerAuthority: unknown,
+) {
   bb.cli.register({
     name: "browser",
     summary: "Inspect and manage Browser host state",
@@ -944,6 +1072,22 @@ function registerCli(bb: BbPluginApi, browser: BrowserService) {
         summary: "Clear retained Browser activity metadata",
         usage:
           'bb browser activity-clear [--profile <id>] [--host <id>] --confirm "Clear Browser activity records" [--json]',
+      },
+      {
+        name: "request-status",
+        summary: "Inspect a Browser Grant Request",
+        usage: "bb browser request-status --request <id> [--json]",
+      },
+      {
+        name: "request-decide",
+        summary: "Refuse unsafe agent-facing Browser Grant Request decisions",
+        usage:
+          "bb browser request-decide --request <id> [--decision <deny|retry|one-hour|persist>] [--confirm <text>] [--json]",
+      },
+      {
+        name: "request-revoke",
+        summary: "Refuse unsafe agent-facing Browser Grant Request revocation",
+        usage: "bb browser request-revoke --request <id> [--json]",
       },
       {
         name: "list",
@@ -1006,7 +1150,7 @@ function registerCli(bb: BbPluginApi, browser: BrowserService) {
         usage: "bb browser purge [--confirm <text>] [--json]",
       },
     ],
-    run: (argv, context) => runCli(browser, argv, context),
+    run: (argv, context) => runCli(browser, ownerAuthority, argv, context),
   });
 }
 
@@ -1055,6 +1199,14 @@ export default function plugin(bb: BbPluginApi) {
     browser_grant_inspect: (input) =>
       browser.inspectGrant(ownerAuthority, input.grantId),
     browser_grant_revoke: (input) => browser.revokeGrant(ownerAuthority, input),
+    browser_grant_requests: (input) =>
+      browser.listGrantRequests(ownerAuthority, input),
+    browser_grant_request_inspect: (input) =>
+      browser.inspectGrantRequest(ownerAuthority, input.requestId),
+    browser_grant_request_decide: (input) =>
+      browser.decideGrantRequest(ownerAuthority, input),
+    browser_grant_request_revoke: (input) =>
+      browser.revokeGrantRequest(ownerAuthority, input.requestId),
     browser_profile_create: (input) => browser.createProfile(input),
     browser_profile_rename: (input) => browser.renameProfile(input),
     browser_profile_select: (input) => browser.selectProfile(input),
@@ -1064,7 +1216,7 @@ export default function plugin(bb: BbPluginApi) {
     browser_host_choices: (input: BrowserHostChoicesInput) =>
       browser.hostChoices(input),
   });
-  registerCli(bb, browser);
+  registerCli(bb, browser, ownerAuthority);
   registerAgentTool(bb, browser);
   bb.agents.configure(() => ({
     tools: ["browser_script"],

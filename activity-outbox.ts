@@ -106,6 +106,7 @@ function activityEventKey(event: BrowserActivityEvent) {
     event.projectId,
     event.hostId,
     event.profileId,
+    event.requestId,
     event.grantId,
     event.grantScope,
     event.grantElevations,
