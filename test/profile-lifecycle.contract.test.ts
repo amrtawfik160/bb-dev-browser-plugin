@@ -166,7 +166,7 @@ describe("Browser Profile destructive lifecycle", () => {
     }
   });
 
-  it("resets browser state only after credential-loss confirmation while preserving identity and settings", async () => {
+  it("R10-04 reset archives the old identity and creates a fresh selected identity with preserved logical settings", async () => {
     const fixture = await profileFixture();
     try {
       await fixture.store.renameProfile({
@@ -193,24 +193,115 @@ describe("Browser Profile destructive lifecycle", () => {
       expect(reset).toMatchObject({
         outcome: "reset",
         profile: {
-          profileId: fixture.profile.profileId,
           name: "Work laptop",
           locale: "fr-FR",
           timezone: "Europe/Paris",
           state: "active",
         },
       });
-      expect(await readdir(fixture.paths.browserDataPath)).toEqual([]);
+      if (!("profile" in reset)) throw new Error("Expected reset profile.");
+      expect(reset.profile.profileId).not.toBe(fixture.profile.profileId);
+      const inventory = await fixture.store.listProfiles("host-a");
+      expect(
+        inventory.profiles.find(
+          ({ profileId }) => profileId === fixture.profile.profileId,
+        ),
+      ).toMatchObject({ state: "archived", name: "Work laptop" });
+      const replacementPaths = profileStoragePaths({
+        rootDirectory: fixture.rootDirectory,
+        installationId: fixture.installationId,
+        hostId: "host-a",
+        profileId: reset.profile.profileId,
+      });
+      expect(await readdir(replacementPaths.browserDataPath)).toEqual([]);
       await expect(
-        readdir(fixture.paths.downloadsDirectory),
-      ).rejects.toMatchObject({
-        code: "ENOENT",
+        readFile(join(fixture.paths.browserDataPath, "Cookies"), "utf8"),
+      ).resolves.toBe("signed-in");
+    } finally {
+      await rm(fixture.rootDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("R10-06 refuses an interrupted restore when journal replay occurs after archive expiry", async () => {
+    let now = RETENTION_START;
+    let interruptRestore = false;
+    const fixture = await profileFixture({
+      clock: () => now,
+      reportProgress: ({ phase }) => {
+        if (phase === "updating-storage" && interruptRestore) {
+          interruptRestore = false;
+          throw new Error("simulated restore interruption");
+        }
+      },
+    });
+    try {
+      await fixture.store.archiveProfile({
+        hostId: "host-a",
+        profileId: fixture.profile.profileId,
+      });
+      interruptRestore = true;
+      await expect(
+        fixture.store.restoreArchivedProfile({
+          hostId: "host-a",
+          profileId: fixture.profile.profileId,
+        }),
+      ).rejects.toThrow("simulated restore interruption");
+
+      now = AFTER_RETENTION;
+      const restarted = createFileBrowserProfileStore({
+        rootDirectory: fixture.rootDirectory,
+        installationId: fixture.installationId,
+        clock: () => now,
+        lifecycle: { stopProfile: async () => undefined },
+      });
+      await restarted.reconcileProfileLifecycle("host-a");
+      const inventory = await restarted.listProfiles("host-a");
+      expect(
+        inventory.profiles.find(
+          ({ profileId }) => profileId === fixture.profile.profileId,
+        ),
+      ).toMatchObject({ state: "archived" });
+      await expect(
+        readFile(fixture.paths.lifecycleJournalPath),
+      ).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(fixture.rootDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("R10-07 rejects archived reset before journaling and clears a legacy invalid reset journal", async () => {
+    const fixture = await profileFixture();
+    try {
+      await fixture.store.archiveProfile({
+        hostId: "host-a",
+        profileId: fixture.profile.profileId,
       });
       await expect(
-        readFile(fixture.paths.runtimeManifestPath),
-      ).rejects.toMatchObject({
-        code: "ENOENT",
-      });
+        fixture.store.resetProfile({
+          hostId: "host-a",
+          profileId: fixture.profile.profileId,
+          confirmation: RESET_PROFILE_CONFIRMATION,
+        }),
+      ).rejects.toThrow("Restore the Archived Profile before resetting it");
+      await expect(
+        readFile(fixture.paths.lifecycleJournalPath),
+      ).rejects.toMatchObject({ code: "ENOENT" });
+
+      await mkdir(fixture.paths.lifecycleDirectory, { recursive: true });
+      await writeFile(
+        fixture.paths.lifecycleJournalPath,
+        JSON.stringify({
+          operation: "reset",
+          hostId: "host-a",
+          profileId: fixture.profile.profileId,
+          startedAt: RETENTION_START.toISOString(),
+          phase: "stopped",
+        }),
+      );
+      await fixture.store.reconcileProfileLifecycle("host-a");
+      await expect(
+        readFile(fixture.paths.lifecycleJournalPath),
+      ).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
       await rm(fixture.rootDirectory, { recursive: true, force: true });
     }
@@ -367,11 +458,21 @@ describe("Browser Profile destructive lifecycle", () => {
         const reconciled = inventory.profiles.find(
           ({ profileId }) => profileId === fixture.profile.profileId,
         );
-        if (operation === "reset" || operation === "restore") {
+        if (operation === "restore") {
           expect(reconciled).toMatchObject({ state: "active" });
         }
         if (operation === "reset") {
-          expect(await readdir(fixture.paths.browserDataPath)).toEqual([]);
+          expect(reconciled).toMatchObject({ state: "archived" });
+          const replacement = inventory.profiles.find(
+            ({ profileId, state, name }) =>
+              profileId !== fixture.profile.profileId &&
+              state === "active" &&
+              name === fixture.profile.name,
+          );
+          expect(replacement).toMatchObject({
+            state: "active",
+            name: fixture.profile.name,
+          });
         }
         if (operation === "delete") {
           expect(reconciled).toBeUndefined();

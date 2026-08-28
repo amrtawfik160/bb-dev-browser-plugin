@@ -18,6 +18,8 @@ import {
 } from "./profile-recovery.js";
 import {
   createFileHostAdministrationStateStore,
+  createHostAdministrationBoundary,
+  createProductionPrivilegedExecutor,
   createReadOnlyHostAdministrationBoundary,
   type HostAdministrationBoundary,
 } from "./host-operations.js";
@@ -30,7 +32,6 @@ import {
 import {
   BROWSER_STORAGE_ROOT,
   DEFAULT_PROFILE_ID,
-  STOP_BROWSER_CONFIRMATION,
   browserProfileUnavailableStatus,
   type BrowserActivityEvent,
   type BrowserScriptRequest,
@@ -155,17 +156,7 @@ export function createBrowserHostEntry(
   function profileLifecycle(dataDir: string): BrowserProfileLifecycleBoundary {
     return {
       async stopProfile(hostId, profileId) {
-        const response = await administration(dataDir).disable({
-          hostId,
-          profileId,
-          confirmation: STOP_BROWSER_CONFIRMATION,
-        });
-        if (
-          response.outcome !== "stopped" &&
-          response.outcome !== "already-stopped"
-        ) {
-          throw new Error(response.message);
-        }
+        await administration(dataDir).stopProfile({ hostId, profileId });
       },
     };
   }
@@ -192,15 +183,17 @@ export function createBrowserHostEntry(
   }
   function recovery(dataDir: string) {
     if (retainedRecovery !== undefined) return retainedRecovery;
-    const stateStore = createFileHostAdministrationStateStore(dataDir);
     retainedRecovery =
       recoverySource === undefined
         ? createFileBrowserProfileRecovery({
             rootDirectory: join(dataDir, "browser-profiles"),
             installationId: hostInstallationId(dataDir),
             state: {
-              isProfileStopped: async (hostId) =>
-                (await stateStore.read(hostId))?.processesStopped === true,
+              isProfileStopped: (hostId, profileId) =>
+                administration(dataDir).isProfileStopped({
+                  hostId,
+                  profileId,
+                }),
               isDevBrowserProfileStopped: unverifiedDevBrowserProfileIsStopped,
             },
             ownership: createBrowserUserProfileOwnershipBoundary(),
@@ -440,11 +433,12 @@ export function createBrowserHostEntry(
 
 export default createBrowserHostEntry(
   (dataDir) =>
-    createReadOnlyHostAdministrationBoundary({
+    createHostAdministrationBoundary({
       readiness: createHostReadinessBoundary(
         createDefaultHostSnapshotReader(dataDir),
       ),
       installationId: hostInstallationId(dataDir),
+      executor: createProductionPrivilegedExecutor(),
       stateStore: createFileHostAdministrationStateStore(dataDir),
     }),
   (dataDir, lifecycle) =>
@@ -459,9 +453,15 @@ export default createBrowserHostEntry(
       rootDirectory: BROWSER_STORAGE_ROOT,
       installationId: hostInstallationId(dataDir),
       state: {
-        isProfileStopped: async (hostId) =>
-          (await createFileHostAdministrationStateStore(dataDir).read(hostId))
-            ?.processesStopped === true,
+        isProfileStopped: (hostId, profileId) =>
+          createHostAdministrationBoundary({
+            readiness: createHostReadinessBoundary(
+              createDefaultHostSnapshotReader(dataDir),
+            ),
+            installationId: hostInstallationId(dataDir),
+            executor: createProductionPrivilegedExecutor(),
+            stateStore: createFileHostAdministrationStateStore(dataDir),
+          }).isProfileStopped({ hostId, profileId }),
         isDevBrowserProfileStopped: unverifiedDevBrowserProfileIsStopped,
       },
       ownership: createBrowserUserProfileOwnershipBoundary(),

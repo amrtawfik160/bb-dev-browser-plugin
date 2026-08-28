@@ -216,6 +216,9 @@ export async function createPublicPluginHarness(options?: {
   profileStore?: BrowserProfileStore;
   profileRecovery?: BrowserProfileRecovery;
   deferProjectLookup?: boolean;
+  deferProfileInventory?: boolean;
+  deferProfileInventoryAfterCalls?: number;
+  deferProfileSelection?: boolean;
   deferGrantRequestRpc?: (
     requests: BrowserGrantRequest[],
     callIndex: number,
@@ -241,6 +244,36 @@ export async function createPublicPluginHarness(options?: {
     options?.deferProjectLookup === true
       ? new Promise<void>((resolve) => {
           releaseProjectLookupGate = resolve;
+        })
+      : Promise.resolve();
+  let resolveProfileInventoryStarted: (() => void) | undefined;
+  let releaseProfileInventoryGate: (() => void) | undefined;
+  const profileInventoryStarted =
+    options?.deferProfileInventory === true
+      ? new Promise<void>((resolve) => {
+          resolveProfileInventoryStarted = resolve;
+        })
+      : Promise.resolve();
+  const profileInventoryGate =
+    options?.deferProfileInventory === true
+      ? new Promise<void>((resolve) => {
+          releaseProfileInventoryGate = resolve;
+        })
+      : Promise.resolve();
+  let profileInventoryDeferred = false;
+  let profileInventoryCalls = 0;
+  let resolveProfileSelectionStarted: (() => void) | undefined;
+  let releaseProfileSelectionGate: (() => void) | undefined;
+  const profileSelectionStarted =
+    options?.deferProfileSelection === true
+      ? new Promise<void>((resolve) => {
+          resolveProfileSelectionStarted = resolve;
+        })
+      : Promise.resolve();
+  const profileSelectionGate =
+    options?.deferProfileSelection === true
+      ? new Promise<void>((resolve) => {
+          releaseProfileSelectionGate = resolve;
         })
       : Promise.resolve();
   const hostRpcFailures = new Map<string, string>();
@@ -505,11 +538,23 @@ export async function createPublicPluginHarness(options?: {
         );
       }
       if (method === "listProfiles") {
-        return host.experimental_call(
+        const inventory = await host.experimental_call(
           "listProfiles",
           browserProfileHostTargetSchema.parse(input),
           { signal },
         );
+        profileInventoryCalls += 1;
+        const deferAfterCalls = options?.deferProfileInventoryAfterCalls ?? 0;
+        if (
+          options?.deferProfileInventory === true &&
+          !profileInventoryDeferred &&
+          profileInventoryCalls > deferAfterCalls
+        ) {
+          profileInventoryDeferred = true;
+          resolveProfileInventoryStarted?.();
+          await profileInventoryGate;
+        }
+        return inventory;
       }
       if (method === "createProfile") {
         return host.experimental_call(
@@ -526,11 +571,16 @@ export async function createPublicPluginHarness(options?: {
         );
       }
       if (method === "selectProfile") {
-        return host.experimental_call(
+        const inventory = await host.experimental_call(
           "selectProfile",
           browserProfileSelectRequestSchema.parse(input),
           { signal },
         );
+        if (options?.deferProfileSelection === true) {
+          resolveProfileSelectionStarted?.();
+          await profileSelectionGate;
+        }
+        return inventory;
       }
       if (method === "archiveProfile" || method === "restoreArchivedProfile") {
         return host.experimental_call(
@@ -1371,6 +1421,14 @@ export async function createPublicPluginHarness(options?: {
     projectLookupStarted,
     releaseProjectLookup() {
       releaseProjectLookupGate?.();
+    },
+    profileInventoryStarted,
+    releaseProfileInventory() {
+      releaseProfileInventoryGate?.();
+    },
+    profileSelectionStarted,
+    releaseProfileSelection() {
+      releaseProfileSelectionGate?.();
     },
     seedHostActivityEvent,
     runStatusCli,
