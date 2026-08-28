@@ -8,9 +8,11 @@ import {
 } from "../contracts.js";
 import {
   BROWSER_DATABASE_MIGRATIONS,
+  createBrowserDatabaseMigrationPlan,
   createActivityRecordProducers,
   createActivityRecordStore,
 } from "../activity-records.js";
+import { GRANT_REQUEST_MIGRATION } from "../grant-requests.js";
 
 const HOST_ID = "host-activity-test";
 const PROFILE_ID = DEFAULT_PROFILE_ID;
@@ -79,8 +81,69 @@ async function disposeBackend(
 }
 
 describe("Browser activity record persistence", () => {
-  it("upgrades predecessor records and rolls back a failed migration transaction", async () => {
-    const backend = createFakePluginHost({ pluginId: "activity-migration" });
+  it.each([
+    { history: "fresh", migrationAt11: null },
+    {
+      history: "093 metadata without request",
+      migrationAt11: predecessorActivityGrantMetadataMigration,
+    },
+    {
+      history: "663 request without metadata",
+      migrationAt11: GRANT_REQUEST_MIGRATION,
+    },
+    {
+      history: "both schemas present",
+      migrationAt11: `${GRANT_REQUEST_MIGRATION}\n${predecessorActivityGrantMetadataMigration}`,
+    },
+  ])("migrates the $history history by schema", async ({ migrationAt11 }) => {
+    const backend = createFakePluginHost({
+      pluginId: `activity-migration-${migrationAt11 === null ? "fresh" : "used"}`,
+    });
+    const database = backend.bb.storage.database();
+
+    try {
+      if (migrationAt11 !== null) {
+        backend.bb.storage.migrate(database, [
+          ...BROWSER_DATABASE_MIGRATIONS.slice(0, 11),
+          migrationAt11,
+        ]);
+      }
+
+      backend.bb.storage.migrate(
+        database,
+        createBrowserDatabaseMigrationPlan(database),
+      );
+
+      expect(
+        database
+          .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'browser_grant_request_events'",
+          )
+          .get(),
+      ).toEqual({ name: "browser_grant_request_events" });
+      expect(
+        database
+          .prepare("PRAGMA table_info(browser_activity_records)")
+          .all()
+          .map((column) => (column as { name: string }).name),
+      ).toEqual(
+        expect.arrayContaining([
+          "grant_id",
+          "grant_scope",
+          "grant_elevations",
+          "request_id",
+        ]),
+      );
+      expect(
+        database.prepare("SELECT id FROM _bb_migrations ORDER BY id").all(),
+      ).toEqual(Array.from({ length: 14 }, (_, id) => ({ id })));
+    } finally {
+      await disposeBackend(backend);
+    }
+  });
+
+  it("preserves predecessor activity records during migration", async () => {
+    const backend = createFakePluginHost({ pluginId: "activity-predecessor" });
     const database = backend.bb.storage.database();
 
     try {
@@ -116,13 +179,17 @@ describe("Browser activity record persistence", () => {
           null,
         );
 
-      backend.bb.storage.migrate(database, [...BROWSER_DATABASE_MIGRATIONS]);
-      const migrated = createActivityRecordStore(database, () => NOW).list({
-        hostId: HOST_ID,
-        profileId: PROFILE_ID,
-      });
+      backend.bb.storage.migrate(
+        database,
+        createBrowserDatabaseMigrationPlan(database),
+      );
 
-      expect(migrated).toMatchObject([
+      expect(
+        createActivityRecordStore(database, () => NOW).list({
+          hostId: HOST_ID,
+          profileId: PROFILE_ID,
+        }),
+      ).toMatchObject([
         {
           eventId: "predecessor-1",
           actor: "owner",
@@ -131,10 +198,24 @@ describe("Browser activity record persistence", () => {
           action: "setup",
         },
       ]);
+    } finally {
+      await disposeBackend(backend);
+    }
+  });
 
+  it("rolls back a failed migration transaction", async () => {
+    const backend = createFakePluginHost({ pluginId: "activity-rollback" });
+    const database = backend.bb.storage.database();
+
+    try {
+      backend.bb.storage.migrate(
+        database,
+        createBrowserDatabaseMigrationPlan(database),
+      );
       const appliedBefore = database
         .prepare("SELECT id FROM _bb_migrations ORDER BY id")
         .all();
+
       expect(() =>
         backend.bb.storage.migrate(database, [
           ...BROWSER_DATABASE_MIGRATIONS,

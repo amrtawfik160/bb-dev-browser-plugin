@@ -117,10 +117,60 @@ export const BROWSER_DATABASE_MIGRATIONS = [
   activityRecordsMigration,
   activityTombstonesMigration,
   ...BROWSER_AUTHORIZATION_MIGRATIONS,
-  activityGrantMetadataMigration,
   GRANT_REQUEST_MIGRATION,
+  activityGrantMetadataMigration,
   activityGrantRequestMetadataMigration,
 ] as const;
+
+const skippedCompatibilityMigration = "SELECT 1";
+
+function tableExists(database: Database.Database, tableName: string): boolean {
+  return (
+    database
+      .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")
+      .get(tableName) !== undefined
+  );
+}
+
+function activityGrantMetadataExists(database: Database.Database): boolean {
+  if (!tableExists(database, "browser_activity_records")) return false;
+  const columns = new Set(
+    database
+      .prepare("PRAGMA table_info(browser_activity_records)")
+      .all()
+      .map((column) => (column as { name: string }).name),
+  );
+  return ["grant_id", "grant_scope", "grant_elevations"].every((column) =>
+    columns.has(column),
+  );
+}
+
+function activityGrantCompatibilityMigration(
+  database: Database.Database,
+): string {
+  const requestTableExists = tableExists(
+    database,
+    "browser_grant_request_events",
+  );
+  const grantMetadataExists = activityGrantMetadataExists(database);
+  if (grantMetadataExists && !requestTableExists) {
+    return GRANT_REQUEST_MIGRATION;
+  }
+  if (grantMetadataExists && requestTableExists) {
+    return skippedCompatibilityMigration;
+  }
+  return activityGrantMetadataMigration;
+}
+
+export function createBrowserDatabaseMigrationPlan(
+  database: Database.Database,
+): string[] {
+  return [
+    ...BROWSER_DATABASE_MIGRATIONS.slice(0, 12),
+    activityGrantCompatibilityMigration(database),
+    ...BROWSER_DATABASE_MIGRATIONS.slice(13),
+  ];
+}
 
 const activityRowSchema = z
   .object({

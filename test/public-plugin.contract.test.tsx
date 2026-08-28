@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { fireEvent, waitFor } from "@testing-library/react";
+import { act, fireEvent, waitFor } from "@testing-library/react";
 import {
   mkdtemp,
   mkdir,
@@ -30,6 +30,7 @@ import {
   DEFAULT_PROFILE_ID,
   PERSIST_BROWSER_ELEVATED_ACCESS_CONFIRMATION,
   setupRequiredStatus,
+  type BrowserGrantRequest,
   type BrowserStatus,
 } from "../contracts.js";
 import { createPublicPluginHarness } from "./public-plugin-harness.js";
@@ -111,6 +112,14 @@ async function grantDefaultProfileOrigin(
     fileTransfer: false,
     invalidCertificateOrigins: [],
   });
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((fulfill) => {
+    resolve = fulfill;
+  });
+  return { promise, resolve };
 }
 
 describe("Browser public plugin contract", () => {
@@ -1059,6 +1068,114 @@ describe("Browser public plugin contract", () => {
       );
     } finally {
       await browser.dispose();
+    }
+  });
+
+  it("ignores an older panel refresh that resolves after a newer refresh", async () => {
+    const firstStarted = deferred<void>();
+    const secondStarted = deferred<void>();
+    const firstResponse = deferred<BrowserGrantRequest[]>();
+    const secondResponse = deferred<BrowserGrantRequest[]>();
+    const snapshots: BrowserGrantRequest[][] = [];
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+      deferGrantRequestRpc: (requests, callIndex) => {
+        snapshots[callIndex] = requests;
+        if (callIndex === 0) {
+          firstStarted.resolve();
+          return firstResponse.promise;
+        }
+        secondStarted.resolve();
+        return secondResponse.promise;
+      },
+    });
+
+    try {
+      await browser.createBrowserProfile({
+        hostId: "host-browser-test",
+        name: "Overlapping refresh target",
+      });
+      const denied = await browser.runBrowserScriptWithProfile(undefined, {
+        destinationOrigin: "https://overlapping-refresh.example.test",
+      });
+      const requestId = browserScriptFailureSchema.parse(
+        JSON.parse(denied.content[0]!.text),
+      ).error.grantRequest!.requestId;
+      const panel = await browser.openExistingThreadPanel();
+      await firstStarted.promise;
+
+      await browser.decideBrowserGrantRequest({
+        requestId,
+        decision: "one-hour",
+      });
+      window.dispatchEvent(new Event("focus"));
+      await secondStarted.promise;
+
+      await act(async () => {
+        secondResponse.resolve(snapshots[1]!);
+        await secondResponse.promise;
+      });
+      const notices = await panel.panel.findByRole("region", {
+        name: "Browser Grant Request notices",
+      });
+      expect(notices.textContent).toMatch(
+        new RegExp(`${requestId}.*approved`, "i"),
+      );
+
+      await act(async () => {
+        firstResponse.resolve(snapshots[0]!);
+        await firstResponse.promise;
+      });
+      expect(notices.textContent).toMatch(
+        new RegExp(`${requestId}.*approved`, "i"),
+      );
+      expect(notices.textContent).not.toMatch(
+        new RegExp(`${requestId}.*pending`, "i"),
+      );
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("does not refresh after unmount while a panel request is in flight", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const requestStarted = deferred<void>();
+    const response = deferred<BrowserGrantRequest[]>();
+    let refreshCalls = 0;
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+      deferGrantRequestRpc: (requests) => {
+        refreshCalls += 1;
+        requestStarted.resolve();
+        return response.promise.then(() => requests);
+      },
+    });
+
+    try {
+      await browser.createBrowserProfile({
+        hostId: "host-browser-test",
+        name: "Unmounted refresh target",
+      });
+      await browser.runBrowserScriptWithProfile(undefined, {
+        destinationOrigin: "https://unmounted-refresh.example.test",
+      });
+      const panel = await browser.openExistingThreadPanel();
+      await requestStarted.promise;
+
+      panel.panel.lifecycle.unmount();
+      await act(async () => {
+        response.resolve([]);
+        await response.promise;
+      });
+      await vi.advanceTimersByTimeAsync(2_000);
+      window.dispatchEvent(new Event("focus"));
+      await vi.runAllTimersAsync();
+
+      expect(refreshCalls).toBe(1);
+      expect(panel.panel.container.innerHTML).toBe("");
+    } finally {
+      await browser.dispose();
+      vi.useRealTimers();
     }
   });
 

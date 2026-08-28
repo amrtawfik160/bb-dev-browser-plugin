@@ -1,7 +1,16 @@
 import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
+import { fork, type ChildProcess } from "node:child_process";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 import { BROWSER_DATABASE_MIGRATIONS } from "../activity-records.js";
 import { createProfileGrantStore } from "../authorization.js";
+import {
+  createGrantRequestStore,
+  GRANT_REQUEST_MIGRATION,
+} from "../grant-requests.js";
 import {
   browserGrantRequestDecisionResponseSchema,
   browserGrantRequestSchema,
@@ -10,6 +19,52 @@ import {
 } from "../contracts.js";
 
 const NOW = new Date("2026-08-28T00:00:00.000Z");
+
+type DecisionProcessMessage =
+  | { type: "ready" }
+  | { type: "entered" }
+  | { type: "result"; outcome: string }
+  | { type: "error"; message: string };
+
+function spawnDecisionProcess(databasePath: string, requestId: string) {
+  const child = fork(
+    join(process.cwd(), "node_modules/vite-node/vite-node.mjs"),
+    ["--script", "test/fixtures/grant-decision-process.ts"],
+    {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        R9_DECISION_DATABASE_PATH: databasePath,
+        R9_DECISION_REQUEST_ID: requestId,
+      },
+      stdio: ["ignore", "pipe", "pipe", "ipc"],
+    },
+  );
+  let ready!: () => void;
+  let entered!: () => void;
+  let complete!: (message: DecisionProcessMessage) => void;
+  const readyPromise = new Promise<void>((resolve) => {
+    ready = resolve;
+  });
+  const enteredPromise = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  const resultPromise = new Promise<DecisionProcessMessage>((resolve) => {
+    complete = resolve;
+  });
+  child.on("message", (message: DecisionProcessMessage) => {
+    if (message.type === "ready") ready();
+    if (message.type === "entered") entered();
+    if (message.type === "result" || message.type === "error") {
+      complete(message);
+    }
+  });
+  return { child, readyPromise, enteredPromise, resultPromise };
+}
+
+function stopProcess(child: ChildProcess) {
+  if (child.exitCode === null && child.signalCode === null) child.kill();
+}
 
 function createStore() {
   const backend = createFakePluginHost({ pluginId: "grant-request-contract" });
@@ -142,10 +197,8 @@ describe("Browser Grant Request store contract", () => {
       const requestId = denied.grantRequest!.requestId;
       store.decideRequest({ requestId, decision: "retry" });
 
-      const [first, second] = await Promise.all([
-        Promise.resolve().then(() => store.authorize(authorization())),
-        Promise.resolve().then(() => secondStore.authorize(authorization())),
-      ]);
+      const first = store.authorize(authorization());
+      const second = secondStore.authorize(authorization());
       expect(first).toMatchObject({
         allowed: true,
         temporaryGrant: { mode: "retry" },
@@ -317,42 +370,59 @@ describe("Browser Grant Request store contract", () => {
     }
   });
 
-  it("allows only one winner when two stores decide the same request concurrently", async () => {
-    const { backend, store } = createStore();
-    const competingStore = createProfileGrantStore(
-      backend.bb.storage.database(),
-      {
-        clock: () => NOW,
-        idFactory: () => "competing-store",
-      },
-    );
+  it("allows one winner across overlapping independent decision processes", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "grant-decision-"));
+    const databasePath = join(directory, "browser.sqlite");
+    const database = new Database(databasePath);
+    database.exec(GRANT_REQUEST_MIGRATION);
+    const store = createGrantRequestStore(database, {
+      clock: () => NOW,
+      idFactory: () => "concurrent-request",
+    });
+    const denied = store.authorize(authorization(), "Explicit retry required.");
+    if (denied.allowed || denied.grantRequest === null) {
+      throw new Error("expected a pending Grant Request");
+    }
+    const requestId = denied.grantRequest.requestId;
+    database.exec("BEGIN EXCLUSIVE");
+    const first = spawnDecisionProcess(databasePath, requestId);
+    const second = spawnDecisionProcess(databasePath, requestId);
 
     try {
-      const denied = store.authorize(authorization());
-      const requestId = denied.grantRequest!.requestId;
-      const [first, second] = await Promise.all([
-        Promise.resolve().then(() =>
-          store.decideRequest({ requestId, decision: "retry" }),
-        ),
-        Promise.resolve().then(() =>
-          competingStore.decideRequest({ requestId, decision: "one-hour" }),
-        ),
-      ]);
+      await Promise.all([first.readyPromise, second.readyPromise]);
+      first.child.send("decide");
+      second.child.send("decide");
+      await Promise.all([first.enteredPromise, second.enteredPromise]);
+      database.exec("COMMIT");
 
-      expect([first.outcome, second.outcome].sort()).toEqual([
-        "already-decided",
-        "retry-approved",
+      const results = await Promise.all([
+        first.resultPromise,
+        second.resultPromise,
       ]);
+      const errors = results.filter((result) => result.type === "error");
+      expect(errors).toEqual([]);
       expect(
-        backend.bb.storage
-          .database()
+        results
+          .filter((result) => result.type === "result")
+          .map((result) => result.outcome)
+          .sort(),
+      ).toEqual(["already-decided", "retry-approved"]);
+      expect(
+        database
           .prepare(
-            "SELECT COUNT(*) AS count FROM browser_grant_request_events WHERE request_id = ? AND event_type = 'approved'",
+            "SELECT event_type, COUNT(*) AS count FROM browser_grant_request_events WHERE request_id = ? GROUP BY event_type ORDER BY event_type",
           )
-          .get(requestId),
-      ).toMatchObject({ count: 1 });
+          .all(requestId),
+      ).toEqual([
+        { event_type: "approved", count: 1 },
+        { event_type: "requested", count: 1 },
+      ]);
     } finally {
-      await backend.harness.lifecycle.dispose();
+      if (database.inTransaction) database.exec("ROLLBACK");
+      stopProcess(first.child);
+      stopProcess(second.child);
+      database.close();
+      await rm(directory, { recursive: true, force: true });
     }
   });
 

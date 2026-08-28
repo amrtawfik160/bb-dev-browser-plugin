@@ -65,6 +65,7 @@ import {
   type BrowserHostTarget,
   type BrowserStatus,
   type BrowserHostChoicesInput,
+  type BrowserGrantRequest,
   type BrowserStatusInput,
   type rpcContract,
 } from "../contracts.js";
@@ -211,6 +212,10 @@ export async function createPublicPluginHarness(options?: {
   profileStore?: BrowserProfileStore;
   profileRecovery?: BrowserProfileRecovery;
   deferProjectLookup?: boolean;
+  deferGrantRequestRpc?: (
+    requests: BrowserGrantRequest[],
+    callIndex: number,
+  ) => Promise<BrowserGrantRequest[]>;
 }) {
   const configuredHostId = options?.hostId ?? HOST_ID;
   const configuredProjectHostIds = options?.projectHostIds ?? [
@@ -551,6 +556,7 @@ export async function createPublicPluginHarness(options?: {
   const threadPanels = new Map<string, RenderedSlot>();
   const newThreadPanels = new Map<string, RenderedSlot>();
   const settingsPanels: RenderedSlot[] = [];
+  let grantRequestRpcCallIndex = 0;
 
   const rpc = {
     browser_status: (input: BrowserStatusInput) =>
@@ -678,7 +684,7 @@ export async function createPublicPluginHarness(options?: {
       ) as Promise<
         ReturnType<typeof browserProfileGrantRevokeResponseSchema.parse>
       >,
-    browser_grant_requests: (input: {
+    browser_grant_requests: async (input: {
       requestId?: string;
       projectId?: string;
       hostId?: string;
@@ -686,11 +692,16 @@ export async function createPublicPluginHarness(options?: {
       profileId?: string;
       status?:
         "pending" | "denied" | "approved" | "consumed" | "expired" | "revoked";
-    }) =>
-      backend.harness.behavior.callRpc(
+    }) => {
+      const requests = (await backend.harness.behavior.callRpc(
         "browser_grant_requests",
         browserGrantRequestQuerySchema.parse(input),
-      ) as Promise<ReturnType<typeof browserGrantRequestsSchema.parse>>,
+      )) as ReturnType<typeof browserGrantRequestsSchema.parse>;
+      const callIndex = grantRequestRpcCallIndex++;
+      return options?.deferGrantRequestRpc === undefined
+        ? requests
+        : options.deferGrantRequestRpc(requests, callIndex);
+    },
     browser_grant_request_inspect: (input: { requestId: string }) =>
       backend.harness.behavior.callRpc(
         "browser_grant_request_inspect",

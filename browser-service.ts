@@ -6,7 +6,7 @@ import type {
 import type Database from "better-sqlite3";
 import { z } from "zod";
 import {
-  BROWSER_DATABASE_MIGRATIONS,
+  createBrowserDatabaseMigrationPlan,
   createActivityRecordStore,
   createActivityRecordProducers,
   activityEventFromOutboxItem,
@@ -423,7 +423,7 @@ export function createBrowserService(
 ) {
   const ownerAuthority = suppliedOwnerAuthority ?? Symbol("browser-owner");
   const database = bb.storage.database();
-  bb.storage.migrate(database, [...BROWSER_DATABASE_MIGRATIONS]);
+  bb.storage.migrate(database, createBrowserDatabaseMigrationPlan(database));
   const activityStore: ActivityRecordStore =
     createActivityRecordStore(database);
   const activityProducers = createActivityRecordProducers(activityStore);

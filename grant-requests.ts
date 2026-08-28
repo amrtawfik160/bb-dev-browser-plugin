@@ -831,7 +831,7 @@ export function createGrantRequestStore(
       input.requestId,
     );
     const events: GrantRequestEvent[] = [];
-    const decisionResponse = database.transaction(() => {
+    const decisionTransaction = database.transaction(() => {
       const now = clock();
       const nowIso = now.toISOString();
       expireRowsAt(database, now, latestEventRows(database), events);
@@ -935,7 +935,8 @@ export function createGrantRequestStore(
         temporaryMode === "retry" ? "retry-approved" : "one-hour-approved",
         eventRowsForRequest(database, normalizedRequestId),
       );
-    })();
+    });
+    const decisionResponse = decisionTransaction.immediate();
     emitRequestEvents(events, options.onEvent);
     return decisionResponse;
   }
