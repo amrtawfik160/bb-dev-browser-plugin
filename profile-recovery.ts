@@ -302,13 +302,35 @@ async function pathExists(path: string) {
   }
 }
 
+async function removeCreatedRecoveryLock(
+  lockPath: string,
+  createdLockMetadata: Awaited<ReturnType<typeof lstat>>,
+) {
+  let currentLockMetadata;
+  try {
+    currentLockMetadata = await lstat(lockPath);
+  } catch (error) {
+    if (isMissingPath(error)) return;
+    throw error;
+  }
+  if (
+    currentLockMetadata.dev !== createdLockMetadata.dev ||
+    currentLockMetadata.ino !== createdLockMetadata.ino
+  ) {
+    return;
+  }
+  await rm(lockPath, { force: true });
+}
+
 async function acquireRecoveryLock(
   lockPath: string,
   ownership: ProfileStorageOwnershipBoundary,
 ) {
   for (let attempt = 0; attempt < 500; attempt += 1) {
+    let createdLockMetadata: Awaited<ReturnType<typeof lstat>> | undefined;
     try {
       const lockFile = await open(lockPath, "wx", ARCHIVE_FILE_MODE);
+      createdLockMetadata = await lockFile.stat();
       try {
         await lockFile.writeFile(`${process.pid}\n`, "utf8");
         await lockFile.sync();
@@ -319,6 +341,11 @@ async function acquireRecoveryLock(
       await ownership.ensureOwned(lockPath, ARCHIVE_FILE_MODE);
       return;
     } catch (error) {
+      if (createdLockMetadata !== undefined) {
+        await Promise.allSettled([
+          removeCreatedRecoveryLock(lockPath, createdLockMetadata),
+        ]);
+      }
       if (!(error instanceof Error) || !("code" in error)) throw error;
       if (error.code !== "EEXIST") throw error;
       if (await removeStaleRecoveryLock(lockPath)) continue;

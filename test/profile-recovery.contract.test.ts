@@ -13,6 +13,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { DEFAULT_PROFILE_ID } from "../contracts.js";
 import {
+  BrowserProfileRecoveryError,
   createFileBrowserProfileRecovery,
   type BrowserProfileRecoveryState,
 } from "../profile-recovery.js";
@@ -1095,6 +1096,51 @@ describe("Browser Profile recovery", () => {
       await expect(stat(abandonedPath)).rejects.toMatchObject({
         code: "ENOENT",
       });
+    } finally {
+      await rm(rootDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("R7-05 removes a lock created before ownership validation fails", async () => {
+    const rootDirectory = await mkdtemp(join(tmpdir(), "bb-browser-recovery-"));
+    let lockPath = "";
+    const ownershipFailure = new BrowserProfileRecoveryError(
+      "recovery-copy-failed",
+      "ownership setup failed",
+    );
+    const ownership = {
+      ensureOwned: async (path: string) => {
+        if (path === lockPath) throw ownershipFailure;
+      },
+      verifyOwned: async () => undefined,
+    };
+
+    try {
+      const store = createFileBrowserProfileStore({
+        rootDirectory,
+        installationId: "installation-test",
+        ownership,
+      });
+      await store.initialize("host-a");
+      const profilePaths = profileStoragePaths({
+        rootDirectory,
+        installationId: "installation-test",
+        hostId: "host-a",
+        profileId: DEFAULT_PROFILE_ID,
+      });
+      lockPath = join(profilePaths.hostStoragePath, ".recovery.lock");
+      const recovery = createFileBrowserProfileRecovery({
+        rootDirectory,
+        installationId: "installation-test",
+        state: {
+          isProfileStopped: async () => true,
+          isDevBrowserProfileStopped: async () => true,
+        },
+        ownership,
+      });
+
+      await expect(recovery.ready).rejects.toBe(ownershipFailure);
+      await expect(stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
       await rm(rootDirectory, { recursive: true, force: true });
     }
