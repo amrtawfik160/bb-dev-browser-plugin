@@ -29,6 +29,7 @@ import {
   browserProfileRecoveryResponseSchema,
   DEFAULT_PROFILE_ID,
   PERSIST_BROWSER_ELEVATED_ACCESS_CONFIRMATION,
+  RESET_PROFILE_CONFIRMATION,
   setupRequiredStatus,
   type BrowserGrantRequest,
   type BrowserStatus,
@@ -1957,6 +1958,193 @@ describe("Browser public plugin contract", () => {
     }
   });
 
+  it("removes persistent and temporary authority before archive stop and never restores it", async () => {
+    const rootDirectory = await mkdtemp(
+      join(tmpdir(), "bb-browser-public-lifecycle-"),
+    );
+    const stopStarted = deferred<void>();
+    const releaseStop = deferred<void>();
+    const profileStore = createFileBrowserProfileStore({
+      rootDirectory,
+      installationId: "installation-public-test",
+      lifecycle: {
+        stopProfile: async () => {
+          stopStarted.resolve();
+          await releaseStop.promise;
+        },
+      },
+    });
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+      profileStore,
+    });
+    try {
+      const profile = await browser.createBrowserProfile({
+        hostId: "host-browser-test",
+        name: "Authority target",
+      });
+      const persistent = await browser.createBrowserGrant({
+        projectId: "project-browser-test",
+        hostId: "host-browser-test",
+        profileId: profile.profileId,
+        originScope: "https://persistent.example.test",
+      });
+      const denied = browserScriptFailureSchema.parse(
+        JSON.parse(
+          (
+            await browser.runBrowserScriptWithProfile(profile.profileId, {
+              destinationOrigin: "https://temporary.example.test",
+            })
+          ).content[0]!.text,
+        ),
+      );
+      const requestId = denied.error.grantRequest!.requestId;
+      const approved = await browser.decideBrowserGrantRequest({
+        requestId,
+        decision: "retry",
+      });
+      expect(approved.temporaryGrant).not.toBeNull();
+
+      const archiving = browser.archiveBrowserProfile({
+        hostId: "host-browser-test",
+        profileId: profile.profileId,
+      });
+      await stopStarted.promise;
+      const concurrentArchive = browser.archiveBrowserProfile({
+        hostId: "host-browser-test",
+        profileId: profile.profileId,
+      });
+
+      expect(
+        await browser.inspectBrowserGrant(persistent.grantId),
+      ).toMatchObject({
+        revokedAt: expect.any(String),
+      });
+      expect(await browser.inspectBrowserGrantRequest(requestId)).toMatchObject(
+        {
+          status: "revoked",
+        },
+      );
+      releaseStop.resolve();
+      await expect(archiving).resolves.toMatchObject({ outcome: "archived" });
+      await expect(concurrentArchive).resolves.toMatchObject({
+        outcome: "already-archived",
+      });
+      await expect(
+        browser.restoreArchivedBrowserProfile({
+          hostId: "host-browser-test",
+          profileId: profile.profileId,
+        }),
+      ).resolves.toMatchObject({ outcome: "restored" });
+      expect(
+        await browser.inspectBrowserGrant(persistent.grantId),
+      ).toMatchObject({
+        revokedAt: expect.any(String),
+      });
+      expect(await browser.inspectBrowserGrantRequest(requestId)).toMatchObject(
+        {
+          status: "revoked",
+        },
+      );
+    } finally {
+      releaseStop.resolve();
+      await browser.dispose();
+      await rm(rootDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("protects the Settings default, confirms credential loss, and fails closed for CLI mutations", async () => {
+    const rootDirectory = await mkdtemp(
+      join(tmpdir(), "bb-browser-public-lifecycle-"),
+    );
+    const profileStore = createFileBrowserProfileStore({
+      rootDirectory,
+      installationId: "installation-public-test",
+      lifecycle: { stopProfile: async () => undefined },
+    });
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+      profileStore,
+    });
+    try {
+      const profile = await browser.createBrowserProfile({
+        hostId: "host-browser-test",
+        name: "Delete target",
+      });
+      await browser.selectBrowserProfile(
+        { hostId: "host-browser-test", profileId: profile.profileId },
+        {},
+      );
+      await expect(
+        browser.deleteBrowserProfile({
+          hostId: "host-browser-test",
+          profileId: profile.profileId,
+          confirmation: profile.name,
+        }),
+      ).rejects.toThrow("Select another default");
+      await expect(
+        browser.resetBrowserProfile({
+          hostId: "host-browser-test",
+          profileId: profile.profileId,
+          confirmation: "reset",
+        }),
+      ).rejects.toThrow("credential loss");
+      await expect(
+        browser.resetBrowserProfile({
+          hostId: "host-browser-test",
+          profileId: profile.profileId,
+          confirmation: RESET_PROFILE_CONFIRMATION,
+        }),
+      ).resolves.toMatchObject({ outcome: "reset" });
+
+      const cli = await browser.runBrowserCli([
+        "archive",
+        "--profile",
+        profile.profileId,
+      ]);
+      expect(cli).toMatchObject({ exitCode: 1 });
+      expect(cli.stderr).toContain("authenticated owner Settings");
+      expect(cli.stdout).toContain("Progress: not started");
+      expect(cli.stdout).toContain("State: active");
+
+      await browser.selectBrowserProfile(
+        { hostId: "host-browser-test", profileId: DEFAULT_PROFILE_ID },
+        {},
+      );
+      await expect(
+        browser.deleteBrowserProfile({
+          hostId: "host-browser-test",
+          profileId: profile.profileId,
+          confirmation: profile.name,
+        }),
+      ).resolves.toMatchObject({ outcome: "deleted" });
+      await expect(
+        browser.deleteBrowserProfile({
+          hostId: "host-browser-test",
+          profileId: profile.profileId,
+          confirmation: profile.name,
+        }),
+      ).resolves.toMatchObject({ outcome: "already-deleted" });
+      const lifecycleRecords = (
+        await browser.runBrowserActivityRecords(profile.profileId)
+      ).filter(({ kind }) => kind === "lifecycle");
+      expect(
+        lifecycleRecords.map(({ action, outcome }) => ({ action, outcome })),
+      ).toEqual(
+        expect.arrayContaining([
+          { action: "reset", outcome: "reset" },
+          { action: "delete", outcome: "deleted" },
+        ]),
+      );
+      expect(JSON.stringify(lifecycleRecords)).not.toMatch(
+        /Delete target|Lose saved sessions|confirmation/i,
+      );
+    } finally {
+      await browser.dispose();
+      await rm(rootDirectory, { recursive: true, force: true });
+    }
+  });
+
   it("R7-06 shows an operation-specific recovery status while Settings waits for completion", async () => {
     let releaseBackup!: (result: BrowserProfileBackupResult) => void;
     const backupResult = new Promise<BrowserProfileBackupResult>((resolve) => {
@@ -2912,6 +3100,65 @@ describe("Browser public plugin contract", () => {
     );
     await settings.findByText(/Selected: profile-/);
     await browser.dispose();
+  });
+
+  it("shows destructive consequences, progress, recovery deadline, and final state in Settings", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+    });
+    const profile = await browser.createBrowserProfile({
+      hostId: "host-browser-test",
+      name: "Lifecycle UI target",
+    });
+    const settings = browser.renderSettings();
+    try {
+      expect(
+        await settings.findAllByText(/removes all agent authority immediately/),
+      ).toHaveLength(2);
+      fireEvent.click(
+        await settings.findByRole("button", {
+          name: "Archive Lifecycle UI target",
+        }),
+      );
+      await settings.findByText(/Archive in progress/);
+      await settings.findByText(/Recoverable until \d{4}-/);
+      fireEvent.click(
+        await settings.findByRole("button", {
+          name: "Restore Lifecycle UI target",
+        }),
+      );
+      await settings.findByText(/Restore in progress/);
+      await settings.findByRole("button", {
+        name: "Reset Lifecycle UI target",
+      });
+
+      const confirmation = settings.getByLabelText(
+        "Lifecycle confirmation Lifecycle UI target",
+      );
+      fireEvent.change(confirmation, {
+        target: { value: RESET_PROFILE_CONFIRMATION },
+      });
+      fireEvent.click(
+        settings.getByRole("button", { name: "Reset Lifecycle UI target" }),
+      );
+      await settings.findByText(/Browser Profile Lifecycle UI target is reset/);
+
+      fireEvent.change(confirmation, { target: { value: profile.name } });
+      fireEvent.click(
+        settings.getByRole("button", {
+          name: "Permanently delete Lifecycle UI target",
+        }),
+      );
+      await waitFor(() =>
+        expect(
+          settings.queryByRole("button", {
+            name: "Permanently delete Lifecycle UI target",
+          }),
+        ).toBeNull(),
+      );
+    } finally {
+      await browser.dispose();
+    }
   });
 
   it("lets a panel choose a host-local Browser Profile", async () => {

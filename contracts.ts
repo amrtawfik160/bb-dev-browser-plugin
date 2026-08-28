@@ -11,6 +11,9 @@ export const BROWSER_STORAGE_ROOT = "/var/lib/bb-browser";
 export const BROWSER_CONFIGURATION_ROOT = "/etc/bb-browser";
 export const STOP_BROWSER_CONFIRMATION = "Stop Browser processes";
 export const CLEAR_ACTIVITY_CONFIRMATION = "Clear Browser activity records";
+export const RESET_PROFILE_CONFIRMATION =
+  "Lose saved sessions and reset this Browser Profile";
+export const PROFILE_ARCHIVE_RETENTION_DAYS = 30;
 export const ACTIVITY_RECORD_LIMIT = 10_000;
 export const ACTIVITY_RETENTION_DAYS = 30;
 export const ACTIVITY_OUTBOX_BATCH_LIMIT = 100;
@@ -261,7 +264,7 @@ export const browserProfileStorageSchema = z
   })
   .strict();
 
-export const browserProfileManifestSchema = z
+const browserProfileManifestBaseSchema = z
   .object({
     version: z.literal(PROFILE_MANIFEST_VERSION),
     profileId: browserProfileIdSchema,
@@ -272,15 +275,38 @@ export const browserProfileManifestSchema = z
     timezone: browserProfileTimezoneSchema,
     createdAt: z.string().datetime(),
     updatedAt: z.string().datetime(),
-    state: z.literal("active"),
     startup: browserProfileStartupSchema,
     storage: browserProfileStorageSchema,
   })
   .strict();
 
-export const browserProfileSchema = browserProfileManifestSchema
-  .extend({ selected: z.boolean() })
+const activeBrowserProfileManifestSchema = browserProfileManifestBaseSchema
+  .extend({
+    state: z.literal("active"),
+    archivedAt: z.null().default(null),
+    expiresAt: z.null().default(null),
+  })
   .strict();
+
+const archivedBrowserProfileManifestSchema = browserProfileManifestBaseSchema
+  .extend({
+    state: z.literal("archived"),
+    archivedAt: z.string().datetime(),
+    expiresAt: z.string().datetime(),
+  })
+  .strict();
+
+export const browserProfileManifestSchema = z.discriminatedUnion("state", [
+  activeBrowserProfileManifestSchema,
+  archivedBrowserProfileManifestSchema,
+]);
+
+export const browserProfileSchema = z.discriminatedUnion("state", [
+  activeBrowserProfileManifestSchema.extend({ selected: z.boolean() }).strict(),
+  archivedBrowserProfileManifestSchema
+    .extend({ selected: z.boolean() })
+    .strict(),
+]);
 
 export const browserProfileHostTargetSchema = z
   .object({ hostId: z.string().min(1) })
@@ -310,6 +336,69 @@ export const browserProfileSelectRequestSchema = z
     hostId: z.string().min(1),
     profileId: browserProfileIdSchema,
   })
+  .strict();
+
+export const browserProfileTargetSchema = z
+  .object({
+    hostId: z.string().min(1),
+    profileId: browserProfileIdSchema,
+  })
+  .strict();
+
+export const browserProfileResetRequestSchema = browserProfileTargetSchema
+  .extend({ confirmation: z.string().min(1) })
+  .strict();
+
+export const browserProfileDeleteRequestSchema = browserProfileTargetSchema
+  .extend({
+    confirmation: z.string().min(1),
+    defaultProfileId: browserProfileIdSchema.optional(),
+  })
+  .strict();
+
+export const browserProfileLifecyclePhaseSchema = z.enum([
+  "stopping",
+  "updating-storage",
+  "completed",
+]);
+
+export const browserProfileLifecycleProgressSchema = z
+  .object({
+    phase: browserProfileLifecyclePhaseSchema,
+    message: z.string().min(1),
+  })
+  .strict();
+
+export const browserProfileLifecycleResponseSchema = z.discriminatedUnion(
+  "outcome",
+  [
+    z
+      .object({
+        outcome: z.enum([
+          "archived",
+          "already-archived",
+          "restored",
+          "already-restored",
+          "reset",
+        ]),
+        profile: browserProfileSchema,
+        progress: browserProfileLifecycleProgressSchema,
+        message: z.string().min(1),
+      })
+      .strict(),
+    z
+      .object({
+        outcome: z.enum(["deleted", "already-deleted"]),
+        profileId: browserProfileIdSchema,
+        progress: browserProfileLifecycleProgressSchema,
+        message: z.string().min(1),
+      })
+      .strict(),
+  ],
+);
+
+export const browserProfileExpiryResponseSchema = z
+  .object({ deletedProfileIds: z.array(browserProfileIdSchema) })
   .strict();
 
 const browserProfileContextSchema = z
@@ -375,6 +464,22 @@ export type BrowserProfileRenameRequest = z.infer<
 >;
 export type BrowserProfileSelectRequest = z.infer<
   typeof browserProfileSelectRequestSchema
+>;
+export type BrowserProfileTarget = z.infer<typeof browserProfileTargetSchema>;
+export type BrowserProfileResetRequest = z.infer<
+  typeof browserProfileResetRequestSchema
+>;
+export type BrowserProfileDeleteRequest = z.infer<
+  typeof browserProfileDeleteRequestSchema
+>;
+export type BrowserProfileLifecycleProgress = z.infer<
+  typeof browserProfileLifecycleProgressSchema
+>;
+export type BrowserProfileLifecycleResponse = z.infer<
+  typeof browserProfileLifecycleResponseSchema
+>;
+export type BrowserProfileExpiryResponse = z.infer<
+  typeof browserProfileExpiryResponseSchema
 >;
 export type BrowserProfileQuery = z.infer<typeof browserProfileQuerySchema>;
 export type BrowserProfileSelectionRequest = z.infer<
@@ -1436,6 +1541,22 @@ export const rpcContract = defineRpcContract({
   browser_profile_select: {
     input: browserProfileSelectionRequestSchema,
     output: browserProfileInventorySchema,
+  },
+  browser_profile_archive: {
+    input: browserProfileTargetSchema,
+    output: browserProfileLifecycleResponseSchema,
+  },
+  browser_profile_restore_archived: {
+    input: browserProfileTargetSchema,
+    output: browserProfileLifecycleResponseSchema,
+  },
+  browser_profile_reset: {
+    input: browserProfileResetRequestSchema,
+    output: browserProfileLifecycleResponseSchema,
+  },
+  browser_profile_delete: {
+    input: browserProfileDeleteRequestSchema.omit({ defaultProfileId: true }),
+    output: browserProfileLifecycleResponseSchema,
   },
   browser_profile_backup: {
     input: browserProfileBackupRequestSchema,

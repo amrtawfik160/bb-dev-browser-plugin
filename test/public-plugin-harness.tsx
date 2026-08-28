@@ -37,15 +37,19 @@ import {
   browserPurgePlanSchema,
   browserPurgeResponseSchema,
   browserProfileCreateRequestSchema,
+  browserProfileDeleteRequestSchema,
   browserProfileBackupRequestSchema,
   browserProfileHostTargetSchema,
   browserProfileImportRequestSchema,
   browserProfileInventorySchema,
+  browserProfileLifecycleResponseSchema,
   browserProfileRenameRequestSchema,
+  browserProfileResetRequestSchema,
   browserProfileRecoveryResponseSchema,
   browserProfileRestoreRequestSchema,
   browserProfileSchema,
   browserProfileSelectRequestSchema,
+  browserProfileTargetSchema,
   browserProfileGrantCreateRequestSchema,
   browserProfileGrantQuerySchema,
   browserProfileGrantRevokeRequestSchema,
@@ -314,6 +318,7 @@ export async function createPublicPluginHarness(options?: {
     createFileBrowserProfileStore({
       rootDirectory: profileStorageRoot!,
       installationId: "installation-public-test",
+      lifecycle: { stopProfile: async () => undefined },
     });
   const profileRecovery =
     options?.profileRecovery ??
@@ -524,6 +529,27 @@ export async function createPublicPluginHarness(options?: {
         return host.experimental_call(
           "selectProfile",
           browserProfileSelectRequestSchema.parse(input),
+          { signal },
+        );
+      }
+      if (method === "archiveProfile" || method === "restoreArchivedProfile") {
+        return host.experimental_call(
+          method,
+          browserProfileTargetSchema.parse(input),
+          { signal },
+        );
+      }
+      if (method === "resetProfile") {
+        return host.experimental_call(
+          method,
+          browserProfileResetRequestSchema.parse(input),
+          { signal },
+        );
+      }
+      if (method === "deleteProfile") {
+        return host.experimental_call(
+          method,
+          browserProfileDeleteRequestSchema.parse(input),
           { signal },
         );
       }
@@ -756,6 +782,45 @@ export async function createPublicPluginHarness(options?: {
         "browser_profile_select",
         input,
       ) as Promise<ReturnType<typeof browserProfileInventorySchema.parse>>,
+    browser_profile_archive: (input: { hostId: string; profileId: string }) =>
+      backend.harness.behavior.callRpc(
+        "browser_profile_archive",
+        input,
+      ) as Promise<
+        ReturnType<typeof browserProfileLifecycleResponseSchema.parse>
+      >,
+    browser_profile_restore_archived: (input: {
+      hostId: string;
+      profileId: string;
+    }) =>
+      backend.harness.behavior.callRpc(
+        "browser_profile_restore_archived",
+        input,
+      ) as Promise<
+        ReturnType<typeof browserProfileLifecycleResponseSchema.parse>
+      >,
+    browser_profile_reset: (input: {
+      hostId: string;
+      profileId: string;
+      confirmation: string;
+    }) =>
+      backend.harness.behavior.callRpc(
+        "browser_profile_reset",
+        input,
+      ) as Promise<
+        ReturnType<typeof browserProfileLifecycleResponseSchema.parse>
+      >,
+    browser_profile_delete: (input: {
+      hostId: string;
+      profileId: string;
+      confirmation: string;
+    }) =>
+      backend.harness.behavior.callRpc(
+        "browser_profile_delete",
+        input,
+      ) as Promise<
+        ReturnType<typeof browserProfileLifecycleResponseSchema.parse>
+      >,
     browser_profile_backup: (input: {
       hostId: string;
       profileId: string;
@@ -967,6 +1032,33 @@ export async function createPublicPluginHarness(options?: {
     const selectionContext =
       context === undefined ? { projectId: PROJECT_ID } : context;
     return rpc.browser_profile_select({ ...input, ...selectionContext });
+  }
+
+  function archiveBrowserProfile(input: { hostId: string; profileId: string }) {
+    return rpc.browser_profile_archive(input);
+  }
+
+  function restoreArchivedBrowserProfile(input: {
+    hostId: string;
+    profileId: string;
+  }) {
+    return rpc.browser_profile_restore_archived(input);
+  }
+
+  function resetBrowserProfile(input: {
+    hostId: string;
+    profileId: string;
+    confirmation: string;
+  }) {
+    return rpc.browser_profile_reset(input);
+  }
+
+  function deleteBrowserProfile(input: {
+    hostId: string;
+    profileId: string;
+    confirmation: string;
+  }) {
+    return rpc.browser_profile_delete(input);
   }
 
   function backupBrowserProfile(input: {
@@ -1295,6 +1387,10 @@ export async function createPublicPluginHarness(options?: {
     createBrowserProfile,
     renameBrowserProfile,
     selectBrowserProfile,
+    archiveBrowserProfile,
+    restoreArchivedBrowserProfile,
+    resetBrowserProfile,
+    deleteBrowserProfile,
     backupBrowserProfile,
     restoreBrowserProfile,
     importBrowserProfile,

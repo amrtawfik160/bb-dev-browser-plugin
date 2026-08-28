@@ -18,15 +18,20 @@ import {
   browserScriptResponseSchema,
   browserScriptRequestSchema,
   browserProfileCreateRequestSchema,
+  browserProfileDeleteRequestSchema,
+  browserProfileExpiryResponseSchema,
   browserProfileBackupRequestSchema,
   browserProfileHostTargetSchema,
   browserProfileImportRequestSchema,
   browserProfileInventorySchema,
+  browserProfileLifecycleResponseSchema,
   browserProfileRenameRequestSchema,
+  browserProfileResetRequestSchema,
   browserProfileRecoveryResponseSchema,
   browserProfileRestoreRequestSchema,
   browserProfileSchema,
   browserProfileSelectRequestSchema,
+  browserProfileTargetSchema,
   browserStatusSchema,
 } from "./contracts.js";
 
@@ -94,6 +99,26 @@ export const browserHostContract = defineRpcContract({
   selectProfile: {
     input: browserProfileSelectRequestSchema,
     output: browserProfileInventorySchema,
+  },
+  archiveProfile: {
+    input: browserProfileTargetSchema,
+    output: browserProfileLifecycleResponseSchema,
+  },
+  restoreArchivedProfile: {
+    input: browserProfileTargetSchema,
+    output: browserProfileLifecycleResponseSchema,
+  },
+  resetProfile: {
+    input: browserProfileResetRequestSchema,
+    output: browserProfileLifecycleResponseSchema,
+  },
+  deleteProfile: {
+    input: browserProfileDeleteRequestSchema,
+    output: browserProfileLifecycleResponseSchema,
+  },
+  expireArchivedProfiles: {
+    input: browserProfileHostTargetSchema,
+    output: browserProfileExpiryResponseSchema,
   },
   backupProfile: {
     input: browserProfileBackupRequestSchema,

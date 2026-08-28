@@ -32,7 +32,7 @@ import {
 } from "./contracts.js";
 
 const CLI_USAGE = [
-  "Usage: bb browser <status|diagnostics|activity|activity-export|activity-clear|requests|request-status|list|create|rename|select|backup|restore|import|setup|disable|uninstall|purge> [options]",
+  "Usage: bb browser <status|diagnostics|activity|activity-export|activity-clear|requests|request-status|list|create|rename|select|backup|restore|import|archive|restore-archived|reset|delete|setup|disable|uninstall|purge> [options]",
   "  setup [--profile <id>] [--step <id> --confirm <text>] [--json]",
   "  purge [--profile <id>] [--confirm <text>] [--json]",
   "  disable|uninstall [--profile <id>] --confirm <text> [--json]",
@@ -48,6 +48,8 @@ const CLI_USAGE = [
   "  backup --profile <id> --archive <path> [--host <id>] [--json]",
   "  restore --profile <id> --archive <path> [--host <id>] [--json]",
   "  import --name <name> --source <path> [--host <id>] [--json]",
+  "  archive|restore-archived --profile <id> [--host <id>] [--json]",
+  "  reset|delete --profile <id> --confirm <text> [--host <id>] [--json]",
 ].join("\n");
 const PROFILE_IMPORT_COMMAND = ["imp", "ort"].join("");
 type BrowserScriptParameters = z.output<typeof browserScriptParametersSchema>;
@@ -66,6 +68,10 @@ const BROWSER_COMMANDS = [
   "backup",
   "restore",
   PROFILE_IMPORT_COMMAND,
+  "archive",
+  "restore-archived",
+  "reset",
+  "delete",
   "setup",
   "disable",
   "uninstall",
@@ -161,7 +167,11 @@ function cliActivityText(records: readonly BrowserActivityRecord[]) {
 }
 
 function cliProfileText(profile: BrowserProfile) {
-  return `${profile.name} (${profile.profileId})\nLocale: ${profile.locale}\nTimezone: ${profile.timezone}`;
+  const retention =
+    profile.state === "archived"
+      ? `\nRecoverable until: ${profile.expiresAt}`
+      : "";
+  return `${profile.name} (${profile.profileId})\nState: ${profile.state}${retention}\nLocale: ${profile.locale}\nTimezone: ${profile.timezone}`;
 }
 
 function cliProfilesText(inventory: BrowserProfileInventory) {
@@ -415,6 +425,18 @@ function validateCliCommandOptions(
   }
   if (command === "select" && parseState.profileId === undefined) {
     return `select requires --profile.\n${CLI_USAGE}`;
+  }
+  if (
+    ["archive", "restore-archived", "reset", "delete"].includes(command) &&
+    parseState.profileId === undefined
+  ) {
+    return `${command} requires --profile.\n${CLI_USAGE}`;
+  }
+  if (
+    ["reset", "delete"].includes(command) &&
+    parseState.confirmation === undefined
+  ) {
+    return `${command} requires --confirm.\n${CLI_USAGE}`;
   }
   if (["backup", "restore"].includes(command)) {
     if (parseState.profileId === undefined) {
@@ -736,6 +758,43 @@ async function runProfileListCli(
   };
 }
 
+async function runFailClosedProfileLifecycleCli(
+  browser: BrowserService,
+  cliArguments: ParsedCliArguments,
+  context: PluginCliContext,
+) {
+  const target = await profileTarget(browser, cliArguments, context);
+  const inventory = await browser.profiles(
+    {
+      hostId: target.hostId,
+      projectId: context.projectId,
+      threadId: context.threadId,
+    },
+    context.signal,
+  );
+  const profile = inventory.profiles.find(
+    ({ profileId }) => profileId === target.profileId,
+  );
+  if (profile === undefined) {
+    throw new Error(`Browser Profile ${target.profileId} is not available.`);
+  }
+  const status = {
+    operation: cliArguments.command,
+    progress: "not-started" as const,
+    profile,
+  };
+  return {
+    exitCode: 1,
+    stdout: cliJsonOrText(
+      cliArguments.json,
+      status,
+      `Progress: not started\n${cliProfileText(profile)}`,
+    ),
+    stderr:
+      "Destructive Browser Profile changes require the authenticated owner Settings transport. Archive removes agent authority and retains data for 30 days; reset loses credentials; permanent deletion cannot be undone.",
+  };
+}
+
 async function runProfileCreateCli(
   browser: BrowserService,
   cliArguments: ParsedCliArguments,
@@ -881,6 +940,13 @@ async function runAdministrationCli(
   cliArguments: ParsedCliArguments,
   context: PluginCliContext,
 ) {
+  if (
+    ["archive", "restore-archived", "reset", "delete"].includes(
+      cliArguments.command,
+    )
+  ) {
+    return runFailClosedProfileLifecycleCli(browser, cliArguments, context);
+  }
   if (cliArguments.command === "list") {
     return runProfileListCli(browser, cliArguments, context);
   }
@@ -1072,6 +1138,30 @@ function registerCli(bb: BbPluginApi, browser: BrowserService) {
           "bb browser import --name <name> --source <path> [--host <id>] [--json]",
       },
       {
+        name: "archive",
+        summary:
+          "Show Archived Profile state; mutation requires owner Settings",
+        usage: "bb browser archive --profile <id> [--host <id>] [--json]",
+      },
+      {
+        name: "restore-archived",
+        summary: "Restore within 30 days through authenticated owner Settings",
+        usage:
+          "bb browser restore-archived --profile <id> [--host <id>] [--json]",
+      },
+      {
+        name: "reset",
+        summary: "Reset credentials through authenticated owner Settings",
+        usage:
+          "bb browser reset --profile <id> --confirm <text> [--host <id>] [--json]",
+      },
+      {
+        name: "delete",
+        summary: "Permanently delete through authenticated owner Settings",
+        usage:
+          "bb browser delete --profile <id> --confirm <name> [--host <id>] [--json]",
+      },
+      {
         name: "setup",
         summary: "Show or apply the consent-gated Browser setup plan",
         usage: "bb browser setup [--step <id> --confirm <text>] [--json]",
@@ -1152,6 +1242,14 @@ export default function plugin(bb: BbPluginApi) {
     browser_profile_create: (input) => browser.createProfile(input),
     browser_profile_rename: (input) => browser.renameProfile(input),
     browser_profile_select: (input) => browser.selectProfile(input),
+    browser_profile_archive: (input) =>
+      browser.archiveProfile(ownerAuthority, input),
+    browser_profile_restore_archived: (input) =>
+      browser.restoreArchivedProfile(ownerAuthority, input),
+    browser_profile_reset: (input) =>
+      browser.resetProfile(ownerAuthority, input),
+    browser_profile_delete: (input) =>
+      browser.deleteProfile(ownerAuthority, input),
     browser_profile_backup: (input) => browser.backupProfile(input),
     browser_profile_restore: (input) => browser.restoreProfile(input),
     browser_profile_import: (input) => browser.importProfile(input),
