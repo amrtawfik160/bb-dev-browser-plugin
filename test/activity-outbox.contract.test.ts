@@ -6,6 +6,19 @@ import type { BrowserActivityEvent } from "../contracts.js";
 import { createActivityOutbox } from "../activity-outbox.js";
 
 const NOW = new Date("2026-08-27T00:00:00.000Z");
+const GRANT_METADATA = {
+  grantId: "grant-outbox-test",
+  grantScope: "https://app.example.test",
+  grantElevations: {
+    wholeWeb: false,
+    fileTransfer: false,
+    invalidCertificateOrigins: [],
+    persistentElevations: false,
+  },
+} satisfies Pick<
+  BrowserActivityEvent,
+  "grantId" | "grantScope" | "grantElevations"
+>;
 
 function activityEvent(
   eventId: string,
@@ -100,4 +113,51 @@ describe("Browser activity host outbox", () => {
       await rm(rootDirectory, { recursive: true, force: true });
     }
   });
+
+  it.each([
+    ["grantId", { grantId: "grant-outbox-other" }],
+    ["grantScope", { grantScope: "https://other.example.test" }],
+    [
+      "grantElevations",
+      {
+        grantElevations: {
+          ...GRANT_METADATA.grantElevations,
+          fileTransfer: true,
+        },
+      },
+    ],
+  ])(
+    "R8-04 rejects a duplicate with conflicting %s while deduplicating identical grant metadata",
+    async (_field, conflictingGrantMetadata) => {
+      const rootDirectory = await mkdtemp(join(tmpdir(), "bb-browser-outbox-"));
+      const filePath = join(rootDirectory, "activity-outbox.json");
+      const event = activityEvent(
+        "outbox-event-grant-metadata",
+        GRANT_METADATA,
+      );
+
+      try {
+        const outbox = createActivityOutbox({
+          filePath,
+          clock: () => NOW,
+        });
+        await outbox.enqueue(event);
+        await outbox.enqueue(
+          activityEvent(event.eventId, { ...GRANT_METADATA }),
+        );
+        expect(await outbox.pending()).toHaveLength(1);
+
+        await expect(
+          outbox.enqueue(
+            activityEvent(event.eventId, {
+              ...GRANT_METADATA,
+              ...conflictingGrantMetadata,
+            }),
+          ),
+        ).rejects.toThrow("conflicting metadata");
+      } finally {
+        await rm(rootDirectory, { recursive: true, force: true });
+      }
+    },
+  );
 });
