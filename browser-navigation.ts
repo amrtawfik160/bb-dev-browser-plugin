@@ -1,4 +1,8 @@
 import { createHash } from "node:crypto";
+import {
+  isBrowserLoopbackHostname,
+  isRawLocalhostHostname,
+} from "./authorization.js";
 
 export type BrowserAddress =
   { kind: "address"; url: string } | { kind: "search"; text: string };
@@ -16,15 +20,21 @@ function explicitBrowserUrl(input: string) {
 }
 
 function implicitBrowserUrl(input: string) {
-  if (/\s/u.test(input) || !/^[\w.-]+(?::\d+)?(?:\/[^\s]*)?$/u.test(input)) {
+  if (/\s/u.test(input) || input.startsWith("?") || input.startsWith("#")) {
     return null;
   }
-  const hostname = input.split(/[/:]/u, 1)[0]!;
-  if (hostname !== "localhost" && !hostname.includes(".")) return null;
-  const scheme =
-    hostname === "localhost" || /^\d+\.\d+\.\d+\.\d+$/u.test(hostname)
-      ? "http"
-      : "https";
+  let candidate: URL;
+  try {
+    candidate = new URL(`http://${input}`);
+  } catch (error) {
+    if (error instanceof TypeError) return null;
+    throw error;
+  }
+  const hostname = candidate.hostname;
+  if (!isBrowserLoopbackHostname(hostname) && !hostname.includes(".")) {
+    return null;
+  }
+  const scheme = isBrowserLoopbackHostname(hostname) ? "http" : "https";
   try {
     return new URL(`${scheme}://${input}`);
   } catch (error) {
@@ -46,41 +56,24 @@ function projectLoopbackHostname(projectId: string) {
   return `p-${digest.slice(0, 12)}.localhost`;
 }
 
-function isRawLoopbackHostname(hostname: string) {
-  return (
-    hostname === "localhost" ||
-    hostname === "0.0.0.0" ||
-    hostname === "[::1]" ||
-    /^127(?:\.\d{1,3}){3}$/u.test(hostname)
-  );
-}
-
 export function projectLoopbackAddress(
   projectId: string,
   address: string,
   mode: LoopbackAddressMode = "project-alias",
 ) {
   const url = new URL(address);
-  if (mode === "project-alias" && isRawLoopbackHostname(url.hostname)) {
+  if (mode === "project-alias" && isRawLocalhostHostname(url.hostname)) {
     url.hostname = projectLoopbackHostname(projectId);
   }
   return url.href;
 }
 
-export function browserNavigationScript(address: BrowserAddress) {
-  const pageSelection = `const tabs = await browser.listPages();
-const page = tabs[0]
-  ? await browser.getPage(tabs[0].id)
-  : await browser.getPage("workspace");`;
-  if (address.kind === "address") {
-    return `${pageSelection}
+export function browserNavigationScript(
+  address: Extract<BrowserAddress, { kind: "address" }>,
+  tabId: string,
+) {
+  return `const page = await browser.getPage(${JSON.stringify(tabId)});
+await page.bringToFront();
 await page.goto(${JSON.stringify(address.url)});
-console.log(page.url());`;
-  }
-  return `${pageSelection}
-await page.keyboard.press("Control+L");
-await page.keyboard.type(${JSON.stringify(address.text)});
-await page.keyboard.press("Enter");
-await page.waitForLoadState("domcontentloaded");
-console.log(page.url());`;
+console.log(JSON.stringify({ tabId: ${JSON.stringify(tabId)}, url: page.url() }));`;
 }

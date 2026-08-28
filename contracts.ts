@@ -1445,10 +1445,60 @@ export const browserStatusInputSchema = z.discriminatedUnion("surface", [
 
 export type BrowserStatusInput = z.infer<typeof browserStatusInputSchema>;
 
+const browserNavigationFields = {
+  input: z.string().min(1).max(2048),
+  tabId: z.string().min(1).optional(),
+  rawLocalhost: z.boolean().default(false),
+} as const;
+
+export const browserPanelNavigationRequestSchema = z.discriminatedUnion(
+  "surface",
+  [
+    threadSurfaceSchema.extend(browserNavigationFields).strict(),
+    newThreadSurfaceSchema.extend(browserNavigationFields).strict(),
+  ],
+);
+
+export const browserNavigationRequestSchema = z
+  .object({
+    hostId: z.string().min(1),
+    profileId: z.string().min(1),
+    projectId: z.string().min(1),
+    input: z.string().min(1).max(2048),
+    tabId: z.string().min(1).optional(),
+    rawLocalhost: z.boolean(),
+  })
+  .strict();
+
+export const browserNavigationResponseSchema = z
+  .object({
+    address: z.object({ kind: z.literal("address"), url: z.string().url() }),
+    location: z.unknown(),
+    tabId: z.string().min(1),
+  })
+  .strict();
+
+export type BrowserPanelNavigationRequest = z.infer<
+  typeof browserPanelNavigationRequestSchema
+>;
+export type BrowserPanelNavigationInput = z.input<
+  typeof browserPanelNavigationRequestSchema
+>;
+export type BrowserNavigationRequest = z.infer<
+  typeof browserNavigationRequestSchema
+>;
+export type BrowserNavigationResponse = z.infer<
+  typeof browserNavigationResponseSchema
+>;
+
 export const rpcContract = defineRpcContract({
   browser_status: {
     input: browserStatusInputSchema,
     output: browserStatusSchema,
+  },
+  browser_navigate: {
+    input: browserPanelNavigationRequestSchema,
+    output: browserNavigationResponseSchema,
   },
   browser_settings_status: {
     input: z.object({ profileId: z.string().min(1) }).strict(),

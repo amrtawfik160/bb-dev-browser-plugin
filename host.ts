@@ -34,10 +34,12 @@ import {
 import {
   BROWSER_STORAGE_ROOT,
   DEFAULT_PROFILE_ID,
+  STOP_BROWSER_CONFIRMATION,
   browserProfileUnavailableStatus,
   type BrowserActivityEvent,
   type BrowserScriptRequest,
   type BrowserScriptResponse,
+  type BrowserNavigationRequest,
 } from "./contracts.js";
 import {
   createBrowserInstanceRuntime,
@@ -152,7 +154,8 @@ export function createBrowserHostEntry(
   let retainedProfiles: BrowserProfileStore | undefined;
   let retainedRecovery: BrowserProfileRecovery | undefined;
   let retainedOutbox: ActivityOutbox | undefined;
-  let retainedRuntime: BrowserInstanceRuntime | undefined;
+  let retainedRuntime: BrowserInstanceRuntime | undefined =
+    typeof runtimeSource === "object" ? runtimeSource : undefined;
   function administration(dataDir: string) {
     if (retainedBoundary !== undefined) return retainedBoundary;
     const boundary = typeof source === "function" ? source(dataDir) : source;
@@ -184,6 +187,21 @@ export function createBrowserHostEntry(
         ? runtimeSource(dataDir)
         : runtimeSource;
     return retainedRuntime;
+  }
+  async function disposeRuntime() {
+    const current = retainedRuntime;
+    retainedRuntime = undefined;
+    await current?.dispose();
+  }
+  async function runInstallationLifecycle(
+    action: "disable" | "uninstall",
+    request: Parameters<HostAdministrationBoundary["disable"]>[0],
+    dataDir: string,
+  ) {
+    if (request.confirmation === STOP_BROWSER_CONFIRMATION) {
+      await disposeRuntime();
+    }
+    return administration(dataDir)[action](request);
   }
   function profiles(dataDir: string) {
     if (retainedProfiles !== undefined) return retainedProfiles;
@@ -228,6 +246,38 @@ export function createBrowserHostEntry(
           : recoverySource;
     return retainedRecovery;
   }
+  async function navigateBrowser(
+    request: BrowserNavigationRequest,
+    dataDir: string,
+  ) {
+    const target = { hostId: request.hostId, profileId: request.profileId };
+    const readiness = await administration(dataDir).inspect(target);
+    if (readiness.state !== "healthy") throw new Error(readiness.message);
+    const inventory = await profiles(dataDir).listProfiles(request.hostId);
+    const profile = inventory.profiles.find(
+      (candidate) =>
+        candidate.profileId === request.profileId &&
+        candidate.state === "active",
+    );
+    if (profile === undefined) {
+      throw new Error("The requested Browser Profile is unavailable.");
+    }
+    const browserRuntime = runtime(dataDir);
+    if (browserRuntime === undefined) {
+      throw new Error("The Workspace Browser runtime is unavailable.");
+    }
+    return browserRuntime.navigate(
+      {
+        ...target,
+        projectId: request.projectId,
+        ...(request.tabId === undefined ? {} : { tabId: request.tabId }),
+        loopbackMode: request.rawLocalhost ? "raw-localhost" : "project-alias",
+        locale: profile.locale,
+        timezone: profile.timezone,
+      },
+      request.input,
+    );
+  }
   function retainWorker(context: {
     experimental_retainWorker(): { dispose(): Promise<void> };
   }) {
@@ -265,16 +315,20 @@ export function createBrowserHostEntry(
           return response;
         })();
       },
-      disable: (request, context) => {
+      disable: async (request, context) => {
         retainWorker(context);
-        return administration(context.experimental_paths.dataDir).disable(
+        return runInstallationLifecycle(
+          "disable",
           request,
+          context.experimental_paths.dataDir,
         );
       },
-      uninstall: (request, context) => {
+      uninstall: async (request, context) => {
         retainWorker(context);
-        return administration(context.experimental_paths.dataDir).uninstall(
+        return runInstallationLifecycle(
+          "uninstall",
           request,
+          context.experimental_paths.dataDir,
         );
       },
       purgePlan: (target, context) => {
@@ -327,6 +381,10 @@ export function createBrowserHostEntry(
                 {
                   hostId: request.hostId,
                   profileId: request.profileId,
+                  projectId: request.projectId,
+                  ...(request.tabId === undefined
+                    ? {}
+                    : { tabId: request.tabId }),
                   locale: profile.locale,
                   timezone: profile.timezone,
                 },
@@ -352,6 +410,10 @@ export function createBrowserHostEntry(
             startedAt,
           );
         }
+      },
+      navigate: async (request, context) => {
+        retainWorker(context);
+        return navigateBrowser(request, context.experimental_paths.dataDir);
       },
       activityOutbox: async ({ limit }, context) => {
         retainWorker(context);
@@ -470,7 +532,7 @@ export function createBrowserHostEntry(
     },
     dispose: async () => {
       try {
-        await retainedRuntime?.dispose();
+        await disposeRuntime();
       } finally {
         await workerLease?.dispose();
       }
@@ -487,11 +549,9 @@ const devBrowserExecutable = join(
   "bin",
   "dev-browser.js",
 );
-const playwrightBrowserRoot =
+const playwrightChromiumSetupSource = join(
   process.env.PLAYWRIGHT_BROWSERS_PATH ??
-  join(homedir(), ".cache", "ms-playwright");
-const playwrightChromiumPath = join(
-  playwrightBrowserRoot,
+    join(homedir(), ".cache", "ms-playwright"),
   `chromium-${PINNED_BROWSER_RUNTIME.chromiumRevision}`,
   "chrome-linux64",
   "chrome",
@@ -506,6 +566,7 @@ export default createBrowserHostEntry(
       installationId: hostInstallationId(dataDir),
       executor: createProductionPrivilegedExecutor(),
       stateStore: createFileHostAdministrationStateStore(dataDir),
+      fallbackSourcePath: playwrightChromiumSetupSource,
     }),
   (dataDir, lifecycle) =>
     createFileBrowserProfileStore({
@@ -540,7 +601,6 @@ export default createBrowserHostEntry(
         "/usr/bin/google-chrome-stable",
         "/usr/bin/google-chrome",
       ],
-      playwrightChromiumPath,
       launchBoundary: createProductionBrowserProcessBoundary({
         devBrowserExecutable,
         devBrowserPackageDirectory,

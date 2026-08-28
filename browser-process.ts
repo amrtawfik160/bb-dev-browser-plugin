@@ -1,5 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { constants, readFileSync } from "node:fs";
 import {
   access,
@@ -7,24 +7,24 @@ import {
   chown,
   cp,
   mkdir,
-  open,
   readFile,
-  rename,
-  rm,
   unlink,
   watch,
 } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import type {
   BrowserExecutionRequest,
   BrowserLaunchBoundary,
   BrowserLaunchRequest,
+  BrowserProcessIdentity,
   RunningBrowserProcess,
 } from "./browser-runtime.js";
 
 const DEVTOOLS_PORT_FILE = "DevToolsActivePort";
 const MAX_BROWSER_RESULT_BYTES = 256 * 1024;
 const MAX_PROCESS_ERROR_BYTES = 64 * 1024;
+const HELPER_STOP_TIMEOUT_MS = 2_000;
+const BROWSER_CLOSE_TIMEOUT_MS = 2_000;
 
 type BrowserProcessBoundaryOptions = {
   devBrowserExecutable: string;
@@ -62,51 +62,6 @@ async function stagedDevBrowserExecutable(
   return stagedExecutable;
 }
 
-async function stagedBrowserExecutable(request: BrowserLaunchRequest) {
-  if (request.kind === "chrome-stable") return request.executablePath;
-  const stagedDirectory = join(
-    request.runtimeDirectory,
-    "playwright-chromium-1208",
-  );
-  const stagedExecutable = join(stagedDirectory, "chrome");
-  try {
-    await access(stagedExecutable, constants.X_OK);
-    return stagedExecutable;
-  } catch (error) {
-    if (!(
-      error instanceof Error &&
-      "code" in error &&
-      error.code === "ENOENT"
-    )) {
-      throw error;
-    }
-  }
-  const lockPath = `${stagedDirectory}.installing`;
-  const stagingDirectory = `${stagedDirectory}.staging-${randomUUID()}`;
-  let lock;
-  try {
-    lock = await open(lockPath, "wx", 0o600);
-  } catch (error) {
-    if (error instanceof Error && "code" in error && error.code === "EEXIST") {
-      throw new Error("Pinned Chromium fallback installation is in progress.", {
-        cause: error,
-      });
-    }
-    throw error;
-  }
-  try {
-    await cp(dirname(request.executablePath), stagingDirectory, {
-      recursive: true,
-    });
-    await rename(stagingDirectory, stagedDirectory);
-    return stagedExecutable;
-  } finally {
-    await rm(stagingDirectory, { recursive: true, force: true });
-    await lock.close();
-    await unlink(lockPath);
-  }
-}
-
 function browserUserIdentity(passwdPath: string) {
   const entry = readFileSync(passwdPath, "utf8")
     .split("\n")
@@ -118,11 +73,45 @@ function browserUserIdentity(passwdPath: string) {
     !Number.isSafeInteger(userId) ||
     userId <= 0 ||
     !Number.isSafeInteger(groupId) ||
-    groupId < 0
+    groupId <= 0
   ) {
     throw new Error("The unprivileged bb-browser user is not configured.");
   }
   return { userId, groupId };
+}
+
+function configuredSearchTemplate(preferences: unknown) {
+  if (typeof preferences !== "object" || preferences === null) return null;
+  const provider = (preferences as Record<string, unknown>)[
+    "default_search_provider_data"
+  ];
+  if (typeof provider !== "object" || provider === null) return null;
+  const templateData = (provider as Record<string, unknown>)[
+    "template_url_data"
+  ];
+  if (typeof templateData !== "object" || templateData === null) return null;
+  const url = (templateData as Record<string, unknown>).url;
+  return typeof url === "string" ? url : null;
+}
+
+async function configuredSearchUrl(profileDirectory: string, text: string) {
+  const preferencesPath = join(profileDirectory, "Default", "Preferences");
+  const preferences = JSON.parse(
+    await readFile(preferencesPath, "utf8"),
+  ) as unknown;
+  const template = configuredSearchTemplate(preferences);
+  if (template === null || !template.includes("{searchTerms}")) {
+    throw new Error("Chrome's configured search engine is unavailable.");
+  }
+  const searchUrl = new URL(
+    template.replaceAll("{searchTerms}", encodeURIComponent(text)),
+  );
+  if (searchUrl.protocol !== "http:" && searchUrl.protocol !== "https:") {
+    throw new Error(
+      "Chrome's configured search engine returned an unsafe URL.",
+    );
+  }
+  return searchUrl.href;
 }
 
 function ownedProcess(
@@ -229,6 +218,87 @@ function waitForExit(child: ChildProcessWithoutNullStreams) {
   });
 }
 
+async function processIdentity(pid: number): Promise<BrowserProcessIdentity> {
+  const [statContents, commandLine] = await Promise.all([
+    readFile(`/proc/${pid}/stat`, "utf8"),
+    readFile(`/proc/${pid}/cmdline`),
+  ]);
+  const fields = statContents
+    .slice(statContents.lastIndexOf(")") + 2)
+    .split(" ");
+  const startedAtTicks = fields[19];
+  if (startedAtTicks === undefined || !/^\d+$/u.test(startedAtTicks)) {
+    throw new Error("Browser process identity is unavailable.");
+  }
+  return {
+    pid,
+    startedAtTicks,
+    commandHash: createHash("sha256").update(commandLine).digest("hex"),
+  };
+}
+
+function sameProcessIdentity(
+  expected: BrowserProcessIdentity,
+  actual: BrowserProcessIdentity,
+) {
+  return (
+    expected.pid === actual.pid &&
+    expected.startedAtTicks === actual.startedAtTicks &&
+    expected.commandHash === actual.commandHash
+  );
+}
+
+function waitForProcessExit(pid: number) {
+  return new Promise<void>((resolve, reject) => {
+    const poll = setInterval(() => {
+      try {
+        process.kill(pid, 0);
+      } catch (error) {
+        if (
+          error instanceof Error &&
+          "code" in error &&
+          error.code === "ESRCH"
+        ) {
+          clearInterval(poll);
+          resolve();
+          return;
+        }
+        clearInterval(poll);
+        reject(error);
+      }
+    }, 250);
+    poll.unref();
+  });
+}
+
+async function stopRecoveredProcess(pid: number) {
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ESRCH")
+      return;
+    throw error;
+  }
+  const limit = deadline(10_000, "Recovered browser shutdown timed out.");
+  const graceful = await Promise.race([
+    waitForProcessExit(pid).then(() => true),
+    limit.elapsed.then(
+      () => false,
+      () => false,
+    ),
+  ]);
+  limit.cancel();
+  if (graceful) return;
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ESRCH")
+      return;
+    throw error;
+  }
+  await waitForProcessExit(pid);
+}
+
 async function stopProcess(child: ChildProcessWithoutNullStreams) {
   if (child.exitCode !== null || child.signalCode !== null) return;
   child.kill("SIGTERM");
@@ -242,6 +312,68 @@ async function stopProcess(child: ChildProcessWithoutNullStreams) {
   });
   await Promise.race([waitForExit(child), forcedExit]);
   if (deadline !== undefined) clearTimeout(deadline);
+}
+
+function deadline(milliseconds: number, message: string) {
+  let timeout: NodeJS.Timeout;
+  const elapsed = new Promise<never>((_resolve, reject) => {
+    timeout = setTimeout(() => reject(new Error(message)), milliseconds);
+    timeout.unref();
+  });
+  return { elapsed, cancel: () => clearTimeout(timeout) };
+}
+
+async function boundedOutput(
+  child: ChildProcessWithoutNullStreams,
+  milliseconds: number,
+  message: string,
+) {
+  const limit = deadline(milliseconds, message);
+  try {
+    return await Promise.race([collectOutput(child), limit.elapsed]);
+  } finally {
+    limit.cancel();
+  }
+}
+
+async function requestBrowserClose(endpoint: string) {
+  let socket: WebSocket | undefined;
+  const closed = new Promise<void>((resolve, reject) => {
+    const closeSocket = new WebSocket(endpoint);
+    socket = closeSocket;
+    closeSocket.addEventListener("open", () => {
+      closeSocket.send(JSON.stringify({ id: 1, method: "Browser.close" }));
+    });
+    closeSocket.addEventListener("close", () => resolve());
+    closeSocket.addEventListener("error", () =>
+      reject(new Error("Automation Mode browser close failed.")),
+    );
+  });
+  const limit = deadline(
+    BROWSER_CLOSE_TIMEOUT_MS,
+    "Automation Mode browser close timed out.",
+  );
+  try {
+    await Promise.race([closed, limit.elapsed]);
+  } finally {
+    limit.cancel();
+    const activeSocket = socket;
+    if (
+      activeSocket?.readyState === WebSocket.CONNECTING ||
+      activeSocket?.readyState === WebSocket.OPEN
+    ) {
+      activeSocket.close();
+    }
+  }
+}
+
+async function attemptBrowserClose(profileDirectory: string) {
+  const endpoint = await activeDevToolsEndpoint(profileDirectory);
+  if (endpoint === null) return;
+  await requestBrowserClose(endpoint).then(
+    () => undefined,
+    () => undefined,
+  );
 }
 
 async function helperIsRunning(helperHome: string) {
@@ -370,7 +502,15 @@ async function stopAttachedHelper(
     { ...process.env, HOME: helperHome },
   );
   devBrowserProcess.stdin.end();
-  await collectOutput(devBrowserProcess);
+  try {
+    await boundedOutput(
+      devBrowserProcess,
+      HELPER_STOP_TIMEOUT_MS,
+      "dev-browser attachment shutdown timed out.",
+    );
+  } finally {
+    await stopProcess(devBrowserProcess);
+  }
 }
 
 async function stopBrowserProcess(
@@ -382,6 +522,7 @@ async function stopBrowserProcess(
   try {
     await stopAttachedHelper(context, request, identity);
   } finally {
+    await attemptBrowserClose(request.profileDirectory);
     await stopProcess(browserProcess);
   }
 }
@@ -389,12 +530,13 @@ async function stopBrowserProcess(
 async function launchProductionBrowser(
   context: ProductionProcessContext,
   request: BrowserLaunchRequest,
+  onSpawn: (identity: BrowserProcessIdentity) => Promise<void> = async () => {},
 ): Promise<RunningBrowserProcess> {
   const identity = browserUserIdentity(context.passwdPath);
   await ownedDirectory(request.profileDirectory, identity);
   await ownedDirectory(request.runtimeDirectory, identity);
   await removeDevToolsPortFile(request.profileDirectory);
-  const executablePath = await stagedBrowserExecutable(request);
+  const executablePath = request.executablePath;
   const browserProcess = ownedProcess(
     context.setprivExecutable,
     identity,
@@ -402,6 +544,12 @@ async function launchProductionBrowser(
     ["--headless=new", ...request.chromeArguments],
     browserEnvironment(request),
   );
+  try {
+    await onSpawn(await processIdentity(browserProcess.pid!));
+  } catch (error) {
+    await stopProcess(browserProcess);
+    throw error;
+  }
   let automationEndpoint: string;
   try {
     automationEndpoint = await browserAutomationEndpoint(
@@ -415,7 +563,45 @@ async function launchProductionBrowser(
   return {
     pid: browserProcess.pid!,
     automationEndpoint,
+    exited: waitForExit(browserProcess),
     stop: () => stopBrowserProcess(context, request, identity, browserProcess),
+  };
+}
+
+async function recoverProductionBrowser(
+  context: ProductionProcessContext,
+  request: BrowserLaunchRequest,
+  expectedIdentity: BrowserProcessIdentity,
+  storedEndpoint: string | null,
+): Promise<RunningBrowserProcess | null> {
+  let actualIdentity: BrowserProcessIdentity;
+  try {
+    actualIdentity = await processIdentity(expectedIdentity.pid);
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT")
+      return null;
+    throw error;
+  }
+  if (!sameProcessIdentity(expectedIdentity, actualIdentity)) return null;
+  const automationEndpoint =
+    storedEndpoint ?? (await activeDevToolsEndpoint(request.profileDirectory));
+  if (automationEndpoint === null) return null;
+  const identity = browserUserIdentity(context.passwdPath);
+  return {
+    pid: expectedIdentity.pid,
+    automationEndpoint,
+    exited: waitForProcessExit(expectedIdentity.pid),
+    stop: async () => {
+      try {
+        await stopAttachedHelper(context, request, identity);
+      } finally {
+        await requestBrowserClose(automationEndpoint).then(
+          () => undefined,
+          () => undefined,
+        );
+        await stopRecoveredProcess(expectedIdentity.pid);
+      }
+    },
   };
 }
 
@@ -460,7 +646,16 @@ export function createProductionBrowserProcessBoundary(
     get effectiveUserId() {
       return browserUserIdentity(passwdPath).userId;
     },
-    launch: (request) => launchProductionBrowser(context, request),
+    get effectiveGroupId() {
+      return browserUserIdentity(passwdPath).groupId;
+    },
+    launch: (request, onSpawn) =>
+      launchProductionBrowser(context, request, onSpawn),
+    recover: (request, identity, endpoint) =>
+      recoverProductionBrowser(context, request, identity, endpoint),
+    processIdentity,
     execute: (request) => executeBrowserHelper(context, request),
+    configuredSearchUrl: ({ profileDirectory, text }) =>
+      configuredSearchUrl(profileDirectory, text),
   };
 }

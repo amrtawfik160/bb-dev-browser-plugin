@@ -1,5 +1,6 @@
 import {
   chmod,
+  chown,
   mkdir,
   mkdtemp,
   readFile,
@@ -8,7 +9,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   BrowserInstanceError,
   createBrowserInstanceRuntime,
@@ -17,37 +18,100 @@ import {
   type BrowserLaunchBoundary,
   type BrowserLaunchRequest,
 } from "../browser-runtime.js";
+import { fallbackBrowserPaths } from "../browser-fallback.js";
+import { PINNED_BROWSER_RUNTIME } from "../dependency-inventory.js";
 import { profileStoragePaths } from "../profile-storage.js";
 
 function launchFixture(
-  options: { endpoint?: string; runAsUser?: string } = {},
+  options: {
+    endpoint?: string;
+    runAsUser?: string;
+    groupId?: number;
+    recoveredPid?: number;
+  } = {},
 ) {
   const launches: BrowserLaunchRequest[] = [];
   const executions: { endpoint: string; code: string; timeoutMs: number }[] =
     [];
   const stopped: number[] = [];
+  const exits = new Map<number, (error?: Error) => void>();
   let nextPid = 4100;
   const boundary: BrowserLaunchBoundary = {
     runAsUser: options.runAsUser ?? "bb-browser",
     effectiveUserId: 1001,
-    async launch(request) {
+    effectiveGroupId: options.groupId ?? 1001,
+    async launch(request, onSpawn) {
       launches.push(request);
       const pid = nextPid++;
+      let reportExit!: (error?: Error) => void;
+      const exited = new Promise<void>((resolve, reject) => {
+        reportExit = (error) =>
+          error === undefined ? resolve() : reject(error);
+      });
+      exits.set(pid, reportExit);
+      const identity = {
+        pid,
+        startedAtTicks: `fixture-${pid}`,
+        commandHash: `fixture-command-${pid}`,
+      };
+      await onSpawn?.(identity);
       return {
         pid,
         automationEndpoint:
           options.endpoint ?? `http://127.0.0.1:${12_000 + launches.length}`,
         async stop() {
           stopped.push(pid);
+          reportExit();
         },
+        exited,
+      };
+    },
+    async recover(_request, identity, endpoint) {
+      if (identity.pid !== options.recoveredPid || endpoint === null)
+        return null;
+      let reportExit!: (error?: Error) => void;
+      const exited = new Promise<void>((resolve, reject) => {
+        reportExit = (error) =>
+          error === undefined ? resolve() : reject(error);
+      });
+      exits.set(identity.pid, reportExit);
+      return {
+        pid: identity.pid,
+        automationEndpoint: endpoint,
+        exited,
+        async stop() {
+          stopped.push(identity.pid);
+          reportExit();
+        },
+      };
+    },
+    async processIdentity(pid) {
+      return {
+        pid,
+        startedAtTicks: `fixture-${pid}`,
+        commandHash: `fixture-command-${pid}`,
       };
     },
     async execute(request) {
       executions.push(request);
       return { output: "attached" };
     },
+    async configuredSearchUrl({ text }) {
+      return `https://search.fixture.test/?q=${encodeURIComponent(text)}`;
+    },
   };
-  return { boundary, executions, launches, stopped };
+  return {
+    boundary,
+    executions,
+    launches,
+    stopped,
+    crash(pid: number) {
+      exits.get(pid)?.();
+    },
+    fail(pid: number) {
+      exits.get(pid)?.(new Error("fixture process observer failed"));
+    },
+  };
 }
 
 async function runtimeFixture() {
@@ -73,6 +137,7 @@ async function runtimeFixture() {
       profileId: "profile-a",
       locale: "en-GB",
       timezone: "Europe/London",
+      projectId: "project-a",
     },
   };
 }
@@ -146,12 +211,74 @@ describe("Browser Instance runtime", () => {
     }
   });
 
+  it("uses only an ownership- and integrity-verified canonical fallback", async () => {
+    const fixture = await runtimeFixture();
+    const fallback = fallbackBrowserPaths(
+      profileStoragePaths({
+        rootDirectory: fixture.rootDirectory,
+        installationId: "installation-canonical",
+        hostId: fixture.target.hostId,
+        profileId: fixture.target.profileId,
+      }).hostStoragePath,
+    );
+    await mkdir(fallback.directory, { recursive: true });
+    await writeFile(fallback.executablePath, "fixture executable");
+    await chmod(fallback.executablePath, 0o755);
+    await chown(fallback.executablePath, 1001, 1001);
+    await writeFile(
+      fallback.manifestPath,
+      JSON.stringify({
+        ...PINNED_BROWSER_RUNTIME,
+        executableSha256:
+          "6f1af2dfc4d7f16dacf404b1f6c9fd4a65cfffb8edde6dcf957463a0e41fb1ed",
+      }),
+    );
+    await chmod(fallback.manifestPath, 0o600);
+    await chown(fallback.manifestPath, 1001, 1001);
+    const runtime = createBrowserInstanceRuntime({
+      rootDirectory: fixture.rootDirectory,
+      installationId: "installation-canonical",
+      chromeStablePaths: [],
+      launchBoundary: fixture.processFixture.boundary,
+    });
+    try {
+      await expect(runtime.start(fixture.target)).resolves.toMatchObject({
+        browser: "playwright-chromium",
+      });
+      expect(fixture.processFixture.launches[0]?.executablePath).toBe(
+        fallback.executablePath,
+      );
+    } finally {
+      await runtime.dispose();
+      await fixture.runtime.dispose();
+      await rm(fixture.rootDirectory, { recursive: true, force: true });
+    }
+  });
+
   it.each([
-    [{ runAsUser: "root", effectiveUserId: 0, chromeArguments: [] }, "root"],
+    [
+      {
+        runAsUser: "root",
+        effectiveUserId: 0,
+        effectiveGroupId: 0,
+        chromeArguments: [],
+      },
+      "root",
+    ],
     [
       {
         runAsUser: "bb-browser",
         effectiveUserId: 1001,
+        effectiveGroupId: 0,
+        chromeArguments: [],
+      },
+      "root group",
+    ],
+    [
+      {
+        runAsUser: "bb-browser",
+        effectiveUserId: 1001,
+        effectiveGroupId: 1001,
         chromeArguments: ["--no-sandbox"],
       },
       "sandbox",
@@ -237,6 +364,14 @@ describe("Browser Instance runtime", () => {
       const launch = fixture.processFixture.launches[0]!;
       expect(launch.chromeArguments).toContain("--restore-last-session");
       expect(launch.chromeArguments).toContain("--lang=en-GB");
+      expect(launch.chromeArguments).toContain("--no-first-run");
+      expect(launch.chromeArguments).toContain("--no-default-browser-check");
+      expect(launch.chromeArguments).toContain("--disable-sync");
+      expect(launch.chromeArguments).toContain("--disable-extensions");
+      expect(launch.chromeArguments.join(" ")).toContain("PasswordManager");
+      expect(launch.chromeArguments.join(" ")).toContain("AutofillAddress");
+      expect(launch.chromeArguments.join(" ")).toContain("AutofillCreditCard");
+      expect(launch.chromeArguments).not.toContain("--password-store=basic");
       expect(launch.chromeArguments).not.toContain("about:blank");
 
       await fixture.runtime.stop(fixture.target);
@@ -261,7 +396,16 @@ describe("Browser Instance runtime", () => {
     });
     const lockPath = `${paths.runtimeManifestPath}.instance.lock`;
     await mkdir(paths.runtimeManifestsDirectory, { recursive: true });
-    await writeFile(lockPath, JSON.stringify({ workerPid: 2_147_000_000 }));
+    await writeFile(
+      lockPath,
+      JSON.stringify({
+        workerIdentity: {
+          pid: 2_147_000_000,
+          startedAtTicks: "dead-worker",
+          commandHash: "dead-worker-command",
+        },
+      }),
+    );
     try {
       await expect(
         fixture.runtime.start(fixture.target),
@@ -274,26 +418,115 @@ describe("Browser Instance runtime", () => {
     }
   });
 
+  it("attaches to an identity-matched orphan instead of launching a duplicate", async () => {
+    const fixture = await runtimeFixture();
+    const recoveredPid = 4900;
+    const recoveryBoundary = launchFixture({ recoveredPid });
+    const runtime = createBrowserInstanceRuntime({
+      rootDirectory: fixture.rootDirectory,
+      installationId: "installation-recovery",
+      chromeStablePaths: [fixture.browserExecutable],
+      playwrightChromiumPath: join(fixture.rootDirectory, "fallback-chromium"),
+      launchBoundary: recoveryBoundary.boundary,
+    });
+    const recoveryPaths = profileStoragePaths({
+      rootDirectory: fixture.rootDirectory,
+      installationId: "installation-recovery",
+      hostId: fixture.target.hostId,
+      profileId: fixture.target.profileId,
+    });
+    await mkdir(recoveryPaths.runtimeManifestsDirectory, { recursive: true });
+    await writeFile(
+      `${recoveryPaths.runtimeManifestPath}.instance.lock`,
+      JSON.stringify({
+        workerIdentity: {
+          pid: 2_147_000_000,
+          startedAtTicks: "dead-worker",
+          commandHash: "dead-worker-command",
+        },
+      }),
+    );
+    await writeFile(
+      recoveryPaths.runtimeManifestPath,
+      JSON.stringify({
+        schemaVersion: 1,
+        phase: "starting",
+        identity: {
+          pid: recoveredPid,
+          startedAtTicks: `fixture-${recoveredPid}`,
+          commandHash: `fixture-command-${recoveredPid}`,
+        },
+        automationEndpoint: "ws://127.0.0.1:14900/devtools/browser/orphan",
+        publicState: null,
+      }),
+    );
+    try {
+      await expect(runtime.start(fixture.target)).resolves.toMatchObject({
+        pid: recoveredPid,
+      });
+      expect(recoveryBoundary.launches).toHaveLength(0);
+      const manifest = JSON.parse(
+        await readFile(recoveryPaths.runtimeManifestPath, "utf8"),
+      ) as { phase: string };
+      expect(manifest.phase).toBe("running");
+    } finally {
+      await runtime.dispose();
+      await fixture.runtime.dispose();
+      await rm(fixture.rootDirectory, { recursive: true, force: true });
+    }
+  });
+
   it("navigates addresses directly and delegates search text to Chrome", async () => {
     const fixture = await runtimeFixture();
     try {
       await fixture.runtime.navigate(
-        fixture.target,
+        { ...fixture.target, projectId: "project-a", tabId: "tab-a" },
         "https://fixture.example/account",
       );
-      await fixture.runtime.navigate(fixture.target, "configured search query");
+      await fixture.runtime.navigate(
+        { ...fixture.target, projectId: "project-a" },
+        "configured search query",
+      );
 
       expect(fixture.processFixture.executions[0]?.code).toContain(
         'page.goto("https://fixture.example/account")',
       );
-      expect(fixture.processFixture.executions[1]?.code).toContain(
-        'page.keyboard.press("Control+L")',
+      expect(fixture.processFixture.executions[0]?.code).toContain(
+        'browser.getPage("tab-a")',
+      );
+      expect(fixture.processFixture.executions[1]?.code).not.toContain(
+        "keyboard.press",
       );
       expect(fixture.processFixture.executions[1]?.code).toContain(
-        'page.keyboard.type("configured search query")',
+        'browser.getPage("tab-a")',
       );
-      expect(fixture.processFixture.executions[1]?.code).not.toMatch(
-        /google|bing|duckduckgo/iu,
+    } finally {
+      await fixture.runtime.dispose();
+      await rm(fixture.rootDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("makes an explicitly targeted agent tab the shared active tab", async () => {
+    const fixture = await runtimeFixture();
+    try {
+      await fixture.runtime.execute(
+        { ...fixture.target, projectId: "project-a", tabId: "tab-agent" },
+        "console.log(await browser.listPages())",
+        5_000,
+      );
+      await fixture.runtime.navigate(
+        { ...fixture.target, projectId: "project-a" },
+        "https://fixture.example/after-agent",
+      );
+
+      expect(fixture.processFixture.executions[0]?.code).toContain(
+        'browser.getPage("tab-agent")',
+      );
+      expect(fixture.processFixture.executions[0]?.code).toContain(
+        "await __bbTargetPage.bringToFront()",
+      );
+      expect(fixture.processFixture.executions[1]?.code).toContain(
+        'browser.getPage("tab-agent")',
       );
     } finally {
       await fixture.runtime.dispose();
@@ -335,6 +568,64 @@ describe("Browser Instance runtime", () => {
     } finally {
       await fixture.runtime.dispose();
       await competingRuntime.dispose();
+      await rm(fixture.rootDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("retires a crashed Browser Instance and repairs it on the next operation", async () => {
+    const fixture = await runtimeFixture();
+    try {
+      const first = await fixture.runtime.start(fixture.target);
+      fixture.processFixture.crash(first.pid);
+      const paths = profileStoragePaths({
+        rootDirectory: fixture.rootDirectory,
+        installationId: "installation-a",
+        hostId: fixture.target.hostId,
+        profileId: fixture.target.profileId,
+      });
+      await vi.waitFor(async () => {
+        await expect(
+          readFile(paths.runtimeManifestPath, "utf8"),
+        ).rejects.toMatchObject({
+          code: "ENOENT",
+        });
+      });
+
+      const repaired = await fixture.runtime.start(fixture.target);
+
+      expect(repaired.pid).not.toBe(first.pid);
+      expect(fixture.processFixture.launches).toHaveLength(2);
+    } finally {
+      await fixture.runtime.dispose();
+      await rm(fixture.rootDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("retires ownership when the browser exit observer reports an error", async () => {
+    const fixture = await runtimeFixture();
+    try {
+      const first = await fixture.runtime.start(fixture.target);
+      fixture.processFixture.fail(first.pid);
+      const paths = profileStoragePaths({
+        rootDirectory: fixture.rootDirectory,
+        installationId: "installation-a",
+        hostId: fixture.target.hostId,
+        profileId: fixture.target.profileId,
+      });
+      await vi.waitFor(async () => {
+        await expect(
+          readFile(paths.runtimeManifestPath, "utf8"),
+        ).rejects.toMatchObject({ code: "ENOENT" });
+      });
+
+      await expect(
+        fixture.runtime.start(fixture.target),
+      ).resolves.toMatchObject({
+        state: "running",
+      });
+      expect(fixture.processFixture.launches).toHaveLength(2);
+    } finally {
+      await fixture.runtime.dispose();
       await rm(fixture.rootDirectory, { recursive: true, force: true });
     }
   });

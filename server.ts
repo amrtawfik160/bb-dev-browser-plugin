@@ -1213,6 +1213,7 @@ export default function plugin(bb: BbPluginApi) {
       input.profileSelection === "selected"
         ? browser.selectedStatus(panelIdentity(input))
         : browser.status(panelIdentity(input), input.profileId),
+    browser_navigate: (input) => browser.navigate(input),
     browser_settings_status: (input) =>
       browser.settingsStatuses(input.profileId),
     browser_diagnostics: (input) => browser.diagnostics(input),

@@ -296,13 +296,26 @@ function scopeMatchesOrigin(scope: string, origin: string) {
   );
 }
 
+export function isBrowserLoopbackHostname(hostname: string) {
+  const normalized = hostname.toLowerCase();
+  return (
+    normalized === "localhost" ||
+    normalized === "localhost." ||
+    isIpv4Loopback(normalized) ||
+    isIpv6Loopback(normalized)
+  );
+}
+
+export function isRawLocalhostHostname(hostname: string) {
+  const normalized = hostname.toLowerCase();
+  return (
+    RAW_LOCALHOST_HOSTS.has(normalized) || isBrowserLoopbackHostname(normalized)
+  );
+}
+
 function isRawLocalhost(origin: string) {
   const hostname = new URL(origin).hostname.toLowerCase();
-  return (
-    RAW_LOCALHOST_HOSTS.has(hostname) ||
-    isIpv4Loopback(hostname) ||
-    isIpv6Loopback(hostname)
-  );
+  return isRawLocalhostHostname(hostname);
 }
 
 function isIpv4Loopback(hostname: string) {

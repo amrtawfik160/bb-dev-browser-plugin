@@ -1,15 +1,30 @@
+import { execFile } from "node:child_process";
 import { createServer, type Server } from "node:http";
-import { access, chmod, mkdtemp, readFile, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { createRequire } from "node:module";
-import { chromium } from "playwright";
+import { access, readFile, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { promisify } from "node:util";
 import { expect, it } from "vitest";
-import { createProductionBrowserProcessBoundary } from "../browser-process.js";
 import { projectLoopbackAddress } from "../browser-navigation.js";
-import { createBrowserInstanceRuntime } from "../browser-runtime.js";
+import { profileStoragePaths } from "../profile-storage.js";
+import {
+  createDefaultHostSnapshotReader,
+  hostInstallationId,
+} from "../readiness.js";
 
-const runRealBrowser = process.env.BB_BROWSER_REAL_INTEGRATION === "1";
+const integrationEnabled = process.env.BB_BROWSER_REAL_INTEGRATION === "1";
+const integrationRequired =
+  process.env.BB_BROWSER_REAL_INTEGRATION_REQUIRED === "1";
+if (integrationRequired && !integrationEnabled) {
+  throw new Error("The mandatory real-browser gate cannot be skipped.");
+}
+
+function requiredEnvironment(name: string) {
+  const setting = process.env[name];
+  if (setting === undefined || setting === "") {
+    throw new Error(`The provisioned-host gate requires ${name}.`);
+  }
+  return setting;
+}
 
 function listen(server: Server) {
   return new Promise<number>((resolve, reject) => {
@@ -59,115 +74,153 @@ function authenticationFixture() {
   });
 }
 
-function parseBrowserOutput(output: unknown) {
-  if (typeof output !== "string") throw new Error("Invalid browser output.");
-  return JSON.parse(output) as Record<string, unknown>;
+type WorkerReport = {
+  instance: { pid: number; automationEndpoint: string; browser: string };
+  scriptOutput: string;
+  uid: number;
+  gid: number;
+  ownedProcesses: { pid: number; command: string; status: string }[];
+  helperProcess: { pid: number; status: string; socketReady: boolean } | null;
+};
+
+async function runWorker(environment: NodeJS.ProcessEnv) {
+  const { stdout } = await promisify(execFile)(
+    join(process.cwd(), "node_modules/.bin/vite-node"),
+    ["--script", "test/fixtures/real-browser-worker.ts"],
+    { env: { ...process.env, ...environment }, maxBuffer: 1024 * 1024 },
+  );
+  return JSON.parse(stdout.trim()) as WorkerReport;
 }
 
-it.runIf(runRealBrowser)(
-  "preserves deterministic authentication, storage, popup tabs, and locale across restart",
+function parsedScriptOutput(report: WorkerReport) {
+  return JSON.parse(report.scriptOutput) as Record<string, unknown>;
+}
+
+function assertDedicatedIdentity(report: WorkerReport) {
+  expect(report.uid).toBeGreaterThan(0);
+  expect(report.gid).toBeGreaterThan(0);
+  expect(report.ownedProcesses.length).toBeGreaterThan(0);
+  for (const process_ of report.ownedProcesses) {
+    expect(process_.status).toMatch(
+      new RegExp(`^Uid:\\s+${report.uid}\\s`, "mu"),
+    );
+    expect(process_.status).toMatch(
+      new RegExp(`^Gid:\\s+${report.gid}\\s`, "mu"),
+    );
+    expect(process_.command).not.toContain("--no-sandbox");
+  }
+  expect(report.helperProcess).not.toBeNull();
+  expect(report.helperProcess?.socketReady).toBe(true);
+  expect(report.helperProcess?.status).toMatch(
+    new RegExp(`^Uid:\\s+${report.uid}\\s`, "mu"),
+  );
+  expect(report.helperProcess?.status).toMatch(
+    new RegExp(`^Gid:\\s+${report.gid}\\s`, "mu"),
+  );
+}
+
+async function assertLoopbackSocket(endpoint: string) {
+  const url = new URL(endpoint);
+  expect(url.hostname).toBe("127.0.0.1");
+  const port = Number(url.port).toString(16).toUpperCase().padStart(4, "0");
+  const sockets = `${await readFile("/proc/net/tcp", "utf8")}\n${await readFile("/proc/net/tcp6", "utf8")}`;
+  expect(sockets).toContain(`0100007F:${port}`);
+}
+
+it.runIf(integrationEnabled)(
+  "mandatory provisioned host preserves authentication across a real worker restart",
   async () => {
-    const chromeStable =
-      process.env.BB_BROWSER_CHROME_PATH ?? "/usr/bin/google-chrome-stable";
-    await access(chromeStable);
-    const rootDirectory = await mkdtemp(join(tmpdir(), "browser-auth-"));
-    await chmod(rootDirectory, 0o755);
+    const dataDirectory = requiredEnvironment("BB_BROWSER_HOST_DATA_DIR");
+    const rootDirectory =
+      process.env.BB_BROWSER_REAL_ROOT ?? "/var/lib/bb-browser";
+    const hostId = process.env.BB_BROWSER_REAL_HOST_ID ?? "ci-browser-host";
+    const profileId =
+      process.env.BB_BROWSER_REAL_PROFILE_ID ?? "ci-auth-fixture";
+    const projectId =
+      process.env.BB_BROWSER_REAL_PROJECT_ID ?? "ci-browser-project";
+    const installationId = hostInstallationId(dataDirectory);
+    const target = { hostId, profileId };
+    const snapshot =
+      await createDefaultHostSnapshotReader(dataDirectory).snapshot(target);
+    expect(snapshot.dedicatedUser.state).toBe("ready");
+    expect(snapshot.protectedStorage.state).toBe("ready");
+    expect(snapshot.browser?.compatible).toBe(true);
+    expect(snapshot.sandbox.available).toBe(true);
+
     const server = authenticationFixture();
     const port = await listen(server);
-    const require = createRequire(import.meta.url);
-    const devBrowserDirectory = dirname(
-      require.resolve("dev-browser/package.json"),
-    );
-    const boundary = createProductionBrowserProcessBoundary({
-      devBrowserExecutable: join(devBrowserDirectory, "bin", "dev-browser.js"),
-      devBrowserPackageDirectory: devBrowserDirectory,
-    });
-    const runtimeOptions = {
-      rootDirectory,
-      installationId: "installation-auth",
-      chromeStablePaths: [chromeStable],
-      playwrightChromiumPath: chromium.executablePath(),
-      launchBoundary: boundary,
-    };
-    const target = {
-      hostId: "host-auth",
-      profileId: "profile-auth",
-      locale: "en-GB",
-      timezone: "Europe/London",
-    };
-    const projectAddress = projectLoopbackAddress(
-      "project-auth",
+    const fixtureAddress = projectLoopbackAddress(
+      projectId,
       `http://localhost:${port}/account`,
     );
-    let runtime = createBrowserInstanceRuntime(runtimeOptions);
+    const paths = profileStoragePaths({
+      rootDirectory,
+      installationId,
+      hostId,
+      profileId,
+    });
+    const workerEnvironment = {
+      BB_BROWSER_REAL_ROOT: rootDirectory,
+      BB_BROWSER_REAL_INSTALLATION_ID: installationId,
+      BB_BROWSER_REAL_HOST_ID: hostId,
+      BB_BROWSER_REAL_PROFILE_ID: profileId,
+      BB_BROWSER_REAL_PROJECT_ID: projectId,
+      BB_BROWSER_FIXTURE_ADDRESS: fixtureAddress,
+    };
+    let cleanupRequired = false;
     try {
-      const first = await runtime.start(target);
-      const uid = boundary.effectiveUserId;
-      expect(await readFile(`/proc/${first.pid}/status`, "utf8")).toMatch(
-        new RegExp(`^Uid:\\s+${uid}\\s`, "mu"),
-      );
-      expect(first.automationEndpoint).toMatch(/^ws:\/\/127\.0\.0\.1:/u);
-
-      const signedIn = parseBrowserOutput(
-        await runtime.execute(
-          target,
-          `const page = await browser.getPage("auth");
-await page.goto(${JSON.stringify(projectAddress)});
-await page.fill("input[name=user]", "fixture-user");
-await Promise.all([page.waitForURL("**/account"), page.click("button")]);
-await page.evaluate(() => {
-  localStorage.setItem("local-token", "persistent");
-  sessionStorage.setItem("session-token", "restorable");
-});
-const popupReady = page.waitForEvent("popup");
-await page.click("#popup");
-await (await popupReady).waitForLoadState("domcontentloaded");
-console.log(JSON.stringify({ pages: await browser.listPages() }));`,
-          15_000,
-        ),
-      );
-      expect(JSON.stringify(signedIn.pages)).toContain("/popup");
-
-      const competing = createBrowserInstanceRuntime(runtimeOptions);
-      await expect(competing.start(target)).rejects.toMatchObject({
-        code: "profile-in-use",
+      cleanupRequired = true;
+      const first = await runWorker({
+        ...workerEnvironment,
+        BB_BROWSER_WORKER_ACTION: "start",
       });
-      await competing.dispose();
-      await runtime.stop(target);
-      await runtime.dispose();
-
-      runtime = createBrowserInstanceRuntime(runtimeOptions);
-      const restored = parseBrowserOutput(
-        await runtime.execute(
-          target,
-          `const pages = await browser.listPages();
-const account = pages.find((page) => page.url.includes("/account"));
-if (!account) throw new Error("account tab was not restored");
-const page = await browser.getPage(account.id);
-console.log(JSON.stringify({
-  pages,
-  heading: await page.locator("h1").textContent(),
-  local: await page.evaluate(() => localStorage.getItem("local-token")),
-  session: await page.evaluate(() => sessionStorage.getItem("session-token")),
-  locale: await page.evaluate(() => navigator.language),
-  timezone: await page.evaluate(() => Intl.DateTimeFormat().resolvedOptions().timeZone),
-}));`,
-          15_000,
-        ),
+      expect(parsedScriptOutput(first)).toMatchObject({
+        accountHeading: "Signed in",
+        popupHeading: "Authenticated popup",
+      });
+      expect(first.instance.browser).toBe(
+        snapshot.browser?.name.startsWith("Google Chrome")
+          ? "chrome-stable"
+          : "playwright-chromium",
       );
-      expect(restored).toMatchObject({
+      assertDedicatedIdentity(first);
+      await assertLoopbackSocket(first.instance.automationEndpoint);
+      await expect(
+        access(`${paths.runtimeManifestPath}.instance.lock`),
+      ).resolves.toBeUndefined();
+
+      const restored = await runWorker({
+        ...workerEnvironment,
+        BB_BROWSER_WORKER_ACTION: "restore",
+      });
+      expect(restored.instance.pid).toBe(first.instance.pid);
+      expect(restored.instance.browser).toBe(first.instance.browser);
+      expect(parsedScriptOutput(restored)).toMatchObject({
         heading: "Signed in",
+        popupHeading: "Authenticated popup",
         local: "persistent",
         session: "restorable",
         locale: "en-GB",
         timezone: "Europe/London",
       });
-      expect(JSON.stringify(restored.pages)).toContain("/popup");
+      assertDedicatedIdentity(restored);
+      cleanupRequired = false;
+      await expect(access(paths.runtimeManifestPath)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      await expect(
+        access(`${paths.runtimeManifestPath}.instance.lock`),
+      ).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
-      await runtime.dispose();
+      if (cleanupRequired) {
+        await runWorker({
+          ...workerEnvironment,
+          BB_BROWSER_WORKER_ACTION: "cleanup",
+        });
+      }
       await close(server);
-      await rm(rootDirectory, { recursive: true, force: true });
+      await rm(paths.profileDirectory, { recursive: true, force: true });
     }
   },
-  60_000,
+  120_000,
 );

@@ -204,6 +204,11 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
   );
   const [grantRequests, setGrantRequests] = useState<BrowserGrantRequest[]>([]);
   const [profileError, setProfileError] = useState<string | null>(null);
+  const [navigationInput, setNavigationInput] = useState("");
+  const [rawLocalhost, setRawLocalhost] = useState(false);
+  const [navigationLocation, setNavigationLocation] = useState<string | null>(
+    null,
+  );
 
   const statusRequest: BrowserStatusInput =
     selectedHostId === undefined
@@ -331,6 +336,35 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
       );
   }
 
+  function navigate(event: FormEvent) {
+    event.preventDefault();
+    const hostId = status?.hostId;
+    const profileId = status?.profileId;
+    if (
+      hostId === null ||
+      hostId === undefined ||
+      profileId === undefined ||
+      navigationInput.trim() === ""
+    ) {
+      return;
+    }
+    setProfileError(null);
+    void rpc
+      .call("browser_navigate", {
+        ...request,
+        hostId,
+        profileId,
+        input: navigationInput,
+        rawLocalhost,
+      })
+      .then((response) => {
+        setNavigationLocation(response.address.url);
+      })
+      .catch((error: unknown) =>
+        setProfileError(administrationErrorMessage(error)),
+      );
+  }
+
   if (status === null) {
     return (
       <div role="status" className="p-6 text-sm text-muted-foreground">
@@ -345,6 +379,38 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
       ) : null}
       {profiles === null || status.hostId === null ? null : (
         <PanelProfilePicker inventory={profiles} onChange={selectProfile} />
+      )}
+      {status.state !== "healthy" ? null : (
+        <form className="mt-5 text-left" onSubmit={navigate}>
+          <label className="block text-sm" htmlFor="browser-address">
+            Address or search
+          </label>
+          <div className="mt-2 flex gap-2">
+            <input
+              id="browser-address"
+              aria-label="Address or search"
+              className="min-w-0 grow rounded border px-3 py-2 text-sm"
+              value={navigationInput}
+              onChange={(event) => setNavigationInput(event.target.value)}
+            />
+            <button type="submit" className="rounded border px-3 py-2 text-sm">
+              Go
+            </button>
+          </div>
+          <label className="mt-2 flex items-center gap-2 text-xs">
+            <input
+              type="checkbox"
+              checked={rawLocalhost}
+              onChange={(event) => setRawLocalhost(event.target.checked)}
+            />
+            Use raw localhost compatibility
+          </label>
+          {navigationLocation === null ? null : (
+            <p className="mt-2 break-all text-xs text-muted-foreground">
+              {navigationLocation}
+            </p>
+          )}
+        </form>
       )}
       <PanelGrantRequestNotices requests={grantRequests} />
       {profileError === null ? null : <p role="alert">{profileError}</p>}

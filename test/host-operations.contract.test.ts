@@ -149,6 +149,16 @@ describe("Browser host administration contract", () => {
       "install-system-packages",
       "configure-protected-storage",
     ]);
+    expect(executor.successfulOperations.at(-1)).toMatchObject({
+      kind: "configure-protected-storage",
+      fallback: {
+        sourcePath: "/playwright/chromium-1208/chrome",
+        executablePath: expect.stringContaining("/browsers/chromium/chrome"),
+        manifestPath: expect.stringContaining(
+          "/browsers/chromium/version.json",
+        ),
+      },
+    });
 
     const repeated = await boundary.setup({
       ...target,

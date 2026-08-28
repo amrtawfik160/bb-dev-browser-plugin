@@ -1,0 +1,28 @@
+name: Provisioned browser acceptance
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  real-browser:
+    name: mandatory provisioned-host gate
+    runs-on: [self-hosted, linux, x64, bb-browser-provisioned]
+    timeout-minutes: 10
+    env:
+      BB_BROWSER_HOST_DATA_DIR: ${{ vars.BB_BROWSER_HOST_DATA_DIR }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run format:check
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - name: Mandatory real Workspace Browser acceptance
+        run: npm run test:real-browser

@@ -51,6 +51,37 @@ function connectToEndpoint(endpoint: string) {
 }
 
 describe("production browser process boundary", () => {
+  it("resolves search text through the Browser Profile configured engine", async () => {
+    const rootDirectory = await mkdtemp(join(tmpdir(), "browser-search-"));
+    const profileDirectory = join(rootDirectory, "profile");
+    await mkdir(join(profileDirectory, "Default"), { recursive: true });
+    await writeFile(
+      join(profileDirectory, "Default", "Preferences"),
+      JSON.stringify({
+        default_search_provider_data: {
+          template_url_data: {
+            url: "https://search.fixture.test/results?q={searchTerms}",
+          },
+        },
+      }),
+    );
+    const boundary = createProductionBrowserProcessBoundary({
+      devBrowserExecutable: "/bin/true",
+    });
+    try {
+      await expect(
+        boundary.configuredSearchUrl({
+          profileDirectory,
+          text: "configured search",
+        }),
+      ).resolves.toBe(
+        "https://search.fixture.test/results?q=configured%20search",
+      );
+    } finally {
+      await rm(rootDirectory, { recursive: true, force: true });
+    }
+  });
+
   it("runs the browser identity unprivileged and binds Automation Mode to loopback", async () => {
     const rootDirectory = await mkdtemp(join(tmpdir(), "browser-process-"));
     const sourceDirectory = join(rootDirectory, "source");
