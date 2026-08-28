@@ -16,6 +16,11 @@ const HOST_ID = "host-activity-test";
 const PROFILE_ID = DEFAULT_PROFILE_ID;
 const OTHER_PROFILE_ID = "profile-other";
 const NOW = new Date("2026-08-27T00:00:00.000Z");
+const predecessorActivityGrantMetadataMigration = `
+ALTER TABLE browser_activity_records ADD COLUMN grant_id TEXT;
+ALTER TABLE browser_activity_records ADD COLUMN grant_scope TEXT;
+ALTER TABLE browser_activity_records ADD COLUMN grant_elevations TEXT;
+`;
 
 function activityEvent(
   overrides: Partial<BrowserActivityEvent> = {},
@@ -80,23 +85,35 @@ describe("Browser activity record persistence", () => {
 
     try {
       backend.bb.storage.migrate(database, [
-        ...BROWSER_DATABASE_MIGRATIONS.slice(0, 6),
+        ...BROWSER_DATABASE_MIGRATIONS.slice(0, 11),
+        predecessorActivityGrantMetadataMigration,
       ]);
       database
         .prepare(
           `INSERT INTO browser_activity_records
-             (occurred_at, actor, host_id, profile_id, kind, action, outcome, interrupted)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+             (event_id, actor, project_id, host_id, profile_id,
+              destination_origin, occurred_at, kind, action, outcome,
+              interrupted, interruption_reason, duration_ms,
+              grant_id, grant_scope, grant_elevations)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
-          "2026-08-26T12:00:00.000Z",
+          "predecessor-1",
           "owner",
+          null,
           HOST_ID,
           PROFILE_ID,
+          null,
+          "2026-08-26T12:00:00.000Z",
           "lifecycle",
           "setup",
           "completed",
           0,
+          null,
+          null,
+          null,
+          null,
+          null,
         );
 
       backend.bb.storage.migrate(database, [...BROWSER_DATABASE_MIGRATIONS]);
@@ -107,7 +124,7 @@ describe("Browser activity record persistence", () => {
 
       expect(migrated).toMatchObject([
         {
-          eventId: "legacy-1",
+          eventId: "predecessor-1",
           actor: "owner",
           projectId: null,
           kind: "lifecycle",

@@ -317,6 +317,45 @@ describe("Browser Grant Request store contract", () => {
     }
   });
 
+  it("allows only one winner when two stores decide the same request concurrently", async () => {
+    const { backend, store } = createStore();
+    const competingStore = createProfileGrantStore(
+      backend.bb.storage.database(),
+      {
+        clock: () => NOW,
+        idFactory: () => "competing-store",
+      },
+    );
+
+    try {
+      const denied = store.authorize(authorization());
+      const requestId = denied.grantRequest!.requestId;
+      const [first, second] = await Promise.all([
+        Promise.resolve().then(() =>
+          store.decideRequest({ requestId, decision: "retry" }),
+        ),
+        Promise.resolve().then(() =>
+          competingStore.decideRequest({ requestId, decision: "one-hour" }),
+        ),
+      ]);
+
+      expect([first.outcome, second.outcome].sort()).toEqual([
+        "already-decided",
+        "retry-approved",
+      ]);
+      expect(
+        backend.bb.storage
+          .database()
+          .prepare(
+            "SELECT COUNT(*) AS count FROM browser_grant_request_events WHERE request_id = ? AND event_type = 'approved'",
+          )
+          .get(requestId),
+      ).toMatchObject({ count: 1 });
+    } finally {
+      await backend.harness.lifecycle.dispose();
+    }
+  });
+
   it("requires second confirmation for persistent elevated access and persists exact scope", async () => {
     const { backend, store } = createStore();
 

@@ -10,7 +10,6 @@ import {
   type BrowserService,
 } from "./browser-service.js";
 import {
-  browserGrantRequestDecisionSchema,
   browserScriptParametersSchema,
   type BrowserActivityRecord,
   type BrowserHostChoicesInput,
@@ -33,7 +32,7 @@ import {
 } from "./contracts.js";
 
 const CLI_USAGE = [
-  "Usage: bb browser <status|diagnostics|activity|activity-export|activity-clear|requests|request-status|request-decide|request-revoke|list|create|rename|select|backup|restore|import|setup|disable|uninstall|purge> [options]",
+  "Usage: bb browser <status|diagnostics|activity|activity-export|activity-clear|requests|request-status|list|create|rename|select|backup|restore|import|setup|disable|uninstall|purge> [options]",
   "  setup [--profile <id>] [--step <id> --confirm <text>] [--json]",
   "  purge [--profile <id>] [--confirm <text>] [--json]",
   "  disable|uninstall [--profile <id>] --confirm <text> [--json]",
@@ -42,8 +41,6 @@ const CLI_USAGE = [
   `  activity-clear [--profile <id>] --confirm "Clear Browser activity records" [--json]`,
   "  requests [--json]",
   "  request-status --request <id> [--json]",
-  "  request-decide --request <id> [--decision <deny|retry|one-hour|persist>] [--confirm <text>] [--json]",
-  "  request-revoke --request <id> [--json]",
   "  list [--host <id>] [--json]",
   "  create --name <name> [--locale <locale>] [--timezone <zone>] [--host <id>] [--json]",
   "  rename --profile <id> --name <name> [--locale <locale>] [--timezone <zone>] [--host <id>] [--json]",
@@ -53,8 +50,6 @@ const CLI_USAGE = [
   "  import --name <name> --source <path> [--host <id>] [--json]",
 ].join("\n");
 const PROFILE_IMPORT_COMMAND = ["imp", "ort"].join("");
-const OWNER_SETTINGS_CLI_ERROR =
-  "Browser Grant Request decisions and revocation require the owner Settings transport; the agent-facing CLI cannot approve or revoke Browser Grant Requests.";
 type BrowserScriptParameters = z.output<typeof browserScriptParametersSchema>;
 const BROWSER_COMMANDS = [
   "status",
@@ -64,8 +59,6 @@ const BROWSER_COMMANDS = [
   "activity-clear",
   "requests",
   "request-status",
-  "request-decide",
-  "request-revoke",
   "list",
   "create",
   "rename",
@@ -93,7 +86,6 @@ type ParsedCliArguments = {
   stepId?: z.output<typeof setupStepIdSchema>;
   confirmation?: string;
   requestId?: string;
-  decision?: z.output<typeof browserGrantRequestDecisionSchema>;
 };
 
 type CliArgumentParseResult =
@@ -229,7 +221,6 @@ type CliOptionName =
   | "--archive"
   | "--source"
   | "--request"
-  | "--decision"
   | "confirmation";
 type ParsedCliOption = {
   name: CliOptionName;
@@ -246,8 +237,7 @@ function cliOptionName(argument: string): CliOptionName | null {
     argument === "--timezone" ||
     argument === "--archive" ||
     argument === "--source" ||
-    argument === "--request" ||
-    argument === "--decision"
+    argument === "--request"
   ) {
     return argument;
   }
@@ -282,7 +272,6 @@ type CliParseState = {
   stepId?: ParsedCliArguments["stepId"];
   confirmation?: string;
   requestId?: string;
-  decision?: ParsedCliArguments["decision"];
 };
 
 function applyCliOption(
@@ -329,18 +318,6 @@ function applyCliOption(
     parseState.requestId = option.optionValue;
     return null;
   }
-  if (option.name === "--decision") {
-    const parsedDecision = browserGrantRequestDecisionSchema.safeParse(
-      option.optionValue,
-    );
-    if (!parsedDecision.success) {
-      return (
-        "Unknown request decision: " + option.optionValue + ".\n" + CLI_USAGE
-      );
-    }
-    parseState.decision = parsedDecision.data;
-    return null;
-  }
   parseState.confirmation = option.optionValue;
   return null;
 }
@@ -378,26 +355,11 @@ function validateCliCommandOptions(
   ) {
     return `Confirmation is not valid for ${command}.\n${CLI_USAGE}`;
   }
-  if (
-    !["request-status", "request-decide", "request-revoke"].includes(command) &&
-    parseState.requestId !== undefined
-  ) {
-    return (
-      "--request is only valid for request inspection, decision, or revocation.\n" +
-      CLI_USAGE
-    );
+  if (command !== "request-status" && parseState.requestId !== undefined) {
+    return "--request is only valid for request inspection.\n" + CLI_USAGE;
   }
   if (command === "request-status" && parseState.requestId === undefined) {
     return `request-status requires --request.\n${CLI_USAGE}`;
-  }
-  if (
-    ["request-decide", "request-revoke"].includes(command) &&
-    parseState.requestId === undefined
-  ) {
-    return command + " requires --request.\n" + CLI_USAGE;
-  }
-  if (command !== "request-decide" && parseState.decision !== undefined) {
-    return "--decision is only valid for request-decide.\n" + CLI_USAGE;
   }
   if (
     command === "setup" &&
@@ -518,7 +480,6 @@ function parseCliArguments(argv: string[]): CliArgumentParseResult {
       stepId: parseState.stepId,
       confirmation: parseState.confirmation,
       requestId: parseState.requestId,
-      decision: parseState.decision,
     },
   };
 }
@@ -606,10 +567,10 @@ async function runActivityClearCli(
 
 async function runGrantRequestsCli(
   browser: BrowserService,
-  authority: unknown,
   json: boolean,
+  context: PluginCliContext,
 ) {
-  const requests = await browser.listGrantRequests(authority);
+  const requests = await browser.listAgentGrantRequests(context);
   return {
     exitCode: 0,
     stdout: json
@@ -637,11 +598,11 @@ function cliGrantRequestText(request: BrowserGrantRequest) {
 
 async function runGrantRequestStatusCli(
   browser: BrowserService,
-  authority: unknown,
   requestId: string,
   json: boolean,
+  context: PluginCliContext,
 ) {
-  const request = await browser.inspectGrantRequest(authority, requestId);
+  const request = await browser.inspectAgentGrantRequest(context, requestId);
   if (request === null) {
     return {
       exitCode: 1,
@@ -971,7 +932,6 @@ async function runAdministrationCli(
 
 async function runCli(
   browser: BrowserService,
-  authority: unknown,
   argv: string[],
   context: PluginCliContext,
 ) {
@@ -986,18 +946,10 @@ async function runCli(
       return await runDiagnosticsCli(browser, profileId, hostId, json, context);
     }
     if (command === "requests") {
-      return await runGrantRequestsCli(browser, authority, json);
+      return await runGrantRequestsCli(browser, json, context);
     }
     if (command === "request-status") {
-      return await runGrantRequestStatusCli(
-        browser,
-        authority,
-        requestId!,
-        json,
-      );
-    }
-    if (command === "request-decide" || command === "request-revoke") {
-      return { exitCode: 1, stderr: OWNER_SETTINGS_CLI_ERROR };
+      return await runGrantRequestStatusCli(browser, requestId!, json, context);
     }
     return await runAdministrationCli(browser, parsed.arguments, context);
   } catch (error) {
@@ -1037,11 +989,7 @@ async function runBrowserScript(
   return response.ok ? toolSuccess(response.result) : toolFailure(response);
 }
 
-function registerCli(
-  bb: BbPluginApi,
-  browser: BrowserService,
-  ownerAuthority: unknown,
-) {
+function registerCli(bb: BbPluginApi, browser: BrowserService) {
   bb.cli.register({
     name: "browser",
     summary: "Inspect and manage Browser host state",
@@ -1074,20 +1022,14 @@ function registerCli(
           'bb browser activity-clear [--profile <id>] [--host <id>] --confirm "Clear Browser activity records" [--json]',
       },
       {
+        name: "requests",
+        summary: "List Browser Grant Requests",
+        usage: "bb browser requests [--json]",
+      },
+      {
         name: "request-status",
         summary: "Inspect a Browser Grant Request",
         usage: "bb browser request-status --request <id> [--json]",
-      },
-      {
-        name: "request-decide",
-        summary: "Refuse unsafe agent-facing Browser Grant Request decisions",
-        usage:
-          "bb browser request-decide --request <id> [--decision <deny|retry|one-hour|persist>] [--confirm <text>] [--json]",
-      },
-      {
-        name: "request-revoke",
-        summary: "Refuse unsafe agent-facing Browser Grant Request revocation",
-        usage: "bb browser request-revoke --request <id> [--json]",
       },
       {
         name: "list",
@@ -1150,7 +1092,7 @@ function registerCli(
         usage: "bb browser purge [--confirm <text>] [--json]",
       },
     ],
-    run: (argv, context) => runCli(browser, ownerAuthority, argv, context),
+    run: (argv, context) => runCli(browser, argv, context),
   });
 }
 
@@ -1216,7 +1158,7 @@ export default function plugin(bb: BbPluginApi) {
     browser_host_choices: (input: BrowserHostChoicesInput) =>
       browser.hostChoices(input),
   });
-  registerCli(bb, browser, ownerAuthority);
+  registerCli(bb, browser);
   registerAgentTool(bb, browser);
   bb.agents.configure(() => ({
     tools: ["browser_script"],

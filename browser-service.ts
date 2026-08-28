@@ -1,4 +1,8 @@
-import type { BbPluginApi, PluginAgentToolContext } from "@get-bb/plugin-sdk";
+import type {
+  BbPluginApi,
+  PluginAgentToolContext,
+  PluginCliContext,
+} from "@get-bb/plugin-sdk";
 import type Database from "better-sqlite3";
 import { z } from "zod";
 import {
@@ -118,12 +122,7 @@ function grantRequestActivityOutcome(event: GrantRequestEvent) {
 }
 
 function grantRequestActivityActor(event: GrantRequestEvent) {
-  if (event.eventType === "requested" || event.eventType === "consumed") {
-    return "agent" as const;
-  }
-  return event.eventType === "expired"
-    ? ("system" as const)
-    : ("owner" as const);
+  return event.actor;
 }
 
 function grantRequestActivityElevations(event: GrantRequestEvent) {
@@ -893,7 +892,15 @@ export function createBrowserService(
         temporaryGrant === undefined
           ? null
           : setTimeout(
-              () => revocationController.abort(),
+              () => {
+                void withGrantStateSerialization(() => {
+                  grantStore.expireTemporaryGrant(
+                    temporaryGrant.grantId,
+                    new Date(temporaryGrant.expiresAt),
+                  );
+                  revocationController.abort();
+                });
+              },
               Math.max(
                 0,
                 new Date(temporaryGrant.expiresAt).getTime() - Date.now(),
@@ -1151,6 +1158,55 @@ export function createBrowserService(
   ) {
     requireOwnerSettingsAuthority(authority);
     return browserProfileGrantsSchema.parse(grantStore.list(query));
+  }
+
+  async function agentGrantRequestScope(
+    context: PluginCliContext,
+  ): Promise<BrowserGrantRequestQuery> {
+    const hostId = await resolvedHostId(bb, context);
+    if (hostId === null) {
+      throw new Error(
+        "Select a workspace host before reading Browser Grant Requests.",
+      );
+    }
+    const projectId = await profileContextProjectId(bb, context);
+    const inventory = await profileInventory(
+      {
+        hostId,
+        projectId: context.projectId,
+        threadId: context.threadId,
+      },
+      context.signal,
+    );
+    return {
+      projectId,
+      hostId,
+      installationId: inventory.installationId,
+      profileId: inventory.selectedProfileId,
+    };
+  }
+
+  async function listAgentGrantRequests(context: PluginCliContext) {
+    const scope = await agentGrantRequestScope(context);
+    return browserGrantRequestsSchema.parse(grantStore.listRequests(scope));
+  }
+
+  async function inspectAgentGrantRequest(
+    context: PluginCliContext,
+    requestId: string,
+  ) {
+    const scope = await agentGrantRequestScope(context);
+    const request = grantStore.inspectRequest(requestId);
+    if (
+      request === null ||
+      request.projectId !== scope.projectId ||
+      request.hostId !== scope.hostId ||
+      request.installationId !== scope.installationId ||
+      request.profileId !== scope.profileId
+    ) {
+      return null;
+    }
+    return request;
   }
 
   async function inspectGrant(authority: unknown, grantId: string) {
@@ -1607,6 +1663,8 @@ export function createBrowserService(
     revokeGrant,
     listGrantRequests,
     inspectGrantRequest,
+    listAgentGrantRequests,
+    inspectAgentGrantRequest,
     decideGrantRequest,
     revokeGrantRequest,
     activityRecords,

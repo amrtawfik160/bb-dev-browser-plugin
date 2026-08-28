@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { fireEvent } from "@testing-library/react";
+import { fireEvent, waitFor } from "@testing-library/react";
 import {
   mkdtemp,
   mkdir,
@@ -392,6 +392,63 @@ describe("Browser public plugin contract", () => {
     await browser.dispose();
   });
 
+  it("keeps safe request reads registered while removing unsupported agent mutations", async () => {
+    const browser = await createPublicPluginHarness();
+
+    try {
+      const help = await browser.runBrowserCli([]);
+      const registeredNames = browser
+        .registeredBrowserCliCommands()
+        .map((command) => command.name);
+
+      expect(help.stderr).toContain("requests [--json]");
+      expect(help.stderr).toContain("request-status --request <id>");
+      expect(help.stderr).not.toContain("request-decide");
+      expect(help.stderr).not.toContain("request-revoke");
+      expect(registeredNames).toContain("requests");
+      expect(registeredNames).toContain("request-status");
+      expect(registeredNames).not.toContain("request-decide");
+      expect(registeredNames).not.toContain("request-revoke");
+
+      const decisionCommand = await browser.runBrowserCli([
+        "request-decide",
+        "--request",
+        "grant-request-foreign",
+      ]);
+      expect(decisionCommand.stderr).toContain("Usage: bb browser");
+      expect(decisionCommand.stderr).not.toContain("owner Settings");
+
+      const decisionOption = await browser.runBrowserCli([
+        "requests",
+        "--decision",
+        "retry",
+      ]);
+      expect(decisionOption.stderr).toContain("Unknown option: --decision");
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("keeps requests help, parser, and registration metadata in parity", async () => {
+    const browser = await createPublicPluginHarness();
+
+    try {
+      expect(
+        browser
+          .registeredBrowserCliCommands()
+          .find((command) => command.name === "requests"),
+      ).toEqual({
+        name: "requests",
+        summary: "List Browser Grant Requests",
+        usage: "bb browser requests [--json]",
+      });
+      const parsed = await browser.runBrowserCli(["requests", "--json"]);
+      expect(parsed).toMatchObject({ exitCode: 0, stdout: "[]" });
+    } finally {
+      await browser.dispose();
+    }
+  });
+
   it("gates browser_script through the owner grant create, inspect, and revoke contract", async () => {
     const browser = await createPublicPluginHarness({
       snapshot: preparedSnapshot,
@@ -501,6 +558,71 @@ describe("Browser public plugin contract", () => {
     );
     await settings.findByRole("list", { name: "Browser Grant Request list" });
     await browser.dispose();
+  });
+
+  it("scopes agent-facing request list and status to the invoking project, host, profile, and installation", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+    });
+
+    try {
+      await browser.createBrowserProfile({
+        hostId: "host-browser-test",
+        name: "Scoped request target",
+      });
+      const ownDenied = await browser.runBrowserScriptWithProfile(undefined, {
+        destinationOrigin: "https://scoped-own.example.test",
+      });
+      const foreignProjectDenied = await browser.runBrowserScriptWithProfile(
+        undefined,
+        {
+          destinationOrigin: "https://scoped-foreign-project.example.test",
+          projectId: "project-foreign",
+          threadId: "thread-foreign-project",
+        },
+      );
+      const otherProfile = (
+        await browser.runBrowserProfiles("host-browser-test")
+      ).profiles.find((profile) => profile.name === "Scoped request target");
+      if (otherProfile === undefined) {
+        throw new Error("expected the additional Browser Profile");
+      }
+      const foreignProfileDenied = await browser.runBrowserScriptWithProfile(
+        otherProfile.profileId,
+        { destinationOrigin: "https://scoped-foreign-profile.example.test" },
+      );
+      const ownRequestId = browserScriptFailureSchema.parse(
+        JSON.parse(ownDenied.content[0]!.text),
+      ).error.grantRequest!.requestId;
+      const foreignProjectRequestId = browserScriptFailureSchema.parse(
+        JSON.parse(foreignProjectDenied.content[0]!.text),
+      ).error.grantRequest!.requestId;
+      const foreignProfileRequestId = browserScriptFailureSchema.parse(
+        JSON.parse(foreignProfileDenied.content[0]!.text),
+      ).error.grantRequest!.requestId;
+
+      const list = await browser.runBrowserCli(["requests", "--json"]);
+      expect(list.exitCode).toBe(0);
+      expect(JSON.parse(list.stdout!)).toEqual([
+        expect.objectContaining({ requestId: ownRequestId }),
+      ]);
+
+      for (const foreignRequestId of [
+        foreignProjectRequestId,
+        foreignProfileRequestId,
+      ]) {
+        const status = await browser.runBrowserCli([
+          "request-status",
+          "--request",
+          foreignRequestId,
+          "--json",
+        ]);
+        expect(status.exitCode).toBe(1);
+        expect(status.stderr).toContain("was not found");
+      }
+    } finally {
+      await browser.dispose();
+    }
   });
 
   it("keeps approval non-resuming and requires an explicit current-state retry", async () => {
@@ -796,6 +918,63 @@ describe("Browser public plugin contract", () => {
     }
   });
 
+  it("links direct persistent grant revocation back to its request atomically", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+    });
+
+    try {
+      await browser.createBrowserProfile({
+        hostId: "host-browser-test",
+        name: "Persistent revocation target",
+      });
+      const denied = await browser.runBrowserScriptWithProfile(undefined, {
+        destinationOrigin: "https://persistent-revocation.example.test",
+        fileTransfer: true,
+      });
+      const requestId = browserScriptFailureSchema.parse(
+        JSON.parse(denied.content[0]!.text),
+      ).error.grantRequest!.requestId;
+      const persisted = await browser.decideBrowserGrantRequest({
+        requestId,
+        decision: "persist",
+        persistenceConfirmation: PERSIST_BROWSER_ELEVATED_ACCESS_CONFIRMATION,
+      });
+      const grantId = persisted.grant?.grantId;
+      if (grantId === undefined) throw new Error("expected a persistent grant");
+
+      expect(await browser.revokeBrowserGrant(grantId)).toMatchObject({
+        grantId,
+        outcome: "revoked",
+      });
+      expect(await browser.inspectBrowserGrantRequest(requestId)).toMatchObject(
+        { status: "revoked", revokedAt: expect.any(String) },
+      );
+      expect(await browser.runBrowserActivityRecords()).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            actor: "owner",
+            requestId,
+            action: "grant-request-revoked",
+            outcome: "revoked",
+          }),
+        ]),
+      );
+
+      const reRequested = await browser.runBrowserScriptWithProfile(undefined, {
+        destinationOrigin: "https://persistent-revocation.example.test",
+        fileTransfer: true,
+      });
+      expect(
+        browserScriptFailureSchema.parse(
+          JSON.parse(reRequested.content[0]!.text),
+        ).error.grantRequest?.requestId,
+      ).not.toBe(requestId);
+    } finally {
+      await browser.dispose();
+    }
+  });
+
   it("renders expired requests and keeps request identity plus explicit retry guidance on the panel and browser_script", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(new Date("2026-08-28T00:00:00.000Z"));
@@ -845,6 +1024,114 @@ describe("Browser public plugin contract", () => {
     }
   });
 
+  it("refreshes panel request notices after an external request transition", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+    });
+
+    try {
+      await browser.createBrowserProfile({
+        hostId: "host-browser-test",
+        name: "Live request target",
+      });
+      const denied = await browser.runBrowserScriptWithProfile(undefined, {
+        destinationOrigin: "https://live-request.example.test",
+      });
+      const requestId = browserScriptFailureSchema.parse(
+        JSON.parse(denied.content[0]!.text),
+      ).error.grantRequest!.requestId;
+      const panel = await browser.openExistingThreadPanel();
+      await panel.panel.findByText(requestId);
+
+      await browser.decideBrowserGrantRequest({
+        requestId,
+        decision: "one-hour",
+      });
+      window.dispatchEvent(new Event("focus"));
+
+      const notices = await panel.panel.findByRole("region", {
+        name: "Browser Grant Request notices",
+      });
+      await waitFor(() =>
+        expect(notices.textContent).toMatch(
+          new RegExp(`${requestId}.*approved`, "i"),
+        ),
+      );
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("persists one in-flight temporary expiry before aborting the browser call", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    vi.setSystemTime(new Date("2026-08-28T00:00:00.000Z"));
+    let signalHostCallStarted!: () => void;
+    const hostCallStarted = new Promise<void>((resolve) => {
+      signalHostCallStarted = resolve;
+    });
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+      browserScriptDelayMs: 2 * 60 * 60 * 1000,
+      browserScriptStarted: signalHostCallStarted,
+    });
+
+    try {
+      await browser.createBrowserProfile({
+        hostId: "host-browser-test",
+        name: "Temporary expiry target",
+      });
+      const denied = await browser.runBrowserScriptWithProfile(undefined, {
+        destinationOrigin: "https://temporary-expiry.example.test",
+      });
+      const requestId = browserScriptFailureSchema.parse(
+        JSON.parse(denied.content[0]!.text),
+      ).error.grantRequest!.requestId;
+      expect(
+        (
+          await browser.decideBrowserGrantRequest({
+            requestId,
+            decision: "one-hour",
+          })
+        ).outcome,
+      ).toBe("one-hour-approved");
+
+      const operation = browser.runBrowserScriptWithProfile(undefined, {
+        destinationOrigin: "https://temporary-expiry.example.test",
+      });
+      await hostCallStarted;
+      const operationOutcome = operation.then(
+        () => null,
+        (error: unknown) => error,
+      );
+      await vi.advanceTimersByTimeAsync(60 * 60 * 1000);
+      await Promise.resolve();
+
+      const events = browser
+        .persistedGrantRequestEvents()
+        .filter((event) => event.request_id === requestId);
+      expect(events.at(-1)).toMatchObject({
+        event_type: "expired",
+        event_at: "2026-08-28T01:00:00.000Z",
+      });
+      expect(
+        events.filter((event) => event.event_type === "expired"),
+      ).toHaveLength(1);
+      expect(await operationOutcome).toMatchObject({
+        message: "browser script aborted",
+      });
+      expect(
+        (await browser.runBrowserActivityRecords()).filter(
+          (record) =>
+            record.requestId === requestId &&
+            record.action === "grant-request-expired",
+        ),
+      ).toHaveLength(1);
+    } finally {
+      await browser.dispose();
+      vi.useRealTimers();
+    }
+  });
+
   it("keeps CLI request inspection safe and fails closed for agent-facing decisions while recording metadata-only request lifecycle", async () => {
     const browser = await createPublicPluginHarness({
       snapshot: preparedSnapshot,
@@ -881,7 +1168,7 @@ describe("Browser public plugin contract", () => {
         "--json",
       ]);
       expect(cliDecision.exitCode).toBe(1);
-      expect(cliDecision.stderr).toContain("owner Settings");
+      expect(cliDecision.stderr).toContain("Usage: bb browser");
       expect(
         (await browser.inspectBrowserGrantRequest(requestId))?.status,
       ).toBe("pending");
@@ -892,7 +1179,7 @@ describe("Browser public plugin contract", () => {
         "--json",
       ]);
       expect(cliRevoke.exitCode).toBe(1);
-      expect(cliRevoke.stderr).toContain("owner Settings");
+      expect(cliRevoke.stderr).toContain("Usage: bb browser");
 
       const approved = await browser.decideBrowserGrantRequest({
         requestId,
@@ -1059,6 +1346,12 @@ describe("Browser public plugin contract", () => {
         })
       ).isError,
     ).toBe(false);
+    const pendingDenied = await browser.runBrowserScriptWithProfile(undefined, {
+      destinationOrigin: "https://cleanup-request.example.test",
+    });
+    const pendingRequestId = browserScriptFailureSchema.parse(
+      JSON.parse(pendingDenied.content[0]!.text),
+    ).error.grantRequest!.requestId;
 
     await browser.emitProjectChange("project-deleted");
 
@@ -1082,6 +1375,12 @@ describe("Browser public plugin contract", () => {
           actor: "system",
           kind: "grant",
           action: "project-deleted",
+          outcome: "revoked",
+        }),
+        expect.objectContaining({
+          actor: "system",
+          requestId: pendingRequestId,
+          action: "grant-request-revoked",
           outcome: "revoked",
         }),
       ]),

@@ -1,6 +1,7 @@
 import type {
   JsonValue,
   PluginCliExecutionResult,
+  PluginCliContext,
   PluginNewThreadPanelProps,
   PluginSettingsSectionProps,
   PluginThreadPanelProps,
@@ -8,6 +9,7 @@ import type {
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { z } from "zod";
 import {
   createFakePluginHost,
   makeThreadResponse,
@@ -90,6 +92,11 @@ const HOST_ID = "host-browser-test";
 const PROJECT_ID = "project-browser-test";
 const THREAD_ID = "thread-browser-test";
 const ENVIRONMENT_ID = "environment-browser-test";
+const persistedGrantRequestEventSchema = z.object({
+  request_id: z.string(),
+  event_type: z.string(),
+  event_at: z.string(),
+});
 
 type PublicToolFailure = {
   content: [{ type: "text"; text: string }];
@@ -349,10 +356,13 @@ export async function createPublicPluginHarness(options?: {
         };
       },
       threads: {
-        get: async () =>
+        get: async ({ threadId }) =>
           makeThreadResponse({
-            id: THREAD_ID,
-            projectId: PROJECT_ID,
+            id: threadId,
+            projectId:
+              threadId === "thread-foreign-project"
+                ? "project-foreign"
+                : PROJECT_ID,
             environmentId: ENVIRONMENT_ID,
           }),
       },
@@ -866,11 +876,19 @@ export async function createPublicPluginHarness(options?: {
     });
   }
 
-  function runBrowserCli(argv: string[]): Promise<PluginCliExecutionResult> {
+  function runBrowserCli(
+    argv: string[],
+    context: Partial<PluginCliContext> = {},
+  ): Promise<PluginCliExecutionResult> {
     return backend.harness.behavior.runCli(argv, {
       threadId: THREAD_ID,
       projectId: PROJECT_ID,
+      ...context,
     });
+  }
+
+  function registeredBrowserCliCommands() {
+    return backend.harness.inspection.registrations.cli?.commands ?? [];
   }
 
   function runBrowserActivityRecords(profileId = DEFAULT_PROFILE_ID) {
@@ -889,6 +907,16 @@ export async function createPublicPluginHarness(options?: {
 
   function persistedHostOutbox() {
     return readFile(join(hostDataRoot, "browser-activity-outbox.json"), "utf8");
+  }
+
+  function persistedGrantRequestEvents() {
+    return backend.bb.storage
+      .database()
+      .prepare(
+        "SELECT * FROM browser_grant_request_events ORDER BY event_sequence",
+      )
+      .all()
+      .map((row) => persistedGrantRequestEventSchema.parse(row));
   }
 
   function diagnosticLogEntries() {
@@ -1114,6 +1142,7 @@ export async function createPublicPluginHarness(options?: {
       fileTransfer?: boolean;
       invalidCertificate?: boolean;
       projectId?: string;
+      threadId?: string | null;
       signal?: AbortSignal;
     },
   ) {
@@ -1134,7 +1163,9 @@ export async function createPublicPluginHarness(options?: {
         ...(profileId === undefined ? {} : { profileId }),
       },
       {
-        threadId: THREAD_ID,
+        ...(overrides?.threadId === null
+          ? {}
+          : { threadId: overrides?.threadId ?? THREAD_ID }),
         projectId: overrides?.projectId ?? PROJECT_ID,
         ...(overrides?.signal === undefined
           ? {}
@@ -1243,9 +1274,11 @@ export async function createPublicPluginHarness(options?: {
     runStatusCliText,
     runDiagnosticsCli,
     runBrowserCli,
+    registeredBrowserCliCommands,
     runBrowserActivityRecords,
     persistedActivityRows,
     persistedHostOutbox,
+    persistedGrantRequestEvents,
     diagnosticLogEntries,
     runBrowserProfiles,
     createBrowserProfile,

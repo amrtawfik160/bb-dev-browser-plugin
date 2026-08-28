@@ -114,8 +114,40 @@ export type GrantRequestStoreOptions = {
 export type GrantRequestEventType =
   "requested" | "denied" | "approved" | "consumed" | "expired" | "revoked";
 
+export type GrantRequestEventActor = "agent" | "owner" | "system";
+
+export type GrantRequestEventCause =
+  | "agent-requested"
+  | "agent-consumed"
+  | "owner-decision"
+  | "request-expired"
+  | "owner-revoked"
+  | "persistent-grant-revoked"
+  | "project-deleted"
+  | "profile-deleted";
+
+function defaultEventMetadata(
+  eventType: GrantRequestEventType,
+): Pick<GrantRequestEvent, "actor" | "cause"> {
+  if (eventType === "requested") {
+    return { actor: "agent", cause: "agent-requested" };
+  }
+  if (eventType === "consumed") {
+    return { actor: "agent", cause: "agent-consumed" };
+  }
+  if (eventType === "expired") {
+    return { actor: "system", cause: "request-expired" };
+  }
+  if (eventType === "revoked") {
+    return { actor: "owner", cause: "owner-revoked" };
+  }
+  return { actor: "owner", cause: "owner-decision" };
+}
+
 export type GrantRequestEvent = {
   eventType: GrantRequestEventType;
+  actor: GrantRequestEventActor;
+  cause: GrantRequestEventCause;
   occurredAt: string;
   request: BrowserGrantRequest;
   temporaryGrant: BrowserTemporaryGrant | null;
@@ -383,14 +415,19 @@ function requestEventFromDatabase(
   requestId: string,
   eventType: GrantRequestEventType,
   occurredAt: string,
+  actor?: GrantRequestEventActor,
+  cause?: GrantRequestEventCause,
 ): GrantRequestEvent {
   const history = eventRowsForRequest(database, requestId);
   const latest = history[history.length - 1];
   if (latest === undefined) {
     throw new Error("Browser Grant Request event has no request history.");
   }
+  const metadata = defaultEventMetadata(eventType);
   return {
     eventType,
+    actor: actor ?? metadata.actor,
+    cause: cause ?? metadata.cause,
     occurredAt,
     request: requestFromHistory(history),
     temporaryGrant: temporaryGrantFromHistory(history),
@@ -398,7 +435,7 @@ function requestEventFromDatabase(
   };
 }
 
-function emitRequestEvents(
+export function emitRequestEvents(
   events: readonly GrantRequestEvent[],
   onEvent: GrantRequestStoreOptions["onEvent"],
 ) {
@@ -412,6 +449,8 @@ type RequestEventCollection = {
   requestId: string;
   eventType: GrantRequestEventType;
   occurredAt: string;
+  actor?: GrantRequestEventActor;
+  cause?: GrantRequestEventCause;
 };
 
 function collectRequestEvent({
@@ -420,9 +459,18 @@ function collectRequestEvent({
   requestId,
   eventType,
   occurredAt,
+  actor,
+  cause,
 }: RequestEventCollection) {
   events?.push(
-    requestEventFromDatabase(database, requestId, eventType, occurredAt),
+    requestEventFromDatabase(
+      database,
+      requestId,
+      eventType,
+      occurredAt,
+      actor,
+      cause,
+    ),
   );
 }
 
@@ -470,6 +518,22 @@ function latestRowsForBinding(
       row.host_id === input.hostId &&
       row.installation_id === input.installationId &&
       row.profile_id === input.profileId,
+  );
+}
+
+function requestRowMatchesQuery(
+  row: EventRow,
+  query: BrowserGrantRequestQuery,
+) {
+  return (
+    (query.requestId === undefined || row.request_id === query.requestId) &&
+    (query.projectId === undefined || row.project_id === query.projectId) &&
+    (query.hostId === undefined || row.host_id === query.hostId) &&
+    (query.installationId === undefined ||
+      row.installation_id === query.installationId) &&
+    (query.profileId === undefined || row.profile_id === query.profileId) &&
+    (query.status === undefined ||
+      statusForEvent(row.event_type) === query.status)
   );
 }
 
@@ -541,6 +605,8 @@ export type GrantRequestStore = {
   listRequests(query?: BrowserGrantRequestQuery): BrowserGrantRequest[];
   inspectRequest(requestId: string): BrowserGrantRequest | null;
   inspectTemporaryGrant(grantId: string): BrowserTemporaryGrant | null;
+  expireTemporaryGrant(grantId: string, expirationTime?: Date): void;
+  revokeLinkedGrant(grantId: string, revokedAt: string): GrantRequestEvent[];
   decideRequest(
     input: BrowserGrantRequestDecisionRequest,
   ): BrowserGrantRequestDecisionResponse;
@@ -666,22 +732,17 @@ export function createGrantRequestStore(
   function listRequests(query: BrowserGrantRequestQuery = {}) {
     const events: GrantRequestEvent[] = [];
     const requests = database.transaction(() => {
-      expireRowsAt(database, clock(), latestEventRows(database), events);
+      const expirationQuery = { ...query, status: undefined };
+      expireRowsAt(
+        database,
+        clock(),
+        latestEventRows(database).filter((row) =>
+          requestRowMatchesQuery(row, expirationQuery),
+        ),
+        events,
+      );
       return latestEventRows(database)
-        .filter(
-          (row) =>
-            (query.requestId === undefined ||
-              row.request_id === query.requestId) &&
-            (query.projectId === undefined ||
-              row.project_id === query.projectId) &&
-            (query.hostId === undefined || row.host_id === query.hostId) &&
-            (query.installationId === undefined ||
-              row.installation_id === query.installationId) &&
-            (query.profileId === undefined ||
-              row.profile_id === query.profileId) &&
-            (query.status === undefined ||
-              statusForEvent(row.event_type) === query.status),
-        )
+        .filter((row) => requestRowMatchesQuery(row, query))
         .map((row) =>
           requestFromHistory(eventRowsForRequest(database, row.request_id)),
         );
@@ -694,7 +755,14 @@ export function createGrantRequestStore(
     const normalizedRequestId = browserGrantRequestIdSchema.parse(requestId);
     const events: GrantRequestEvent[] = [];
     const request = database.transaction(() => {
-      expireRowsAt(database, clock(), latestEventRows(database), events);
+      expireRowsAt(
+        database,
+        clock(),
+        latestEventRows(database).filter(
+          (row) => row.request_id === normalizedRequestId,
+        ),
+        events,
+      );
       const history = requestHistoryIfPresent(database, normalizedRequestId);
       return history === null ? null : requestFromHistory(history);
     })();
@@ -733,6 +801,29 @@ export function createGrantRequestStore(
     })();
     emitRequestEvents(events, options.onEvent);
     return temporaryGrant;
+  }
+
+  function expireTemporaryGrant(
+    grantId: string,
+    expirationTime: Date = clock(),
+  ) {
+    if (!grantId.startsWith(TEMPORARY_GRANT_ID_PREFIX)) return;
+    const requestId = grantId.slice(TEMPORARY_GRANT_ID_PREFIX.length);
+    const normalizedRequestId =
+      browserGrantRequestIdSchema.safeParse(requestId);
+    if (!normalizedRequestId.success) return;
+    const events: GrantRequestEvent[] = [];
+    database.transaction(() => {
+      expireRowsAt(
+        database,
+        expirationTime,
+        latestEventRows(database).filter(
+          (row) => row.request_id === normalizedRequestId.data,
+        ),
+        events,
+      );
+    })();
+    emitRequestEvents(events, options.onEvent);
   }
 
   function decideRequest(input: BrowserGrantRequestDecisionRequest) {
@@ -895,8 +986,28 @@ export function createGrantRequestStore(
     return revocationResponse;
   }
 
+  function revokeLinkedGrant(grantId: string, revokedAt: string) {
+    const linked = latestEventRows(database).find(
+      (row) => row.grant_id === grantId && row.event_type === "approved",
+    );
+    if (linked === undefined) return [];
+    appendEvent(database, linked, "revoked", revokedAt);
+    return [
+      requestEventFromDatabase(
+        database,
+        linked.request_id,
+        "revoked",
+        revokedAt,
+        "owner",
+        "persistent-grant-revoked",
+      ),
+    ];
+  }
+
   function revokeMatching(
     predicate: (row: EventRow) => boolean,
+    actor: GrantRequestEventActor,
+    cause: GrantRequestEventCause,
   ): BrowserGrantRequest[] {
     const events: GrantRequestEvent[] = [];
     const requests = database.transaction(() => {
@@ -930,6 +1041,8 @@ export function createGrantRequestStore(
           requestId: row.request_id,
           eventType: "revoked",
           occurredAt: nowIso,
+          actor,
+          cause,
         });
         revoked.push(
           requestFromHistory(eventRowsForRequest(database, row.request_id)),
@@ -946,16 +1059,24 @@ export function createGrantRequestStore(
     listRequests,
     inspectRequest,
     inspectTemporaryGrant,
+    expireTemporaryGrant,
+    revokeLinkedGrant,
     decideRequest,
     revokeRequest,
     revokeProject: (projectId) =>
-      revokeMatching((row) => row.project_id === projectId),
+      revokeMatching(
+        (row) => row.project_id === projectId,
+        "system",
+        "project-deleted",
+      ),
     revokeProfile: (target) =>
       revokeMatching(
         (row) =>
           row.host_id === target.hostId &&
           row.installation_id === target.installationId &&
           row.profile_id === target.profileId,
+        "system",
+        "profile-deleted",
       ),
   };
 }

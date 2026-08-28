@@ -16,6 +16,7 @@ import {
   type BrowserActivityRecord,
 } from "./contracts.js";
 import { BROWSER_AUTHORIZATION_MIGRATIONS } from "./authorization.js";
+import { GRANT_REQUEST_MIGRATION } from "./grant-requests.js";
 
 export { browserActivityEventFromOutboxItem as activityEventFromOutboxItem } from "./contracts.js";
 
@@ -117,6 +118,7 @@ export const BROWSER_DATABASE_MIGRATIONS = [
   activityTombstonesMigration,
   ...BROWSER_AUTHORIZATION_MIGRATIONS,
   activityGrantMetadataMigration,
+  GRANT_REQUEST_MIGRATION,
   activityGrantRequestMetadataMigration,
 ] as const;
 

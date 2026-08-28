@@ -17,7 +17,7 @@ import {
 } from "./contracts.js";
 import {
   createGrantRequestStore,
-  GRANT_REQUEST_MIGRATION,
+  emitRequestEvents,
   type GrantRequestAuthorizationDecision,
   type GrantRequestEvent,
   type GrantRequestStore,
@@ -89,7 +89,6 @@ export const BROWSER_AUTHORIZATION_MIGRATIONS = [
   authorizationMigration,
   authorizationElevationMigration,
   authorizationProjectMigration,
-  GRANT_REQUEST_MIGRATION,
 ] as const;
 
 export type { BrowserAuthorizationRequest } from "./contracts.js";
@@ -173,6 +172,7 @@ type GrantStore = {
   list(query?: BrowserProfileGrantQuery): BrowserProfileGrant[];
   inspect(grantId: string): BrowserProfileGrant | null;
   revoke(grantId: string): BrowserProfileGrantRevokeResult;
+  expireTemporaryGrant(grantId: string, expirationTime?: Date): void;
   authorize(request: BrowserAuthorizationRequest): BrowserAuthorizationDecision;
   listRequests(query?: BrowserGrantRequestQuery): BrowserGrantRequest[];
   inspectRequest(requestId: string): BrowserGrantRequest | null;
@@ -683,31 +683,78 @@ function inspectStoredGrant(
   return rows.length === 0 ? null : grantFromRow(rows[0]);
 }
 
+type StoredGrantRevocationDependencies = {
+  database: Database.Database;
+  clock: () => Date;
+  grantRequests: GrantRequestStore;
+  onGrantRequestEvent: ProfileGrantStoreOptions["onGrantRequestEvent"];
+};
+
+type StoredGrantRevocationTransaction = {
+  revocation: BrowserProfileGrantRevokeResult;
+  events: GrantRequestEvent[];
+};
+
+function existingGrantRevocationResult(
+  grantId: string,
+  revokedAt: string | null | undefined,
+): BrowserProfileGrantRevokeResult | null {
+  if (revokedAt === undefined) {
+    return { grantId, outcome: "not-found" };
+  }
+  if (revokedAt !== null) {
+    return { grantId, outcome: "already-revoked" };
+  }
+  return null;
+}
+
+function revokeStoredGrantTransaction(
+  dependencies: StoredGrantRevocationDependencies,
+  grantId: string,
+): StoredGrantRevocationTransaction {
+  const currentRevokedAt = storedGrantRevokedAt(dependencies.database, grantId);
+  const existingResult = existingGrantRevocationResult(
+    grantId,
+    currentRevokedAt,
+  );
+  if (existingResult !== null) {
+    return { revocation: existingResult, events: [] };
+  }
+  const revokedAt = dependencies.clock().toISOString();
+  const outcome = updateGrantRevocation(
+    dependencies.database,
+    grantId,
+    revokedAt,
+  );
+  return {
+    revocation: { grantId, outcome },
+    events:
+      outcome === "revoked"
+        ? dependencies.grantRequests.revokeLinkedGrant(grantId, revokedAt)
+        : [],
+  };
+}
+
 function revokeStoredGrant(
-  database: Database.Database,
-  clock: () => Date,
+  dependencies: StoredGrantRevocationDependencies,
   grantId: string,
 ): BrowserProfileGrantRevokeResult {
   const normalizedGrantId = browserProfileGrantIdSchema.parse(grantId);
-  const existingRevokedAt = storedGrantRevokedAt(database, normalizedGrantId);
-  if (existingRevokedAt === undefined) {
-    return { grantId: normalizedGrantId, outcome: "not-found" };
-  }
-  if (existingRevokedAt !== null) {
-    return { grantId: normalizedGrantId, outcome: "already-revoked" };
-  }
-  return {
-    grantId: normalizedGrantId,
-    outcome: updateGrantRevocation(database, clock, normalizedGrantId),
-  };
+  const revocationTransaction = dependencies.database.transaction(() => {
+    return revokeStoredGrantTransaction(dependencies, normalizedGrantId);
+  })();
+  emitRequestEvents(
+    revocationTransaction.events,
+    dependencies.onGrantRequestEvent,
+  );
+  return revocationTransaction.revocation;
 }
 
 function updateGrantRevocation(
   database: Database.Database,
-  clock: () => Date,
   grantId: string,
-) {
-  const revokedAt = clock().toISOString();
+  revokedAt: string,
+): "revoked" | "already-revoked" {
   const update = database
     .prepare(
       "UPDATE browser_profile_grants SET revoked_at = ?, updated_at = ? WHERE grant_id = ? AND revoked_at IS NULL",
@@ -870,7 +917,9 @@ export function createProfileGrantStore(
       insertGrant(database, input, clock, idFactory),
     revokePersistentGrant: (grantId) => {
       const existing = storedGrantRevokedAt(database, grantId);
-      if (existing === null) updateGrantRevocation(database, clock, grantId);
+      if (existing === null) {
+        updateGrantRevocation(database, grantId, clock().toISOString());
+      }
     },
     onEvent: options.onGrantRequestEvent,
   });
@@ -879,13 +928,24 @@ export function createProfileGrantStore(
     list: (query = {}) =>
       activeGrantRows(database, query).map((row) => grantFromRow(row)),
     inspect: (grantId) => inspectStoredGrant(database, grantId),
-    revoke: (grantId) => revokeStoredGrant(database, clock, grantId),
+    revoke: (grantId) =>
+      revokeStoredGrant(
+        {
+          database,
+          clock,
+          grantRequests,
+          onGrantRequestEvent: options.onGrantRequestEvent,
+        },
+        grantId,
+      ),
     authorize: (request) =>
       authorizeStoredRequest(database, clock, request, grantRequests),
     listRequests: (query = {}) => grantRequests.listRequests(query),
     inspectRequest: (requestId) => grantRequests.inspectRequest(requestId),
     inspectTemporaryGrant: (grantId) =>
       grantRequests.inspectTemporaryGrant(grantId),
+    expireTemporaryGrant: (grantId, expirationTime) =>
+      grantRequests.expireTemporaryGrant(grantId, expirationTime),
     decideRequest: (input) => grantRequests.decideRequest(input),
     revokeRequest: (requestId) => grantRequests.revokeRequest(requestId),
     revokeProject: (projectId) =>

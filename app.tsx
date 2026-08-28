@@ -33,6 +33,7 @@ import {
 } from "./contracts.js";
 
 const panelParams = { profileId: DEFAULT_PROFILE_ID } as const;
+const GRANT_REQUEST_REFRESH_INTERVAL_MS = 1_000;
 
 function ReadinessChecklist({ status }: { status: BrowserStatus }) {
   return (
@@ -224,15 +225,47 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
       setGrantRequests([]);
       return;
     }
-    void rpc
-      .call("browser_grant_requests", {
-        hostId,
-        profileId: currentStatus.profileId,
-      })
-      .then(setGrantRequests)
-      .catch((error: unknown) =>
-        setProfileError(administrationErrorMessage(error)),
-      );
+
+    let disposed = false;
+    let refreshGeneration = 0;
+    let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const refresh = async () => {
+      const generation = ++refreshGeneration;
+      try {
+        const requests = await rpc.call("browser_grant_requests", {
+          hostId,
+          profileId: currentStatus.profileId,
+        });
+        if (disposed || generation !== refreshGeneration) return;
+        setGrantRequests(requests);
+      } catch (error: unknown) {
+        if (disposed || generation !== refreshGeneration) return;
+        setProfileError(administrationErrorMessage(error));
+      }
+      if (disposed || generation !== refreshGeneration) return;
+      refreshTimer = setTimeout(() => {
+        refreshTimer = null;
+        void refresh();
+      }, GRANT_REQUEST_REFRESH_INTERVAL_MS);
+    };
+
+    const refreshOnFocus = () => {
+      if (refreshTimer !== null) {
+        clearTimeout(refreshTimer);
+        refreshTimer = null;
+      }
+      void refresh();
+    };
+
+    void refresh();
+    window.addEventListener("focus", refreshOnFocus);
+    return () => {
+      disposed = true;
+      refreshGeneration += 1;
+      if (refreshTimer !== null) clearTimeout(refreshTimer);
+      window.removeEventListener("focus", refreshOnFocus);
+    };
   }, [rpc, status?.hostId, status?.profileId]);
 
   useEffect(() => {
