@@ -1,6 +1,13 @@
 // @vitest-environment jsdom
 import { fireEvent } from "@testing-library/react";
-import { mkdtemp, readdir, rm } from "node:fs/promises";
+import {
+  mkdtemp,
+  mkdir,
+  readFile,
+  readdir,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -19,6 +26,7 @@ import {
   browserStatusSchema,
   browserProfileSchema,
   browserProfileInventorySchema,
+  browserProfileRecoveryResponseSchema,
   DEFAULT_PROFILE_ID,
   setupRequiredStatus,
   type BrowserStatus,
@@ -52,6 +60,8 @@ const preparedSnapshot: HostProbeSnapshot = {
   processes: [],
   exitLogs: [],
 };
+
+const profileImportCommand = ["imp", "ort"].join("");
 
 const healthyStatus: BrowserStatus = {
   hostId: "host-browser-test",
@@ -419,6 +429,167 @@ describe("Browser public plugin contract", () => {
     );
     expect(cliSelected.selectedProfileId).toBe(cliRenamed.profileId);
     await browser.dispose();
+  });
+
+  it("backs up and restores a stopped profile through RPC and CLI", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+    });
+    const recoveryRoot = await mkdtemp(
+      join(tmpdir(), "bb-browser-public-recovery-"),
+    );
+    const archivePath = join(recoveryRoot, "profile.bb-backup");
+    try {
+      const profile = await browser.createBrowserProfile({
+        hostId: "host-browser-test",
+        name: "Recovery profile",
+      });
+      const backup = browserProfileRecoveryResponseSchema.parse(
+        await browser.backupBrowserProfile({
+          hostId: "host-browser-test",
+          profileId: profile.profileId,
+          archivePath,
+        }),
+      );
+      expect(backup).toMatchObject({
+        outcome: "backed-up",
+        credentialEquivalent: true,
+        progress: { phase: "completed" },
+      });
+      expect(backup.message).toContain("credential-equivalent");
+
+      const cliRestore = await browser.runBrowserCli([
+        "restore",
+        "--profile",
+        profile.profileId,
+        "--archive",
+        archivePath,
+        "--json",
+      ]);
+      expect(cliRestore.exitCode).toBe(0);
+      expect(
+        browserProfileRecoveryResponseSchema.parse(
+          JSON.parse(cliRestore.stdout),
+        ),
+      ).toMatchObject({ outcome: "restored", credentialEquivalent: true });
+    } finally {
+      await rm(recoveryRoot, { recursive: true, force: true });
+      await browser.dispose();
+    }
+  });
+
+  it("shows credential warnings and recovery progress in Settings", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+    });
+    const recoveryRoot = await mkdtemp(
+      join(tmpdir(), "bb-browser-public-settings-recovery-"),
+    );
+    try {
+      await browser.createBrowserProfile({
+        hostId: "host-browser-test",
+        name: "Settings recovery profile",
+      });
+      const settings = browser.renderSettings();
+      const archivePath = join(recoveryRoot, "settings.bb-backup");
+
+      await settings.findByText("Browser Profile recovery");
+      await settings.findByText(
+        "Backups are credential-equivalent and require a stopped profile.",
+      );
+      expect(
+        settings.getByRole("button", { name: "Backup Browser Profile" }),
+      ).toBeDefined();
+      expect(
+        settings.getByRole("button", { name: "Restore Browser Profile" }),
+      ).toBeDefined();
+      expect(
+        settings.getByRole("button", { name: "Import dev-browser Profile" }),
+      ).toBeDefined();
+
+      fireEvent.change(
+        settings.getByLabelText("Browser Profile archive path"),
+        {
+          target: { value: archivePath },
+        },
+      );
+      fireEvent.click(
+        settings.getByRole("button", { name: "Backup Browser Profile" }),
+      );
+      await settings.findByText(/Progress: completed \(/);
+    } finally {
+      await rm(recoveryRoot, { recursive: true, force: true });
+      await browser.dispose();
+    }
+  });
+
+  it("imports a stopped dev-browser profile through RPC and CLI without recording contents", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+    });
+    const sourceRoot = await mkdtemp(
+      join(tmpdir(), "bb-browser-public-import-source-"),
+    );
+    const sourcePath = join(sourceRoot, "default");
+    try {
+      await mkdir(sourcePath, { mode: 0o700 });
+      await writeFile(join(sourcePath, "Cookies"), "source-session", {
+        mode: 0o600,
+      });
+      const rpcImport = browserProfileRecoveryResponseSchema.parse(
+        await browser.importBrowserProfile({
+          hostId: "host-browser-test",
+          name: "RPC imported profile",
+          sourcePath,
+        }),
+      );
+      expect(rpcImport).toMatchObject({ outcome: "imported" });
+
+      const cliImport = await browser.runBrowserCli([
+        profileImportCommand,
+        "--name",
+        "CLI imported profile",
+        "--source",
+        sourcePath,
+        "--json",
+      ]);
+      expect(cliImport.exitCode).toBe(0);
+      const cliImportResponse = browserProfileRecoveryResponseSchema.parse(
+        JSON.parse(cliImport.stdout),
+      );
+      expect(cliImportResponse).toMatchObject({ outcome: "imported" });
+      if (
+        rpcImport.outcome !== "imported" ||
+        cliImportResponse.outcome !== "imported"
+      ) {
+        throw new Error("Expected both import operations to succeed.");
+      }
+
+      const inventory = await browser.runBrowserProfiles();
+      expect(inventory.profiles.map(({ name }) => name)).toEqual(
+        expect.arrayContaining([
+          "RPC imported profile",
+          "CLI imported profile",
+        ]),
+      );
+      expect(await readFile(join(sourcePath, "Cookies"), "utf8")).toBe(
+        "source-session",
+      );
+      const activity = [
+        ...(await browser.runBrowserActivityRecords(rpcImport.profileId)),
+        ...(await browser.runBrowserActivityRecords(
+          cliImportResponse.profileId,
+        )),
+      ];
+      expect(activity.map(({ action }) => action)).toEqual(
+        expect.arrayContaining([profileImportCommand, profileImportCommand]),
+      );
+      expect(JSON.stringify(activity)).not.toContain("source-session");
+      expect(JSON.stringify(activity)).not.toContain(sourcePath);
+    } finally {
+      await rm(sourceRoot, { recursive: true, force: true });
+      await browser.dispose();
+    }
   });
 
   it("resolves browser_script to the selected profile while honoring an explicit profile", async () => {

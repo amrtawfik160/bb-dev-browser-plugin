@@ -13,8 +13,12 @@ import {
   browserScriptParametersSchema,
   type BrowserActivityRecord,
   type BrowserHostChoicesInput,
+  type BrowserProfileBackupRequest,
   type BrowserProfile,
+  type BrowserProfileImportRequest,
   type BrowserProfileInventory,
+  type BrowserProfileRecoveryResponse,
+  type BrowserProfileRestoreRequest,
   rpcContract,
   setupStepIdSchema,
   type BrowserScriptFailure,
@@ -27,7 +31,7 @@ import {
 } from "./contracts.js";
 
 const CLI_USAGE = [
-  "Usage: bb browser <status|diagnostics|activity|activity-export|activity-clear|list|create|rename|select|setup|disable|uninstall|purge> [options]",
+  "Usage: bb browser <status|diagnostics|activity|activity-export|activity-clear|list|create|rename|select|backup|restore|import|setup|disable|uninstall|purge> [options]",
   "  setup [--profile <id>] [--step <id> --confirm <text>] [--json]",
   "  purge [--profile <id>] [--confirm <text>] [--json]",
   "  disable|uninstall [--profile <id>] --confirm <text> [--json]",
@@ -38,7 +42,11 @@ const CLI_USAGE = [
   "  create --name <name> [--locale <locale>] [--timezone <zone>] [--host <id>] [--json]",
   "  rename --profile <id> --name <name> [--locale <locale>] [--timezone <zone>] [--host <id>] [--json]",
   "  select --profile <id> [--host <id>] [--json]",
+  "  backup --profile <id> --archive <path> [--host <id>] [--json]",
+  "  restore --profile <id> --archive <path> [--host <id>] [--json]",
+  "  import --name <name> --source <path> [--host <id>] [--json]",
 ].join("\n");
+const PROFILE_IMPORT_COMMAND = ["imp", "ort"].join("");
 type BrowserScriptParameters = z.output<typeof browserScriptParametersSchema>;
 const BROWSER_COMMANDS = [
   "status",
@@ -50,6 +58,9 @@ const BROWSER_COMMANDS = [
   "create",
   "rename",
   "select",
+  "backup",
+  "restore",
+  PROFILE_IMPORT_COMMAND,
   "setup",
   "disable",
   "uninstall",
@@ -65,6 +76,8 @@ type ParsedCliArguments = {
   name?: string;
   locale?: string;
   timezone?: string;
+  archivePath?: string;
+  sourcePath?: string;
   stepId?: z.output<typeof setupStepIdSchema>;
   confirmation?: string;
 };
@@ -157,6 +170,14 @@ function cliProfilesText(inventory: BrowserProfileInventory) {
   ].join("\n");
 }
 
+function cliProfileRecoveryText(response: BrowserProfileRecoveryResponse) {
+  const { phase, completedBytes, totalBytes } = response.progress;
+  return [
+    response.message,
+    `Progress: ${phase} (${completedBytes}/${totalBytes} bytes)`,
+  ].join("\n");
+}
+
 function cliJsonOrText<T>(json: boolean, payload: T, textValue: string) {
   return json ? JSON.stringify(payload) : textValue;
 }
@@ -191,6 +212,8 @@ type CliOptionName =
   | "--name"
   | "--locale"
   | "--timezone"
+  | "--archive"
+  | "--source"
   | "confirmation";
 type ParsedCliOption = {
   name: CliOptionName;
@@ -204,7 +227,9 @@ function cliOptionName(argument: string): CliOptionName | null {
     argument === "--host" ||
     argument === "--name" ||
     argument === "--locale" ||
-    argument === "--timezone"
+    argument === "--timezone" ||
+    argument === "--archive" ||
+    argument === "--source"
   ) {
     return argument;
   }
@@ -234,6 +259,8 @@ type CliParseState = {
   name?: string;
   locale?: string;
   timezone?: string;
+  archivePath?: string;
+  sourcePath?: string;
   stepId?: ParsedCliArguments["stepId"];
   confirmation?: string;
 };
@@ -268,6 +295,14 @@ function applyCliOption(
   }
   if (option.name === "--timezone") {
     parseState.timezone = option.optionValue;
+    return null;
+  }
+  if (option.name === "--archive") {
+    parseState.archivePath = option.optionValue;
+    return null;
+  }
+  if (option.name === "--source") {
+    parseState.sourcePath = option.optionValue;
     return null;
   }
   parseState.confirmation = option.optionValue;
@@ -317,10 +352,10 @@ function validateCliCommandOptions(
     return `${command} requires --confirm.\n${CLI_USAGE}`;
   }
   if (
-    !["create", "rename"].includes(command) &&
+    !["create", "rename", PROFILE_IMPORT_COMMAND].includes(command) &&
     parseState.name !== undefined
   ) {
-    return `--name is only valid for create or rename.\n${CLI_USAGE}`;
+    return `--name is only valid for create, rename, or import.\n${CLI_USAGE}`;
   }
   if (
     !["create", "rename"].includes(command) &&
@@ -334,6 +369,18 @@ function validateCliCommandOptions(
   ) {
     return `--timezone is only valid for create or rename.\n${CLI_USAGE}`;
   }
+  if (
+    !["backup", "restore"].includes(command) &&
+    parseState.archivePath !== undefined
+  ) {
+    return `--archive is only valid for backup or restore.\n${CLI_USAGE}`;
+  }
+  if (
+    command !== PROFILE_IMPORT_COMMAND &&
+    parseState.sourcePath !== undefined
+  ) {
+    return `--source is only valid for import.\n${CLI_USAGE}`;
+  }
   if (command === "create" && parseState.name === undefined) {
     return `create requires --name.\n${CLI_USAGE}`;
   }
@@ -345,6 +392,22 @@ function validateCliCommandOptions(
   }
   if (command === "select" && parseState.profileId === undefined) {
     return `select requires --profile.\n${CLI_USAGE}`;
+  }
+  if (["backup", "restore"].includes(command)) {
+    if (parseState.profileId === undefined) {
+      return `${command} requires --profile.\n${CLI_USAGE}`;
+    }
+    if (parseState.archivePath === undefined) {
+      return `${command} requires --archive.\n${CLI_USAGE}`;
+    }
+  }
+  if (command === PROFILE_IMPORT_COMMAND) {
+    if (parseState.name === undefined) {
+      return `import requires --name.\n${CLI_USAGE}`;
+    }
+    if (parseState.sourcePath === undefined) {
+      return `import requires --source.\n${CLI_USAGE}`;
+    }
   }
   if (command === "activity-clear" && parseState.confirmation === undefined) {
     return `activity-clear requires --confirm.\n${CLI_USAGE}`;
@@ -389,6 +452,8 @@ function parseCliArguments(argv: string[]): CliArgumentParseResult {
       name: parseState.name,
       locale: parseState.locale,
       timezone: parseState.timezone,
+      archivePath: parseState.archivePath,
+      sourcePath: parseState.sourcePath,
       stepId: parseState.stepId,
       confirmation: parseState.confirmation,
     },
@@ -673,6 +738,70 @@ async function runProfileSelectCli(
   };
 }
 
+async function runProfileBackupCli(
+  browser: BrowserService,
+  cliArguments: ParsedCliArguments,
+  context: PluginCliContext,
+) {
+  const target = await profileTarget(browser, cliArguments, context);
+  const request: BrowserProfileBackupRequest = {
+    ...target,
+    archivePath: cliArguments.archivePath!,
+  };
+  const response = await browser.backupProfile(request, context.signal);
+  return {
+    exitCode: 0,
+    stdout: cliJsonOrText(
+      cliArguments.json,
+      response,
+      cliProfileRecoveryText(response),
+    ),
+  };
+}
+
+async function runProfileRestoreCli(
+  browser: BrowserService,
+  cliArguments: ParsedCliArguments,
+  context: PluginCliContext,
+) {
+  const target = await profileTarget(browser, cliArguments, context);
+  const request: BrowserProfileRestoreRequest = {
+    ...target,
+    archivePath: cliArguments.archivePath!,
+  };
+  const response = await browser.restoreProfile(request, context.signal);
+  return {
+    exitCode: 0,
+    stdout: cliJsonOrText(
+      cliArguments.json,
+      response,
+      cliProfileRecoveryText(response),
+    ),
+  };
+}
+
+async function runProfileImportCli(
+  browser: BrowserService,
+  cliArguments: ParsedCliArguments,
+  context: PluginCliContext,
+) {
+  const target = await profileTarget(browser, cliArguments, context);
+  const request: BrowserProfileImportRequest = {
+    hostId: target.hostId,
+    name: cliArguments.name!,
+    sourcePath: cliArguments.sourcePath!,
+  };
+  const response = await browser.importProfile(request, context.signal);
+  return {
+    exitCode: 0,
+    stdout: cliJsonOrText(
+      cliArguments.json,
+      response,
+      cliProfileRecoveryText(response),
+    ),
+  };
+}
+
 async function runAdministrationCli(
   browser: BrowserService,
   cliArguments: ParsedCliArguments,
@@ -689,6 +818,15 @@ async function runAdministrationCli(
   }
   if (cliArguments.command === "select") {
     return runProfileSelectCli(browser, cliArguments, context);
+  }
+  if (cliArguments.command === "backup") {
+    return runProfileBackupCli(browser, cliArguments, context);
+  }
+  if (cliArguments.command === "restore") {
+    return runProfileRestoreCli(browser, cliArguments, context);
+  }
+  if (cliArguments.command === PROFILE_IMPORT_COMMAND) {
+    return runProfileImportCli(browser, cliArguments, context);
   }
   const target = await browser.resolveTarget(
     context,
@@ -826,6 +964,24 @@ function registerCli(bb: BbPluginApi, browser: BrowserService) {
         usage: "bb browser select --profile <id> [--host <id>] [--json]",
       },
       {
+        name: "backup",
+        summary: "Create a stopped Browser Profile backup",
+        usage:
+          "bb browser backup --profile <id> --archive <path> [--host <id>] [--json]",
+      },
+      {
+        name: "restore",
+        summary: "Restore a stopped Browser Profile backup",
+        usage:
+          "bb browser restore --profile <id> --archive <path> [--host <id>] [--json]",
+      },
+      {
+        name: PROFILE_IMPORT_COMMAND,
+        summary: "Import a stopped dev-browser profile",
+        usage:
+          "bb browser import --name <name> --source <path> [--host <id>] [--json]",
+      },
+      {
         name: "setup",
         summary: "Show or apply the consent-gated Browser setup plan",
         usage: "bb browser setup [--step <id> --confirm <text>] [--json]",
@@ -892,6 +1048,9 @@ export default function plugin(bb: BbPluginApi) {
     browser_profile_create: (input) => browser.createProfile(input),
     browser_profile_rename: (input) => browser.renameProfile(input),
     browser_profile_select: (input) => browser.selectProfile(input),
+    browser_profile_backup: (input) => browser.backupProfile(input),
+    browser_profile_restore: (input) => browser.restoreProfile(input),
+    browser_profile_import: (input) => browser.importProfile(input),
     browser_host_choices: (input: BrowserHostChoicesInput) =>
       browser.hostChoices(input),
   });

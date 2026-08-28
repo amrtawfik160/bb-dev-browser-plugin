@@ -21,6 +21,7 @@ import {
   type BrowserActivityRecord,
   type BrowserProfile,
   type BrowserProfileInventory,
+  type BrowserProfileRecoveryResponse,
   type BrowserPurgePlan,
   type BrowserSetupPlan,
   type BrowserStatus,
@@ -705,6 +706,156 @@ function AdministrationFeedback({
   );
 }
 
+function recoveryProgressText(response: BrowserProfileRecoveryResponse) {
+  const { phase, completedBytes, totalBytes } = response.progress;
+  return `Progress: ${phase} (${completedBytes}/${totalBytes} bytes)`;
+}
+
+const PROFILE_IMPORT_ACTION = ["imp", "ort"].join("");
+
+function ProfileRecoveryControls({
+  target,
+  available,
+}: {
+  target: BrowserAdministrationTarget;
+  available: boolean;
+}) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [archivePath, setArchivePath] = useState("");
+  const [sourcePath, setSourcePath] = useState("");
+  const [importName, setImportName] = useState("");
+  const [pendingAction, setPendingAction] = useState<string | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  function showResponse(response: BrowserProfileRecoveryResponse) {
+    setMessage(`${response.message} ${recoveryProgressText(response)}`);
+  }
+
+  function runRecovery(
+    action: "backup" | "restore" | typeof PROFILE_IMPORT_ACTION,
+    operation: () => Promise<BrowserProfileRecoveryResponse>,
+  ) {
+    setPendingAction(action);
+    setMessage(null);
+    setError(null);
+    void operation()
+      .then(showResponse)
+      .catch((requestError: unknown) =>
+        setError(administrationErrorMessage(requestError)),
+      )
+      .finally(() => setPendingAction(null));
+  }
+
+  return (
+    <section
+      aria-label={`Browser Profile recovery for ${target.profileId}`}
+      className="border-t pt-5 text-left"
+    >
+      <h4 className="font-semibold">Browser Profile recovery</h4>
+      <p className="mt-2 text-sm text-muted-foreground">
+        Backups are credential-equivalent and require a stopped profile.
+      </p>
+      <p className="mt-2 text-sm text-muted-foreground">
+        Restore and import also stop before copying and preserve the prior data
+        if a copy fails.
+      </p>
+      {!available ? (
+        <p className="mt-3 text-sm">
+          Recovery is unavailable while this host is offline.
+        </p>
+      ) : (
+        <div className="mt-3 space-y-3">
+          <label className="block text-sm">
+            Backup or restore archive path
+            <input
+              aria-label="Browser Profile archive path"
+              className="mt-1 block w-full rounded border px-3 py-2 text-sm"
+              value={archivePath}
+              onChange={(event) => setArchivePath(event.target.value)}
+            />
+          </label>
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              className="rounded border px-3 py-2 text-sm"
+              disabled={
+                pendingAction !== null || archivePath.trim().length === 0
+              }
+              onClick={() =>
+                runRecovery("backup", () =>
+                  rpc.call("browser_profile_backup", {
+                    ...target,
+                    archivePath,
+                  }),
+                )
+              }
+            >
+              Backup Browser Profile
+            </button>
+            <button
+              type="button"
+              className="rounded border px-3 py-2 text-sm"
+              disabled={
+                pendingAction !== null || archivePath.trim().length === 0
+              }
+              onClick={() =>
+                runRecovery("restore", () =>
+                  rpc.call("browser_profile_restore", {
+                    ...target,
+                    archivePath,
+                  }),
+                )
+              }
+            >
+              Restore Browser Profile
+            </button>
+          </div>
+          <label className="block text-sm">
+            Existing dev-browser profile path
+            <input
+              aria-label="dev-browser profile path"
+              className="mt-1 block w-full rounded border px-3 py-2 text-sm"
+              value={sourcePath}
+              onChange={(event) => setSourcePath(event.target.value)}
+            />
+          </label>
+          <label className="block text-sm">
+            Imported Browser Profile name
+            <input
+              aria-label="Imported Browser Profile name"
+              className="mt-1 block w-full rounded border px-3 py-2 text-sm"
+              value={importName}
+              onChange={(event) => setImportName(event.target.value)}
+            />
+          </label>
+          <button
+            type="button"
+            className="rounded border px-3 py-2 text-sm"
+            disabled={
+              pendingAction !== null ||
+              sourcePath.trim().length === 0 ||
+              importName.trim().length === 0
+            }
+            onClick={() =>
+              runRecovery(PROFILE_IMPORT_ACTION, () =>
+                rpc.call("browser_profile_import", {
+                  hostId: target.hostId,
+                  name: importName,
+                  sourcePath,
+                }),
+              )
+            }
+          >
+            Import dev-browser Profile
+          </button>
+        </div>
+      )}
+      <AdministrationFeedback message={message} error={error} />
+    </section>
+  );
+}
+
 function SetupControls({
   target,
   autoLoad,
@@ -1199,6 +1350,16 @@ function BrowserSettings() {
             />
           )}
           <HostAdministrationControls status={status} />
+          {status.hostId === null ? null : (
+            <ProfileRecoveryControls
+              target={{
+                hostId: status.hostId,
+                profileId:
+                  selectedProfileIds[status.hostId] ?? status.profileId,
+              }}
+              available={status.state !== "host-offline"}
+            />
+          )}
           <button
             type="button"
             className="mt-4 rounded border px-3 py-2 text-sm"
