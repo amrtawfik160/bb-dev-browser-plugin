@@ -44,6 +44,7 @@ import {
 } from "../profile-storage.js";
 import type { HostProbeSnapshot } from "../readiness.js";
 import type { BrowserInstanceRuntime } from "../browser-runtime.js";
+import { BrowserScriptExecutionError } from "../browser-runtime.js";
 import type {
   BrowserProfileBackupResult,
   BrowserProfileRecovery,
@@ -2035,7 +2036,8 @@ describe("Browser public plugin contract", () => {
               timeout.handle = setTimeout(
                 () =>
                   finish(
-                    new Error(
+                    new BrowserScriptExecutionError(
+                      "browser_timeout",
                       `Browser script timed out after ${runtimeTimeoutMs}ms.`,
                     ),
                   ),
@@ -2051,7 +2053,13 @@ describe("Browser public plugin contract", () => {
           if (expectedCode === "result_too_large") {
             return "x".repeat(BROWSER_SCRIPT_RESULT_LIMIT_BYTES + 1);
           }
-          throw new Error(message);
+          throw new BrowserScriptExecutionError(
+            expectedCode === "sandbox_violation" ||
+              expectedCode === "tab_invalid"
+              ? expectedCode
+              : "script_failed",
+            message,
+          );
         },
       );
       const browser = await createPublicPluginHarness({
@@ -2099,6 +2107,109 @@ describe("Browser public plugin contract", () => {
       }
     },
   );
+
+  it("reports a user-script ReferenceError as script_failed, not sandbox_violation (issue #13)", async () => {
+    const runtime = publicRuntime(async () => {
+      throw new Error("foo is not defined");
+    });
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+      browserRuntime: runtime,
+    });
+
+    try {
+      await grantDefaultProfileOrigin(browser, "https://example.com");
+      const tool = await browser.runBrowserScriptWithProfile(undefined, {
+        purpose: "Reference a typo",
+        code: "return foo;",
+        destinationOrigin: "https://example.com",
+      });
+      const failure = browserScriptFailureSchema.parse(
+        JSON.parse(tool.content[0]!.text),
+      );
+      expect(failure.error).toMatchObject({
+        state: "runtime-error",
+        code: "script_failed",
+      });
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("does not promote a non-timeout message containing 'timeout' to browser_timeout (issue #13)", async () => {
+    const runtime = publicRuntime(async () => {
+      throw new Error("the operation timed out due to user code, not the host");
+    });
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+      browserRuntime: runtime,
+    });
+
+    try {
+      await grantDefaultProfileOrigin(browser, "https://example.com");
+      const tool = await browser.runBrowserScriptWithProfile(undefined, {
+        purpose: "Mention timeout without a real timeout",
+        code: "throw new Error('the operation timed out due to user code')",
+        destinationOrigin: "https://example.com",
+      });
+      const failure = browserScriptFailureSchema.parse(
+        JSON.parse(tool.content[0]!.text),
+      );
+      expect(failure.error).toMatchObject({
+        state: "runtime-error",
+        code: "script_failed",
+      });
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("surfaces a result that completes before the Control Lease revokes it (issue #13)", async () => {
+    let executionStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      executionStarted = resolve;
+    });
+    const runtime = publicRuntime(
+      async (_target, _code, _timeoutMs, options) => {
+        await new Promise<void>((resolve) => {
+          if (options?.leaseSignal?.aborted) {
+            resolve();
+            return;
+          }
+          executionStarted();
+          options?.leaseSignal?.addEventListener("abort", () => resolve(), {
+            once: true,
+          });
+        });
+        return "completed despite the lease revoking";
+      },
+    );
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+      browserRuntime: runtime,
+    });
+
+    try {
+      await grantDefaultProfileOrigin(browser, "https://example.com");
+      const operation = browser.runBrowserScriptWithProfile(undefined, {
+        purpose: "Complete just before the owner takes over",
+        code: "return page.url();",
+        destinationOrigin: "https://example.com",
+      });
+      await started;
+      await browser.runBrowserNavigation(
+        "https://example.com/owner-takes-control-after-completion",
+      );
+      const result = await operation;
+      expect(result.isError).toBe(false);
+      expect(result.content[0]?.type).toBe("text");
+      expect((result.content[0] as { text: string }).text).toBe(
+        "completed despite the lease revoking",
+      );
+    } finally {
+      await browser.dispose();
+    }
+  });
 
   it("derives the project and host target, exposes the live lease, and gives owner navigation priority", async () => {
     let resolveExecution!: () => void;
@@ -2246,7 +2357,8 @@ describe("Browser public plugin contract", () => {
     let restarted = false;
     const runtime = publicRuntime(async (target) => {
       if (restarted && target.tabId === "runtime-tab") {
-        throw new Error(
+        throw new BrowserScriptExecutionError(
+          "tab_invalid",
           "Browser Tab is invalid or belongs to a previous runtime",
         );
       }

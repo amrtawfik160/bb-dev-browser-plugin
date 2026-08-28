@@ -22,6 +22,7 @@ import type {
   BrowserProcessIdentity,
   RunningBrowserProcess,
 } from "./browser-runtime.js";
+import { BrowserScriptExecutionError } from "./browser-runtime.js";
 import {
   BROWSER_SCRIPT_MAX_SCREENSHOT_BYTES,
   BROWSER_SCRIPT_RESULT_LIMIT_BYTES,
@@ -535,7 +536,8 @@ function collectOutput(
         child.kill("SIGTERM");
         finish(() =>
           reject(
-            new Error(
+            new BrowserScriptExecutionError(
+              "result_too_large",
               `Browser Result exceeds the ${MAX_BROWSER_RESULT_BYTES / 1024} KiB limit.`,
             ),
           ),
@@ -829,7 +831,8 @@ async function executeBrowserHelper(
         throw new Error("Browser Screenshot file is invalid.");
       }
       if (screenshotStats.size > MAX_SCREENSHOT_BYTES) {
-        throw new Error(
+        throw new BrowserScriptExecutionError(
+          "result_too_large",
           `Browser Screenshot exceeds the ${MAX_SCREENSHOT_BYTES / 1024 / 1024} MiB limit.`,
         );
       }
@@ -897,7 +900,8 @@ async function readBoundedScreenshot(screenshotFile: FileHandle) {
     totalBytes += bytesRead;
     chunks.push(chunk.subarray(0, bytesRead));
   }
-  throw new Error(
+  throw new BrowserScriptExecutionError(
+    "result_too_large",
     `Browser Screenshot exceeds the ${MAX_SCREENSHOT_BYTES / 1024 / 1024} MiB limit.`,
   );
 }
@@ -909,7 +913,10 @@ function timedExecutionSignal(timeoutMs: number, signal?: AbortSignal) {
   const timer = setTimeout(
     () =>
       controller.abort(
-        new Error(`Browser script timed out after ${timeoutMs}ms.`),
+        new BrowserScriptExecutionError(
+          "browser_timeout",
+          `Browser script timed out after ${timeoutMs}ms.`,
+        ),
       ),
     timeoutMs,
   );

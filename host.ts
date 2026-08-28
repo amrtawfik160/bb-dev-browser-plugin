@@ -57,6 +57,7 @@ import {
 import {
   assertBrowserScriptResultWithinBounds,
   BrowserInstanceError,
+  BrowserScriptExecutionError,
   createBrowserInstanceRuntime,
   type BrowserInstanceRuntime,
 } from "./browser-runtime.js";
@@ -79,36 +80,18 @@ type BrowserRuntimeSource =
 
 type ScriptSignalContext = { signal: AbortSignal };
 type ScriptActivityOutcome = "succeeded" | "failed" | "interrupted";
+type ScriptActivityRecording = { leaseRevokedAfterCompletion?: boolean };
 
 function controlLeaseKey(target: { hostId: string; profileId: string }) {
   return `${target.hostId}\0${target.profileId}`;
 }
 
 function scriptRuntimeErrorCode(
-  request: BrowserScriptRequest,
   error: unknown,
 ): BrowserScriptRuntimeError["code"] {
-  const message = error instanceof Error ? error.message : String(error);
-  if (/timed out|timeout/iu.test(message)) return "browser_timeout";
-  if (/(?:result|screenshot).*(?:exceed|large|limit)/iu.test(message)) {
-    return "result_too_large";
-  }
-  if (
-    request.tabId !== undefined &&
-    /(?:tab|page|target|browser\.getPage|open tabs).*(?:invalid|not found|closed|no )/iu.test(
-      message,
-    )
-  ) {
-    return "tab_invalid";
-  }
-  if (
-    /(?:process|require|module|deno|bun|node:|filesystem|file system|path traversal|outside.*(?:home|temporary|sandbox)|not defined)/iu.test(
-      message,
-    )
-  ) {
-    return "sandbox_violation";
-  }
-  return "script_failed";
+  return error instanceof BrowserScriptExecutionError
+    ? error.code
+    : "script_failed";
 }
 
 const scriptRuntimeErrorLabels: Record<
@@ -134,7 +117,7 @@ function scriptRuntimeFailure(
       ? "lease_revoked"
       : error instanceof ControlLeaseError
         ? error.code
-        : scriptRuntimeErrorCode(request, error);
+        : scriptRuntimeErrorCode(error);
   const message =
     error instanceof Error && error.message.length > 0
       ? error.message
@@ -185,8 +168,13 @@ function scriptActivityEvent(
   context: ScriptSignalContext,
   outcome: ScriptActivityOutcome,
   startedAt: number,
+  recording: ScriptActivityRecording = {},
 ): BrowserActivityEvent {
-  const interrupted = context.signal.aborted || outcome === "interrupted";
+  const requestAborted = context.signal.aborted;
+  const interrupted =
+    requestAborted ||
+    outcome === "interrupted" ||
+    recording.leaseRevokedAfterCompletion === true;
   return {
     eventId: request.activityEventId,
     actor: "agent",
@@ -197,10 +185,10 @@ function scriptActivityEvent(
     occurredAt: request.activityOccurredAt,
     kind: "agent-operation",
     action: "browser-script",
-    outcome: interrupted ? "interrupted" : outcome,
+    outcome: interrupted && outcome !== "succeeded" ? "interrupted" : outcome,
     interrupted,
     interruptionReason: interrupted
-      ? context.signal.aborted
+      ? requestAborted
         ? "request-aborted"
         : "control-lease-revoked"
       : null,
@@ -214,9 +202,10 @@ async function recordScriptActivity(
   context: ScriptSignalContext,
   outcome: ScriptActivityOutcome,
   startedAt: number,
+  recording: ScriptActivityRecording = {},
 ) {
   await outbox.enqueue(
-    scriptActivityEvent(request, context, outcome, startedAt),
+    scriptActivityEvent(request, context, outcome, startedAt, recording),
   );
 }
 
@@ -641,6 +630,7 @@ export function createBrowserHostEntry(
         const leaseKey = controlLeaseKey(target);
         let lease: ControlLease | undefined;
         let response: BrowserScriptResponse | undefined;
+        let leaseRevokedAfterCompletion = false;
         try {
           const readiness = await administration(dataDir).inspect(target);
           if (readiness.state !== "healthy") {
@@ -698,10 +688,7 @@ export function createBrowserHostEntry(
                 ),
               );
               if (lease.signal.aborted) {
-                throw new ControlLeaseError(
-                  "lease_revoked",
-                  "The Browser Control Lease was revoked before the script completed.",
-                );
+                leaseRevokedAfterCompletion = true;
               }
               response = {
                 ok: true as const,
@@ -740,6 +727,7 @@ export function createBrowserHostEntry(
                 ? "succeeded"
                 : "failed",
             startedAt,
+            { leaseRevokedAfterCompletion },
           );
         }
       },
