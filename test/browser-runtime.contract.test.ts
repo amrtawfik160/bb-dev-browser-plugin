@@ -148,11 +148,20 @@ async function runtimeFixture() {
     playwrightChromiumPath: join(rootDirectory, "fallback-chromium"),
     launchBoundary: processFixture.boundary,
   });
+  async function dispose() {
+    try {
+      await runtime.dispose();
+    } finally {
+      vi.useRealTimers();
+      await rm(rootDirectory, { recursive: true, force: true });
+    }
+  }
   return {
     rootDirectory,
     browserExecutable,
     processFixture,
     runtime,
+    dispose,
     target: {
       hostId: "host-a",
       profileId: "profile-a",
@@ -186,9 +195,7 @@ describe("Browser Instance runtime", () => {
       });
       expect(fixture.processFixture.stopped).toEqual([4100]);
     } finally {
-      await fixture.runtime.dispose();
-      vi.useRealTimers();
-      await rm(fixture.rootDirectory, { recursive: true, force: true });
+      await fixture.dispose();
     }
   });
 
@@ -216,8 +223,7 @@ describe("Browser Instance runtime", () => {
       await expect(waking).resolves.toMatchObject({ state: "running" });
     } finally {
       releaseLaunch();
-      await fixture.runtime.dispose();
-      await rm(fixture.rootDirectory, { recursive: true, force: true });
+      await fixture.dispose();
     }
   });
 
@@ -243,9 +249,7 @@ describe("Browser Instance runtime", () => {
       });
       expect(fixture.processFixture.stopped).toEqual([4100]);
     } finally {
-      await fixture.runtime.dispose();
-      vi.useRealTimers();
-      await rm(fixture.rootDirectory, { recursive: true, force: true });
+      await fixture.dispose();
     }
   });
 
@@ -262,8 +266,7 @@ describe("Browser Instance runtime", () => {
       ).rejects.toMatchObject({ code: "awake-limit" });
       expect(fixture.processFixture.launches).toHaveLength(3);
     } finally {
-      await fixture.runtime.dispose();
-      await rm(fixture.rootDirectory, { recursive: true, force: true });
+      await fixture.dispose();
     }
   });
 
@@ -301,9 +304,7 @@ describe("Browser Instance runtime", () => {
       });
     } finally {
       releaseExecution();
-      await fixture.runtime.dispose();
-      vi.useRealTimers();
-      await rm(fixture.rootDirectory, { recursive: true, force: true });
+      await fixture.dispose();
     }
   });
 
@@ -330,8 +331,7 @@ describe("Browser Instance runtime", () => {
       expect(states.filter((state) => state === "running")).toHaveLength(3);
       expect(fixture.processFixture.stopped).toHaveLength(2);
     } finally {
-      await fixture.runtime.dispose();
-      await rm(fixture.rootDirectory, { recursive: true, force: true });
+      await fixture.dispose();
     }
   });
 
@@ -354,9 +354,7 @@ describe("Browser Instance runtime", () => {
       });
       expect(fixture.processFixture.launches).toHaveLength(3);
     } finally {
-      await fixture.runtime.dispose();
-      vi.useRealTimers();
-      await rm(fixture.rootDirectory, { recursive: true, force: true });
+      await fixture.dispose();
     }
   });
 
@@ -377,8 +375,7 @@ describe("Browser Instance runtime", () => {
       });
       expect(fixture.processFixture.launches).toHaveLength(1);
     } finally {
-      await fixture.runtime.dispose();
-      await rm(fixture.rootDirectory, { recursive: true, force: true });
+      await fixture.dispose();
     }
   });
 
@@ -414,22 +411,24 @@ describe("Browser Instance runtime", () => {
       });
       expect(fixture.processFixture.launches).toHaveLength(2);
     } finally {
-      await fixture.runtime.dispose();
-      await rm(fixture.rootDirectory, { recursive: true, force: true });
+      await fixture.dispose();
     }
   });
 
   it("issue #12 disposes owned children without restarting the retired worker generation", async () => {
     const fixture = await runtimeFixture();
-    const running = await fixture.runtime.start(fixture.target);
-    await fixture.runtime.dispose();
+    try {
+      const running = await fixture.runtime.start(fixture.target);
+      await fixture.runtime.dispose();
 
-    expect(fixture.processFixture.stopped).toEqual([running.pid]);
-    await expect(fixture.runtime.start(fixture.target)).rejects.toMatchObject({
-      code: "browser-unavailable",
-    });
-    expect(fixture.processFixture.launches).toHaveLength(1);
-    await rm(fixture.rootDirectory, { recursive: true, force: true });
+      expect(fixture.processFixture.stopped).toEqual([running.pid]);
+      await expect(fixture.runtime.start(fixture.target)).rejects.toMatchObject(
+        { code: "browser-unavailable" },
+      );
+      expect(fixture.processFixture.launches).toHaveLength(1);
+    } finally {
+      await fixture.dispose();
+    }
   });
 
   it("issue #12 stays lazy after worker restart and fails closed on a corrupt manifest", async () => {
@@ -461,8 +460,50 @@ describe("Browser Instance runtime", () => {
       expect(fixture.processFixture.launches).toHaveLength(0);
     } finally {
       await runtime.dispose();
-      await fixture.runtime.dispose();
-      await rm(fixture.rootDirectory, { recursive: true, force: true });
+      await fixture.dispose();
+    }
+  });
+
+  it("issue #12 preserves an inconsistent launching manifest as repair evidence", async () => {
+    const fixture = await runtimeFixture();
+    const installationId = "installation-inconsistent-launching";
+    const paths = profileStoragePaths({
+      rootDirectory: fixture.rootDirectory,
+      installationId,
+      hostId: fixture.target.hostId,
+      profileId: fixture.target.profileId,
+    });
+    const corruptManifest = JSON.stringify({
+      schemaVersion: 1,
+      phase: "launching",
+      identity: {
+        pid: 4902,
+        startedAtTicks: "unexpected-launching-identity",
+        commandHash: "unexpected-launching-command",
+      },
+      automationEndpoint: null,
+      publicState: null,
+    });
+    await mkdir(paths.runtimeManifestsDirectory, { recursive: true });
+    await writeFile(paths.runtimeManifestPath, corruptManifest);
+    const runtime = createBrowserInstanceRuntime({
+      rootDirectory: fixture.rootDirectory,
+      installationId,
+      chromeStablePaths: [fixture.browserExecutable],
+      playwrightChromiumPath: join(fixture.rootDirectory, "fallback-chromium"),
+      launchBoundary: fixture.processFixture.boundary,
+    });
+    try {
+      await expect(runtime.start(fixture.target)).rejects.toMatchObject({
+        code: "repair-required",
+      });
+      await expect(readFile(paths.runtimeManifestPath, "utf8")).resolves.toBe(
+        corruptManifest,
+      );
+      expect(fixture.processFixture.launches).toHaveLength(0);
+    } finally {
+      await runtime.dispose();
+      await fixture.dispose();
     }
   });
   it("coalesces starts and holds an exclusive installation/host/profile lock", async () => {
@@ -497,9 +538,8 @@ describe("Browser Instance runtime", () => {
         state: "running",
       });
     } finally {
-      await fixture.runtime.dispose();
       await competingRuntime.dispose();
-      await rm(fixture.rootDirectory, { recursive: true, force: true });
+      await fixture.dispose();
     }
   });
 
@@ -572,8 +612,7 @@ describe("Browser Instance runtime", () => {
       );
     } finally {
       await runtime.dispose();
-      await fixture.runtime.dispose();
-      await rm(fixture.rootDirectory, { recursive: true, force: true });
+      await fixture.dispose();
     }
   });
 
@@ -628,8 +667,7 @@ describe("Browser Instance runtime", () => {
       });
     } finally {
       await runtime.dispose();
-      await fixture.runtime.dispose();
-      await rm(fixture.rootDirectory, { recursive: true, force: true });
+      await fixture.dispose();
     }
   });
 
@@ -657,8 +695,7 @@ describe("Browser Instance runtime", () => {
       await fixture.runtime.stop(fixture.target);
       expect(fixture.processFixture.stopped).toEqual([4100]);
     } finally {
-      await fixture.runtime.dispose();
-      await rm(fixture.rootDirectory, { recursive: true, force: true });
+      await fixture.dispose();
     }
   });
 
@@ -703,8 +740,7 @@ describe("Browser Instance runtime", () => {
         ).resolves.toBe(contents);
       }
     } finally {
-      await fixture.runtime.dispose();
-      await rm(fixture.rootDirectory, { recursive: true, force: true });
+      await fixture.dispose();
     }
   });
 
@@ -735,8 +771,7 @@ describe("Browser Instance runtime", () => {
         state: "running",
       });
     } finally {
-      await fixture.runtime.dispose();
-      await rm(fixture.rootDirectory, { recursive: true, force: true });
+      await fixture.dispose();
     }
   });
 
@@ -793,8 +828,7 @@ describe("Browser Instance runtime", () => {
       expect(manifest.phase).toBe("running");
     } finally {
       await runtime.dispose();
-      await fixture.runtime.dispose();
-      await rm(fixture.rootDirectory, { recursive: true, force: true });
+      await fixture.dispose();
     }
   });
 
@@ -821,8 +855,7 @@ describe("Browser Instance runtime", () => {
         state: "running",
       });
     } finally {
-      await fixture.runtime.dispose();
-      await rm(fixture.rootDirectory, { recursive: true, force: true });
+      await fixture.dispose();
     }
   });
 
@@ -874,8 +907,7 @@ describe("Browser Instance runtime", () => {
       expect(recoveryBoundary.launches).toHaveLength(0);
     } finally {
       await runtime.dispose();
-      await fixture.runtime.dispose();
-      await rm(fixture.rootDirectory, { recursive: true, force: true });
+      await fixture.dispose();
     }
   });
 
@@ -904,8 +936,7 @@ describe("Browser Instance runtime", () => {
         'browser.getPage("tab-a")',
       );
     } finally {
-      await fixture.runtime.dispose();
-      await rm(fixture.rootDirectory, { recursive: true, force: true });
+      await fixture.dispose();
     }
   });
 
@@ -920,8 +951,7 @@ describe("Browser Instance runtime", () => {
       expect([...fixture.processFixture.pages]).toEqual(["actual-active-tab"]);
       expect(response.tabId).toBe("actual-active-tab");
     } finally {
-      await fixture.runtime.dispose();
-      await rm(fixture.rootDirectory, { recursive: true, force: true });
+      await fixture.dispose();
     }
   });
 
@@ -948,8 +978,7 @@ describe("Browser Instance runtime", () => {
         'browser.getPage("tab-agent")',
       );
     } finally {
-      await fixture.runtime.dispose();
-      await rm(fixture.rootDirectory, { recursive: true, force: true });
+      await fixture.dispose();
     }
   });
 
@@ -985,9 +1014,8 @@ describe("Browser Instance runtime", () => {
         state: "running",
       });
     } finally {
-      await fixture.runtime.dispose();
       await competingRuntime.dispose();
-      await rm(fixture.rootDirectory, { recursive: true, force: true });
+      await fixture.dispose();
     }
   });
 
@@ -1005,8 +1033,73 @@ describe("Browser Instance runtime", () => {
       expect(repaired.pid).not.toBe(first.pid);
       expect(fixture.processFixture.launches).toHaveLength(2);
     } finally {
-      await fixture.runtime.dispose();
-      await rm(fixture.rootDirectory, { recursive: true, force: true });
+      await fixture.dispose();
+    }
+  });
+
+  it("issue #12 transfers visible-panel pins across crash replacement", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-28T12:00:00.000Z"));
+    const fixture = await runtimeFixture();
+    try {
+      const first = await fixture.runtime.pinPanel(
+        fixture.target,
+        "panel-crash-pinned",
+      );
+      fixture.processFixture.crash(first.pid);
+      await vi.waitFor(() => {
+        expect(fixture.processFixture.launches).toHaveLength(2);
+      });
+
+      await vi.advanceTimersByTimeAsync(30 * 60 * 1_000);
+      expect(await fixture.runtime.status(fixture.target)).toMatchObject({
+        state: "running",
+      });
+
+      await fixture.runtime.unpinPanel(fixture.target, "panel-crash-pinned");
+      await vi.advanceTimersByTimeAsync(30 * 60 * 1_000);
+      expect(await fixture.runtime.status(fixture.target)).toMatchObject({
+        state: "sleeping",
+      });
+    } finally {
+      await fixture.dispose();
+    }
+  });
+
+  it("issue #12 does not transfer a failed operation lease across crash replacement", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-28T12:00:00.000Z"));
+    const fixture = await runtimeFixture();
+    const executionStarted = vi.fn();
+    let rejectExecution!: (error: Error) => void;
+    fixture.processFixture.boundary.execute = async () => {
+      executionStarted();
+      return new Promise<never>((_resolve, reject) => {
+        rejectExecution = reject;
+      });
+    };
+    try {
+      const running = await fixture.runtime.start(fixture.target);
+      const operation = fixture.runtime.execute(
+        fixture.target,
+        "return page.url()",
+        30_000,
+      );
+      await vi.waitFor(() => expect(executionStarted).toHaveBeenCalledOnce());
+
+      fixture.processFixture.crash(running.pid);
+      rejectExecution(new Error("fixture operation interrupted by crash"));
+      await expect(operation).rejects.toThrow("interrupted by crash");
+      await vi.waitFor(() => {
+        expect(fixture.processFixture.launches).toHaveLength(2);
+      });
+
+      await vi.advanceTimersByTimeAsync(30 * 60 * 1_000);
+      expect(await fixture.runtime.status(fixture.target)).toMatchObject({
+        state: "sleeping",
+      });
+    } finally {
+      await fixture.dispose();
     }
   });
 
@@ -1026,8 +1119,7 @@ describe("Browser Instance runtime", () => {
       });
       expect(fixture.processFixture.launches).toHaveLength(2);
     } finally {
-      await fixture.runtime.dispose();
-      await rm(fixture.rootDirectory, { recursive: true, force: true });
+      await fixture.dispose();
     }
   });
 
@@ -1066,9 +1158,7 @@ describe("Browser Instance runtime", () => {
       expect(restartedProcess.launches).toHaveLength(0);
       await restartedRuntime.dispose();
     } finally {
-      await fixture.runtime.dispose();
-      await rm(fixture.rootDirectory, { recursive: true, force: true });
-      vi.useRealTimers();
+      await fixture.dispose();
     }
   });
 });

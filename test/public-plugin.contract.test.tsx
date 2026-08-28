@@ -3183,6 +3183,36 @@ describe("Browser public plugin contract", () => {
     await browser.dispose();
   });
 
+  it("issue #12 bridges host disconnect and reconnect generations to the retained host runtime", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+    });
+    try {
+      await browser.runBrowserStatus({
+        surface: "thread",
+        threadId: "thread-browser-test",
+        profileId: DEFAULT_PROFILE_ID,
+      });
+      await browser.emitHostConnection("host-disconnected");
+      await browser.emitHostConnection("host-connected");
+
+      expect(browser.hostConnectionRequests).toEqual([
+        {
+          hostId: "host-browser-test",
+          generation: 1,
+          state: "disconnected",
+        },
+        {
+          hostId: "host-browser-test",
+          generation: 2,
+          state: "connected",
+        },
+      ]);
+    } finally {
+      await browser.dispose();
+    }
+  });
+
   it("reviews, exports, and clears activity through authenticated CLI surfaces", async () => {
     const browser = await createPublicPluginHarness({
       snapshot: preparedSnapshot,

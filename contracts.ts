@@ -1060,6 +1060,17 @@ export const browserHostTargetSchema = z
   })
   .strict();
 
+export const browserHostConnectionRequestSchema = z
+  .object({
+    hostId: z.string().min(1),
+    generation: z.number().int().nonnegative(),
+    state: z.enum(["connected", "disconnected"]),
+  })
+  .strict();
+
+export const browserHostConnectionResponseSchema =
+  browserHostConnectionRequestSchema.extend({ applied: z.boolean() }).strict();
+
 export const browserActivityEventIdSchema = z
   .string()
   .regex(/^[A-Za-z0-9][A-Za-z0-9:_-]{0,127}$/u);
@@ -1411,7 +1422,8 @@ export function sleepingBrowserStatus(ready: BrowserStatus): BrowserStatus {
     state: "sleeping",
     code: "sleeping",
     label: "Sleeping",
-    message: "This Browser Profile is asleep and will wake when used.",
+    message:
+      "This Browser Instance is sleeping and will wake without changing its Browser Profile.",
   };
 }
 
@@ -1421,7 +1433,7 @@ export function wakingBrowserStatus(ready: BrowserStatus): BrowserStatus {
     state: "waking",
     code: "waking",
     label: "Waking",
-    message: "This Browser Profile is restoring its Browser Instance.",
+    message: "This Browser Instance is waking from its Browser Profile.",
   };
 }
 

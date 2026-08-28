@@ -193,6 +193,7 @@ export function createBrowserHostEntry(
   let retainedOutbox: ActivityOutbox | undefined;
   let retainedRuntime: BrowserInstanceRuntime | undefined =
     typeof runtimeSource === "object" ? runtimeSource : undefined;
+  const hostConnectionGenerations = new Map<string, number>();
   function administration(dataDir: string) {
     if (retainedBoundary !== undefined) return retainedBoundary;
     const boundary = typeof source === "function" ? source(dataDir) : source;
@@ -229,6 +230,39 @@ export function createBrowserHostEntry(
     const current = retainedRuntime;
     retainedRuntime = undefined;
     await current?.dispose();
+  }
+  function hostConnectionGenerationIsNewer(hostId: string, generation: number) {
+    const previousGeneration = hostConnectionGenerations.get(hostId);
+    return previousGeneration === undefined || generation > previousGeneration;
+  }
+  async function applyRuntimeHostConnection(
+    browserRuntime: BrowserInstanceRuntime,
+    request: {
+      hostId: string;
+      state: "connected" | "disconnected";
+    },
+  ) {
+    browserRuntime.hostDisconnected(request.hostId);
+    if (request.state === "connected") {
+      await browserRuntime.hostReconnected(request.hostId);
+    }
+  }
+  async function reconcileHostConnection(
+    request: {
+      hostId: string;
+      generation: number;
+      state: "connected" | "disconnected";
+    },
+    dataDir: string,
+  ) {
+    if (!hostConnectionGenerationIsNewer(request.hostId, request.generation)) {
+      return { ...request, applied: false };
+    }
+    const browserRuntime = runtime(dataDir);
+    if (browserRuntime === undefined) return { ...request, applied: false };
+    hostConnectionGenerations.set(request.hostId, request.generation);
+    await applyRuntimeHostConnection(browserRuntime, request);
+    return { ...request, applied: true };
   }
   async function runInstallationLifecycle(
     action: "disable" | "uninstall",
@@ -348,7 +382,6 @@ export function createBrowserHostEntry(
       : {
           hostId: request.hostId,
           profileId: request.profileId,
-          projectId: "__browser_panel__",
           locale: profile.locale,
           timezone: profile.timezone,
         };
@@ -380,6 +413,13 @@ export function createBrowserHostEntry(
   return experimental_defineHostEntry({
     contract: browserHostContract,
     handlers: {
+      hostConnection: (request, context) => {
+        retainWorker(context);
+        return reconcileHostConnection(
+          request,
+          context.experimental_paths.dataDir,
+        );
+      },
       status: async (target, context) => {
         retainWorker(context);
         const dataDir = context.experimental_paths.dataDir;

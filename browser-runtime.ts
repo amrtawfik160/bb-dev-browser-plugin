@@ -31,14 +31,17 @@ export type BrowserExecutable = {
   executablePath: string;
 };
 
-export type BrowserRuntimeTarget = {
+export type BrowserInstanceTarget = {
   hostId: string;
   profileId: string;
+  locale: string;
+  timezone: string;
+};
+
+export type BrowserRuntimeTarget = BrowserInstanceTarget & {
   projectId: string;
   tabId?: string;
   loopbackMode?: LoopbackAddressMode;
-  locale: string;
-  timezone: string;
 };
 
 export type BrowserLaunchRequest = BrowserExecutable & {
@@ -212,7 +215,7 @@ function assertLoopbackEndpoint(endpoint: string) {
 }
 
 type HeldBrowserInstance = {
-  target: BrowserRuntimeTarget;
+  target: BrowserInstanceTarget;
   publicState: BrowserInstance;
   process: RunningBrowserProcess;
   lock: FileHandle;
@@ -266,13 +269,13 @@ type BrowserInstanceRuntimeOptions = {
 };
 
 function runtimeKey(
-  target: Pick<BrowserRuntimeTarget, "hostId" | "profileId">,
+  target: Pick<BrowserInstanceTarget, "hostId" | "profileId">,
 ) {
   return `${target.hostId}\0${target.profileId}`;
 }
 
 async function browserArguments(
-  target: BrowserRuntimeTarget,
+  target: BrowserInstanceTarget,
   profileDirectory: string,
 ) {
   const arguments_ = [
@@ -383,11 +386,14 @@ async function storedBrowserInstance(path: string) {
       throw invalidRuntimeManifest();
     }
     if (stored.phase === "launching") {
-      return identity === null &&
+      if (
+        identity === null &&
         stored.automationEndpoint === null &&
         stored.publicState === null
-        ? (stored as StoredBrowserInstance)
-        : null;
+      ) {
+        return stored as StoredBrowserInstance;
+      }
+      throw invalidRuntimeManifest();
     }
     if (
       typeof identity !== "object" ||
@@ -536,7 +542,7 @@ async function releaseProfileLock(lock: FileHandle, path: string) {
 
 async function launchRequest(
   options: BrowserInstanceRuntimeOptions,
-  target: BrowserRuntimeTarget,
+  target: BrowserInstanceTarget,
   paths: ProfileStoragePaths,
 ) {
   const browser = await runtimeBrowser(options, paths);
@@ -600,7 +606,7 @@ async function selectFirstStable(paths: readonly string[]) {
 }
 
 function browserInstanceState(
-  target: BrowserRuntimeTarget,
+  target: BrowserInstanceTarget,
   browser: BrowserExecutable,
   browserProcess: RunningBrowserProcess,
 ): BrowserInstance {
@@ -707,7 +713,7 @@ async function recordBrowserCrash(path: string) {
 }
 
 function heldBrowserInstance(input: {
-  target: BrowserRuntimeTarget;
+  target: BrowserInstanceTarget;
   paths: ProfileStoragePaths;
   lockPath: string;
   lock: FileHandle;
@@ -834,7 +840,7 @@ async function cleanupFailedLaunch(
 
 async function launchBrowserInstance(
   options: BrowserInstanceRuntimeOptions,
-  target: BrowserRuntimeTarget,
+  target: BrowserInstanceTarget,
 ) {
   const paths = profileStoragePaths({
     rootDirectory: options.rootDirectory,
@@ -895,6 +901,7 @@ export function createBrowserInstanceRuntime(
 ) {
   const starts = new Map<string, Promise<HeldBrowserInstance>>();
   const activeTabs = new Map<string, string>();
+  const visiblePanelPins = new Map<string, Set<string>>();
   const cleanupFailures = new Map<string, unknown>();
   const retirements = new Map<string, Promise<void>>();
   const lifecycleStates = new Map<
@@ -1024,7 +1031,7 @@ export function createBrowserInstanceRuntime(
     });
   }
 
-  async function heldInstance(target: BrowserRuntimeTarget) {
+  async function heldInstance(target: BrowserInstanceTarget) {
     if (disposed) {
       throw new BrowserInstanceError(
         "browser-unavailable",
@@ -1061,10 +1068,13 @@ export function createBrowserInstanceRuntime(
     throw error;
   }
 
-  function beginStart(target: BrowserRuntimeTarget, key: string) {
+  function beginStart(target: BrowserInstanceTarget, key: string) {
     lifecycleStates.set(key, "waking");
     const start = launchBrowserInstance(options, target).then(
       (held) => {
+        for (const panelId of visiblePanelPins.get(key) ?? []) {
+          held.panelIds.add(panelId);
+        }
         watchBrowserExit(key, held);
         lifecycleStates.set(key, "running");
         scheduleIdleSleep(key, held);
@@ -1077,7 +1087,7 @@ export function createBrowserInstanceRuntime(
   }
 
   async function serializedCapacityStart(
-    target: BrowserRuntimeTarget,
+    target: BrowserInstanceTarget,
     key: string,
   ) {
     const reservation = capacityChanges.then(async () => {
@@ -1173,7 +1183,7 @@ export function createBrowserInstanceRuntime(
   }
 
   return {
-    async start(target: BrowserRuntimeTarget) {
+    async start(target: BrowserInstanceTarget) {
       return (await heldInstance(target)).publicState;
     },
     async stop(target: Pick<BrowserRuntimeTarget, "hostId" | "profileId">) {
@@ -1194,10 +1204,13 @@ export function createBrowserInstanceRuntime(
           .map(([, retirement]) => retirement),
       );
     },
-    async pinPanel(target: BrowserRuntimeTarget, panelId: string) {
+    async pinPanel(target: BrowserInstanceTarget, panelId: string) {
       const key = runtimeKey(target);
       const held = await heldInstance(target);
       held.panelIds.add(panelId);
+      const profilePanelPins = visiblePanelPins.get(key) ?? new Set<string>();
+      profilePanelPins.add(panelId);
+      visiblePanelPins.set(key, profilePanelPins);
       noteActivity(key, held);
       return held.publicState;
     },
@@ -1206,6 +1219,9 @@ export function createBrowserInstanceRuntime(
       panelId: string,
     ) {
       const key = runtimeKey(target);
+      const profilePanelPins = visiblePanelPins.get(key);
+      profilePanelPins?.delete(panelId);
+      if (profilePanelPins?.size === 0) visiblePanelPins.delete(key);
       const start = starts.get(key);
       if (start === undefined) return;
       const held = await start;

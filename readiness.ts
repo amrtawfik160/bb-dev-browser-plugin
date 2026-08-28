@@ -5,7 +5,10 @@ import { createServer } from "node:net";
 import { join, resolve } from "node:path";
 import { z } from "zod";
 import { inspectFallbackBrowser } from "./browser-fallback.js";
-import { browserHostStorageSegment } from "./contracts.js";
+import {
+  BROWSER_STORAGE_ROOT,
+  browserHostStorageSegment,
+} from "./contracts.js";
 import type {
   BrowserDiagnostics,
   BrowserHostTarget,
@@ -584,6 +587,18 @@ async function redactedLogSource(storagePath: string) {
 export function hostInstallationId(dataDir: string) {
   const daemonDataDir = resolve(dataDir, "../../..");
   return createHash("sha256").update(daemonDataDir).digest("hex").slice(0, 32);
+}
+
+export function provisionedBrowserStorageRoot(configuredRoot?: string) {
+  if (
+    configuredRoot !== undefined &&
+    resolve(configuredRoot) !== BROWSER_STORAGE_ROOT
+  ) {
+    throw new Error(
+      `The mandatory provisioned-host gate must use the protected Browser storage root ${BROWSER_STORAGE_ROOT}.`,
+    );
+  }
+  return BROWSER_STORAGE_ROOT;
 }
 
 function hostStoragePath(

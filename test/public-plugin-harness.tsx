@@ -38,6 +38,7 @@ import {
   browserScriptRequestSchema,
   browserSetupRequestSchema,
   browserHostTargetSchema,
+  browserHostConnectionRequestSchema,
   browserPurgePlanSchema,
   browserPurgeResponseSchema,
   browserProfileCreateRequestSchema,
@@ -288,6 +289,9 @@ export async function createPublicPluginHarness(options?: {
         })
       : Promise.resolve();
   const hostRpcFailures = new Map<string, string>();
+  const hostConnectionRequests: z.output<
+    typeof browserHostConnectionRequestSchema
+  >[] = [];
   const setupInspectionTargets: BrowserHostTarget[] = [];
   const expectedStatus =
     options?.status ??
@@ -442,6 +446,11 @@ export async function createPublicPluginHarness(options?: {
       const failure = hostRpcFailures.get(method);
       if (failure !== undefined) throw new Error(failure);
       if (method === "browserScript") options?.browserScriptStarted?.();
+      if (method === "hostConnection") {
+        const request = browserHostConnectionRequestSchema.parse(input);
+        hostConnectionRequests.push(request);
+        return host.experimental_call("hostConnection", request, { signal });
+      }
       if (
         method === "browserScript" &&
         options?.browserScriptResponse !== undefined
@@ -1453,6 +1462,9 @@ export async function createPublicPluginHarness(options?: {
     },
     get navigationRequests() {
       return [...navigationRequests];
+    },
+    get hostConnectionRequests() {
+      return [...hostConnectionRequests];
     },
     openExistingThreadPanel,
     openNewThreadPanel,

@@ -7,6 +7,8 @@ import {
   browserActivityOutboxSchema,
   browserActivityReconciliationRequestSchema,
   browserHostTargetSchema,
+  browserHostConnectionRequestSchema,
+  browserHostConnectionResponseSchema,
   browserLifecycleRequestSchema,
   browserLifecycleResponseSchema,
   browserPurgePlanSchema,
@@ -39,6 +41,10 @@ import {
 } from "./contracts.js";
 
 export const browserHostContract = defineRpcContract({
+  hostConnection: {
+    input: browserHostConnectionRequestSchema,
+    output: browserHostConnectionResponseSchema,
+  },
   status: {
     input: browserHostTargetSchema,
     output: browserStatusSchema,

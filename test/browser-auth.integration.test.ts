@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { createServer, type Server } from "node:http";
-import { access, readFile, rm } from "node:fs/promises";
+import { access, readFile, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { expect, it } from "vitest";
@@ -10,6 +10,7 @@ import {
   createDefaultHostSnapshotReader,
   createHostReadinessBoundary,
   hostInstallationId,
+  provisionedBrowserStorageRoot,
 } from "../readiness.js";
 
 const integrationEnabled = process.env.BB_BROWSER_REAL_INTEGRATION === "1";
@@ -153,6 +154,17 @@ function assertDedicatedIdentity(report: WorkerReport) {
   );
 }
 
+async function assertProtectedProfileOwnership(
+  path: string,
+  report: WorkerReport,
+) {
+  const metadata = await stat(path);
+  expect(metadata.isDirectory()).toBe(true);
+  expect(metadata.uid).toBe(report.uid);
+  expect(metadata.gid).toBe(report.gid);
+  expect(metadata.mode & 0o7777).toBe(0o700);
+}
+
 async function assertLoopbackSocket(endpoint: string) {
   const url = new URL(endpoint);
   expect(url.hostname).toBe("127.0.0.1");
@@ -231,8 +243,9 @@ it.runIf(integrationEnabled)(
   "mandatory provisioned host preserves authentication across a real worker restart",
   async () => {
     const dataDirectory = requiredEnvironment("BB_BROWSER_HOST_DATA_DIR");
-    const rootDirectory =
-      process.env.BB_BROWSER_REAL_ROOT ?? "/var/lib/bb-browser";
+    const rootDirectory = provisionedBrowserStorageRoot(
+      process.env.BB_BROWSER_REAL_ROOT,
+    );
     const hostId = process.env.BB_BROWSER_REAL_HOST_ID ?? "ci-browser-host";
     const profileId =
       process.env.BB_BROWSER_REAL_PROFILE_ID ?? "ci-auth-fixture";
@@ -294,6 +307,9 @@ it.runIf(integrationEnabled)(
           : "playwright-chromium",
       );
       assertDedicatedIdentity(first);
+      await assertProtectedProfileOwnership(paths.hostStoragePath, first);
+      await assertProtectedProfileOwnership(paths.profileDirectory, first);
+      await assertProtectedProfileOwnership(paths.browserDataPath, first);
       await assertLoopbackSocket(first.instance.automationEndpoint);
       expect(first.navigation?.after).toHaveLength(
         first.navigation?.before.length ?? -1,

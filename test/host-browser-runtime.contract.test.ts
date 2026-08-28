@@ -99,7 +99,12 @@ describe("Browser host runtime boundary", () => {
           hostId: HOST_ID,
           profileId: DEFAULT_PROFILE_ID,
         }),
-      ).resolves.toMatchObject({ state: "sleeping", label: "Sleeping" });
+      ).resolves.toMatchObject({
+        state: "sleeping",
+        label: "Sleeping",
+        message:
+          "This Browser Instance is sleeping and will wake without changing its Browser Profile.",
+      });
       await expect(
         host.experimental_call("panelVisibility", {
           hostId: HOST_ID,
@@ -121,7 +126,7 @@ describe("Browser host runtime boundary", () => {
       await rm(rootDirectory, { recursive: true, force: true });
     }
   });
-  it("wakes the selected Browser Profile and returns the attached dev-browser result", async () => {
+  it("issue #12 keeps one Browser Instance across the production host reconnect bridge", async () => {
     const rootDirectory = await mkdtemp(join(tmpdir(), "host-runtime-"));
     const profiles = createFileBrowserProfileStore({
       rootDirectory,
@@ -131,6 +136,7 @@ describe("Browser host runtime boundary", () => {
     const browserExecutable = join(rootDirectory, "chrome-fixture");
     await writeFile(browserExecutable, "fixture");
     await chmod(browserExecutable, 0o755);
+    let launchCount = 0;
     const runtime = createBrowserInstanceRuntime({
       rootDirectory,
       installationId: "installation-runtime",
@@ -141,6 +147,7 @@ describe("Browser host runtime boundary", () => {
         effectiveUserId: 1001,
         effectiveGroupId: 1001,
         async launch() {
+          launchCount += 1;
           return {
             pid: 4200,
             automationEndpoint: "http://127.0.0.1:14200",
@@ -195,6 +202,51 @@ describe("Browser host runtime boundary", () => {
           timeoutMs: 5_000,
         }),
       ).resolves.toEqual({ ok: true, result: "fixture-output" });
+
+      await host.experimental_call("hostConnection", {
+        hostId: HOST_ID,
+        generation: 1,
+        state: "disconnected",
+      });
+      await expect(
+        host.experimental_call("browserScript", {
+          purpose: "Inspect the disconnected fixture",
+          code: "console.log(await browser.listPages())",
+          hostId: HOST_ID,
+          projectId: "project-runtime",
+          threadId: "thread-runtime",
+          activityEventId: "runtime-event-2",
+          activityOccurredAt: "2026-08-28T00:00:01.000Z",
+          profileId: DEFAULT_PROFILE_ID,
+          timeoutMs: 5_000,
+        }),
+      ).rejects.toMatchObject({ code: "host-offline" });
+      await host.experimental_call("hostConnection", {
+        hostId: HOST_ID,
+        generation: 2,
+        state: "connected",
+      });
+      await expect(
+        host.experimental_call("hostConnection", {
+          hostId: HOST_ID,
+          generation: 1,
+          state: "disconnected",
+        }),
+      ).resolves.toMatchObject({ applied: false });
+      await expect(
+        host.experimental_call("browserScript", {
+          purpose: "Inspect the reconnected fixture",
+          code: "console.log(await browser.listPages())",
+          hostId: HOST_ID,
+          projectId: "project-runtime",
+          threadId: "thread-runtime",
+          activityEventId: "runtime-event-3",
+          activityOccurredAt: "2026-08-28T00:00:02.000Z",
+          profileId: DEFAULT_PROFILE_ID,
+          timeoutMs: 5_000,
+        }),
+      ).resolves.toEqual({ ok: true, result: "fixture-output" });
+      expect(launchCount).toBe(1);
     } finally {
       await host.experimental_dispose();
       await rm(rootDirectory, { recursive: true, force: true });
