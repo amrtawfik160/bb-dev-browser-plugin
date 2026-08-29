@@ -1,6 +1,11 @@
 import { defineRpcContract } from "@get-bb/plugin-sdk";
 import {
   browserDiagnosticsSchema,
+  browserActivityAcknowledgementRequestSchema,
+  browserActivityAcknowledgementResponseSchema,
+  browserActivityOutboxRequestSchema,
+  browserActivityOutboxSchema,
+  browserActivityReconciliationRequestSchema,
   browserHostTargetSchema,
   browserLifecycleRequestSchema,
   browserLifecycleResponseSchema,
@@ -10,7 +15,7 @@ import {
   browserSetupPlanSchema,
   browserSetupRequestSchema,
   browserSetupResponseSchema,
-  browserScriptFailureSchema,
+  browserScriptResponseSchema,
   browserScriptRequestSchema,
   browserProfileCreateRequestSchema,
   browserProfileHostTargetSchema,
@@ -56,7 +61,19 @@ export const browserHostContract = defineRpcContract({
   },
   browserScript: {
     input: browserScriptRequestSchema,
-    output: browserScriptFailureSchema,
+    output: browserScriptResponseSchema,
+  },
+  activityOutbox: {
+    input: browserActivityOutboxRequestSchema,
+    output: browserActivityOutboxSchema,
+  },
+  acknowledgeActivity: {
+    input: browserActivityAcknowledgementRequestSchema,
+    output: browserActivityAcknowledgementResponseSchema,
+  },
+  reconcileActivity: {
+    input: browserActivityReconciliationRequestSchema,
+    output: browserActivityOutboxSchema,
   },
   listProfiles: {
     input: browserProfileHostTargetSchema,

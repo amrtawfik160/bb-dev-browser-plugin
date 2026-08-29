@@ -10,6 +10,10 @@ export const SETUP_REQUIRED_MESSAGE =
 export const BROWSER_STORAGE_ROOT = "/var/lib/bb-browser";
 export const BROWSER_CONFIGURATION_ROOT = "/etc/bb-browser";
 export const STOP_BROWSER_CONFIRMATION = "Stop Browser processes";
+export const CLEAR_ACTIVITY_CONFIRMATION = "Clear Browser activity records";
+export const ACTIVITY_RECORD_LIMIT = 10_000;
+export const ACTIVITY_RETENTION_DAYS = 30;
+export const ACTIVITY_OUTBOX_BATCH_LIMIT = 100;
 
 export function browserHostStorageSegment(hostId: string) {
   return encodeURIComponent(hostId).replaceAll(".", "%2E");
@@ -425,6 +429,60 @@ export const browserHostTargetSchema = z
   })
   .strict();
 
+export const browserActivityEventIdSchema = z
+  .string()
+  .regex(/^[A-Za-z0-9][A-Za-z0-9:_-]{0,127}$/u);
+
+export const browserActivityOriginSchema = z
+  .string()
+  .min(1)
+  .max(2048)
+  .refine((candidate) => {
+    try {
+      const origin = new URL(candidate);
+      return (
+        (origin.protocol === "http:" || origin.protocol === "https:") &&
+        origin.origin === candidate &&
+        origin.username === "" &&
+        origin.password === ""
+      );
+    } catch {
+      return false;
+    }
+  }, "Activity destination must be an exact HTTP origin.");
+
+export const browserActivityActorSchema = z.enum(["owner", "agent", "system"]);
+export const browserActivityKindSchema = z.enum([
+  "setup",
+  "lifecycle",
+  "purge",
+  "agent-operation",
+  "grant",
+  "control",
+  "mode",
+  "export",
+]);
+
+const browserActivityMetadataShape = {
+  eventId: browserActivityEventIdSchema,
+  actor: browserActivityActorSchema,
+  projectId: z.string().min(1).nullable(),
+  hostId: z.string().min(1),
+  profileId: z.string().min(1),
+  destinationOrigin: browserActivityOriginSchema.nullable(),
+  occurredAt: z.string().datetime(),
+  kind: browserActivityKindSchema,
+  action: z.string().trim().min(1).max(80),
+  outcome: z.string().trim().min(1).max(80),
+  interrupted: z.boolean(),
+  interruptionReason: z.string().trim().min(1).max(120).nullable(),
+  durationMs: z.number().int().nonnegative().max(30_000).nullable(),
+};
+
+export const browserActivityEventSchema = z
+  .object(browserActivityMetadataShape)
+  .strict();
+
 const browserStatusFields = {
   ...browserStatusTargetSchema.shape,
   capabilities: z.array(readinessCapabilitySchema).length(9),
@@ -541,24 +599,118 @@ export const browserDiagnosticsSchema = z
 export type BrowserDiagnostics = z.infer<typeof browserDiagnosticsSchema>;
 
 export const browserActivityRecordSchema = z
-  .object({
-    id: z.number().int().positive(),
-    occurredAt: z.string().datetime(),
-    actor: z.literal("owner"),
-    hostId: z.string().min(1),
-    profileId: z.string().min(1),
-    kind: z.enum(["setup", "lifecycle", "purge"]),
-    action: z.string().min(1),
-    outcome: z.string().min(1),
-    interrupted: z.boolean(),
-  })
+  .object({ id: z.number().int().positive(), ...browserActivityMetadataShape })
   .strict();
 
 export const browserActivityRecordsSchema = z
   .array(browserActivityRecordSchema)
-  .max(10_000);
+  .max(ACTIVITY_RECORD_LIMIT);
+
+export const browserActivityOutboxItemSchema = z
+  .object({
+    ...browserActivityMetadataShape,
+    attempts: z.number().int().nonnegative(),
+    nextAttemptAt: z.string().datetime(),
+  })
+  .strict();
+
+export const browserActivityOutboxSchema = z
+  .array(browserActivityOutboxItemSchema)
+  .max(ACTIVITY_OUTBOX_BATCH_LIMIT);
+
+export const browserActivityExportSchema = z
+  .object({
+    hostId: z.string().min(1),
+    profileId: z.string().min(1),
+    exportedAt: z.string().datetime(),
+    records: browserActivityRecordsSchema,
+  })
+  .strict();
+
+export const browserActivityClearRequestSchema = z
+  .object({
+    hostId: z.string().min(1),
+    profileId: z.string().min(1),
+    confirmation: z.string().min(1),
+  })
+  .strict();
+
+export const browserActivityClearResponseSchema = z
+  .object({
+    hostId: z.string().min(1),
+    profileId: z.string().min(1),
+    clearedCount: z.number().int().nonnegative(),
+    message: z.string().min(1),
+  })
+  .strict();
+
+export const browserActivityOutboxRequestSchema = z
+  .object({
+    hostId: z.string().min(1),
+    limit: z
+      .number()
+      .int()
+      .positive()
+      .max(ACTIVITY_OUTBOX_BATCH_LIMIT)
+      .default(ACTIVITY_OUTBOX_BATCH_LIMIT),
+  })
+  .strict();
+
+export const browserActivityAcknowledgementRequestSchema = z
+  .object({
+    hostId: z.string().min(1),
+    eventIds: z.array(browserActivityEventIdSchema).max(10_000),
+  })
+  .strict();
+
+export const browserActivityAcknowledgementResponseSchema = z
+  .object({
+    acknowledgedEventIds: z.array(browserActivityEventIdSchema),
+  })
+  .strict();
+
+export const browserActivityReconciliationRequestSchema = z
+  .object({
+    hostId: z.string().min(1),
+    acknowledgedEventIds: z.array(browserActivityEventIdSchema).max(10_000),
+    limit: z
+      .number()
+      .int()
+      .positive()
+      .max(ACTIVITY_OUTBOX_BATCH_LIMIT)
+      .default(ACTIVITY_OUTBOX_BATCH_LIMIT),
+  })
+  .strict();
 
 export type BrowserActivityRecord = z.infer<typeof browserActivityRecordSchema>;
+export type BrowserActivityEvent = z.infer<typeof browserActivityEventSchema>;
+export type BrowserActivityOutboxItem = z.infer<
+  typeof browserActivityOutboxItemSchema
+>;
+export type BrowserActivityExport = z.infer<typeof browserActivityExportSchema>;
+export type BrowserActivityClearResponse = z.infer<
+  typeof browserActivityClearResponseSchema
+>;
+
+export function browserActivityEventFromOutboxItem(
+  outboxItem: BrowserActivityOutboxItem,
+): BrowserActivityEvent {
+  return browserActivityEventSchema.parse({
+    eventId: outboxItem.eventId,
+    actor: outboxItem.actor,
+    projectId: outboxItem.projectId,
+    hostId: outboxItem.hostId,
+    profileId: outboxItem.profileId,
+    destinationOrigin: outboxItem.destinationOrigin,
+    occurredAt: outboxItem.occurredAt,
+    kind: outboxItem.kind,
+    action: outboxItem.action,
+    outcome: outboxItem.outcome,
+    interrupted: outboxItem.interrupted,
+    interruptionReason: outboxItem.interruptionReason,
+    durationMs: outboxItem.durationMs,
+  });
+}
 
 export function setupRequiredStatus(
   target: BrowserStatusTarget,
@@ -665,6 +817,14 @@ export const rpcContract = defineRpcContract({
     input: browserHostTargetSchema,
     output: browserActivityRecordsSchema,
   },
+  browser_activity_export: {
+    input: browserHostTargetSchema,
+    output: browserActivityExportSchema,
+  },
+  browser_activity_clear: {
+    input: browserActivityClearRequestSchema,
+    output: browserActivityClearResponseSchema,
+  },
   browser_setup_plan: {
     input: browserHostTargetSchema,
     output: browserSetupPlanSchema,
@@ -715,6 +875,7 @@ export const browserScriptParametersSchema = z
   .object({
     purpose: z.string().trim().min(1).max(200),
     code: z.string().min(1),
+    destinationOrigin: browserActivityOriginSchema.optional(),
     profileId: z.string().min(1).optional(),
     tabId: z.string().min(1).optional(),
     timeoutMs: z.number().int().positive().max(30_000).default(30_000),
@@ -726,6 +887,8 @@ export const browserScriptRequestSchema = browserScriptParametersSchema
     hostId: z.string().min(1),
     projectId: z.string().min(1),
     threadId: z.string().min(1),
+    activityEventId: browserActivityEventIdSchema,
+    activityOccurredAt: z.string().datetime(),
     profileId: z.string().min(1),
   })
   .strict();
@@ -737,4 +900,18 @@ export const browserScriptFailureSchema = z
   })
   .strict();
 
+export const browserScriptSuccessSchema = z
+  .object({
+    ok: z.literal(true),
+    result: z.unknown(),
+  })
+  .strict();
+
+export const browserScriptResponseSchema = z.discriminatedUnion("ok", [
+  browserScriptSuccessSchema,
+  browserScriptFailureSchema,
+]);
+
+export type BrowserScriptRequest = z.infer<typeof browserScriptRequestSchema>;
 export type BrowserScriptFailure = z.infer<typeof browserScriptFailureSchema>;
+export type BrowserScriptResponse = z.infer<typeof browserScriptResponseSchema>;

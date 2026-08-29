@@ -18,6 +18,7 @@ import {
   rpcContract,
   setupStepIdSchema,
   type BrowserScriptFailure,
+  type BrowserScriptResponse,
   type BrowserPurgePlan,
   type BrowserPurgeResponse,
   type BrowserSetupPlan,
@@ -26,11 +27,13 @@ import {
 } from "./contracts.js";
 
 const CLI_USAGE = [
-  "Usage: bb browser <status|diagnostics|activity|list|create|rename|select|setup|disable|uninstall|purge> [options]",
+  "Usage: bb browser <status|diagnostics|activity|activity-export|activity-clear|list|create|rename|select|setup|disable|uninstall|purge> [options]",
   "  setup [--profile <id>] [--step <id> --confirm <text>] [--json]",
   "  purge [--profile <id>] [--confirm <text>] [--json]",
   "  disable|uninstall [--profile <id>] --confirm <text> [--json]",
   "  activity [--profile <id>] [--json]",
+  `  activity-export [--profile <id>] [--json]`,
+  `  activity-clear [--profile <id>] --confirm "Clear Browser activity records" [--json]`,
   "  list [--host <id>] [--json]",
   "  create --name <name> [--locale <locale>] [--timezone <zone>] [--host <id>] [--json]",
   "  rename --profile <id> --name <name> [--locale <locale>] [--timezone <zone>] [--host <id>] [--json]",
@@ -41,6 +44,8 @@ const BROWSER_COMMANDS = [
   "status",
   "diagnostics",
   "activity",
+  "activity-export",
+  "activity-clear",
   "list",
   "create",
   "rename",
@@ -291,7 +296,9 @@ function validateCliCommandOptions(
     return `--step is only valid for setup.\n${CLI_USAGE}`;
   }
   if (
-    ["status", "diagnostics", "activity", "list"].includes(command) &&
+    ["status", "diagnostics", "activity", "activity-export", "list"].includes(
+      command,
+    ) &&
     parseState.confirmation !== undefined
   ) {
     return `Confirmation is not valid for ${command}.\n${CLI_USAGE}`;
@@ -338,6 +345,9 @@ function validateCliCommandOptions(
   }
   if (command === "select" && parseState.profileId === undefined) {
     return `select requires --profile.\n${CLI_USAGE}`;
+  }
+  if (command === "activity-clear" && parseState.confirmation === undefined) {
+    return `activity-clear requires --confirm.\n${CLI_USAGE}`;
   }
   return null;
 }
@@ -430,6 +440,39 @@ async function runActivityCli(
   return {
     exitCode: 0,
     stdout: cliJsonOrText(json, records, cliActivityText(records)),
+  };
+}
+
+async function runActivityExportCli(
+  browser: BrowserService,
+  target: { hostId: string; profileId: string },
+  json: boolean,
+) {
+  const exported = await browser.exportActivityRecords(target);
+  return {
+    exitCode: 0,
+    stdout: json
+      ? JSON.stringify(exported)
+      : JSON.stringify(exported.records, null, 2),
+  };
+}
+
+async function runActivityClearCli(
+  browser: BrowserService,
+  target: { hostId: string; profileId: string },
+  confirmation: string | undefined,
+  json: boolean,
+) {
+  if (confirmation === undefined) {
+    throw new Error("activity-clear requires --confirm.");
+  }
+  const response = await browser.clearActivityRecords({
+    ...target,
+    confirmation,
+  });
+  return {
+    exitCode: 0,
+    stdout: json ? JSON.stringify(response) : response.message,
   };
 }
 
@@ -655,6 +698,17 @@ async function runAdministrationCli(
   if (cliArguments.command === "activity") {
     return runActivityCli(browser, target, cliArguments.json);
   }
+  if (cliArguments.command === "activity-export") {
+    return runActivityExportCli(browser, target, cliArguments.json);
+  }
+  if (cliArguments.command === "activity-clear") {
+    return runActivityClearCli(
+      browser,
+      target,
+      cliArguments.confirmation,
+      cliArguments.json,
+    );
+  }
   if (cliArguments.command === "setup") {
     return runSetupCli(browser, target, cliArguments, context.signal);
   }
@@ -693,12 +747,28 @@ function toolFailure(failure: BrowserScriptFailure) {
   };
 }
 
+function toolSuccess(result: unknown) {
+  const serialized = JSON.stringify(result);
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: serialized === undefined ? "" : serialized,
+      },
+    ],
+  };
+}
+
 async function runBrowserScript(
   browser: BrowserService,
   parameters: BrowserScriptParameters,
   context: PluginAgentToolContext,
 ) {
-  return toolFailure(await browser.browserScript(parameters, context));
+  const response: BrowserScriptResponse = await browser.browserScript(
+    parameters,
+    context,
+  );
+  return response.ok ? toolSuccess(response.result) : toolFailure(response);
 }
 
 function registerCli(bb: BbPluginApi, browser: BrowserService) {
@@ -720,6 +790,18 @@ function registerCli(bb: BbPluginApi, browser: BrowserService) {
         name: "activity",
         summary: "List retained Browser activity records",
         usage: "bb browser activity [--profile <id>] [--host <id>] [--json]",
+      },
+      {
+        name: "activity-export",
+        summary: "Export retained Browser activity metadata",
+        usage:
+          "bb browser activity-export [--profile <id>] [--host <id>] [--json]",
+      },
+      {
+        name: "activity-clear",
+        summary: "Clear retained Browser activity metadata",
+        usage:
+          'bb browser activity-clear [--profile <id>] [--host <id>] --confirm "Clear Browser activity records" [--json]',
       },
       {
         name: "list",
@@ -798,6 +880,8 @@ export default function plugin(bb: BbPluginApi) {
       browser.settingsStatuses(input.profileId),
     browser_diagnostics: (input) => browser.diagnostics(input),
     browser_activity_records: (input) => browser.activityRecords(input),
+    browser_activity_export: (input) => browser.exportActivityRecords(input),
+    browser_activity_clear: (input) => browser.clearActivityRecords(input),
     browser_setup_plan: (input) => browser.setupPlan(input),
     browser_setup: (input) => browser.setup(input),
     browser_disable: (input) => browser.lifecycle("disable", input),

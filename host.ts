@@ -1,5 +1,9 @@
 import { experimental_defineHostEntry } from "@get-bb/plugin-sdk/host";
 import { join } from "node:path";
+import {
+  createActivityOutbox,
+  type ActivityOutbox,
+} from "./activity-outbox.js";
 import { browserHostContract } from "./host-contract.js";
 import {
   createBrowserUserProfileOwnershipBoundary,
@@ -21,6 +25,9 @@ import {
   BROWSER_STORAGE_ROOT,
   DEFAULT_PROFILE_ID,
   browserProfileUnavailableStatus,
+  type BrowserActivityEvent,
+  type BrowserScriptRequest,
+  type BrowserScriptResponse,
 } from "./contracts.js";
 
 export type HostSetupBoundary = HostReadinessBoundary;
@@ -28,6 +35,9 @@ type HostBoundary = HostReadinessBoundary | HostAdministrationBoundary;
 type HostBoundarySource = HostBoundary | ((dataDir: string) => HostBoundary);
 type ProfileStoreSource =
   BrowserProfileStore | ((dataDir: string) => BrowserProfileStore);
+
+type ScriptSignalContext = { signal: AbortSignal };
+type ScriptActivityOutcome = "succeeded" | "failed";
 
 function isAdministrationBoundary(
   boundary: HostBoundary,
@@ -43,6 +53,42 @@ async function requireReadyForProfileMutation(
   if (status.state !== "healthy") throw new Error(status.message);
 }
 
+function scriptActivityEvent(
+  request: BrowserScriptRequest,
+  context: ScriptSignalContext,
+  outcome: ScriptActivityOutcome,
+  startedAt: number,
+): BrowserActivityEvent {
+  const interrupted = context.signal.aborted;
+  return {
+    eventId: request.activityEventId,
+    actor: "agent",
+    projectId: request.projectId,
+    hostId: request.hostId,
+    profileId: request.profileId,
+    destinationOrigin: request.destinationOrigin ?? null,
+    occurredAt: request.activityOccurredAt,
+    kind: "agent-operation",
+    action: "browser-script",
+    outcome: interrupted ? "interrupted" : outcome,
+    interrupted,
+    interruptionReason: interrupted ? "request-aborted" : null,
+    durationMs: Math.min(Math.max(Date.now() - startedAt, 0), 30_000),
+  };
+}
+
+async function recordScriptActivity(
+  outbox: ActivityOutbox,
+  request: BrowserScriptRequest,
+  context: ScriptSignalContext,
+  outcome: ScriptActivityOutcome,
+  startedAt: number,
+) {
+  await outbox.enqueue(
+    scriptActivityEvent(request, context, outcome, startedAt),
+  );
+}
+
 export function createBrowserHostEntry(
   source: HostBoundarySource,
   profileSource?: ProfileStoreSource,
@@ -50,6 +96,7 @@ export function createBrowserHostEntry(
   let workerLease: { dispose(): Promise<void> } | undefined;
   let retainedBoundary: HostAdministrationBoundary | undefined;
   let retainedProfiles: BrowserProfileStore | undefined;
+  let retainedOutbox: ActivityOutbox | undefined;
   function administration(dataDir: string) {
     if (retainedBoundary !== undefined) return retainedBoundary;
     const boundary = typeof source === "function" ? source(dataDir) : source;
@@ -74,6 +121,13 @@ export function createBrowserHostEntry(
           ? profileSource(dataDir)
           : profileSource;
     return retainedProfiles;
+  }
+  function outbox(dataDir: string) {
+    if (retainedOutbox !== undefined) return retainedOutbox;
+    retainedOutbox = createActivityOutbox({
+      filePath: join(dataDir, "browser-activity-outbox.json"),
+    });
+    return retainedOutbox;
   }
   function retainWorker(context: {
     experimental_retainWorker(): { dispose(): Promise<void> };
@@ -136,32 +190,72 @@ export function createBrowserHostEntry(
           request,
         );
       },
-      browserScript: async ({ hostId, profileId }, context) => {
+      browserScript: async (request, context) => {
         retainWorker(context);
         const dataDir = context.experimental_paths.dataDir;
-        const target = { hostId, profileId };
-        const readiness = await administration(dataDir).inspect(target);
-        if (readiness.state !== "healthy") {
-          return { ok: false as const, error: readiness };
-        }
-        const inventory = await profiles(dataDir).listProfiles(hostId);
-        if (
-          !inventory.profiles.some((profile) => profile.profileId === profileId)
-        ) {
-          return {
-            ok: false as const,
-            error: browserProfileUnavailableStatus({ hostId, profileId }),
-          };
-        }
-        return {
-          ok: false as const,
-          error: await administration(
-            context.experimental_paths.dataDir,
-          ).inspect({
-            hostId,
-            profileId,
-          }),
+        const startedAt = Date.now();
+        const target = {
+          hostId: request.hostId,
+          profileId: request.profileId,
         };
+        let response: BrowserScriptResponse | undefined;
+        try {
+          const readiness = await administration(dataDir).inspect(target);
+          if (readiness.state !== "healthy") {
+            response = { ok: false as const, error: readiness };
+            return response;
+          }
+          const inventory = await profiles(dataDir).listProfiles(
+            request.hostId,
+          );
+          if (
+            !inventory.profiles.some(
+              (profile) => profile.profileId === request.profileId,
+            )
+          ) {
+            response = {
+              ok: false as const,
+              error: browserProfileUnavailableStatus(target),
+            };
+            return response;
+          }
+          response = {
+            ok: false as const,
+            error: await administration(
+              context.experimental_paths.dataDir,
+            ).inspect(target),
+          };
+          return response;
+        } finally {
+          await recordScriptActivity(
+            outbox(dataDir),
+            request,
+            context,
+            response?.ok === true ? "succeeded" : "failed",
+            startedAt,
+          );
+        }
+      },
+      activityOutbox: async ({ limit }, context) => {
+        retainWorker(context);
+        return outbox(context.experimental_paths.dataDir).claim({
+          now: new Date(),
+          limit,
+        });
+      },
+      acknowledgeActivity: async ({ eventIds }, context) => {
+        retainWorker(context);
+        const acknowledgedEventIds = await outbox(
+          context.experimental_paths.dataDir,
+        ).acknowledge(eventIds);
+        return { acknowledgedEventIds };
+      },
+      reconcileActivity: async ({ acknowledgedEventIds, limit }, context) => {
+        retainWorker(context);
+        return outbox(context.experimental_paths.dataDir).reconcile({
+          acknowledgedEventIds,
+          limit,
+        });
       },
       listProfiles: (target, context) => {
         retainWorker(context);

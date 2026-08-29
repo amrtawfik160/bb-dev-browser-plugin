@@ -1,11 +1,19 @@
-import type Database from "better-sqlite3";
 import type { BbPluginApi, PluginAgentToolContext } from "@get-bb/plugin-sdk";
+import type Database from "better-sqlite3";
 import { z } from "zod";
 import {
-  browserActivityRecordSchema,
-  browserActivityRecordsSchema,
+  BROWSER_DATABASE_MIGRATIONS,
+  createActivityRecordStore,
+  createActivityRecordProducers,
+  activityEventFromOutboxItem,
+  newActivityEventId,
+  type ActivityRecordStore,
+} from "./activity-records.js";
+import {
   browserProfileIdSchema,
   browserScriptParametersSchema,
+  ACTIVITY_OUTBOX_BATCH_LIMIT,
+  CLEAR_ACTIVITY_CONFIRMATION,
   browserProfileUnavailableStatus,
   DEFAULT_PROFILE_ID,
   hostOfflineStatus,
@@ -13,6 +21,9 @@ import {
   setupRequiredStatus,
   type BrowserHostTarget,
   type BrowserActivityRecord,
+  type BrowserActivityExport,
+  type BrowserActivityClearResponse,
+  type BrowserScriptRequest,
   type BrowserHostChoice,
   type BrowserHostChoicesInput,
   type BrowserLifecycleRequest,
@@ -32,57 +43,70 @@ import {
   type BrowserDiagnostics,
   type BrowserStatus,
   type BrowserStatusInput,
+  type BrowserScriptResponse,
 } from "./contracts.js";
 import { browserHostContract } from "./host-contract.js";
 import { dependencyInventory } from "./dependency-inventory.js";
-
-const migrations = [
-  `CREATE TABLE browser_preferences (
-    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    default_profile_id TEXT NOT NULL
-  )`,
-  `INSERT INTO browser_preferences (singleton, default_profile_id)
-   VALUES (1, '${DEFAULT_PROFILE_ID}')`,
-  `CREATE TABLE browser_activity_records (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    occurred_at TEXT NOT NULL,
-    actor TEXT NOT NULL CHECK (actor = 'owner'),
-    host_id TEXT NOT NULL,
-    profile_id TEXT NOT NULL,
-    kind TEXT NOT NULL CHECK (kind IN ('setup', 'lifecycle', 'purge')),
-    action TEXT NOT NULL,
-    outcome TEXT NOT NULL,
-    interrupted INTEGER NOT NULL CHECK (interrupted IN (0, 1))
-  )`,
-  `CREATE TABLE browser_activity_outbox (
-    record_id INTEGER PRIMARY KEY,
-    occurred_at TEXT NOT NULL,
-    payload TEXT NOT NULL,
-    acknowledged_at TEXT
-  )`,
-  `ALTER TABLE browser_preferences RENAME TO browser_preferences_legacy`,
-  `CREATE TABLE browser_preferences (
-    project_id TEXT NOT NULL,
-    host_id TEXT NOT NULL,
-    profile_id TEXT NOT NULL,
-    PRIMARY KEY (project_id, host_id)
-  )`,
-];
-
-const activityRowSchema = z
-  .object({
-    id: z.number().int().positive(),
-    occurred_at: z.string().datetime(),
-    actor: z.literal("owner"),
-    host_id: z.string().min(1),
-    profile_id: z.string().min(1),
-    kind: z.enum(["setup", "lifecycle", "purge"]),
-    action: z.string().min(1),
-    outcome: z.string().min(1),
-    interrupted: z.number().int().min(0).max(1),
-  })
-  .strict();
 type BrowserScriptParameters = z.output<typeof browserScriptParametersSchema>;
+type AgentActivityInput = {
+  eventId: string;
+  occurredAt: string;
+  projectId: string;
+  hostId: string;
+  profileId: string;
+  destinationOrigin: string | null;
+};
+type AgentActivityOutcome = "succeeded" | "failed";
+type AgentScriptTarget = {
+  hostId: string | null;
+  profileId: string;
+};
+type AgentScriptCall = {
+  parameters: BrowserScriptParameters;
+  context: PluginAgentToolContext;
+  hostId: string;
+  profileId: string;
+  activity: AgentActivityInput;
+};
+
+class ActivitySyncTransportError extends Error {
+  constructor() {
+    super("Browser activity synchronization is pending.");
+    this.name = "ActivitySyncTransportError";
+  }
+}
+
+function agentBrowserScriptRequest(
+  call: AgentScriptCall,
+): BrowserScriptRequest {
+  return {
+    purpose: call.parameters.purpose,
+    code: call.parameters.code,
+    ...(call.parameters.destinationOrigin === undefined
+      ? {}
+      : { destinationOrigin: call.parameters.destinationOrigin }),
+    profileId: call.profileId,
+    ...(call.parameters.tabId === undefined
+      ? {}
+      : { tabId: call.parameters.tabId }),
+    timeoutMs: call.parameters.timeoutMs,
+    activityEventId: call.activity.eventId,
+    activityOccurredAt: call.activity.occurredAt,
+    hostId: call.hostId,
+    projectId: call.context.projectId,
+    threadId: call.context.threadId,
+  };
+}
+
+function offlineAgentScriptFailure(call: AgentScriptCall) {
+  return {
+    ok: false as const,
+    error: hostOfflineStatus({
+      hostId: call.hostId,
+      profileId: call.profileId,
+    }),
+  };
+}
 const profilePreferenceRowSchema = z
   .object({ profile_id: browserProfileIdSchema })
   .strict();
@@ -92,8 +116,6 @@ type BrowserIdentity = {
   threadId?: string;
   hostId?: string;
 };
-type ActivityRecordInput = Omit<BrowserActivityRecord, "id">;
-
 type ProfileContext = Pick<BrowserProfileQuery, "projectId" | "threadId">;
 
 type ProfileHostCall = {
@@ -110,96 +132,6 @@ type ProfileHostCall = {
     response: BrowserProfileInventory;
   };
 };
-
-function activityRecordFromRow(row: unknown): BrowserActivityRecord {
-  const parsed = activityRowSchema.parse(row);
-  return browserActivityRecordSchema.parse({
-    id: parsed.id,
-    occurredAt: parsed.occurred_at,
-    actor: parsed.actor,
-    hostId: parsed.host_id,
-    profileId: parsed.profile_id,
-    kind: parsed.kind,
-    action: parsed.action,
-    outcome: parsed.outcome,
-    interrupted: parsed.interrupted === 1,
-  });
-}
-
-function appendActivityRecord(
-  database: Database.Database,
-  input: ActivityRecordInput,
-): BrowserActivityRecord {
-  const append = database.transaction(() => {
-    const inserted = database
-      .prepare(
-        `INSERT INTO browser_activity_records
-          (occurred_at, actor, host_id, profile_id, kind, action, outcome, interrupted)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        input.occurredAt,
-        input.actor,
-        input.hostId,
-        input.profileId,
-        input.kind,
-        input.action,
-        input.outcome,
-        input.interrupted ? 1 : 0,
-      );
-    const record = browserActivityRecordSchema.parse({
-      ...input,
-      id: Number(inserted.lastInsertRowid),
-    });
-    database
-      .prepare(
-        `INSERT INTO browser_activity_outbox
-          (record_id, occurred_at, payload)
-         VALUES (?, ?, ?)`,
-      )
-      .run(record.id, record.occurredAt, JSON.stringify(record));
-    database
-      .prepare(
-        `DELETE FROM browser_activity_records
-         WHERE profile_id = ?
-           AND id NOT IN (
-             SELECT id FROM browser_activity_records
-             WHERE profile_id = ? ORDER BY id DESC LIMIT 10000
-           )`,
-      )
-      .run(record.profileId, record.profileId);
-    database
-      .prepare(
-        `DELETE FROM browser_activity_records
-         WHERE profile_id = ? AND occurred_at < datetime('now', '-30 days')`,
-      )
-      .run(record.profileId);
-    database
-      .prepare(
-        `DELETE FROM browser_activity_outbox
-         WHERE record_id NOT IN (SELECT id FROM browser_activity_records)`,
-      )
-      .run();
-    return record;
-  });
-  return append();
-}
-
-function listActivityRecords(
-  database: Database.Database,
-  target: BrowserHostTarget,
-): BrowserActivityRecord[] {
-  const rows = database
-    .prepare(
-      `SELECT id, occurred_at, actor, host_id, profile_id, kind, action,
-              outcome, interrupted
-       FROM browser_activity_records
-       WHERE host_id = ? AND profile_id = ?
-       ORDER BY id ASC`,
-    )
-    .all(target.hostId, target.profileId);
-  return browserActivityRecordsSchema.parse(rows.map(activityRecordFromRow));
-}
 
 function selectedProfilePreference(
   database: Database.Database,
@@ -381,12 +313,238 @@ export function panelIdentity(input: BrowserStatusInput): BrowserIdentity {
 
 export function createBrowserService(bb: BbPluginApi) {
   const database = bb.storage.database();
-  bb.storage.migrate(database, migrations);
+  bb.storage.migrate(database, [...BROWSER_DATABASE_MIGRATIONS]);
+  const activityStore: ActivityRecordStore =
+    createActivityRecordStore(database);
+  const activityProducers = createActivityRecordProducers(activityStore);
   const host = bb.hosts.experimental_client({ contract: browserHostContract });
+
+  function recordAgentActivity(
+    input: AgentActivityInput,
+    signal: AbortSignal,
+    outcome: AgentActivityOutcome,
+    startedAt: number,
+  ) {
+    const interrupted = signal.aborted;
+    activityProducers.agent({
+      ...input,
+      actor: "agent",
+      action: "browser-script",
+      outcome: interrupted ? "interrupted" : outcome,
+      interrupted,
+      interruptionReason: interrupted ? "request-aborted" : null,
+      durationMs: Math.min(Math.max(Date.now() - startedAt, 0), 30_000),
+    });
+  }
 
   async function hostConnection(hostId: string, signal?: AbortSignal) {
     const hosts = await bb.sdk.hosts.list({ signal });
     return hosts.find((candidate) => candidate.id === hostId)?.status ?? null;
+  }
+
+  async function callActivityTransport<T>(operation: () => Promise<T>) {
+    try {
+      return await operation();
+    } catch {
+      throw new ActivitySyncTransportError();
+    }
+  }
+
+  async function syncHostConnection(hostId: string, signal?: AbortSignal) {
+    try {
+      return (await hostConnection(hostId, signal)) === "connected";
+    } catch {
+      throw new ActivitySyncTransportError();
+    }
+  }
+
+  async function reconcileActivityBatch(
+    hostId: string,
+    acknowledgedEventIds: readonly string[],
+    signal?: AbortSignal,
+  ) {
+    return callActivityTransport(() =>
+      host.call(
+        "reconcileActivity",
+        {
+          hostId,
+          acknowledgedEventIds: [...acknowledgedEventIds],
+          limit: ACTIVITY_OUTBOX_BATCH_LIMIT,
+        },
+        { hostId, signal },
+      ),
+    );
+  }
+
+  async function acknowledgeActivityBatch(
+    hostId: string,
+    eventIds: readonly string[],
+    signal?: AbortSignal,
+  ) {
+    const response = await callActivityTransport(() =>
+      host.call(
+        "acknowledgeActivity",
+        { hostId, eventIds: [...eventIds] },
+        { hostId, signal },
+      ),
+    );
+    return response.acknowledgedEventIds;
+  }
+
+  function mergeActivityEventIds(
+    acknowledgedEventIds: readonly string[],
+    acceptedEventIds: readonly string[],
+  ) {
+    return [...new Set([...acknowledgedEventIds, ...acceptedEventIds])];
+  }
+
+  async function syncActivityBatch(
+    hostId: string,
+    acknowledgedEventIds: readonly string[],
+    signal?: AbortSignal,
+  ) {
+    await reconcileActivityBatch(hostId, acknowledgedEventIds, signal);
+    if (acknowledgedEventIds.length > 0) {
+      const acknowledged = await acknowledgeActivityBatch(
+        hostId,
+        acknowledgedEventIds,
+        signal,
+      );
+      activityStore.acknowledgeClearedEvents(hostId, acknowledged);
+    }
+    const batch = await callActivityTransport(() =>
+      host.call(
+        "activityOutbox",
+        { hostId, limit: ACTIVITY_OUTBOX_BATCH_LIMIT },
+        { hostId, signal },
+      ),
+    );
+    if (batch.length === 0) return [];
+    const acceptedEventIds = activityStore.ingest(
+      batch.map(activityEventFromOutboxItem),
+    );
+    await acknowledgeActivityBatch(hostId, acceptedEventIds, signal);
+    return acceptedEventIds;
+  }
+
+  async function syncConnectedActivity(hostId: string, signal?: AbortSignal) {
+    let acknowledgedEventIds = activityStore.eventIds(hostId);
+    while (true) {
+      const acceptedEventIds = await syncActivityBatch(
+        hostId,
+        acknowledgedEventIds,
+        signal,
+      );
+      if (acceptedEventIds.length === 0) return;
+      acknowledgedEventIds = mergeActivityEventIds(
+        acknowledgedEventIds,
+        acceptedEventIds,
+      );
+    }
+  }
+
+  async function syncActivity(hostId: string, signal?: AbortSignal) {
+    try {
+      if (!(await syncHostConnection(hostId, signal))) return;
+      await syncConnectedActivity(hostId, signal);
+    } catch (error) {
+      if (!(error instanceof ActivitySyncTransportError)) throw error;
+      // Keep local records available while the durable host outbox retries.
+    }
+  }
+
+  async function syncConnectedHosts(signal?: AbortSignal) {
+    const hosts = await bb.sdk.hosts.list({ signal });
+    for (const candidate of hosts) {
+      if (candidate.status === "connected") {
+        await syncActivity(candidate.id, signal);
+      }
+    }
+  }
+
+  function subscribeToHostReconnects() {
+    const unsubscribe = bb.sdk.subscribe({
+      event: "host:changed",
+      callback: (event) => {
+        if (!event.changes.includes("host-connected")) return;
+        const synchronization =
+          event.id === undefined
+            ? syncConnectedHosts()
+            : syncActivity(event.id);
+        return synchronization.catch(() => {
+          bb.log.warn(
+            "Browser activity synchronization failed; pending events will retry.",
+          );
+        });
+      },
+    });
+    bb.onDispose(unsubscribe);
+  }
+
+  async function resolveAgentScriptTarget(
+    parameters: BrowserScriptParameters,
+    context: PluginAgentToolContext,
+  ): Promise<AgentScriptTarget> {
+    const hostId = await resolvedHostId(bb, context);
+    if (hostId === null) {
+      return {
+        hostId: null,
+        profileId: parameters.profileId ?? DEFAULT_PROFILE_ID,
+      };
+    }
+    return {
+      hostId,
+      profileId:
+        parameters.profileId ?? (await selectedProfileId(context, hostId)),
+    };
+  }
+
+  async function runWithAgentActivity(
+    activity: AgentActivityInput,
+    hostId: string,
+    signal: AbortSignal,
+    operation: () => Promise<BrowserScriptResponse>,
+  ): Promise<BrowserScriptResponse> {
+    const startedAt = Date.now();
+    try {
+      const response = await operation();
+      recordAgentActivity(
+        activity,
+        signal,
+        response.ok ? "succeeded" : "failed",
+        startedAt,
+      );
+      return response;
+    } catch (error) {
+      recordAgentActivity(activity, signal, "failed", startedAt);
+      throw error;
+    } finally {
+      await syncActivity(hostId, signal);
+    }
+  }
+
+  async function runAgentBrowserScriptCall(call: AgentScriptCall) {
+    if (
+      (await hostConnection(call.hostId, call.context.signal)) !== "connected"
+    ) {
+      recordAgentActivity(
+        call.activity,
+        call.context.signal,
+        "failed",
+        Date.now(),
+      );
+      return offlineAgentScriptFailure(call);
+    }
+    return runWithAgentActivity(
+      call.activity,
+      call.hostId,
+      call.context.signal,
+      () =>
+        host.call("browserScript", agentBrowserScriptRequest(call), {
+          hostId: call.hostId,
+          signal: call.context.signal,
+        }),
+    );
   }
 
   async function hostStatus(
@@ -531,7 +689,33 @@ export function createBrowserService(bb: BbPluginApi) {
   }
 
   async function activityRecords(target: BrowserHostTarget) {
-    return listActivityRecords(database, target);
+    await syncActivity(target.hostId);
+    return activityStore.list(target);
+  }
+
+  async function exportActivityRecords(
+    target: BrowserHostTarget,
+  ): Promise<BrowserActivityExport> {
+    await syncActivity(target.hostId);
+    return activityStore.export(target);
+  }
+
+  async function clearActivityRecords(request: {
+    hostId: string;
+    profileId: string;
+    confirmation: string;
+  }): Promise<BrowserActivityClearResponse> {
+    if (request.confirmation !== CLEAR_ACTIVITY_CONFIRMATION) {
+      throw new Error(`Type exactly: ${CLEAR_ACTIVITY_CONFIRMATION}.`);
+    }
+    await syncActivity(request.hostId);
+    const clearedCount = activityStore.clear(request);
+    return {
+      hostId: request.hostId,
+      profileId: request.profileId,
+      clearedCount,
+      message: `Cleared ${clearedCount} Browser activity records.`,
+    };
   }
 
   async function profiles(target: BrowserProfileQuery, signal?: AbortSignal) {
@@ -623,32 +807,43 @@ export function createBrowserService(bb: BbPluginApi) {
     operation: () => Promise<T>;
     outcome: (response: T) => string;
     successTarget?: (response: T) => BrowserHostTarget;
+    projectId?: string | null;
   }): Promise<T> {
     const occurredAt = new Date().toISOString();
     try {
       const response = await request.operation();
       const target = request.successTarget?.(response) ?? request.target;
-      appendActivityRecord(database, {
+      activityProducers.record({
+        eventId: newActivityEventId("server"),
         occurredAt,
         actor: "owner",
+        projectId: request.projectId ?? null,
         hostId: target.hostId,
         profileId: target.profileId,
+        destinationOrigin: null,
         kind: request.kind,
         action: request.action,
         outcome: request.outcome(response),
         interrupted: false,
+        interruptionReason: null,
+        durationMs: null,
       });
       return response;
     } catch (error) {
-      appendActivityRecord(database, {
+      activityProducers.record({
+        eventId: newActivityEventId("server"),
         occurredAt,
         actor: "owner",
+        projectId: request.projectId ?? null,
         hostId: request.target.hostId,
         profileId: request.target.profileId,
+        destinationOrigin: null,
         kind: request.kind,
         action: request.action,
         outcome: "failed",
         interrupted: false,
+        interruptionReason: null,
+        durationMs: null,
       });
       throw error;
     }
@@ -789,48 +984,44 @@ export function createBrowserService(bb: BbPluginApi) {
     parameters: BrowserScriptParameters,
     context: PluginAgentToolContext,
   ) {
-    const hostId = await resolvedHostId(bb, context);
-    if (hostId === null) {
+    const activityEventId = newActivityEventId("agent");
+    const occurredAt = new Date().toISOString();
+    const target = await resolveAgentScriptTarget(parameters, context);
+    if (target.hostId === null) {
       return {
         ok: false as const,
         error: setupRequiredStatus({
-          hostId,
-          profileId: parameters.profileId ?? DEFAULT_PROFILE_ID,
+          hostId: target.hostId,
+          profileId: target.profileId,
         }),
       };
     }
-    if ((await hostConnection(hostId, context.signal)) !== "connected") {
-      return {
-        ok: false as const,
-        error: hostOfflineStatus({
-          hostId,
-          profileId: parameters.profileId ?? DEFAULT_PROFILE_ID,
-        }),
-      };
-    }
-    const profileId =
-      parameters.profileId ?? (await selectedProfileId(context, hostId));
-    return host.call(
-      "browserScript",
-      {
-        purpose: parameters.purpose,
-        code: parameters.code,
-        profileId,
-        ...(parameters.tabId === undefined ? {} : { tabId: parameters.tabId }),
-        timeoutMs: parameters.timeoutMs,
-        hostId,
-        projectId: context.projectId,
-        threadId: context.threadId,
-      },
-      { hostId, signal: context.signal },
-    );
+    const activity: AgentActivityInput = {
+      eventId: activityEventId,
+      occurredAt,
+      projectId: context.projectId,
+      hostId: target.hostId,
+      profileId: target.profileId,
+      destinationOrigin: parameters.destinationOrigin ?? null,
+    };
+    return runAgentBrowserScriptCall({
+      parameters,
+      context,
+      hostId: target.hostId,
+      profileId: target.profileId,
+      activity,
+    });
   }
+
+  subscribeToHostReconnects();
 
   return {
     browserScript,
     activityRecords,
+    clearActivityRecords,
     createProfile,
     diagnostics,
+    exportActivityRecords,
     lifecycle,
     purge,
     purgePlan,

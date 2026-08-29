@@ -1,15 +1,24 @@
-import { useEffect, useState, type FormEvent, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useState,
+  type FormEvent,
+  type ReactNode,
+} from "react";
 import { definePluginApp, useRpc } from "@get-bb/plugin-sdk/app";
 import type {
   PluginNewThreadPanelProps,
   PluginThreadPanelProps,
 } from "@get-bb/plugin-sdk/app";
 import {
+  CLEAR_ACTIVITY_CONFIRMATION,
   DEFAULT_PROFILE_ID,
   STOP_BROWSER_CONFIRMATION,
   type BrowserHostChoice,
   type BrowserHostChoicesInput,
   type BrowserDiagnostics,
+  type BrowserActivityExport,
+  type BrowserActivityRecord,
   type BrowserProfile,
   type BrowserProfileInventory,
   type BrowserPurgePlan,
@@ -492,9 +501,11 @@ function ProfileCreateForm({
 function ProfileControls({
   hostId,
   available,
+  onProfileSelected,
 }: {
   hostId: string;
   available: boolean;
+  onProfileSelected: (hostId: string, profileId: string) => void;
 }) {
   const rpc = useRpc<typeof rpcContract>();
   const [inventory, setInventory] = useState<BrowserProfileInventory | null>(
@@ -513,6 +524,7 @@ function ProfileControls({
   function refreshProfiles() {
     return rpc.call("browser_profiles", { hostId }).then((nextInventory) => {
       setInventory(nextInventory);
+      onProfileSelected(hostId, nextInventory.selectedProfileId);
       return nextInventory;
     });
   }
@@ -524,11 +536,14 @@ function ProfileControls({
     }
     void rpc
       .call("browser_profiles", { hostId })
-      .then(setInventory)
+      .then((nextInventory) => {
+        setInventory(nextInventory);
+        onProfileSelected(hostId, nextInventory.selectedProfileId);
+      })
       .catch((requestError: unknown) =>
         setError(administrationErrorMessage(requestError)),
       );
-  }, [available, hostId, rpc]);
+  }, [available, hostId, onProfileSelected, rpc]);
 
   function createProfile(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -588,7 +603,10 @@ function ProfileControls({
         hostId,
         profileId: profile.profileId,
       })
-      .then(setInventory)
+      .then((nextInventory) => {
+        setInventory(nextInventory);
+        onProfileSelected(hostId, nextInventory.selectedProfileId);
+      })
       .catch((requestError: unknown) =>
         setError(administrationErrorMessage(requestError)),
       )
@@ -989,6 +1007,120 @@ function PurgeControls({ target }: { target: BrowserAdministrationTarget }) {
   );
 }
 
+function ActivityControls({ target }: { target: BrowserAdministrationTarget }) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [records, setRecords] = useState<BrowserActivityRecord[] | null>(null);
+  const [exported, setExported] = useState<BrowserActivityExport | null>(null);
+  const [confirmation, setConfirmation] = useState("");
+  const [pendingAction, setPendingAction] = useState<string | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  function reviewActivity() {
+    setPendingAction("review");
+    setError(null);
+    void rpc
+      .call("browser_activity_records", target)
+      .then(setRecords)
+      .finally(() => setPendingAction(null))
+      .catch((requestError: unknown) =>
+        setError(administrationErrorMessage(requestError)),
+      );
+  }
+
+  function exportActivity() {
+    setPendingAction("export");
+    setError(null);
+    void rpc
+      .call("browser_activity_export", target)
+      .then((payload) => {
+        setExported(payload);
+        setRecords(payload.records);
+      })
+      .finally(() => setPendingAction(null))
+      .catch((requestError: unknown) =>
+        setError(administrationErrorMessage(requestError)),
+      );
+  }
+
+  function clearActivity() {
+    setPendingAction("clear");
+    setMessage(null);
+    setError(null);
+    void rpc
+      .call("browser_activity_clear", { ...target, confirmation })
+      .then((response) => {
+        setRecords([]);
+        setExported(null);
+        setConfirmation("");
+        setMessage(response.message);
+      })
+      .finally(() => setPendingAction(null))
+      .catch((requestError: unknown) =>
+        setError(administrationErrorMessage(requestError)),
+      );
+  }
+
+  return (
+    <section
+      aria-label={`Browser activity controls for host ${target.hostId}`}
+      className="border-t pt-5 text-left"
+    >
+      <h4 className="font-semibold">Browser Activity</h4>
+      <p className="mt-2 text-sm text-muted-foreground">
+        Review only allow-listed metadata retained for 30 days and up to 10,000
+        records per profile. Owner browsing is not recorded.
+      </p>
+      <div className="mt-3 flex flex-wrap gap-2">
+        <button
+          type="button"
+          className="rounded border px-3 py-2 text-sm"
+          disabled={pendingAction !== null}
+          onClick={reviewActivity}
+        >
+          Review Browser activity
+        </button>
+        <button
+          type="button"
+          className="rounded border px-3 py-2 text-sm"
+          disabled={pendingAction !== null}
+          onClick={exportActivity}
+        >
+          Export Browser activity
+        </button>
+      </div>
+      <label className="mt-3 block text-sm">
+        Type <code>{CLEAR_ACTIVITY_CONFIRMATION}</code> to clear
+        <input
+          aria-label="Activity clear confirmation"
+          className="mt-1 block w-full rounded border px-3 py-2 text-sm"
+          value={confirmation}
+          onChange={(event) => setConfirmation(event.target.value)}
+        />
+      </label>
+      <button
+        type="button"
+        className="mt-3 rounded border px-3 py-2 text-sm"
+        disabled={pendingAction !== null}
+        onClick={clearActivity}
+      >
+        Clear Browser activity
+      </button>
+      {records === null ? null : (
+        <pre aria-label="Browser activity records" className="mt-3 text-xs">
+          {JSON.stringify(records, null, 2)}
+        </pre>
+      )}
+      {exported === null ? null : (
+        <pre aria-label="Browser activity export" className="mt-3 text-xs">
+          {JSON.stringify(exported, null, 2)}
+        </pre>
+      )}
+      <AdministrationFeedback message={message} error={error} />
+    </section>
+  );
+}
+
 function HostAdministrationControls({ status }: { status: BrowserStatus }) {
   if (
     status.hostId === null ||
@@ -1017,8 +1149,18 @@ function HostAdministrationControls({ status }: { status: BrowserStatus }) {
 function BrowserSettings() {
   const rpc = useRpc<typeof rpcContract>();
   const [statuses, setStatuses] = useState<BrowserStatus[] | null>(null);
+  const [selectedProfileIds, setSelectedProfileIds] = useState<
+    Record<string, string>
+  >({});
   const [diagnostics, setDiagnostics] = useState<BrowserDiagnostics | null>(
     null,
+  );
+
+  const handleProfileSelected = useCallback(
+    (hostId: string, profileId: string) => {
+      setSelectedProfileIds((current) => ({ ...current, [hostId]: profileId }));
+    },
+    [],
   );
 
   useEffect(() => {
@@ -1044,6 +1186,16 @@ function BrowserSettings() {
             <ProfileControls
               hostId={status.hostId}
               available={status.state !== "host-offline"}
+              onProfileSelected={handleProfileSelected}
+            />
+          )}
+          {status.hostId === null ? null : (
+            <ActivityControls
+              target={{
+                hostId: status.hostId,
+                profileId:
+                  selectedProfileIds[status.hostId] ?? status.profileId,
+              }}
             />
           )}
           <HostAdministrationControls status={status} />

@@ -6,6 +6,9 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   browserActivityRecordsSchema,
+  browserActivityOutboxSchema,
+  browserActivityExportSchema,
+  browserActivityClearResponseSchema,
   browserDiagnosticsSchema,
   browserLifecycleResponseSchema,
   browserSetupPlanSchema,
@@ -659,6 +662,343 @@ describe("Browser public plugin contract", () => {
     expect(JSON.stringify(profileActivity)).not.toMatch(
       /Audited profile|Audited renamed|Should not exist/,
     );
+    await browser.dispose();
+  });
+
+  it("records agent operations without recording owner reads or sensitive inputs", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+    });
+
+    await browser.runBrowserStatus({
+      surface: "new-thread",
+      projectId: "project-browser-test",
+      hostId: "host-browser-test",
+      profileId: DEFAULT_PROFILE_ID,
+    });
+    await browser.runBrowserScriptWithProfile(undefined, {
+      purpose:
+        "Inspect credentials at https://app.example.test/login?token=purpose-secret",
+      code: "await page.goto('https://app.example.test/login?token=script-secret'); return 'clipboard-secret';",
+      destinationOrigin: "https://app.example.test",
+    });
+
+    const records = await browser.runBrowserActivityRecords();
+    expect(records).toHaveLength(1);
+    expect(records[0]).toMatchObject({
+      actor: "agent",
+      projectId: "project-browser-test",
+      hostId: "host-browser-test",
+      profileId: DEFAULT_PROFILE_ID,
+      kind: "agent-operation",
+      action: "browser-script",
+      destinationOrigin: "https://app.example.test",
+      outcome: "failed",
+      interrupted: false,
+      interruptionReason: null,
+    });
+    const serialized = JSON.stringify(records);
+    const diagnostics = await browser.runDiagnosticsCli();
+    const persistedRows = JSON.stringify(browser.persistedActivityRows());
+    const persistedOutbox = await browser.persistedHostOutbox();
+    const diagnosticLogs = JSON.stringify(browser.diagnosticLogEntries());
+    const persistedSurfaces = [
+      serialized,
+      diagnostics.stdout,
+      persistedRows,
+      persistedOutbox,
+      diagnosticLogs,
+    ].join("\n");
+    for (const forbidden of [
+      "purpose-secret",
+      "script-secret",
+      "clipboard-secret",
+      "Inspect credentials",
+      "/login",
+      "password",
+      "keyboard",
+      "pointer",
+      "screenshot",
+      "cookie",
+      "form data",
+    ]) {
+      expect(persistedSurfaces).not.toContain(forbidden);
+    }
+    await browser.dispose();
+  });
+
+  it("uses the production outbox claim path and persists retry backoff", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+    });
+    browser.setHostRpcFailure(
+      "acknowledgeActivity",
+      "activity acknowledgement unavailable",
+    );
+    await browser.seedHostActivityEvent();
+    await browser.runBrowserActivityRecords();
+
+    const outbox = browserActivityOutboxSchema.parse(
+      JSON.parse(await browser.persistedHostOutbox()).events,
+    );
+    expect(outbox).toMatchObject([{ attempts: 1 }]);
+    expect(outbox[0]?.nextAttemptAt).not.toBe(outbox[0]?.occurredAt);
+    await browser.dispose();
+  });
+
+  it("records the final agent outcome when a browser script succeeds", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+      browserScriptResponse: { ok: true, result: { title: "done" } },
+    });
+
+    await browser.runBrowserScriptWithProfile(undefined, {
+      purpose: "Successful browser operation",
+      code: "return document.title;",
+      destinationOrigin: "https://example.com",
+    });
+
+    const records = await browser.runBrowserActivityRecords();
+    expect(records[0]).toMatchObject({
+      outcome: "succeeded",
+      interrupted: false,
+    });
+    expect(records[0]?.durationMs).toEqual(expect.any(Number));
+
+    await browser.dispose();
+  });
+
+  it("records failed agent operations with completed timing metadata", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+    });
+
+    const reply = await browser.runBrowserScriptWithProfile(undefined, {
+      purpose: "Failed browser operation",
+      code: "return document.title;",
+      destinationOrigin: "https://example.com",
+    });
+
+    expect(reply.isError).toBe(true);
+    const records = await browser.runBrowserActivityRecords();
+    expect(records[0]).toMatchObject({
+      outcome: "failed",
+      interrupted: false,
+      interruptionReason: null,
+    });
+    expect(records[0]?.durationMs).toEqual(expect.any(Number));
+
+    await browser.dispose();
+  });
+
+  it("records an agent operation as interrupted when its final signal is aborted", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+      browserScriptDelayMs: 25,
+    });
+    const controller = new AbortController();
+    const operation = browser.runBrowserScriptWithProfile(undefined, {
+      purpose: "Interrupted browser operation",
+      code: "return document.title;",
+      destinationOrigin: "https://example.com",
+      signal: controller.signal,
+    });
+
+    await new Promise<void>((resolve) => {
+      setTimeout(() => {
+        controller.abort();
+        resolve();
+      }, 1);
+    });
+    await operation.catch(() => undefined);
+
+    const records = await browser.runBrowserActivityRecords();
+    expect(records[0]).toMatchObject({
+      outcome: "interrupted",
+      interrupted: true,
+      interruptionReason: "request-aborted",
+    });
+    expect(records[0]?.durationMs).toEqual(expect.any(Number));
+
+    await browser.dispose();
+  });
+
+  it("does not restore activity cleared while offline after host reconnect", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+    });
+    browser.setHostRpcFailure(
+      "reconcileActivity",
+      "activity reconciliation unavailable",
+    );
+
+    await browser.runBrowserScriptWithProfile(undefined, {
+      purpose: "Create pending activity",
+      code: "return page.url();",
+      destinationOrigin: "https://app.example.test",
+    });
+    expect(
+      browserActivityOutboxSchema.parse(
+        JSON.parse(await browser.persistedHostOutbox()).events,
+      ),
+    ).toHaveLength(1);
+
+    browser.setHostRpcFailure("reconcileActivity");
+    browser.setHostConnection("disconnected");
+    const clearReply = await browser.runBrowserCli([
+      "activity-clear",
+      "--confirm",
+      "Clear Browser activity records",
+      "--json",
+    ]);
+    expect(clearReply.exitCode).toBe(0);
+    expect(JSON.parse(clearReply.stdout ?? "{}").clearedCount).toBeGreaterThan(
+      0,
+    );
+
+    await browser.emitHostConnection("host-connected");
+
+    expect(
+      browserActivityOutboxSchema.parse(
+        JSON.parse(await browser.persistedHostOutbox()).events,
+      ),
+    ).toEqual([]);
+    expect(await browser.runBrowserActivityRecords()).toEqual([]);
+    await browser.dispose();
+  });
+
+  it("reviews, exports, and clears activity through authenticated CLI surfaces", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+    });
+
+    await browser.runBrowserScriptWithProfile(undefined, {
+      purpose: "Review private page",
+      code: "return 'private-content';",
+      destinationOrigin: "https://app.example.test",
+    });
+
+    const review = await browser.runBrowserCli(["activity", "--json"]);
+    const reviewedRecords = browserActivityRecordsSchema.parse(
+      JSON.parse(review.stdout),
+    );
+    expect(review.exitCode).toBe(0);
+    expect(reviewedRecords).toHaveLength(1);
+
+    const textReview = await browser.runBrowserCli(["activity"]);
+    expect(textReview.stdout).toContain("agent-operation:browser-script");
+
+    const exported = await browser.runBrowserCli(["activity-export", "--json"]);
+    const exportPayload = browserActivityExportSchema.parse(
+      JSON.parse(exported.stdout),
+    );
+    expect(exportPayload.records).toHaveLength(2);
+    expect(exportPayload.records.at(-1)?.action).toBe("activity-export");
+
+    const rejectedClear = await browser.runBrowserCli([
+      "activity-clear",
+      "--confirm",
+      "wrong confirmation",
+      "--json",
+    ]);
+    expect(rejectedClear.exitCode).toBe(1);
+    expect(rejectedClear.stderr).toContain("Clear Browser activity records");
+
+    const cleared = await browser.runBrowserCli([
+      "activity-clear",
+      "--confirm",
+      "Clear Browser activity records",
+      "--json",
+    ]);
+    const clearPayload = browserActivityClearResponseSchema.parse(
+      JSON.parse(cleared.stdout),
+    );
+    expect(clearPayload.clearedCount).toBe(2);
+    expect(
+      browserActivityRecordsSchema.parse(
+        JSON.parse(
+          (await browser.runBrowserCli(["activity", "--json"])).stdout,
+        ),
+      ),
+    ).toEqual([]);
+    await browser.dispose();
+  });
+
+  it("reviews, exports, and clears activity from authenticated Settings controls", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+    });
+    await browser.runBrowserScriptWithProfile(undefined, {
+      purpose: "Review private page",
+      code: "return 'private-content';",
+      destinationOrigin: "https://app.example.test",
+    });
+
+    const settings = browser.renderSettings();
+    const reviewButton = await settings.findByRole("button", {
+      name: "Review Browser activity",
+    });
+    fireEvent.click(reviewButton);
+    const records = await settings.findByLabelText("Browser activity records");
+    expect(records.textContent).toContain("browser-script");
+
+    fireEvent.click(
+      settings.getByRole("button", { name: "Export Browser activity" }),
+    );
+    const exportView = await settings.findByLabelText(
+      "Browser activity export",
+    );
+    expect(exportView.textContent).toContain("activity-export");
+
+    const confirmation = settings.getByRole("textbox", {
+      name: "Activity clear confirmation",
+    });
+    fireEvent.change(confirmation, {
+      target: { value: "Clear Browser activity records" },
+    });
+    fireEvent.click(
+      settings.getByRole("button", { name: "Clear Browser activity" }),
+    );
+    await settings.findByText("Cleared 2 Browser activity records.");
+    expect(records.textContent).toBe("[]");
+    await browser.dispose();
+  });
+
+  it("uses the selected non-default profile for Settings activity controls", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+    });
+    const settings = browser.renderSettings();
+
+    await settings.findByText("Browser Profiles");
+    const name = await settings.findByRole("textbox", {
+      name: "New Browser Profile name",
+    });
+    fireEvent.change(name, { target: { value: "Activity profile" } });
+    fireEvent.click(
+      settings.getByRole("button", { name: "Create Browser Profile" }),
+    );
+    await settings.findByText("Activity profile");
+
+    fireEvent.click(
+      settings.getByRole("button", { name: "Select Activity profile" }),
+    );
+    await settings.findByText(/Selected: profile-/);
+    const inventory = await browser.runBrowserProfiles();
+    const selectedProfileId = inventory.selectedProfileId;
+    expect(selectedProfileId).not.toBe(DEFAULT_PROFILE_ID);
+
+    await browser.runBrowserScriptWithProfile(selectedProfileId, {
+      purpose: "Review selected profile activity",
+      code: "return document.title;",
+      destinationOrigin: "https://example.com",
+    });
+    fireEvent.click(
+      settings.getByRole("button", { name: "Review Browser activity" }),
+    );
+    const records = await settings.findByLabelText("Browser activity records");
+    expect(records.textContent).toContain(selectedProfileId);
+
     await browser.dispose();
   });
 
