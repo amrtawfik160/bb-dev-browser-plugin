@@ -27,10 +27,12 @@
     "format:check": "prettier --check .",
     "lint": "eslint .",
     "test": "vitest run",
+    "test:real-browser": "BB_BROWSER_REAL_INTEGRATION_REQUIRED=1 BB_BROWSER_REAL_INTEGRATION=1 vitest run test/browser-auth.integration.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "dev-browser": "0.2.9",
+    "playwright": "1.58.2",
     "zod": "4.3.6"
   },
   "devDependencies": {

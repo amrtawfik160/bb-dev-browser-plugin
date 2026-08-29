@@ -17,6 +17,8 @@ import {
   browserSetupResponseSchema,
   browserScriptResponseSchema,
   browserScriptRequestSchema,
+  browserNavigationRequestSchema,
+  browserNavigationResponseSchema,
   browserProfileCreateRequestSchema,
   browserProfileDeleteRequestSchema,
   browserProfileExpiryResponseSchema,
@@ -71,6 +73,10 @@ export const browserHostContract = defineRpcContract({
   browserScript: {
     input: browserScriptRequestSchema,
     output: browserScriptResponseSchema,
+  },
+  navigate: {
+    input: browserNavigationRequestSchema,
+    output: browserNavigationResponseSchema,
   },
   activityOutbox: {
     input: browserActivityOutboxRequestSchema,

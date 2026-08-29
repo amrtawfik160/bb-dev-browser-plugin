@@ -30,6 +30,8 @@ import {
   browserDiagnosticsSchema,
   browserLifecycleRequestSchema,
   browserLifecycleResponseSchema,
+  browserNavigationRequestSchema,
+  browserNavigationResponseSchema,
   browserPurgeRequestSchema,
   browserScriptRequestSchema,
   browserSetupRequestSchema,
@@ -53,6 +55,8 @@ import {
   browserProfileGrantCreateRequestSchema,
   browserProfileGrantQuerySchema,
   browserProfileGrantRevokeRequestSchema,
+  type BrowserPanelNavigationInput,
+  type BrowserNavigationRequest,
   browserProfileGrantRevokeResponseSchema,
   browserProfileGrantSchema,
   browserProfileGrantsSchema,
@@ -207,6 +211,11 @@ export async function createPublicPluginHarness(options?: {
   browserScriptResponse?: { ok: true; result: unknown };
   browserScriptDelayMs?: number;
   browserScriptStarted?: () => void;
+  navigationResponse?: {
+    address: { kind: "address"; url: string };
+    location: unknown;
+    tabId: string;
+  };
   hostIds?: readonly string[];
   projectHostIds?: readonly string[];
   probeFailure?: boolean;
@@ -516,6 +525,14 @@ export async function createPublicPluginHarness(options?: {
           { signal },
         );
       }
+      if (method === "navigate") {
+        const request = browserNavigationRequestSchema.parse(input);
+        navigationRequests.push(request);
+        if (options?.navigationResponse !== undefined) {
+          return options.navigationResponse;
+        }
+        return host.experimental_call("navigate", request, { signal });
+      }
       if (method === "activityOutbox") {
         return host.experimental_call(
           "activityOutbox",
@@ -633,6 +650,7 @@ export async function createPublicPluginHarness(options?: {
   const newThreadPanels = new Map<string, RenderedSlot>();
   const settingsPanels: RenderedSlot[] = [];
   let grantRequestRpcCallIndex = 0;
+  const navigationRequests: BrowserNavigationRequest[] = [];
 
   const rpc = {
     browser_status: (input: BrowserStatusInput) =>
@@ -640,6 +658,10 @@ export async function createPublicPluginHarness(options?: {
         "browser_status",
         input,
       ) as Promise<BrowserStatus>,
+    browser_navigate: (input: BrowserPanelNavigationInput) =>
+      backend.harness.behavior.callRpc("browser_navigate", input) as Promise<
+        ReturnType<typeof browserNavigationResponseSchema.parse>
+      >,
     browser_settings_status: (input: { profileId: string }) =>
       backend.harness.behavior.callRpc(
         "browser_settings_status",
@@ -1408,6 +1430,9 @@ export async function createPublicPluginHarness(options?: {
     },
     get sharedPortDeclarations() {
       return backend.harness.inspection.sharedPortDeclarations;
+    },
+    get navigationRequests() {
+      return [...navigationRequests];
     },
     openExistingThreadPanel,
     openNewThreadPanel,

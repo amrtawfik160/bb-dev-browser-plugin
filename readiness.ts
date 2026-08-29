@@ -4,6 +4,7 @@ import { access, lstat, readFile, stat, statfs } from "node:fs/promises";
 import { createServer } from "node:net";
 import { join, resolve } from "node:path";
 import { z } from "zod";
+import { inspectFallbackBrowser } from "./browser-fallback.js";
 import { browserHostStorageSegment } from "./contracts.js";
 import type {
   BrowserDiagnostics,
@@ -12,10 +13,7 @@ import type {
   BrowserStatusTarget,
   ReadinessCapability,
 } from "./contracts.js";
-import {
-  dependencyInventory,
-  PINNED_BROWSER_RUNTIME,
-} from "./dependency-inventory.js";
+import { dependencyInventory } from "./dependency-inventory.js";
 
 const FIVE_GIB = 5 * 1024 ** 3;
 
@@ -58,14 +56,6 @@ const connectConfigSchema = z
   })
   .passthrough();
 
-const fallbackBrowserVersionSchema = z
-  .object({
-    playwrightVersion: z.string().min(1),
-    chromiumRevision: z.string().min(1),
-    chromiumVersion: z.string().min(1),
-  })
-  .strict();
-
 function jsonDocument(contents: string) {
   try {
     return JSON.parse(contents) as unknown;
@@ -73,11 +63,6 @@ function jsonDocument(contents: string) {
     if (error instanceof SyntaxError) return null;
     throw error;
   }
-}
-
-function fallbackBrowserVersion(contents: string) {
-  const parsed = fallbackBrowserVersionSchema.safeParse(jsonDocument(contents));
-  return parsed.success ? parsed.data : null;
 }
 
 export interface HostProbeSnapshot {
@@ -440,16 +425,17 @@ async function chromeAvailability(paths: HostProbePaths) {
   return null;
 }
 
-async function fallbackBrowserAvailability(hostStorage: string) {
-  const fallbackDirectory = join(hostStorage, "browsers", "chromium");
-  const executable = join(fallbackDirectory, "chrome");
-  if (!(await fileExists(executable))) return null;
-  const rawVersion = await readFile(
-    join(fallbackDirectory, "version.json"),
-    "utf8",
-  ).catch(() => null);
-  const installed = rawVersion && fallbackBrowserVersion(rawVersion);
-  if (!installed) {
+async function fallbackBrowserAvailability(
+  hostStorage: string,
+  browserUser: Awaited<ReturnType<typeof dedicatedUser>>,
+) {
+  if (browserUser.uid === null || browserUser.gid === null) return null;
+  const installed = await inspectFallbackBrowser({
+    hostStoragePath: hostStorage,
+    uid: browserUser.uid,
+    gid: browserUser.gid,
+  });
+  if (installed === null) {
     return {
       name: "Pinned Playwright Chromium",
       version: null,
@@ -458,19 +444,19 @@ async function fallbackBrowserAvailability(hostStorage: string) {
   }
   return {
     name: "Pinned Playwright Chromium",
-    version: installed.chromiumVersion,
-    compatible:
-      installed.playwrightVersion ===
-        PINNED_BROWSER_RUNTIME.playwrightVersion &&
-      installed.chromiumRevision === PINNED_BROWSER_RUNTIME.chromiumRevision &&
-      installed.chromiumVersion === PINNED_BROWSER_RUNTIME.chromiumVersion,
+    version: installed.manifest.chromiumVersion,
+    compatible: true,
   };
 }
 
-async function browserAvailability(paths: HostProbePaths, hostStorage: string) {
+async function browserAvailability(
+  paths: HostProbePaths,
+  hostStorage: string,
+  browserUser: Awaited<ReturnType<typeof dedicatedUser>>,
+) {
   const chrome = await chromeAvailability(paths);
   if (chrome?.compatible === true) return chrome;
-  const fallback = await fallbackBrowserAvailability(hostStorage);
+  const fallback = await fallbackBrowserAvailability(hostStorage, browserUser);
   return fallback?.compatible === true ? fallback : (chrome ?? fallback);
 }
 
@@ -508,17 +494,20 @@ async function dedicatedUser(paths: HostProbePaths) {
     .find((line) => line.startsWith("bb-browser:"))
     ?.split(":");
   if (fields === undefined) {
-    return { state: "missing" as const, uid: null };
+    return { state: "missing" as const, uid: null, gid: null };
   }
   const uid = Number(fields[2]);
+  const gid = Number(fields[3]);
   const shell = fields[6] ?? "";
-  const unprivileged = Number.isInteger(uid) && uid > 0;
+  const unprivileged =
+    Number.isInteger(uid) && uid > 0 && Number.isInteger(gid) && gid > 0;
   const noLogin = ["/usr/sbin/nologin", "/sbin/nologin", "/bin/false"].includes(
     shell,
   );
   return {
     state: unprivileged && noLogin ? ("ready" as const) : ("invalid" as const),
     uid,
+    gid,
   };
 }
 
@@ -638,7 +627,7 @@ export function createDefaultHostSnapshotReader(
       ] = await Promise.all([
         readFile(paths.osRelease, "utf8").catch(() => ""),
         connectEnrollment(dataDir),
-        browserAvailability(paths, storagePath),
+        browserAvailability(paths, storagePath, browserUser),
         sandboxAvailability(paths),
         protectedStorage(
           storagePath,

@@ -80,6 +80,8 @@ import {
   type BrowserProfileGrantQuery,
   type BrowserProfileGrantRevokeRequest,
   type BrowserProfileGrantRevokeResponse,
+  type BrowserPanelNavigationInput,
+  type BrowserNavigationResponse,
 } from "./contracts.js";
 import { browserHostContract } from "./host-contract.js";
 import { dependencyInventory } from "./dependency-inventory.js";
@@ -2167,11 +2169,37 @@ export function createBrowserService(
     });
   }
 
+  async function navigate(
+    request: BrowserPanelNavigationInput,
+    signal?: AbortSignal,
+  ): Promise<BrowserNavigationResponse> {
+    const identity = panelIdentity(request);
+    const hostId = await resolvedHostId(bb, identity);
+    if (hostId === null || hostId !== request.hostId) {
+      throw new Error("The selected workspace host is unavailable.");
+    }
+    const projectId = await profileContextProjectId(bb, identity);
+    await requireConnectedHost(hostId, signal);
+    return host.call(
+      "navigate",
+      {
+        hostId,
+        profileId: request.profileId,
+        projectId,
+        input: request.input,
+        ...(request.tabId === undefined ? {} : { tabId: request.tabId }),
+        rawLocalhost: request.rawLocalhost ?? false,
+      },
+      { hostId, signal },
+    );
+  }
+
   subscribeToHostReconnects();
   subscribeToProjectDeletion();
 
   return {
     browserScript,
+    navigate,
     grants,
     createGrant,
     inspectGrant,

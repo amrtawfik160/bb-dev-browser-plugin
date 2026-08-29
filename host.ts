@@ -1,6 +1,8 @@
 import { experimental_defineHostEntry } from "@get-bb/plugin-sdk/host";
 import { randomUUID } from "node:crypto";
-import { join } from "node:path";
+import { createRequire } from "node:module";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import {
   createActivityOutbox,
   type ActivityOutbox,
@@ -32,11 +34,19 @@ import {
 import {
   BROWSER_STORAGE_ROOT,
   DEFAULT_PROFILE_ID,
+  STOP_BROWSER_CONFIRMATION,
   browserProfileUnavailableStatus,
   type BrowserActivityEvent,
   type BrowserScriptRequest,
   type BrowserScriptResponse,
+  type BrowserNavigationRequest,
 } from "./contracts.js";
+import {
+  createBrowserInstanceRuntime,
+  type BrowserInstanceRuntime,
+} from "./browser-runtime.js";
+import { createProductionBrowserProcessBoundary } from "./browser-process.js";
+import { PINNED_BROWSER_RUNTIME } from "./dependency-inventory.js";
 
 export type HostSetupBoundary = HostReadinessBoundary;
 type HostBoundary = HostReadinessBoundary | HostAdministrationBoundary;
@@ -49,6 +59,8 @@ type ProfileStoreSource =
     ) => BrowserProfileStore);
 type ProfileRecoverySource =
   BrowserProfileRecovery | ((dataDir: string) => BrowserProfileRecovery);
+type BrowserRuntimeSource =
+  BrowserInstanceRuntime | ((dataDir: string) => BrowserInstanceRuntime);
 
 type ScriptSignalContext = { signal: AbortSignal };
 type ScriptActivityOutcome = "succeeded" | "failed";
@@ -135,12 +147,15 @@ export function createBrowserHostEntry(
   source: HostBoundarySource,
   profileSource?: ProfileStoreSource,
   recoverySource?: ProfileRecoverySource,
+  runtimeSource?: BrowserRuntimeSource,
 ) {
   let workerLease: { dispose(): Promise<void> } | undefined;
   let retainedBoundary: HostAdministrationBoundary | undefined;
   let retainedProfiles: BrowserProfileStore | undefined;
   let retainedRecovery: BrowserProfileRecovery | undefined;
   let retainedOutbox: ActivityOutbox | undefined;
+  let retainedRuntime: BrowserInstanceRuntime | undefined =
+    typeof runtimeSource === "object" ? runtimeSource : undefined;
   function administration(dataDir: string) {
     if (retainedBoundary !== undefined) return retainedBoundary;
     const boundary = typeof source === "function" ? source(dataDir) : source;
@@ -156,9 +171,37 @@ export function createBrowserHostEntry(
   function profileLifecycle(dataDir: string): BrowserProfileLifecycleBoundary {
     return {
       async stopProfile(hostId, profileId) {
-        await administration(dataDir).stopProfile({ hostId, profileId });
+        try {
+          await runtime(dataDir)?.stop({ hostId, profileId });
+        } finally {
+          await administration(dataDir).stopProfile({ hostId, profileId });
+        }
       },
     };
+  }
+  function runtime(dataDir: string) {
+    if (retainedRuntime !== undefined) return retainedRuntime;
+    if (runtimeSource === undefined) return undefined;
+    retainedRuntime =
+      typeof runtimeSource === "function"
+        ? runtimeSource(dataDir)
+        : runtimeSource;
+    return retainedRuntime;
+  }
+  async function disposeRuntime() {
+    const current = retainedRuntime;
+    retainedRuntime = undefined;
+    await current?.dispose();
+  }
+  async function runInstallationLifecycle(
+    action: "disable" | "uninstall",
+    request: Parameters<HostAdministrationBoundary["disable"]>[0],
+    dataDir: string,
+  ) {
+    if (request.confirmation === STOP_BROWSER_CONFIRMATION) {
+      await disposeRuntime();
+    }
+    return administration(dataDir)[action](request);
   }
   function profiles(dataDir: string) {
     if (retainedProfiles !== undefined) return retainedProfiles;
@@ -203,6 +246,38 @@ export function createBrowserHostEntry(
           : recoverySource;
     return retainedRecovery;
   }
+  async function navigateBrowser(
+    request: BrowserNavigationRequest,
+    dataDir: string,
+  ) {
+    const target = { hostId: request.hostId, profileId: request.profileId };
+    const readiness = await administration(dataDir).inspect(target);
+    if (readiness.state !== "healthy") throw new Error(readiness.message);
+    const inventory = await profiles(dataDir).listProfiles(request.hostId);
+    const profile = inventory.profiles.find(
+      (candidate) =>
+        candidate.profileId === request.profileId &&
+        candidate.state === "active",
+    );
+    if (profile === undefined) {
+      throw new Error("The requested Browser Profile is unavailable.");
+    }
+    const browserRuntime = runtime(dataDir);
+    if (browserRuntime === undefined) {
+      throw new Error("The Workspace Browser runtime is unavailable.");
+    }
+    return browserRuntime.navigate(
+      {
+        ...target,
+        projectId: request.projectId,
+        ...(request.tabId === undefined ? {} : { tabId: request.tabId }),
+        loopbackMode: request.rawLocalhost ? "raw-localhost" : "project-alias",
+        locale: profile.locale,
+        timezone: profile.timezone,
+      },
+      request.input,
+    );
+  }
   function retainWorker(context: {
     experimental_retainWorker(): { dispose(): Promise<void> };
   }) {
@@ -240,16 +315,20 @@ export function createBrowserHostEntry(
           return response;
         })();
       },
-      disable: (request, context) => {
+      disable: async (request, context) => {
         retainWorker(context);
-        return administration(context.experimental_paths.dataDir).disable(
+        return runInstallationLifecycle(
+          "disable",
           request,
+          context.experimental_paths.dataDir,
         );
       },
-      uninstall: (request, context) => {
+      uninstall: async (request, context) => {
         retainWorker(context);
-        return administration(context.experimental_paths.dataDir).uninstall(
+        return runInstallationLifecycle(
+          "uninstall",
           request,
+          context.experimental_paths.dataDir,
         );
       },
       purgePlan: (target, context) => {
@@ -282,16 +361,36 @@ export function createBrowserHostEntry(
           const inventory = await profiles(dataDir).listProfiles(
             request.hostId,
           );
-          if (
-            !inventory.profiles.some(
-              (profile) =>
-                profile.profileId === request.profileId &&
-                profile.state === "active",
-            )
-          ) {
+          const profile = inventory.profiles.find(
+            (candidate) =>
+              candidate.profileId === request.profileId &&
+              candidate.state === "active",
+          );
+          if (profile === undefined) {
             response = {
               ok: false as const,
               error: browserProfileUnavailableStatus(target),
+            };
+            return response;
+          }
+          const browserRuntime = runtime(dataDir);
+          if (browserRuntime !== undefined) {
+            response = {
+              ok: true as const,
+              result: await browserRuntime.execute(
+                {
+                  hostId: request.hostId,
+                  profileId: request.profileId,
+                  projectId: request.projectId,
+                  ...(request.tabId === undefined
+                    ? {}
+                    : { tabId: request.tabId }),
+                  locale: profile.locale,
+                  timezone: profile.timezone,
+                },
+                request.code,
+                request.timeoutMs,
+              ),
             };
             return response;
           }
@@ -311,6 +410,10 @@ export function createBrowserHostEntry(
             startedAt,
           );
         }
+      },
+      navigate: async (request, context) => {
+        retainWorker(context);
+        return navigateBrowser(request, context.experimental_paths.dataDir);
       },
       activityOutbox: async ({ limit }, context) => {
         retainWorker(context);
@@ -427,9 +530,32 @@ export function createBrowserHostEntry(
         return recovery(dataDir).importDevBrowserProfile(request);
       },
     },
-    dispose: async () => workerLease?.dispose(),
+    dispose: async () => {
+      try {
+        await disposeRuntime();
+      } finally {
+        await workerLease?.dispose();
+      }
+    },
   });
 }
+
+const require = createRequire(import.meta.url);
+const devBrowserPackageDirectory = dirname(
+  require.resolve("dev-browser/package.json"),
+);
+const devBrowserExecutable = join(
+  devBrowserPackageDirectory,
+  "bin",
+  "dev-browser.js",
+);
+const playwrightChromiumSetupSource = join(
+  process.env.PLAYWRIGHT_BROWSERS_PATH ??
+    join(homedir(), ".cache", "ms-playwright"),
+  `chromium-${PINNED_BROWSER_RUNTIME.chromiumRevision}`,
+  "chrome-linux64",
+  "chrome",
+);
 
 export default createBrowserHostEntry(
   (dataDir) =>
@@ -440,6 +566,7 @@ export default createBrowserHostEntry(
       installationId: hostInstallationId(dataDir),
       executor: createProductionPrivilegedExecutor(),
       stateStore: createFileHostAdministrationStateStore(dataDir),
+      fallbackSourcePath: playwrightChromiumSetupSource,
     }),
   (dataDir, lifecycle) =>
     createFileBrowserProfileStore({
@@ -465,5 +592,18 @@ export default createBrowserHostEntry(
         isDevBrowserProfileStopped: unverifiedDevBrowserProfileIsStopped,
       },
       ownership: createBrowserUserProfileOwnershipBoundary(),
+    }),
+  (dataDir) =>
+    createBrowserInstanceRuntime({
+      rootDirectory: BROWSER_STORAGE_ROOT,
+      installationId: hostInstallationId(dataDir),
+      chromeStablePaths: [
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/google-chrome",
+      ],
+      launchBoundary: createProductionBrowserProcessBoundary({
+        devBrowserExecutable,
+        devBrowserPackageDirectory,
+      }),
     }),
 );

@@ -18,7 +18,7 @@ describe("Browser package contract", () => {
         host: "./host.ts",
         skills: ["skills"],
       },
-      dependencies: { "dev-browser": "0.2.9" },
+      dependencies: { "dev-browser": "0.2.9", playwright: "1.58.2" },
       devDependencies: { "@get-bb/plugin-sdk": "0.4.21" },
     });
     expect(skill).toMatch(/^---\nname: browser\n/);
@@ -33,6 +33,7 @@ describe("Browser package contract", () => {
         /^@get-bb\/plugin-sdk\/testing(?:\/(?:app|host))?$/,
         /^@testing-library\/react$/,
         /^better-sqlite3$/,
+        /^playwright$/,
         /^react$/,
         /^typescript-eslint$/,
         /^vitest$/,

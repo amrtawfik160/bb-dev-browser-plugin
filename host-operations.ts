@@ -1,7 +1,16 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rename,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { promisify } from "node:util";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { z } from "zod";
 import {
   BROWSER_CONFIGURATION_ROOT,
@@ -24,6 +33,8 @@ import {
   type SetupStepId,
 } from "./contracts.js";
 import type { HostReadinessBoundary } from "./readiness.js";
+import { fallbackBrowserPaths } from "./browser-fallback.js";
+import { PINNED_BROWSER_RUNTIME } from "./dependency-inventory.js";
 
 export const BROWSER_USER = "bb-browser";
 export const BROWSER_USER_HOME = BROWSER_STORAGE_ROOT;
@@ -105,6 +116,12 @@ export type PrivilegedOperation =
       installationId: string;
       hostId: string;
       confirmation: string;
+      fallback: {
+        sourcePath: string;
+        directory: string;
+        executablePath: string;
+        manifestPath: string;
+      };
     }
   | {
       kind: "stop-profile-processes";
@@ -250,6 +267,115 @@ function ownedProcessStopArguments() {
   return ["--signal", "TERM", "--uid", BROWSER_USER, "--full", ".*"];
 }
 
+async function installConfigurationFile(
+  run: ExecuteFile,
+  sourcePath: string,
+  targetPath: string,
+) {
+  await run("/usr/bin/install", [
+    "-m",
+    "0600",
+    "-o",
+    BROWSER_USER,
+    "-g",
+    BROWSER_USER,
+    sourcePath,
+    targetPath,
+  ]);
+}
+
+async function installOwnedDirectory(run: ExecuteFile, path: string) {
+  await run("/usr/bin/install", [
+    "-d",
+    "-m",
+    "0700",
+    "-o",
+    BROWSER_USER,
+    "-g",
+    BROWSER_USER,
+    path,
+  ]);
+}
+
+async function installFallbackExecutable(
+  run: ExecuteFile,
+  fallback: Extract<
+    PrivilegedOperation,
+    { kind: "configure-protected-storage" }
+  >["fallback"],
+) {
+  await run("/usr/bin/install", [
+    "-m",
+    "0755",
+    "-o",
+    BROWSER_USER,
+    "-g",
+    BROWSER_USER,
+    fallback.sourcePath,
+    fallback.executablePath,
+  ]);
+}
+
+async function writeSetupEvidence(
+  directory: string,
+  operation: Extract<
+    PrivilegedOperation,
+    { kind: "configure-protected-storage" }
+  >,
+) {
+  const executable = await readFile(operation.fallback.sourcePath);
+  const hostStatePath = join(directory, "host-state.json");
+  const manifestPath = join(directory, "version.json");
+  await writeFile(
+    hostStatePath,
+    JSON.stringify({
+      schemaVersion: 1,
+      installationId: operation.installationId,
+      hostId: operation.hostId,
+    }),
+  );
+  await writeFile(
+    manifestPath,
+    JSON.stringify({
+      ...PINNED_BROWSER_RUNTIME,
+      executableSha256: createHash("sha256").update(executable).digest("hex"),
+    }),
+  );
+  return { hostStatePath, manifestPath };
+}
+
+async function configureProtectedStorage(
+  run: ExecuteFile,
+  operation: Extract<
+    PrivilegedOperation,
+    { kind: "configure-protected-storage" }
+  >,
+) {
+  for (const directory of [operation.path, operation.fallback.directory]) {
+    await installOwnedDirectory(run, directory);
+  }
+  await installFallbackExecutable(run, operation.fallback);
+  const temporaryDirectory = await mkdtemp(join(tmpdir(), "bb-browser-setup-"));
+  try {
+    const { hostStatePath, manifestPath } = await writeSetupEvidence(
+      temporaryDirectory,
+      operation,
+    );
+    await installConfigurationFile(
+      run,
+      hostStatePath,
+      join(operation.path, "host-state.json"),
+    );
+    await installConfigurationFile(
+      run,
+      manifestPath,
+      operation.fallback.manifestPath,
+    );
+  } finally {
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  }
+}
+
 async function executeProductionOperation(
   run: ExecuteFile,
   operation: PrivilegedOperation,
@@ -259,6 +385,9 @@ async function executeProductionOperation(
   }
   if (operation.kind === "stop-owned-processes") {
     return stopMatchingProcesses(run, ownedProcessStopArguments());
+  }
+  if (operation.kind === "configure-protected-storage") {
+    return configureProtectedStorage(run, operation);
   }
   throw new Error(
     `Production Browser privileged execution is not configured for ${operation.kind}.`,
@@ -542,8 +671,10 @@ function configureProtectedStorageOperation(
   target: BrowserHostTarget,
   installationId: string,
   confirmation: string,
+  fallbackSourcePath: string,
 ): PrivilegedOperation {
   const paths = browserInstallationPaths(installationId, target.hostId);
+  const fallback = fallbackBrowserPaths(paths.hostStoragePath);
   return {
     kind: "configure-protected-storage",
     path: paths.hostStoragePath,
@@ -552,6 +683,7 @@ function configureProtectedStorageOperation(
     installationId,
     hostId: target.hostId,
     confirmation,
+    fallback: { sourcePath: fallbackSourcePath, ...fallback },
   };
 }
 
@@ -560,6 +692,7 @@ function setupOperation(
   target: BrowserHostTarget,
   installationId: string,
   confirmation: string,
+  fallbackSourcePath: string,
 ): PrivilegedOperation {
   if (stepId === "dedicated-user") {
     return createDedicatedUserOperation(confirmation);
@@ -571,6 +704,7 @@ function setupOperation(
     target,
     installationId,
     confirmation,
+    fallbackSourcePath,
   );
 }
 
@@ -850,6 +984,7 @@ export interface HostAdministrationOptions {
   installationId: string;
   executor: PrivilegedExecutor;
   stateStore?: HostAdministrationStateStore;
+  fallbackSourcePath?: string;
 }
 
 interface HostAdministrationRuntime {
@@ -858,6 +993,7 @@ interface HostAdministrationRuntime {
   executor: PrivilegedExecutor;
   stateStore: HostAdministrationStateStore;
   mutationQueues: Map<string, Promise<void>>;
+  fallbackSourcePath: string;
 }
 
 async function withHostMutationLock<T>(
@@ -979,6 +1115,7 @@ async function executeSetupStep(
         target,
         runtime.installationId,
         request.confirmation,
+        runtime.fallbackSourcePath,
       ),
     );
   } catch (error) {
@@ -1264,6 +1401,9 @@ function createAdministrationRuntime(
     stateStore:
       options.stateStore ?? createMemoryHostAdministrationStateStore(),
     mutationQueues: new Map(),
+    fallbackSourcePath:
+      options.fallbackSourcePath ??
+      `/playwright/chromium-${PINNED_BROWSER_RUNTIME.chromiumRevision}/chrome`,
   };
 }
 

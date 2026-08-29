@@ -276,6 +276,38 @@ describe("Browser public plugin contract", () => {
     await browser.dispose();
   });
 
+  it("routes owner address-field navigation from the Browser Panel to the host", async () => {
+    const browser = await createPublicPluginHarness({
+      status: healthyStatus,
+      navigationResponse: {
+        address: {
+          kind: "address",
+          url: "http://p-project.localhost:4173/account",
+        },
+        location: { url: "http://p-project.localhost:4173/account" },
+        tabId: "shared-tab-1",
+      },
+    });
+    const panel = await browser.openExistingThreadPanel();
+    const address = await panel.panel.findByLabelText("Address or search");
+
+    fireEvent.change(address, { target: { value: "localhost:4173/account" } });
+    fireEvent.click(panel.panel.getByRole("button", { name: "Go" }));
+
+    await waitFor(() => expect(browser.navigationRequests).toHaveLength(1));
+    expect(browser.navigationRequests[0]).toMatchObject({
+      hostId: "host-browser-test",
+      profileId: DEFAULT_PROFILE_ID,
+      projectId: "project-browser-test",
+      input: "localhost:4173/account",
+      rawLocalhost: false,
+    });
+    expect(
+      await panel.panel.findByText("http://p-project.localhost:4173/account"),
+    ).toBeTruthy();
+    await browser.dispose();
+  });
+
   it("opens one full-bleed Setup required panel per profile on an existing thread", async () => {
     const browser = await createPublicPluginHarness();
 

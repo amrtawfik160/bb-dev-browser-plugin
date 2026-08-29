@@ -205,7 +205,7 @@ async function browserUserOwner(
     !Number.isSafeInteger(uid) ||
     uid <= 0 ||
     !Number.isSafeInteger(gid) ||
-    gid < 0
+    gid <= 0
   ) {
     throw new Error("The bb-browser system user is not configured.");
   }

@@ -288,6 +288,26 @@ describe("Workspace Browser host readiness contract", () => {
     await host.experimental_dispose();
   });
 
+  it("rejects a dedicated browser identity with root group membership", async () => {
+    const fixture = await createRealProbeFixture();
+    await writeFile(
+      fixture.paths.passwd,
+      "bb-browser:x:1001:0::/var/lib/bb-browser:/usr/sbin/nologin\n",
+    );
+    const host = createRealProbeHost(fixture);
+    try {
+      const status = await host.experimental_call("status", target);
+      expect(
+        status.capabilities.find(
+          (capability) => capability.id === "dedicated-user",
+        ),
+      ).toMatchObject({ status: "failed" });
+    } finally {
+      await host.experimental_dispose();
+      await fixture.cleanup();
+    }
+  });
+
   it("classifies low disk headroom as Repair required", async () => {
     const host = experimental_createHostEntryHarness(
       createBrowserHostEntry(
@@ -432,6 +452,8 @@ describe("Workspace Browser host readiness contract", () => {
         playwrightVersion: "1.58.2",
         chromiumRevision: "1208",
         chromiumVersion: "145.0.7632.6",
+        executableSha256:
+          "6f1af2dfc4d7f16dacf404b1f6c9fd4a65cfffb8edde6dcf957463a0e41fb1ed",
       }),
       expectedState: "healthy",
       expectedCapability: "ready",
@@ -442,6 +464,8 @@ describe("Workspace Browser host readiness contract", () => {
         playwrightVersion: "1.57.0",
         chromiumRevision: "1194",
         chromiumVersion: "143.0.7499.4",
+        executableSha256:
+          "6f1af2dfc4d7f16dacf404b1f6c9fd4a65cfffb8edde6dcf957463a0e41fb1ed",
       }),
       expectedState: "repair-required",
       expectedCapability: "failed",
@@ -465,7 +489,10 @@ describe("Workspace Browser host readiness contract", () => {
       await mkdir(fallbackDirectory, { recursive: true });
       await writeFile(join(fallbackDirectory, "chrome"), "fixture executable");
       await chmod(join(fallbackDirectory, "chrome"), 0o755);
+      await chown(join(fallbackDirectory, "chrome"), 1001, 1001);
       await writeFile(join(fallbackDirectory, "version.json"), versionEvidence);
+      await chmod(join(fallbackDirectory, "version.json"), 0o600);
+      await chown(join(fallbackDirectory, "version.json"), 1001, 1001);
       const host = createRealProbeHost(fixture);
 
       try {
