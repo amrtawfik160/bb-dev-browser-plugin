@@ -1,6 +1,6 @@
 # `bb browser` CLI reference
 
-Every command below is the exact surface registered in `server.ts` and was
+Every command below is the exact surface handled in `server.ts` and was
 verified against the source. The plugin namespace is `browser`. Flag names are
 not interchangeable — for example, `transfer` uses `--environment <id>
 --path <relative-path>`, not `--source`/`--environment-root`.
