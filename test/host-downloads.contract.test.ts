@@ -175,12 +175,10 @@ function createFakeFilesystem(
 
 const OWNER = {
   actor: "owner" as const,
-  fileTransferGranted: false,
   leaseActive: false,
 };
 const AGENT_AUTHORIZED = {
   actor: "agent" as const,
-  fileTransferGranted: true,
   leaseActive: true,
 };
 
@@ -225,7 +223,6 @@ async function stageDownload(
     suggestedName: overrides.suggestedName ?? "report.pdf",
     contentType: "application/pdf",
     totalBytes: overrides.totalBytes ?? PAYLOAD.byteLength,
-    sourceOrigin: null,
   });
   if (start.outcome !== "quarantined")
     throw new Error(`start failed: ${JSON.stringify(start)}`);
@@ -288,7 +285,6 @@ describe("Host Downloads quarantine", () => {
       suggestedName: "big.bin",
       contentType: null,
       totalBytes: 2048,
-      sourceOrigin: null,
     });
     expect(response.outcome).toBe("rejected");
     if (response.outcome === "rejected")
@@ -313,7 +309,6 @@ describe("Host Downloads quarantine", () => {
       suggestedName: "third.pdf",
       contentType: null,
       totalBytes: PAYLOAD.byteLength,
-      sourceOrigin: null,
     });
     expect(response.outcome).toBe("rejected");
     if (response.outcome === "rejected")
@@ -329,7 +324,6 @@ describe("Host Downloads quarantine", () => {
       suggestedName: "low.bin",
       contentType: null,
       totalBytes: 100,
-      sourceOrigin: null,
     });
     expect(response.outcome).toBe("rejected");
     if (response.outcome === "rejected")
@@ -344,7 +338,6 @@ describe("Host Downloads quarantine", () => {
       suggestedName: "race.bin",
       contentType: null,
       totalBytes: null,
-      sourceOrigin: null,
     });
     expect(start.outcome).toBe("quarantined");
     const chunk = new Uint8Array(512);
@@ -368,15 +361,34 @@ describe("Host Downloads quarantine", () => {
     expect(manager.size()).toBe(0);
   });
 
-  it("cleans up on an interrupted (failed) download", async () => {
+  it("cleans up on an interrupted (failed) download and reports the real outcome", async () => {
     const { fake, manager } = setup();
     const id = await stageDownload(manager, { downloadId: "fail" });
     expect(fake.has("/q/p1/fail.pdf")).toBe(false);
     void id;
-    await manager.failDownload({
+    const failed = await manager.failDownload({
       hostId: "h1",
       downloadId: "fail",
       reason: "network reset",
+    });
+    // S1 (issue #20 findings): the fail outcome carries the real result —
+    // `failed`, the owning profile, and `removed: 1` — not a fabricated purge.
+    expect(failed).toEqual({
+      outcome: "failed",
+      downloadId: "fail",
+      profileId: "p1",
+      removed: 1,
+    });
+    const missing = await manager.failDownload({
+      hostId: "h1",
+      downloadId: "absent",
+      reason: "already gone",
+    });
+    expect(missing).toEqual({
+      outcome: "missing",
+      downloadId: "absent",
+      profileId: null,
+      removed: 0,
     });
     expect(manager.size()).toBe(0);
   });
@@ -463,19 +475,19 @@ describe("Host Downloads export", () => {
     }
   });
 
-  it("requires the file-transfer grant for agent client export", async () => {
+  it("requires an active Control Lease for agent client export", async () => {
     const { manager } = setup();
     const id = await stageDownload(manager);
     const outcome = await manager.exportToClient(
       { hostId: "h1", downloadId: id },
-      { actor: "agent", fileTransferGranted: false, leaseActive: true },
+      { actor: "agent", leaseActive: false },
     );
     expect(outcome.outcome).toBe("rejected");
     if (outcome.outcome === "rejected")
       expect(outcome.reason).toBe("unauthorized");
   });
 
-  it("authorizes agent client export with grant and lease", async () => {
+  it("authorizes agent client export with an active Control Lease", async () => {
     const { manager } = setup();
     const id = await stageDownload(manager);
     const outcome = await manager.exportToClient(
@@ -570,7 +582,7 @@ describe("Host Downloads export", () => {
     }
   });
 
-  it("requires the file-transfer grant for agent workspace export", async () => {
+  it("requires an active Control Lease for agent workspace export", async () => {
     const { fake, manager } = setup();
     fake.put("/env", { kind: "directory", mtimeNs: 1_000_000n });
     const id = await stageDownload(manager);
@@ -581,7 +593,7 @@ describe("Host Downloads export", () => {
         environmentRoot: "/env",
         relativePath: "out/report.pdf",
       },
-      { actor: "agent", fileTransferGranted: false, leaseActive: true },
+      { actor: "agent", leaseActive: false },
       "/env",
     );
     expect(outcome.outcome).toBe("rejected");
@@ -597,7 +609,6 @@ describe("Host Downloads export", () => {
       suggestedName: "partial.bin",
       contentType: null,
       totalBytes: 10,
-      sourceOrigin: null,
     });
     expect(start.outcome).toBe("quarantined");
     const outcome = await manager.exportToClient(
@@ -636,7 +647,6 @@ describe("Host Downloads limits", () => {
       suggestedName: "bounded.bin",
       contentType: null,
       totalBytes: 700,
-      sourceOrigin: null,
     });
     expect(response.outcome).toBe("rejected");
     if (response.outcome === "rejected")
@@ -680,7 +690,6 @@ describe("Host Downloads listing and progress", () => {
       suggestedName: "live.bin",
       contentType: null,
       totalBytes: 100,
-      sourceOrigin: null,
     });
     const progress = manager.progress("live");
     expect(progress).toMatchObject({
@@ -693,24 +702,34 @@ describe("Host Downloads listing and progress", () => {
 });
 
 describe("Host Downloads authorization", () => {
-  it("authorizes owner export without a grant or lease", () => {
+  it("authorizes owner export without a lease", () => {
     expect(
       authorizeDownloadExport({
         actor: "owner",
-        fileTransferGranted: false,
         leaseActive: false,
       }),
     ).toEqual({ authorized: true });
   });
 
-  it("requires the file-transfer grant for agent export", () => {
+  it("requires an active Control Lease for agent export", () => {
+    // S2 (issue #20 findings): the host layer enforces the real Control Lease
+    // for agent exports. The file-transfer grant is the single authoritative
+    // gate in browser-service (the only layer with grant-store access); the
+    // host cannot verify grants, so it does not fabricate them — it enforces
+    // the lease it owns. A direct host-RPC caller without a real lease is
+    // denied, never unconditionally authorized.
     expect(
       authorizeDownloadExport({
         actor: "agent",
-        fileTransferGranted: false,
+        leaseActive: false,
+      }),
+    ).toEqual({ authorized: false, reason: "control-lease-required" });
+    expect(
+      authorizeDownloadExport({
+        actor: "agent",
         leaseActive: true,
       }),
-    ).toEqual({ authorized: false, reason: "file-transfer-grant-required" });
+    ).toEqual({ authorized: true });
   });
 
   it("fails closed resolving the quarantine root without a data directory", () => {

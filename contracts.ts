@@ -2465,12 +2465,6 @@ export const browserDownloadStartRequestSchema = z
     contentType: z.string().min(1).max(200).nullable(),
     /** Declared total bytes when known; null when unknown (streamed). */
     totalBytes: z.number().int().nonnegative().nullable(),
-    /**
-     * Metadata-only source web origin (scheme://host:port). Recorded only for
-     * quarantine metadata; never the full URL and never retained in Activity
-     * Records.
-     */
-    sourceOrigin: browserActivityOriginSchema.nullable(),
   })
   .strict();
 export type BrowserDownloadStartRequest = z.infer<
@@ -2519,6 +2513,25 @@ export const browserDownloadFailInputSchema = z
   .strict();
 export type BrowserDownloadFailInput = z.infer<
   typeof browserDownloadFailInputSchema
+>;
+
+/**
+ * Outcome of failing a quarantined download (issue #20 findings, S1). Carries
+ * the real result from the manager — not a fabricated purge outcome. A
+ * `failed` outcome removes the quarantine file (`removed: 1`) and reports the
+ * owning profile; a `missing` outcome reports `removed: 0` and `profileId:
+ * null` because no record existed to clean up.
+ */
+export const browserDownloadFailOutcomeSchema = z
+  .object({
+    outcome: z.enum(["failed", "missing"]),
+    downloadId: z.string().min(1).max(120),
+    profileId: z.string().min(1).max(120).nullable(),
+    removed: z.number().int().min(0).max(1),
+  })
+  .strict();
+export type BrowserDownloadFailOutcome = z.infer<
+  typeof browserDownloadFailOutcomeSchema
 >;
 
 export const browserDownloadCancelInputSchema = z
@@ -3061,7 +3074,7 @@ export const rpcContract = defineRpcContract({
   },
   browser_download_fail: {
     input: browserDownloadFailInputSchema,
-    output: browserDownloadPurgeOutcomeSchema,
+    output: browserDownloadFailOutcomeSchema,
   },
   browser_download_cancel: {
     input: browserDownloadCancelInputSchema,

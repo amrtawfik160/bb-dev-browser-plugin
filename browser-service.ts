@@ -109,6 +109,7 @@ import {
   type BrowserDownloadCompleteInput,
   type BrowserDownloadCompleteOutcome,
   type BrowserDownloadFailInput,
+  type BrowserDownloadFailOutcome,
   type BrowserDownloadCancelInput,
   type BrowserDownloadCancelOutcome,
   type BrowserDownloadListInput,
@@ -2745,7 +2746,7 @@ export function createBrowserService(
   async function downloadFail(
     input: BrowserDownloadFailInput,
     signal?: AbortSignal,
-  ): Promise<BrowserDownloadPurgeOutcome> {
+  ): Promise<BrowserDownloadFailOutcome> {
     await requireConnectedHost(input.hostId, signal);
     return host.call("downloadFail", input, { hostId: input.hostId, signal });
   }

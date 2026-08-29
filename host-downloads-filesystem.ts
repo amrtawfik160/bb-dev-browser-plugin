@@ -45,7 +45,12 @@ export function createNodeHostDownloadsFilesystem(): HostDownloadFilesystem {
     writeFile: (path, data, mode) =>
       writeFile(path, data, { mode, flag: "wx" }).then(() => undefined),
     appendFile: (path, data) =>
-      appendFile(path, data, { flag: "ax" }).then(() => undefined),
+      // Append to the existing quarantine file created by `startDownload`
+      // ("wx"). "ax" (exclusive append) would fail with EEXIST because the
+      // file already exists, so a streaming download could never append. Use
+      // "a" so chunks append to the quarantine file (creating it only if it
+      // was never started, which startDownload prevents).
+      appendFile(path, data, { flag: "a" }).then(() => undefined),
     readFile: (path) => readFile(path).then((buf) => new Uint8Array(buf)),
     mkdir: (path, mode) =>
       mkdir(path, { recursive: true, mode }).then(() => undefined),

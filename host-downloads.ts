@@ -8,7 +8,6 @@ import {
   BROWSER_DOWNLOAD_MAX_PROFILE_BYTES_LIMIT,
   BROWSER_DOWNLOAD_MIN_LIMIT_BYTES,
   BROWSER_DOWNLOAD_TTL_MS,
-  type BrowserActivityOrigin,
   type BrowserDownloadAppendInput,
   type BrowserDownloadAppendOutcome,
   type BrowserDownloadCancelInput,
@@ -20,6 +19,7 @@ import {
   type BrowserDownloadExportOutcome,
   type BrowserDownloadExportWorkspaceInput,
   type BrowserDownloadFailInput,
+  type BrowserDownloadFailOutcome,
   type BrowserDownloadListInput,
   type BrowserDownloadListResult,
   type BrowserDownloadListingEntry,
@@ -36,7 +36,6 @@ import {
 } from "./contracts.js";
 import type { TransferStagingStat } from "./transfer-staging.js";
 export type { TransferStagingStat };
-import { authorizeFileTransfer } from "./transfer-staging.js";
 import { createLowDiskGuard } from "./quarantine-guards.js";
 
 /**
@@ -106,7 +105,6 @@ type DownloadRecord = {
   contentType: string | null;
   totalBytes: number | null;
   bytesDownloaded: number;
-  sourceOrigin: BrowserActivityOrigin | null;
   quarantinePath: string;
   createdAt: number;
   expiresAt: number;
@@ -116,7 +114,11 @@ type DownloadRecord = {
 
 export interface HostDownloadExportAuthorization {
   actor: BrowserDownloadExportActor;
-  fileTransferGranted: boolean;
+  /**
+   * Real, host-verified Control Lease state. The host owns the Control Lease
+   * manager, so it computes this from real state — it never trusts the caller
+   * for it (issue #20 findings, S2).
+   */
   leaseActive: boolean;
 }
 
@@ -200,20 +202,32 @@ export function resolveHostDownloadsRoot(dataDirectory: string | undefined) {
 }
 
 /**
- * Decide whether `actor` may export a quarantined download. The owner always
- * may because the owner already holds the browser; an agent additionally
- * needs the file-transfer elevated grant and an active Control Lease. Reuses
- * the shared {@link authorizeFileTransfer} decision so export authorization
- * stays consistent with Transfer Staging.
+ * Decide whether `actor` may export a quarantined download at the host
+ * layer. The owner always may because the owner already holds the browser; an
+ * agent additionally needs an active Control Lease. The host owns the Control
+ * Lease manager, so it passes the REAL lease state here — never a fabricated
+ * `true` (issue #20 findings, S2).
+ *
+ * The file-transfer elevated grant is NOT enforced at this layer. The host
+ * worker has no access to the grant store (it lives in the server-side browser
+ * service, the only layer with grant-store access), so the host cannot verify
+ * grants without fabricating them. The grant remains the single authoritative
+ * gate in `authorizeAgentDownloadExport` (browser-service), which checks both
+ * the grant and the lease before the host is ever called. Enforcing the real
+ * lease here means a direct host-RPC caller claiming `actor: "agent"` without
+ * a real active Control Lease is denied — it never gets unconditional
+ * authorization.
  */
 export function authorizeDownloadExport(
   authorization: HostDownloadExportAuthorization,
 ): BrowserFileTransferDecision {
-  return authorizeFileTransfer({
-    actor: authorization.actor,
-    fileTransferGranted: authorization.fileTransferGranted,
-    leaseActive: authorization.leaseActive,
-  });
+  if (authorization.actor === "owner") {
+    return { authorized: true };
+  }
+  if (!authorization.leaseActive) {
+    return { authorized: false, reason: "control-lease-required" };
+  }
+  return { authorized: true };
 }
 
 export function createHostDownloadsManager(options: HostDownloadsOptions) {
@@ -399,7 +413,6 @@ export function createHostDownloadsManager(options: HostDownloadsOptions) {
       contentType: request.contentType,
       totalBytes: request.totalBytes,
       bytesDownloaded: 0,
-      sourceOrigin: request.sourceOrigin,
       quarantinePath: path,
       createdAt: now,
       expiresAt: now + limits.expiryMs,
@@ -553,19 +566,35 @@ export function createHostDownloadsManager(options: HostDownloadsOptions) {
 
   /**
    * Fail a download: clean up the quarantine file and mark the record failed.
-   * Called on an interrupted download or a host-reported failure.
+   * Called on an interrupted download or a host-reported failure. Returns the
+   * real outcome (issue #20 findings, S1) — `failed` with the owning profile
+   * and `removed: 1` when a record existed, `missing` with `removed: 0` and
+   * `profileId: null` otherwise. Never fabricates a purge outcome.
    */
   async function failDownload(
     input: BrowserDownloadFailInput,
-  ): Promise<{ outcome: "failed" | "missing" }> {
+  ): Promise<BrowserDownloadFailOutcome> {
     const record = downloads.get(input.downloadId);
-    if (record === undefined) return { outcome: "missing" };
+    if (record === undefined) {
+      return {
+        outcome: "missing",
+        downloadId: input.downloadId,
+        profileId: null,
+        removed: 0,
+      };
+    }
+    const profileId = record.profileId;
     record.phase = "failed";
     record.error = input.reason;
     await removeDownload(record);
     downloads.delete(record.downloadId);
     byProfileName.delete(`${record.profileId}\u0000${record.safeName}`);
-    return { outcome: "failed" };
+    return {
+      outcome: "failed",
+      downloadId: input.downloadId,
+      profileId,
+      removed: 1,
+    };
   }
 
   /**
@@ -655,41 +684,63 @@ export function createHostDownloadsManager(options: HostDownloadsOptions) {
   }
 
   /**
+   * Shared export preamble (issue #20 findings, S5): assert the manager is
+   * open, authorize the actor against the real Control Lease, look up the
+   * quarantine record, and verify it is in an exportable phase. Returns the
+   * resolved record when the export may proceed, or a rejection outcome
+   * otherwise. Both `exportToClient` and `exportToWorkspace` route through
+   * this so the authorize → get → phase-check sequence stays identical.
+   */
+  function resolveExportable(
+    downloadId: string,
+    authorization: HostDownloadExportAuthorization,
+  ): { record: DownloadRecord } | { rejection: BrowserDownloadExportOutcome } {
+    assertOpen();
+    const decision = authorizeDownloadExport(authorization);
+    if (!decision.authorized) {
+      return {
+        rejection: rejection(
+          downloadId,
+          "unauthorized",
+          "Agent export requires an active Control Lease.",
+        ),
+      };
+    }
+    const record = downloads.get(downloadId);
+    if (record === undefined) {
+      return {
+        rejection: rejection(
+          downloadId,
+          "not-found",
+          "The download is not in quarantine.",
+        ),
+      };
+    }
+    if (record.phase !== "quarantined" && record.phase !== "exported") {
+      return {
+        rejection: rejection(
+          downloadId,
+          "failed",
+          "Only a completed download may be exported.",
+        ),
+      };
+    }
+    return { record };
+  }
+
+  /**
    * Export a quarantined download to the displaying client. The bytes leave
    * quarantine only on this explicit owner decision; the quarantine file
-   * remains for later expiry or deletion. Agent export requires the
-   * file-transfer grant and an active Control Lease.
+   * remains for later expiry or deletion. Agent export requires an active
+   * Control Lease (the file-transfer grant is enforced by browser-service).
    */
   async function exportToClient(
     input: BrowserDownloadExportClientInput,
     authorization: HostDownloadExportAuthorization,
   ): Promise<BrowserDownloadExportOutcome> {
-    assertOpen();
-    const decision = authorizeDownloadExport(authorization);
-    if (!decision.authorized) {
-      return rejection(
-        input.downloadId,
-        "unauthorized",
-        decision.reason === "file-transfer-grant-required"
-          ? "Agent export requires the file-transfer grant."
-          : "Agent export requires an active Control Lease.",
-      );
-    }
-    const record = downloads.get(input.downloadId);
-    if (record === undefined) {
-      return rejection(
-        input.downloadId,
-        "not-found",
-        "The download is not in quarantine.",
-      );
-    }
-    if (record.phase !== "quarantined" && record.phase !== "exported") {
-      return rejection(
-        input.downloadId,
-        "failed",
-        "Only a completed download may be exported.",
-      );
-    }
+    const resolved = resolveExportable(input.downloadId, authorization);
+    if ("rejection" in resolved) return resolved.rejection;
+    const record = resolved.record;
     const data = await readQuarantineBytes(record);
     if (data === null) {
       return rejection(
@@ -714,40 +765,18 @@ export function createHostDownloadsManager(options: HostDownloadsOptions) {
    * Export a quarantined download into the workspace environment. The target
    * resolves through BB's environment file API and must remain inside the
    * environment after realpath resolution; an existing target requires a
-   * separate overwrite confirmation, and agent export requires the
-   * file-transfer grant. The quarantine file remains for later expiry.
+   * separate overwrite confirmation, and agent export requires an active
+   * Control Lease (the file-transfer grant is enforced by browser-service).
+   * The quarantine file remains for later expiry.
    */
   async function exportToWorkspace(
     input: BrowserDownloadExportWorkspaceInput,
     authorization: HostDownloadExportAuthorization,
     environmentRoot: string,
   ): Promise<BrowserDownloadExportOutcome> {
-    assertOpen();
-    const decision = authorizeDownloadExport(authorization);
-    if (!decision.authorized) {
-      return rejection(
-        input.downloadId,
-        "unauthorized",
-        decision.reason === "file-transfer-grant-required"
-          ? "Agent export requires the file-transfer grant."
-          : "Agent export requires an active Control Lease.",
-      );
-    }
-    const record = downloads.get(input.downloadId);
-    if (record === undefined) {
-      return rejection(
-        input.downloadId,
-        "not-found",
-        "The download is not in quarantine.",
-      );
-    }
-    if (record.phase !== "quarantined" && record.phase !== "exported") {
-      return rejection(
-        input.downloadId,
-        "failed",
-        "Only a completed download may be exported.",
-      );
-    }
+    const resolved = resolveExportable(input.downloadId, authorization);
+    if ("rejection" in resolved) return resolved.rejection;
+    const record = resolved.record;
     let resolvedRoot: string;
     try {
       resolvedRoot = await filesystem.realpath(environmentRoot);

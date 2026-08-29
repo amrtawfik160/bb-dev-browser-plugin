@@ -56,6 +56,27 @@ import {
   BROWSER_DOWNLOAD_MAX_PROFILE_BYTES,
   BROWSER_DOWNLOAD_TTL_MS,
   type BrowserDownloadExportActor,
+  type BrowserDownloadStartInput,
+  type BrowserDownloadStartResponse,
+  type BrowserDownloadAppendInput,
+  type BrowserDownloadAppendOutcome,
+  type BrowserDownloadCompleteInput,
+  type BrowserDownloadCompleteOutcome,
+  type BrowserDownloadFailInput,
+  type BrowserDownloadFailOutcome,
+  type BrowserDownloadCancelInput,
+  type BrowserDownloadCancelOutcome,
+  type BrowserDownloadListInput,
+  type BrowserDownloadListResult,
+  type BrowserDownloadLimits,
+  type BrowserDownloadLimitsInput,
+  type BrowserDownloadTargetInput,
+  type BrowserDownloadProgressResult,
+  type BrowserDownloadExportClientInput,
+  type BrowserDownloadExportWorkspaceInput,
+  type BrowserDownloadExportOutcome,
+  type BrowserDownloadPurgeInput,
+  type BrowserDownloadPurgeOutcome,
 } from "./contracts.js";
 import { createPanelCapabilityStore } from "./panel-capability.js";
 import { createPanelGatewayPool } from "./panel-gateway-pool.js";
@@ -131,23 +152,156 @@ function controlLeaseKey(target: { hostId: string; profileId: string }) {
 }
 
 /**
- * Host-side export authorization. Browser-service is the real gate for agent
- * exports (file-transfer grant + Control Lease, matching Transfer Staging);
- * the host passes an owner-equivalent authorization for owners and a
- * fully-authorized agent authorization for agents that already passed the
- * browser-service gate so the manager's authorization path is exercised.
+ * Host-side export authorization (issue #20 findings, S2). The host owns the
+ * Control Lease manager, so it computes the REAL lease state for the
+ * actor/profile and never fabricates it. The file-transfer elevated grant is
+ * NOT computed here: the host worker has no access to the grant store (it
+ * lives in the server-side browser service, the only layer with grant-store
+ * access), so the host cannot verify grants without fabricating them. The
+ * grant remains the single authoritative gate in browser-service's
+ * `authorizeAgentDownloadExport`, which checks grant + lease before the host
+ * is ever called. By enforcing the real lease here, a direct host-RPC caller
+ * claiming `actor: "agent"` without a real active Control Lease is denied —
+ * it never gets unconditional authorization.
  */
-function downloadAuthorization(request: {
-  actor?: BrowserDownloadExportActor;
-}): {
+function downloadAuthorization(
+  request: {
+    hostId: string;
+    profileId?: string;
+    actor?: BrowserDownloadExportActor;
+  },
+  controlLeases: ControlLeaseManager,
+): {
   actor: BrowserDownloadExportActor;
-  fileTransferGranted: boolean;
   leaseActive: boolean;
 } {
-  if (request.actor === "agent") {
-    return { actor: "agent", fileTransferGranted: true, leaseActive: true };
+  const actor = request.actor ?? "owner";
+  if (actor === "owner") {
+    return { actor: "owner", leaseActive: false };
   }
-  return { actor: "owner", fileTransferGranted: false, leaseActive: false };
+  const key = controlLeaseKey({
+    hostId: request.hostId,
+    profileId: request.profileId ?? DEFAULT_PROFILE_ID,
+  });
+  const lease = controlLeases.state(key);
+  return { actor: "agent", leaseActive: lease !== undefined };
+}
+
+/**
+ * Non-provisioned-host fallback (issue #20 findings, S6). Every `download*`
+ * host handler fails closed when Host Downloads is not provisioned (the host
+ * data directory is absent and the quarantine manager cannot be constructed).
+ * Rather than repeat the fallback literal in ~11 handlers, they route through
+ * this single helper, which returns the privacy-safe, schema-valid default for
+ * the operation: a `rejected`/`missing` outcome for mutating RPCs, an empty
+ * listing with the documented default limits for `downloadList`, the default
+ * limits for `downloadLimits`, `null` for `downloadProgress`, a `missing`
+ * fail outcome with `removed: 0`, and a no-op `purged` outcome for
+ * `downloadPurge`. The host is never mutated in any of these paths.
+ */
+function downloadNotProvisionedFallback(
+  operation: "start",
+  request: BrowserDownloadStartInput,
+): BrowserDownloadStartResponse;
+function downloadNotProvisionedFallback(
+  operation: "append",
+  request: BrowserDownloadAppendInput,
+): BrowserDownloadAppendOutcome;
+function downloadNotProvisionedFallback(
+  operation: "complete",
+  request: BrowserDownloadCompleteInput,
+): BrowserDownloadCompleteOutcome;
+function downloadNotProvisionedFallback(
+  operation: "fail",
+  request: BrowserDownloadFailInput,
+): BrowserDownloadFailOutcome;
+function downloadNotProvisionedFallback(
+  operation: "cancel",
+  request: BrowserDownloadCancelInput,
+): BrowserDownloadCancelOutcome;
+function downloadNotProvisionedFallback(
+  operation: "list",
+  request: BrowserDownloadListInput,
+): BrowserDownloadListResult;
+function downloadNotProvisionedFallback(
+  operation: "limits",
+  request: BrowserDownloadLimitsInput,
+): BrowserDownloadLimits;
+function downloadNotProvisionedFallback(
+  operation: "progress",
+  request: BrowserDownloadTargetInput,
+): BrowserDownloadProgressResult;
+function downloadNotProvisionedFallback(
+  operation: "exportClient" | "exportWorkspace",
+  request:
+    BrowserDownloadExportClientInput | BrowserDownloadExportWorkspaceInput,
+): BrowserDownloadExportOutcome;
+function downloadNotProvisionedFallback(
+  operation: "purge",
+  request: BrowserDownloadPurgeInput,
+): BrowserDownloadPurgeOutcome;
+function downloadNotProvisionedFallback(
+  operation: string,
+  request: { downloadId?: string; profileId?: string | null },
+): unknown {
+  const downloadId = request.downloadId ?? "";
+  switch (operation) {
+    case "start":
+      return {
+        outcome: "rejected",
+        downloadId,
+        reason: "low-disk",
+        message:
+          "The host data directory is not provisioned for Host Downloads.",
+      };
+    case "append":
+      return {
+        outcome: "rejected",
+        downloadId,
+        reason: "not-found",
+        message: "Host Downloads is not provisioned.",
+      };
+    case "complete":
+      return { outcome: "missing", downloadId };
+    case "fail":
+      return { outcome: "missing", downloadId, profileId: null, removed: 0 };
+    case "cancel":
+      return { outcome: "missing", downloadId };
+    case "list":
+      return {
+        downloads: [],
+        limits: {
+          maxFileBytes: BROWSER_DOWNLOAD_MAX_FILE_BYTES,
+          maxProfileBytes: BROWSER_DOWNLOAD_MAX_PROFILE_BYTES,
+          expiryMs: BROWSER_DOWNLOAD_TTL_MS,
+        },
+        freeSpaceBytes: null,
+      };
+    case "limits":
+      return {
+        maxFileBytes: BROWSER_DOWNLOAD_MAX_FILE_BYTES,
+        maxProfileBytes: BROWSER_DOWNLOAD_MAX_PROFILE_BYTES,
+        expiryMs: BROWSER_DOWNLOAD_TTL_MS,
+      };
+    case "progress":
+      return null;
+    case "exportClient":
+    case "exportWorkspace":
+      return {
+        outcome: "rejected",
+        downloadId,
+        reason: "not-found",
+        message: "Host Downloads is not provisioned.",
+      };
+    case "purge":
+      return {
+        outcome: "purged",
+        profileId: request.profileId ?? null,
+        removed: 0,
+      };
+    default:
+      throw new Error(`Unknown download fallback operation: ${operation}`);
+  }
 }
 
 function scriptRuntimeErrorCode(
@@ -322,6 +476,21 @@ async function recordExpiredProfiles(
  * captures the actor, authorization context, host/profile, destination, and
  * outcome, never file contents, full URLs, page data, or clipboard data. The
  * destination is `client` or `workspace`; no web destination origin applies.
+ *
+ * P4 (issue #20 findings): exports are the only in-scope security outcome
+ * recorded for Host Downloads, so this remains the single download Activity
+ * Record. Quarantine rejections (a download blocked from entering quarantine,
+ * so no data ever crossed the trust boundary), cancellations (the owner
+ * removing their own quarantined data before export), and purges (profile
+ * lifecycle cleanup that destroys quarantined data in place) are intentionally
+ * NOT recorded: none of these events move quarantined data across the trust
+ * boundary — data either never enters quarantine, or is destroyed on the host
+ * without leaving it. Recording them would require a new `download` Activity
+ * kind and a database schema migration (a table rebuild of
+ * `browser_activity_records`), which is out of scope for this findings fix;
+ * the export record is sufficient to audit the security-relevant moment when
+ * quarantined bytes leave the host. Revisit if rejection/cancellation/purge
+ * auditing becomes a compliance requirement.
  */
 async function recordDownloadExport(
   outbox: ActivityOutbox,
@@ -1041,14 +1210,28 @@ export function createBrowserHostEntry(
         subscribeDownloads: (onUpdate) => {
           // Push the live quarantine listing to the panel so it observes
           // progress, state, limits, expiry, and errors (issue #20).
+          //
+          // S7 (issue #20 findings): the listing is refreshed by polling on a
+          // one-second interval rather than by event-driven emission on every
+          // manager state change. The manager has no internal pub/sub and is
+          // shared across panels; wiring per-change emissions (start/append/
+          // complete/fail/cancel/expire/purge/export) would add cross-cutting
+          // state-change hooks for a bounded, low-frequency listing, so the
+          // cheaper polling approach is kept here. P1 (issue #20 findings):
+          // each emit first reaps time-expired downloads so time-based expiry
+          // of a live quarantined download actually fires while a panel is
+          // observing — without waiting for a profile lifecycle event.
           const manager = hostDownloads(dataDir);
           if (manager === null) return () => undefined;
           const emit = () => {
             void manager
-              .listDownloads({
-                hostId: request.hostId,
-                profileId: request.profileId,
-              })
+              .expire()
+              .then(() =>
+                manager.listDownloads({
+                  hostId: request.hostId,
+                  profileId: request.profileId,
+                }),
+              )
               .then(onUpdate)
               .catch(() => undefined);
           };
@@ -1676,13 +1859,7 @@ export function createBrowserHostEntry(
         const dataDir = context.experimental_paths.dataDir;
         const manager = hostDownloads(dataDir);
         if (manager === null) {
-          return {
-            outcome: "rejected" as const,
-            downloadId: request.downloadId,
-            reason: "low-disk" as const,
-            message:
-              "The host data directory is not provisioned for Host Downloads.",
-          };
+          return downloadNotProvisionedFallback("start", request);
         }
         const { hostId: _hostId, ...startRequest } = request;
         void _hostId;
@@ -1693,12 +1870,7 @@ export function createBrowserHostEntry(
         const dataDir = context.experimental_paths.dataDir;
         const manager = hostDownloads(dataDir);
         if (manager === null) {
-          return {
-            outcome: "rejected" as const,
-            downloadId: request.downloadId,
-            reason: "not-found" as const,
-            message: "Host Downloads is not provisioned.",
-          };
+          return downloadNotProvisionedFallback("append", request);
         }
         return manager.appendChunk(request);
       },
@@ -1707,10 +1879,7 @@ export function createBrowserHostEntry(
         const dataDir = context.experimental_paths.dataDir;
         const manager = hostDownloads(dataDir);
         if (manager === null) {
-          return {
-            outcome: "missing" as const,
-            downloadId: request.downloadId,
-          };
+          return downloadNotProvisionedFallback("complete", request);
         }
         return manager.completeDownload(request);
       },
@@ -1719,24 +1888,16 @@ export function createBrowserHostEntry(
         const dataDir = context.experimental_paths.dataDir;
         const manager = hostDownloads(dataDir);
         if (manager === null) {
-          return {
-            outcome: "purged" as const,
-            profileId: null,
-            removed: 0,
-          };
+          return downloadNotProvisionedFallback("fail", request);
         }
-        await manager.failDownload(request);
-        return { outcome: "purged" as const, profileId: null, removed: 0 };
+        return manager.failDownload(request);
       },
       downloadCancel: async (request, context) => {
         retainWorker(context);
         const dataDir = context.experimental_paths.dataDir;
         const manager = hostDownloads(dataDir);
         if (manager === null) {
-          return {
-            outcome: "missing" as const,
-            downloadId: request.downloadId,
-          };
+          return downloadNotProvisionedFallback("cancel", request);
         }
         return manager.cancelDownload(request);
       },
@@ -1745,16 +1906,9 @@ export function createBrowserHostEntry(
         const dataDir = context.experimental_paths.dataDir;
         const manager = hostDownloads(dataDir);
         if (manager === null) {
-          return {
-            downloads: [],
-            limits: {
-              maxFileBytes: BROWSER_DOWNLOAD_MAX_FILE_BYTES,
-              maxProfileBytes: BROWSER_DOWNLOAD_MAX_PROFILE_BYTES,
-              expiryMs: BROWSER_DOWNLOAD_TTL_MS,
-            },
-            freeSpaceBytes: null,
-          };
+          return downloadNotProvisionedFallback("list", request);
         }
+        await manager.expire().catch(() => undefined);
         return manager.listDownloads(request);
       },
       downloadLimits: async (request, context) => {
@@ -1762,11 +1916,7 @@ export function createBrowserHostEntry(
         const dataDir = context.experimental_paths.dataDir;
         const manager = hostDownloads(dataDir);
         if (manager === null) {
-          return {
-            maxFileBytes: BROWSER_DOWNLOAD_MAX_FILE_BYTES,
-            maxProfileBytes: BROWSER_DOWNLOAD_MAX_PROFILE_BYTES,
-            expiryMs: BROWSER_DOWNLOAD_TTL_MS,
-          };
+          return downloadNotProvisionedFallback("limits", request);
         }
         return manager.configureLimits(request);
       },
@@ -1774,7 +1924,9 @@ export function createBrowserHostEntry(
         retainWorker(context);
         const dataDir = context.experimental_paths.dataDir;
         const manager = hostDownloads(dataDir);
-        if (manager === null) return null;
+        if (manager === null) {
+          return downloadNotProvisionedFallback("progress", request);
+        }
         return manager.progress(request.downloadId) ?? null;
       },
       downloadExportClient: async (request, context) => {
@@ -1782,16 +1934,11 @@ export function createBrowserHostEntry(
         const dataDir = context.experimental_paths.dataDir;
         const manager = hostDownloads(dataDir);
         if (manager === null) {
-          return {
-            outcome: "rejected" as const,
-            downloadId: request.downloadId,
-            reason: "not-found" as const,
-            message: "Host Downloads is not provisioned.",
-          };
+          return downloadNotProvisionedFallback("exportClient", request);
         }
         const result = await manager.exportToClient(
           request,
-          downloadAuthorization(request),
+          downloadAuthorization(request, controlLeases),
         );
         await recordDownloadExport(outbox(dataDir), {
           hostId: request.hostId,
@@ -1807,16 +1954,11 @@ export function createBrowserHostEntry(
         const dataDir = context.experimental_paths.dataDir;
         const manager = hostDownloads(dataDir);
         if (manager === null) {
-          return {
-            outcome: "rejected" as const,
-            downloadId: request.downloadId,
-            reason: "not-found" as const,
-            message: "Host Downloads is not provisioned.",
-          };
+          return downloadNotProvisionedFallback("exportWorkspace", request);
         }
         const result = await manager.exportToWorkspace(
           request,
-          downloadAuthorization(request),
+          downloadAuthorization(request, controlLeases),
           request.environmentRoot,
         );
         await recordDownloadExport(outbox(dataDir), {
@@ -1833,11 +1975,7 @@ export function createBrowserHostEntry(
         const dataDir = context.experimental_paths.dataDir;
         const manager = hostDownloads(dataDir);
         if (manager === null) {
-          return {
-            outcome: "purged" as const,
-            profileId: request.profileId ?? null,
-            removed: 0,
-          };
+          return downloadNotProvisionedFallback("purge", request);
         }
         return manager.purge(request);
       },

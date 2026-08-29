@@ -67,6 +67,7 @@ import {
   browserDownloadCompleteInputSchema,
   browserDownloadCompleteOutcomeSchema,
   browserDownloadFailInputSchema,
+  browserDownloadFailOutcomeSchema,
   browserDownloadCancelInputSchema,
   browserDownloadCancelOutcomeSchema,
   browserDownloadListInputSchema,
@@ -257,7 +258,7 @@ export const browserHostContract = defineRpcContract({
   },
   downloadFail: {
     input: browserDownloadFailInputSchema,
-    output: browserDownloadPurgeOutcomeSchema,
+    output: browserDownloadFailOutcomeSchema,
   },
   downloadCancel: {
     input: browserDownloadCancelInputSchema,

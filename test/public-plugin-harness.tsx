@@ -102,6 +102,7 @@ import {
   browserDownloadProgressResultSchema,
   browserDownloadExportOutcomeSchema,
   browserDownloadPurgeOutcomeSchema,
+  browserDownloadFailOutcomeSchema,
   DEFAULT_PROFILE_ID,
   setupRequiredStatus,
   type BrowserHostTarget,
@@ -1267,7 +1268,7 @@ export async function createPublicPluginHarness(options?: {
       backend.harness.behavior.callRpc(
         "browser_download_fail",
         input,
-      ) as Promise<ReturnType<typeof browserDownloadPurgeOutcomeSchema.parse>>,
+      ) as Promise<ReturnType<typeof browserDownloadFailOutcomeSchema.parse>>,
     browser_download_cancel: (
       input: Parameters<
         typeof rpcContract.browser_download_cancel.input.parse

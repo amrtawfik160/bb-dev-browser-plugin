@@ -6,6 +6,8 @@ import {
   BROWSER_PANEL_TEXT_CONTRAST,
   type BrowserContextAction,
   type BrowserDialogEvent,
+  type BrowserDownloadListingEntry,
+  type BrowserDownloadLimits,
 } from "./contracts.js";
 
 /**
@@ -317,5 +319,123 @@ export function PanelContextMenu({
         </p>
       )}
     </div>
+  );
+}
+
+/**
+ * Host Downloads quarantine surface (issue #20). A pure, SDK-free
+ * presentational component so the export control, cancellation, state, and
+ * error display can be unit tested without the plugin app host. Exports go
+ * through callbacks wired to the server RPCs in app.tsx; cancellation is
+ * low-latency over the panel transport.
+ */
+export function PanelDownloadsSurface({
+  downloads,
+  limits,
+  isController,
+  exportState,
+  onCancel,
+  onExportClient,
+}: {
+  downloads: (BrowserDownloadListingEntry & { error?: string | null })[];
+  limits: BrowserDownloadLimits | null;
+  isController: boolean;
+  exportState: {
+    /** DownloadId currently being exported, if any. */
+    inFlightDownloadId: string | null;
+    /** Privacy-safe error message for the last export, if it failed. */
+    error: string | null;
+  };
+  onCancel: (downloadId: string) => void;
+  onExportClient: (downloadId: string) => void;
+}) {
+  return (
+    <section
+      aria-label="Browser Host Downloads quarantine"
+      className="mt-4 text-left"
+    >
+      <h3 className="text-sm font-medium">Host Downloads</h3>
+      <p className="mt-1 text-xs text-muted-foreground">
+        Downloads are quarantined on the workspace host and never opened or
+        exported automatically. Export is an explicit owner decision.
+      </p>
+      {limits === null ? null : (
+        <p className="mt-1 text-xs text-muted-foreground">
+          Limits: {Math.round(limits.maxFileBytes / (1024 * 1024))} MiB/file ·{" "}
+          {Math.round(limits.maxProfileBytes / (1024 * 1024 * 1024))}{" "}
+          GiB/profile · expires after{" "}
+          {Math.round(limits.expiryMs / (24 * 60 * 60_000))} days.
+        </p>
+      )}
+      {exportState.error === null ? null : (
+        <p role="alert" className="mt-1 text-xs text-red-600">
+          {exportState.error}
+        </p>
+      )}
+      {downloads.length === 0 ? (
+        <p className="mt-2 text-xs text-muted-foreground">
+          No quarantined downloads.
+        </p>
+      ) : (
+        <ul className="mt-2 space-y-2">
+          {downloads.map((download) => {
+            return (
+              <li
+                key={download.downloadId}
+                className="rounded border p-2 text-xs"
+              >
+                <div className="flex flex-wrap items-baseline justify-between gap-2">
+                  <strong className="break-all">{download.safeName}</strong>
+                  <span aria-label="Download quarantine state">
+                    {download.phase}
+                  </span>
+                </div>
+                <div className="mt-1 text-muted-foreground">
+                  {download.sizeBytes}
+                  {download.totalBytes === null
+                    ? " bytes"
+                    : `/${download.totalBytes} bytes`}{" "}
+                  · expires {new Date(download.expiresAt).toLocaleString()}
+                  {download.contentType === null
+                    ? ""
+                    : ` · ${download.contentType}`}
+                </div>
+                {download.error === null ||
+                download.error === undefined ? null : (
+                  <p role="alert" className="mt-1 text-red-600">
+                    {download.error}
+                  </p>
+                )}
+                <div className="mt-2 flex flex-wrap gap-2">
+                  {download.phase === "downloading" && isController ? (
+                    <button
+                      type="button"
+                      className="rounded border px-2 py-1"
+                      onClick={() => onCancel(download.downloadId)}
+                    >
+                      Cancel download
+                    </button>
+                  ) : null}
+                  {download.phase === "quarantined" && isController ? (
+                    <button
+                      type="button"
+                      className="rounded border px-2 py-1"
+                      disabled={
+                        exportState.inFlightDownloadId === download.downloadId
+                      }
+                      onClick={() => onExportClient(download.downloadId)}
+                    >
+                      {exportState.inFlightDownloadId === download.downloadId
+                        ? "Exporting…"
+                        : "Export to client"}
+                    </button>
+                  ) : null}
+                </div>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </section>
   );
 }

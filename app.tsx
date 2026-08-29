@@ -44,6 +44,7 @@ import {
 import {
   PanelDialogLayer,
   PanelContextMenu,
+  PanelDownloadsSurface,
   usePrefersReducedMotion,
   isBbGlobalShortcut,
 } from "./panel-chrome.js";
@@ -237,99 +238,6 @@ function PanelGrantRequestNotices({
   );
 }
 
-/**
- * Host Downloads quarantine surface (issue #20). Surfaces progress,
- * quarantine state, limits, expiry, and cancellation from privacy-safe
- * metadata only — never file contents, full URLs, page data, or clipboard
- * data. Exports go through the server RPC; cancellation is low-latency over
- * the panel transport.
- */
-function PanelDownloadsSurface({
-  downloads,
-  limits,
-  isController,
-  onCancel,
-}: {
-  downloads: (BrowserDownloadListingEntry & { error?: string | null })[];
-  limits: BrowserDownloadLimits | null;
-  isController: boolean;
-  onCancel: (downloadId: string) => void;
-}) {
-  return (
-    <section
-      aria-label="Browser Host Downloads quarantine"
-      className="mt-4 text-left"
-    >
-      <h3 className="text-sm font-medium">Host Downloads</h3>
-      <p className="mt-1 text-xs text-muted-foreground">
-        Downloads are quarantined on the workspace host and never opened or
-        exported automatically. Export is an explicit owner decision.
-      </p>
-      {limits === null ? null : (
-        <p className="mt-1 text-xs text-muted-foreground">
-          Limits: {Math.round(limits.maxFileBytes / (1024 * 1024))} MiB/file ·{" "}
-          {Math.round(limits.maxProfileBytes / (1024 * 1024 * 1024))}{" "}
-          GiB/profile · expires after{" "}
-          {Math.round(limits.expiryMs / (24 * 60 * 60_000))} days.
-        </p>
-      )}
-      {downloads.length === 0 ? (
-        <p className="mt-2 text-xs text-muted-foreground">
-          No quarantined downloads.
-        </p>
-      ) : (
-        <ul className="mt-2 space-y-2">
-          {downloads.map((download) => (
-            <li
-              key={download.downloadId}
-              className="rounded border p-2 text-xs"
-            >
-              <div className="flex flex-wrap items-baseline justify-between gap-2">
-                <strong className="break-all">{download.safeName}</strong>
-                <span aria-label="Download quarantine state">
-                  {download.phase}
-                </span>
-              </div>
-              <div className="mt-1 text-muted-foreground">
-                {download.sizeBytes}
-                {download.totalBytes === null
-                  ? " bytes"
-                  : `/${download.totalBytes} bytes`}{" "}
-                · expires {new Date(download.expiresAt).toLocaleString()}
-                {download.contentType === null
-                  ? ""
-                  : ` · ${download.contentType}`}
-              </div>
-              {download.error === null ||
-              download.error === undefined ? null : (
-                <p role="alert" className="mt-1 text-red-600">
-                  {download.error}
-                </p>
-              )}
-              <div className="mt-2 flex gap-2">
-                {download.phase === "downloading" && isController ? (
-                  <button
-                    type="button"
-                    className="rounded border px-2 py-1"
-                    onClick={() => onCancel(download.downloadId)}
-                  >
-                    Cancel download
-                  </button>
-                ) : null}
-                {download.phase === "quarantined" ? (
-                  <span className="text-muted-foreground">
-                    Export from the Downloads drawer (client or workspace).
-                  </span>
-                ) : null}
-              </div>
-            </li>
-          ))}
-        </ul>
-      )}
-    </section>
-  );
-}
-
 function PanelStreamSurface({
   status,
   panelId,
@@ -375,8 +283,16 @@ function PanelStreamSurface({
   >([]);
   const [downloadsLimits, setDownloadsLimits] =
     useState<BrowserDownloadLimits | null>(null);
-  const [downloadError, setDownloadError] = useState<string | null>(null);
-  void downloadError;
+  // The per-download error is surfaced inline in the listing (download.error).
+  // There is no separate top-level download-error state (issue #20 findings,
+  // S4): the previous downloadError state was dead — set but never displayed.
+  // P2 (issue #20 findings): export control state. An in-flight download
+  // disables its export button; an export failure is shown briefly above the
+  // listing.
+  const [exportInFlightDownloadId, setExportInFlightDownloadId] = useState<
+    string | null
+  >(null);
+  const [exportError, setExportError] = useState<string | null>(null);
   // The deterministic test environment has no real BB Connect tunnel; opening a
   // WebSocket there would attempt a real network call. The stream is exercised
   // against the provisioned host through the real-browser integration suite.
@@ -567,17 +483,6 @@ function PanelStreamSurface({
           }
           return;
         }
-        if (message.type === "download_ack") {
-          const payload = message as {
-            downloadId?: string;
-            action?: string;
-          };
-          // Clear a transient cancellation error on acknowledgement.
-          if (payload.action === "cancelled") {
-            setDownloadError(null);
-          }
-          return;
-        }
         if (message.type === "control") {
           // The host pushed the live shared control state and tab strip; derive
           // this panel's own role from the panel list so the surface updates
@@ -701,6 +606,63 @@ function PanelStreamSurface({
     sendStream({ type: "download_cancel", downloadId });
   }
 
+  /**
+   * P2 (issue #20 findings): export a quarantined download to the displaying
+   * client through the existing server RPC. The bytes leave quarantine only on
+   * this explicit owner decision and are saved in the browser as a download.
+   */
+  async function exportDownloadToClient(downloadId: string) {
+    if (!isController || status.hostId === null) return;
+    setExportError(null);
+    setExportInFlightDownloadId(downloadId);
+    try {
+      const outcome = await rpc.call("browser_download_export_client", {
+        hostId: status.hostId,
+        downloadId,
+        ...(status.profileId === undefined
+          ? {}
+          : { profileId: status.profileId }),
+      });
+      if (outcome.outcome !== "exported") {
+        setExportError(
+          outcome.outcome === "rejected"
+            ? `Export rejected: ${outcome.reason}.`
+            : "Export failed.",
+        );
+        return;
+      }
+      saveExportedBytes(outcome.safeName, outcome.contentType, outcome.data);
+    } catch (error) {
+      setExportError(error instanceof Error ? error.message : "Export failed.");
+    } finally {
+      setExportInFlightDownloadId(null);
+    }
+  }
+
+  /**
+   * Save the exported client bytes as a browser download so the owner receives
+   * the file. Privacy-safe: the bytes are the owner's own quarantined file.
+   */
+  function saveExportedBytes(
+    safeName: string,
+    contentType: string | null | undefined,
+    data: string | undefined,
+  ) {
+    if (data === undefined) return;
+    const bytes = new Uint8Array(Buffer.from(data, "base64"));
+    const blob = new Blob([bytes], {
+      type: contentType === null ? undefined : (contentType ?? undefined),
+    });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = safeName;
+    document.body.appendChild(anchor);
+    anchor.click();
+    document.body.removeChild(anchor);
+    URL.revokeObjectURL(url);
+  }
+
   if (capability?.outcome === "issued") {
     return (
       <section
@@ -758,7 +720,12 @@ function PanelStreamSurface({
           downloads={downloads}
           limits={downloadsLimits}
           isController={isController}
+          exportState={{
+            inFlightDownloadId: exportInFlightDownloadId,
+            error: exportError,
+          }}
           onCancel={cancelDownload}
+          onExportClient={exportDownloadToClient}
         />
       </section>
     );
