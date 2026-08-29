@@ -158,6 +158,18 @@ export type BrowserInstance = {
   automationEndpoint: string;
 };
 
+/**
+ * A page in the runtime's shared tab inventory. The runtime id is stable for
+ * the life of the instance; `openerTabId` is present when the runtime reports a
+ * popup so the host can normalize it into the shared tab strip.
+ */
+export type RuntimeBrowserPage = {
+  id: string;
+  url: string;
+  title: string;
+  openerTabId: string | null;
+};
+
 export type BrowserRepairDiagnostics = {
   crashCount: number;
   windowMs: number;
@@ -949,6 +961,38 @@ function activeTabId(activeTabOutput: unknown) {
   return active.id;
 }
 
+const pageInventoryScript = `console.log(JSON.stringify(await browser.listPages()));`;
+
+/**
+ * Parse the runtime's page inventory script output into a list of pages. Each
+ * entry carries its runtime id, url, and optional title/opener so the host can
+ * feed the shared tab strip and normalize popups.
+ */
+function parsePageInventory(raw: unknown): Array<{
+  id: string;
+  url: string;
+  title?: unknown;
+  openerTabId?: unknown;
+}> {
+  const text = typeof raw === "string" ? raw : String(raw);
+  const parsed = JSON.parse(text) as unknown;
+  if (!Array.isArray(parsed)) return [];
+  return parsed
+    .filter(
+      (entry): entry is Record<string, unknown> =>
+        typeof entry === "object" &&
+        entry !== null &&
+        typeof entry.id === "string" &&
+        typeof entry.url === "string",
+    )
+    .map((entry) => ({
+      id: entry.id as string,
+      url: entry.url as string,
+      title: entry.title,
+      openerTabId: entry.openerTabId,
+    }));
+}
+
 /**
  * Extract the page URL from a history-navigation script's JSON output. The
  * script prints `{ tabId, url }`; the location response is that JSON string.
@@ -1697,6 +1741,41 @@ ${codeForTarget}`;
       } finally {
         operationSignal.dispose();
       }
+    },
+    /**
+     * List the runtime's shared page inventory so the host can feed the shared
+     * tab strip from real browser state. Runtime tab ids are stable for the
+     * life of the instance. `openerTabId` is reported for popup pages when the
+     * runtime can detect the opener, so the host can normalize popups into the
+     * strip.
+     */
+    async listPages(
+      target: Pick<BrowserRuntimeTarget, "hostId" | "profileId">,
+    ): Promise<RuntimeBrowserPage[]> {
+      // listPages runs after an operation that already started the instance, so
+      // heldInstance returns the running start without relaunching; the locale
+      // and timezone are only used for a fresh launch, which does not happen here.
+      const held = await heldInstance({
+        hostId: target.hostId,
+        profileId: target.profileId,
+        locale: "en-US",
+        timezone: "UTC",
+      });
+      const key = runtimeKey(target);
+      noteActivity(key, held);
+      const raw = assertBrowserScriptResultWithinBounds(
+        await options.launchBoundary.execute(
+          executionRequest(held, target.profileId, pageInventoryScript, 30_000),
+        ),
+      );
+      const parsed = parsePageInventory(raw);
+      return parsed.map((page) => ({
+        id: String(page.id),
+        url: String(page.url),
+        title: typeof page.title === "string" ? page.title : "",
+        openerTabId:
+          typeof page.openerTabId === "string" ? page.openerTabId : null,
+      }));
     },
     async dispose() {
       disposed = true;

@@ -1421,6 +1421,7 @@ export default function plugin(bb: BbPluginApi) {
     browser_panel_control: (input) => browser.panelControl(input),
     browser_panel_take_control: (input) => browser.takeControl(input),
     browser_panel_release_control: (input) => browser.releaseControl(input),
+    browser_panel_reclaim_control: (input) => browser.reclaimControl(input),
     browser_settings_status: (input) =>
       browser.settingsStatuses(input.profileId),
     browser_diagnostics: (input) => browser.diagnostics(input),

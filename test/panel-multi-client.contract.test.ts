@@ -169,6 +169,106 @@ describe("Browser Panel multi-client control (issue #16)", () => {
     await browser.dispose();
   });
 
+  it("lets two owner sessions share one controller and both observe a transfer", async () => {
+    const browser = await createPublicPluginHarness({ status: healthyStatus });
+    // Two owner sessions open panels for the same profile; the first is the
+    // controller and the second is view-only, but both observe the shared state.
+    await browser.runBrowserPanelControl({
+      ...target(),
+      panelId: "panel-a",
+      ownerSessionId: "session-owner-1",
+    });
+    const second = await browser.runBrowserPanelControl({
+      ...target(),
+      panelId: "panel-b",
+      ownerSessionId: "session-owner-2",
+    });
+    expect(second.role).toBe("spectator");
+    expect(second.control.panels).toHaveLength(2);
+
+    const transferred = await browser.runBrowserTakeControl({
+      ...target(),
+      panelId: "panel-b",
+      ownerSessionId: "session-owner-2",
+    });
+    expect(transferred.role).toBe("controller");
+
+    // The first owner session observes the transfer through the shared state.
+    const firstObserved = await browser.runBrowserPanelControl({
+      ...target(),
+      panelId: "panel-a",
+      ownerSessionId: "session-owner-1",
+    });
+    expect(firstObserved.role).toBe("spectator");
+    expect(firstObserved.control.controllerPanelId).toBe("panel-b");
+    await browser.dispose();
+  });
+
+  it("drives layout from the controller viewport and keeps spectators from resizing it", async () => {
+    const browser = await createPublicPluginHarness({ status: healthyStatus });
+    // The first panel becomes the controller and its viewport drives layout.
+    const first = await browser.runBrowserPanelControl({
+      ...target(),
+      panelId: "panel-a",
+      ownerSessionId: "session-a",
+      viewport: { width: 1280, height: 720 },
+    });
+    expect(first.control.controllerViewport).toEqual({
+      width: 1280,
+      height: 720,
+    });
+    // A second panel connects with a different viewport but is a spectator.
+    const second = await browser.runBrowserPanelControl({
+      ...target(),
+      panelId: "panel-b",
+      ownerSessionId: "session-b",
+      viewport: { width: 800, height: 600 },
+    });
+    expect(second.role).toBe("spectator");
+    // The spectator's own viewport is recorded for its letterbox, not the page.
+    const spectatorEntry = second.control.panels.find(
+      (panel) => panel.panelId === "panel-b",
+    );
+    expect(spectatorEntry?.viewport).toEqual({ width: 800, height: 600 });
+    // The shared controller viewport is unchanged by the spectator connecting.
+    expect(second.control.controllerViewport).toEqual({
+      width: 1280,
+      height: 720,
+    });
+    // Transferring control carries the new controller's viewport to every panel.
+    const transferred = await browser.runBrowserTakeControl({
+      ...target(),
+      panelId: "panel-b",
+      ownerSessionId: "session-b",
+      viewport: { width: 1600, height: 900 },
+    });
+    expect(transferred.control.controllerViewport).toEqual({
+      width: 1600,
+      height: 900,
+    });
+    await browser.dispose();
+  });
+
+  it("does not re-grant input on reclaim without an active reclaim window", async () => {
+    const browser = await createPublicPluginHarness({ status: healthyStatus });
+    await browser.runBrowserPanelControl({
+      ...target(),
+      panelId: "panel-a",
+      ownerSessionId: "session-a",
+    });
+    // A spectator with no disconnect/reclaim window that calls reclaim stays
+    // view-only; reclaim only re-grants input within the 10-second window after
+    // a controller disconnect.
+    const reclaim = await browser.runBrowserReclaimControl({
+      ...target(),
+      panelId: "panel-b",
+      ownerSessionId: "session-b",
+    });
+    expect(reclaim.role).toBe("spectator");
+    expect(reclaim.control.controllerPanelId).toBe("panel-a");
+    await browser.dispose();
+  });
+
   it("renders the control surface and Take control control on the panel", async () => {
     const browser = await createPublicPluginHarness({ status: healthyStatus });
     const panel = await browser.openExistingThreadPanel();

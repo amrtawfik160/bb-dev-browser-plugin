@@ -1781,6 +1781,12 @@ export const browserPanelClientSchema = z
       width: z.number().int().positive(),
       height: z.number().int().positive(),
     }),
+    /**
+     * Deadline (clock ms) until which this panel may reclaim control after a
+     * disconnect, or null when it has no reclaim window. A spectator with an
+     * unexpired deadline must reclaim explicitly to regain input.
+     */
+    reclaimUntil: z.number().int().nullable(),
   })
   .strict();
 
@@ -1842,6 +1848,17 @@ export const browserPanelTakeControlRequestSchema =
   browserPanelControlRequestSchema;
 export type BrowserPanelTakeControlRequest = z.infer<
   typeof browserPanelTakeControlRequestSchema
+>;
+
+/**
+ * A disconnected controller reclaims control within its reclaim window. The
+ * same panel must call this explicitly after a reconnect; input is not
+ * re-granted automatically.
+ */
+export const browserPanelReclaimControlRequestSchema =
+  browserPanelControlRequestSchema;
+export type BrowserPanelReclaimControlRequest = z.infer<
+  typeof browserPanelReclaimControlRequestSchema
 >;
 
 /** The controller releases control and returns to spectator. */
@@ -1915,6 +1932,10 @@ export const rpcContract = defineRpcContract({
   },
   browser_panel_take_control: {
     input: browserPanelTakeControlRequestSchema,
+    output: browserPanelControlResponseSchema,
+  },
+  browser_panel_reclaim_control: {
+    input: browserPanelReclaimControlRequestSchema,
     output: browserPanelControlResponseSchema,
   },
   browser_panel_release_control: {

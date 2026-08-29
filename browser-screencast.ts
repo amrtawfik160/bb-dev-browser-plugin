@@ -23,6 +23,12 @@ export type CdpScreencastSourceOptions = {
    */
   resolveEndpoint: () => Promise<string>;
   clock?: { now(): number };
+  /**
+   * The controller's logical viewport that drives the screencast capture size.
+   * Spectators scale and letterbox this exact viewport rather than resizing it
+   * independently. Defaults to the supported maximum when unset.
+   */
+  viewport?: { width: number; height: number };
 };
 
 type CdpResponse = {
@@ -56,6 +62,16 @@ export function createCdpScreencastSource(
   let screencastStarted = false;
   let stopped = false;
   let captureTimer: ReturnType<typeof setInterval> | undefined;
+  let viewport: { width: number; height: number } = options.viewport ?? {
+    width: PANEL_MAX_VIEWPORT_WIDTH,
+    height: PANEL_MAX_VIEWPORT_HEIGHT,
+  };
+  function clampScreencastViewport(next: { width: number; height: number }) {
+    return {
+      width: Math.max(1, Math.min(next.width, PANEL_MAX_VIEWPORT_WIDTH)),
+      height: Math.max(1, Math.min(next.height, PANEL_MAX_VIEWPORT_HEIGHT)),
+    };
+  }
   const pending = new Map<
     number,
     { resolve: (value: unknown) => void; reject: (error: Error) => void }
@@ -94,13 +110,14 @@ export function createCdpScreencastSource(
   }
 
   async function startScreencast(session: string, fps: number) {
+    const clamped = clampScreencastViewport(viewport);
     await send(
       "Page.startScreencast",
       {
         format: SCREENCAST_FORMAT,
         quality: SCREENCAST_QUALITY,
-        maxWidth: PANEL_MAX_VIEWPORT_WIDTH,
-        maxHeight: PANEL_MAX_VIEWPORT_HEIGHT,
+        maxWidth: clamped.width,
+        maxHeight: clamped.height,
         everyNthFrame: SCREENCAST_EVERY_NTH_FRAME,
       },
       session,
@@ -241,6 +258,19 @@ export function createCdpScreencastSource(
       if (sessionId === undefined || socket === null) return;
       const session = sessionId;
       void dispatchInput(payload, session).catch(() => undefined);
+    },
+    /**
+     * Apply the controller's logical viewport to the screencast. If the
+     * screencast is already running, restart it at the new dimensions so the
+     * capture tracks the controller viewport rather than an independent size.
+     */
+    setViewport(next: { width: number; height: number }) {
+      viewport = clampScreencastViewport(next);
+      if (screencastStarted && sessionId !== undefined) {
+        void startScreencast(sessionId, PANEL_MAX_FRAMES_PER_SECOND).catch(
+          () => undefined,
+        );
+      }
     },
     async stop() {
       stopped = true;

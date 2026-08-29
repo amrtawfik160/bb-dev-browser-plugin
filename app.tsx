@@ -217,9 +217,15 @@ function PanelGrantRequestNotices({
 function PanelStreamSurface({
   status,
   panelId,
+  onControlState,
 }: {
   status: BrowserStatus;
   panelId: string;
+  /**
+   * Live control-state updates pushed from the host over the stream so every
+   * panel observes control transfers and tab changes without re-fetching.
+   */
+  onControlState?: (response: BrowserPanelControlResponse) => void;
 }) {
   const rpc = useRpc<typeof rpcContract>();
   const bbContext = useBbContext();
@@ -230,6 +236,10 @@ function PanelStreamSurface({
     "connecting" | "streaming" | "reconnecting" | "offline"
   >("connecting");
   const [streamError, setStreamError] = useState<string | null>(null);
+  const [controllerViewport, setControllerViewport] = useState<{
+    width: number;
+    height: number;
+  } | null>(null);
   const ownerSessionId = ownerSessionIdFromContext(bbContext);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const streamRef = useRef<PanelStreamAdapter | null>(null);
@@ -382,6 +392,31 @@ function PanelStreamSurface({
           setStreamState("streaming");
           return;
         }
+        if (message.type === "control") {
+          // The host pushed the live shared control state and tab strip; derive
+          // this panel's own role from the panel list so the surface updates
+          // without a re-fetch.
+          const payload = message as {
+            control?: BrowserPanelControlResponse["control"];
+            tabs?: BrowserPanelControlResponse["tabs"];
+          };
+          if (payload.control !== undefined && payload.tabs !== undefined) {
+            const own = payload.control.panels.find(
+              (panel) => panel.panelId === panelId,
+            );
+            onControlState?.({
+              role: own?.role ?? "spectator",
+              control: payload.control,
+              tabs: payload.tabs,
+            });
+            // The controller's viewport drives the capture size; spectators
+            // letterbox it. Size the canvas to that viewport so frames map 1:1
+            // and CSS scales/letterboxes for the panel.
+            const viewport = payload.control.controllerViewport;
+            if (viewport !== null) setControllerViewport(viewport);
+          }
+          return;
+        }
         if (message.type === "frame" && message.data !== undefined) {
           drawFrame({
             mimeType: message.mimeType ?? "image/png",
@@ -441,8 +476,8 @@ function PanelStreamSurface({
           ref={canvasRef}
           aria-label="Browser stream surface"
           role="img"
-          width={1920}
-          height={1080}
+          width={controllerViewport?.width ?? 1920}
+          height={controllerViewport?.height ?? 1080}
           className="mt-3 h-64 w-full rounded border bg-muted"
         />
         <p className="mt-2 text-xs text-muted-foreground" aria-live="polite">
@@ -487,16 +522,17 @@ function PanelStreamSurface({
 function PanelControlSurface({
   status,
   panelId,
+  control,
+  setControl,
 }: {
   status: BrowserStatus;
   panelId: string;
+  control: BrowserPanelControlResponse | null;
+  setControl: (response: BrowserPanelControlResponse | null) => void;
 }) {
   const rpc = useRpc<typeof rpcContract>();
   const bbContext = useBbContext();
   const ownerSessionId = ownerSessionIdFromContext(bbContext);
-  const [control, setControl] = useState<BrowserPanelControlResponse | null>(
-    null,
-  );
   const [transferPending, setTransferPending] = useState(false);
 
   // Join the shared control session for this profile on mount and whenever the
@@ -556,8 +592,39 @@ function PanelControlSurface({
     }
   }
 
+  // A disconnected controller that reconnects stays view-only until it
+  // explicitly reclaims within its 10-second window; the reclaim RPC is the
+  // explicit action that re-grants input without silently re-granting it on
+  // reconnect.
+  async function reclaim() {
+    if (status.hostId === null) return;
+    setTransferPending(true);
+    try {
+      const response = await rpc.call("browser_panel_reclaim_control", {
+        hostId: status.hostId,
+        profileId: status.profileId,
+        panelId,
+        ownerSessionId,
+      });
+      setControl(response);
+    } finally {
+      setTransferPending(false);
+    }
+  }
+
   if (control === null) return null;
   const isController = control.role === "controller";
+  const ownEntry = control.control.panels.find(
+    (panel) => panel.panelId === panelId,
+  );
+  // The reclaim window is live while the deadline is in the future. The host
+  // clock drives the deadline, so compare against the observed value only to
+  // decide which explicit action to surface.
+  const canReclaim =
+    !isController &&
+    ownEntry?.reclaimUntil !== undefined &&
+    ownEntry.reclaimUntil !== null &&
+    ownEntry.reclaimUntil > Date.now();
   const spectatorCount = control.control.panels.filter(
     (panel) => panel.role === "spectator",
   ).length;
@@ -605,9 +672,19 @@ function PanelControlSurface({
           type="button"
           className="ml-auto rounded border px-3 py-1 text-xs"
           disabled={transferPending}
-          onClick={() => void transfer(isController)}
+          onClick={() =>
+            void (isController
+              ? transfer(false)
+              : canReclaim
+                ? reclaim()
+                : transfer(true))
+          }
         >
-          {isController ? "Release control" : "Take control"}
+          {isController
+            ? "Release control"
+            : canReclaim
+              ? "Reclaim control"
+              : "Take control"}
         </button>
       </div>
       {control.control.controllerViewport === null ? null : (
@@ -678,6 +755,11 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
     null,
   );
   const [panelId] = useState(() => `browser-panel-${nextBrowserPanelId++}`);
+  // Shared control state lifted so the stream's live control broadcasts keep
+  // the control surface current without re-fetching (ADR 0012).
+  const [control, setControl] = useState<BrowserPanelControlResponse | null>(
+    null,
+  );
 
   const statusRequest: BrowserStatusInput =
     selectedHostId === undefined
@@ -974,8 +1056,17 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
       )}
       {status.state === "healthy" ? (
         <>
-          <PanelControlSurface status={status} panelId={panelId} />
-          <PanelStreamSurface status={status} panelId={panelId} />
+          <PanelControlSurface
+            status={status}
+            panelId={panelId}
+            control={control}
+            setControl={setControl}
+          />
+          <PanelStreamSurface
+            status={status}
+            panelId={panelId}
+            onControlState={setControl}
+          />
         </>
       ) : null}
       <PanelGrantRequestNotices requests={grantRequests} />

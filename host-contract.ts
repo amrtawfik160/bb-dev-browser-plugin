@@ -30,6 +30,7 @@ import {
   browserPanelControlRequestSchema,
   browserPanelControlResponseSchema,
   browserPanelTakeControlRequestSchema,
+  browserPanelReclaimControlRequestSchema,
   browserPanelReleaseControlRequestSchema,
   browserProfileCreateRequestSchema,
   browserProfileDeleteRequestSchema,
@@ -116,6 +117,10 @@ export const browserHostContract = defineRpcContract({
   },
   takeControl: {
     input: browserPanelTakeControlRequestSchema,
+    output: browserPanelControlResponseSchema,
+  },
+  reclaimControl: {
+    input: browserPanelReclaimControlRequestSchema,
     output: browserPanelControlResponseSchema,
   },
   releaseControl: {

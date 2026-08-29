@@ -2,7 +2,11 @@ import { WebSocketServer, type WebSocket } from "ws";
 import { createServer, type Server } from "node:http";
 import type { PanelGateway } from "./panel-gateway.js";
 import type { PanelStreamAdapter } from "./panel-stream.js";
-import { PANEL_GATEWAY_BIND_HOST } from "./contracts.js";
+import {
+  PANEL_GATEWAY_BIND_HOST,
+  type BrowserPanelControlState,
+  type BrowserTabStrip,
+} from "./contracts.js";
 
 /**
  * Automation Mode stream transport. The host binds a dynamic loopback gateway
@@ -37,6 +41,12 @@ export interface ScreencastSource {
   input(payload: ScreencastInputPayload): void;
   /** Release the underlying browser resources. Idempotent. */
   stop(): Promise<void>;
+  /**
+   * Apply the controller's logical viewport to the capture so the screencast
+   * tracks the controller viewport rather than an independent size. Optional;
+   * sources without a dynamic viewport ignore it.
+   */
+  setViewport?(viewport: { width: number; height: number }): void;
 }
 
 export type PanelTransportServerOptions = {
@@ -65,6 +75,15 @@ export type PanelTransportServerOptions = {
 export type PanelTransportServer = {
   start(): Promise<number>;
   stop(): Promise<void>;
+  /**
+   * Push the live shared control state and tab strip to the connected panel so
+   * every panel observes control transfers and tab changes without re-fetching.
+   * No-op when the panel is not currently authorized.
+   */
+  broadcastControl(
+    control: BrowserPanelControlState,
+    tabs: BrowserTabStrip,
+  ): void;
   get port(): number | undefined;
   get state(): "idle" | "listening" | "closed";
 };
@@ -257,9 +276,18 @@ export function createPanelTransportServer(
     gateway.close();
   }
 
+  function broadcastControl(
+    control: BrowserPanelControlState,
+    tabs: BrowserTabStrip,
+  ) {
+    if (disposed || connection === undefined || !authorized) return;
+    sendJson(connection, { type: "control", control, tabs });
+  }
+
   return {
     start,
     stop,
+    broadcastControl,
     get port() {
       return boundPort;
     },

@@ -49,6 +49,7 @@ import {
   type BrowserPanelVisibilityRequest,
   type BrowserPanelTransportRequest,
   type BrowserPanelControlResponse,
+  type BrowserPanelControlState,
   type BrowserStatus,
   type BrowserTabStrip,
 } from "./contracts.js";
@@ -72,6 +73,7 @@ import {
   BrowserScriptExecutionError,
   createBrowserInstanceRuntime,
   type BrowserInstanceRuntime,
+  type RuntimeBrowserPage,
 } from "./browser-runtime.js";
 import { createProductionBrowserProcessBoundary } from "./browser-process.js";
 import { PINNED_BROWSER_RUNTIME } from "./dependency-inventory.js";
@@ -394,6 +396,41 @@ export function createBrowserHostEntry(
       tabs: browserTabStrip(target).snapshot() as BrowserTabStrip,
     };
   }
+  /**
+   * Feed the shared tab strip from real browser state. New pages the runtime
+   * reports are added through openTab (top-level) or normalizePopup (popup),
+   * then syncPages reconciles url/title changes, removals, and the active tab.
+   * Runtime tab ids stay authoritative so the strip and runtime stay consistent
+   * for the life of the instance.
+   */
+  async function reconcileRuntimeTabs(
+    dataDir: string,
+    target: { hostId: string; profileId: string },
+    activeTabId?: string,
+  ) {
+    const browserRuntime = runtime(dataDir);
+    if (browserRuntime === undefined) return;
+    const strip = browserTabStrip(target);
+    let pages: RuntimeBrowserPage[];
+    try {
+      pages = await browserRuntime.listPages(target);
+    } catch {
+      // Feeding the strip is best-effort: if the runtime inventory cannot be
+      // read (for example a host blip), leave the prior strip intact until the
+      // next operation reconciles, rather than dropping tabs the user sees.
+      return;
+    }
+    for (const page of pages) {
+      if (strip.tab(page.id) !== undefined) continue;
+      if (page.openerTabId !== null) {
+        strip.normalizePopup(page.url, page.title, page.openerTabId, page.id);
+      } else {
+        strip.openTab(page.url, page.title, page.id);
+      }
+    }
+    strip.syncPages(pages);
+    if (activeTabId !== undefined) strip.activateTab(activeTabId);
+  }
   const hostConnectionGenerations = new Map<string, number>();
   function administration(dataDir: string) {
     if (retainedBoundary !== undefined) return retainedBoundary;
@@ -573,7 +610,7 @@ export function createBrowserHostEntry(
       signal,
     );
     try {
-      return await browserRuntime.navigate(
+      const response = await browserRuntime.navigate(
         {
           ...target,
           projectId: request.projectId,
@@ -587,6 +624,8 @@ export function createBrowserHostEntry(
         request.input,
         { signal, leaseSignal: lease.signal },
       );
+      await reconcileRuntimeTabs(dataDir, target, response.tabId);
+      return response;
     } finally {
       lease.release();
     }
@@ -613,7 +652,7 @@ export function createBrowserHostEntry(
       signal,
     );
     try {
-      return await browserRuntime.history(
+      const response = await browserRuntime.history(
         {
           ...target,
           projectId: request.projectId,
@@ -624,6 +663,8 @@ export function createBrowserHostEntry(
         request.direction,
         { signal, leaseSignal: lease.signal },
       );
+      await reconcileRuntimeTabs(dataDir, target, response.tabId);
+      return response;
     } finally {
       lease.release();
     }
@@ -725,20 +766,33 @@ export function createBrowserHostEntry(
       const stream = createAutomationStreamAdapter({
         capabilities: panelCapabilities,
       });
-      const source = createCdpScreencastSource({
-        resolveEndpoint: async () =>
-          (await browserRuntime.start(target)).automationEndpoint,
-      });
       const controlTarget = {
         hostId: request.hostId,
         profileId: request.profileId,
       };
       const control = panelControlSession(controlTarget);
+      const source = createCdpScreencastSource({
+        resolveEndpoint: async () =>
+          (await browserRuntime.start(target)).automationEndpoint,
+        // The controller's logical viewport drives the screencast capture size;
+        // spectators scale and letterbox it rather than resizing it.
+        viewport: control.controllerViewport ?? undefined,
+      });
+      // Apply the controller's viewport to the stream policy so the ready frame
+      // carries the controller viewport, and keep it in sync when control moves.
+      const applyControllerViewport = () => {
+        const controllerViewport = control.controllerViewport;
+        if (controllerViewport === null) return;
+        stream.setViewport(controllerViewport);
+        source.setViewport?.(controllerViewport);
+      };
+      applyControllerViewport();
       // The panel joins the shared control session for its profile: the first
       // panel becomes the controller and owns the viewport; later panels are
       // view-only spectators. Input through the transport is gated so only the
       // connected controller can send browser input.
       control.connectPanel(request.panelId, request.ownerSessionId);
+      applyControllerViewport();
       const transport = createPanelTransportServer({
         gateway,
         stream,
@@ -746,6 +800,18 @@ export function createBrowserHostEntry(
         canInput: () => control.canInput(request.panelId),
         onDisconnect: () => control.disconnectPanel(request.panelId),
       });
+      // Push live control transfers and tab changes to this panel so every
+      // panel observes the shared state without re-fetching (ADR 0012).
+      const strip = browserTabStrip(controlTarget);
+      const pushControlState = () => {
+        applyControllerViewport();
+        transport.broadcastControl(
+          control.state() as BrowserPanelControlState,
+          strip.snapshot() as BrowserTabStrip,
+        );
+      };
+      const unsubscribeControl = control.subscribe(pushControlState);
+      const unsubscribeTabs = strip.subscribe(pushControlState);
       const port = await transport.start();
       const transportKey = `${request.hostId}\u0000${request.profileId}\u0000${request.panelId}`;
       const previous = panelTransports.get(transportKey);
@@ -753,7 +819,14 @@ export function createBrowserHostEntry(
         await previous.stop().catch(() => undefined);
         panelTransports.delete(transportKey);
       }
-      panelTransports.set(transportKey, transport);
+      panelTransports.set(transportKey, {
+        ...transport,
+        async stop() {
+          unsubscribeControl();
+          unsubscribeTabs();
+          await transport.stop();
+        },
+      });
       return {
         gatewayPort: port,
         bindHost: gateway.declaredBindHost(),
@@ -937,6 +1010,7 @@ export function createBrowserHostEntry(
               if (lease.signal.aborted) {
                 leaseRevokedAfterCompletion = true;
               }
+              await reconcileRuntimeTabs(dataDir, target);
               response = {
                 ok: true as const,
                 result: browserResult,
@@ -1045,6 +1119,25 @@ export function createBrowserHostEntry(
         };
         const session = panelControlSession(target);
         session.releaseControl(request.panelId);
+        return toControlResponse(
+          target,
+          session.role(request.panelId) ?? "spectator",
+        );
+      },
+      reclaimControl: async (request, context) => {
+        retainWorker(context);
+        const target = {
+          hostId: request.hostId,
+          profileId: request.profileId,
+        };
+        const session = panelControlSession(target);
+        // Reclaim the controller's own lease after a reconnect. If an agent
+        // acquired a lease while the controller was disconnected, the owner
+        // reclaim interrupts it just like Take control so the page is preserved
+        // for human use.
+        if (session.reclaimControl(request.panelId)) {
+          await session.takeControl(request.panelId, request.viewport);
+        }
         return toControlResponse(
           target,
           session.role(request.panelId) ?? "spectator",

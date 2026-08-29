@@ -91,6 +91,7 @@ import {
   type BrowserPanelControlRequest,
   type BrowserPanelControlResponse,
   type BrowserPanelTakeControlRequest,
+  type BrowserPanelReclaimControlRequest,
   type BrowserPanelReleaseControlRequest,
 } from "./contracts.js";
 import { browserHostContract } from "./host-contract.js";
@@ -2481,6 +2482,22 @@ export function createBrowserService(
     });
   }
 
+  /**
+   * A disconnected controller reclaims control within its 10-second window
+   * after a reconnect. Input is not re-granted automatically; the owner must
+   * reclaim explicitly so the reclaim path is observable and atomic.
+   */
+  async function reclaimControl(
+    request: BrowserPanelReclaimControlRequest,
+    signal?: AbortSignal,
+  ): Promise<BrowserPanelControlResponse> {
+    await requireConnectedHost(request.hostId, signal);
+    return host.call("reclaimControl", request, {
+      hostId: request.hostId,
+      signal,
+    });
+  }
+
   subscribeToHostConnections();
   subscribeToProjectDeletion();
 
@@ -2494,6 +2511,7 @@ export function createBrowserService(
     panelControl,
     takeControl,
     releaseControl,
+    reclaimControl,
     grants,
     createGrant,
     inspectGrant,

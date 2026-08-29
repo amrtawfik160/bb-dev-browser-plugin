@@ -40,6 +40,11 @@ export type PanelClient = {
   role: PanelRole;
   connection: PanelConnectionState;
   viewport: PanelViewport;
+  /**
+   * Deadline (clock ms) until which this panel may reclaim control after a
+   * disconnect, or null when it has no reclaim window.
+   */
+  reclaimUntil: number | null;
 };
 
 export type PanelViewport = { width: number; height: number };
@@ -138,6 +143,12 @@ export function createPanelControlState(options: PanelControlStateOptions) {
         role: client.role,
         connection: client.connection,
         viewport: client.viewport,
+        /**
+         * Deadline (clock ms) until which this panel may reclaim control after
+         * a disconnect, or null when it has no reclaim window. A spectator with
+         * an unexpired deadline must reclaim explicitly to regain input.
+         */
+        reclaimUntil: client.reclaimUntil,
       })),
     };
   }
@@ -218,9 +229,12 @@ export function createPanelControlState(options: PanelControlStateOptions) {
     if (client.role === "controller") {
       // Input freezes immediately. Only the same panel can reclaim within the
       // window before control becomes available to other panels or agents.
+      // The disconnected controller drops to spectator so a reconnect cannot
+      // silently re-grant input; it must call reclaimControl explicitly.
       reclaimOwnerPanelId = panelId;
       reclaimDeadline = clock.now() + reclaimWindowMs;
       client.reclaimUntil = reclaimDeadline;
+      client.role = "spectator";
       controllerPanelId = null;
       controllerViewport = null;
     }
@@ -236,7 +250,6 @@ export function createPanelControlState(options: PanelControlStateOptions) {
   function reclaimControl(panelId: string): boolean {
     const client = panels.get(panelId);
     if (client === undefined) return false;
-    if (client.role !== "controller") return false;
     if (client.connection !== "connected") return false;
     if (reclaimOwnerPanelId !== panelId) return false;
     if (!reclaimActive()) {
@@ -247,9 +260,12 @@ export function createPanelControlState(options: PanelControlStateOptions) {
       emit();
       return false;
     }
+    // Within the window: restore the controller so input is re-granted only by
+    // an explicit reclaim, never automatically on reconnect.
     client.reclaimUntil = null;
     clearReclaim();
     if (controllerPanelId !== null) return controllerPanelId === panelId;
+    client.role = "controller";
     controllerPanelId = panelId;
     controllerViewport = clampPanelViewport(client.viewport);
     emit();

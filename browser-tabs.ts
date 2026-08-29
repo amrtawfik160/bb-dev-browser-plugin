@@ -110,13 +110,15 @@ export function createBrowserTabStrip(options: BrowserTabStripOptions = {}) {
 
   /**
    * Open a top-level page tab and activate it. Returns the runtime tab id the
-   * strip assigned.
+   * strip assigned. When the runtime already minted a stable id for the page,
+   * pass it so the strip and runtime stay consistent for the life of the
+   * instance.
    */
-  function openTab(url: string, title = ""): string {
-    const tabId = newTabId();
-    upsertTab({ tabId, url, title, origin: "page", openerTabId: null });
-    activateTab(tabId);
-    return tabId;
+  function openTab(url: string, title = "", tabId?: string): string {
+    const id = tabId ?? newTabId();
+    upsertTab({ tabId: id, url, title, origin: "page", openerTabId: null });
+    activateTab(id);
+    return id;
   }
 
   /**
@@ -129,21 +131,29 @@ export function createBrowserTabStrip(options: BrowserTabStripOptions = {}) {
     url: string,
     title: string,
     openerTabId: string | null,
+    tabId?: string,
   ): string {
-    const tabId = newTabId();
-    upsertTab({ tabId, url, title, origin: "popup", openerTabId });
-    activateTab(tabId);
-    return tabId;
+    const id = tabId ?? newTabId();
+    upsertTab({ tabId: id, url, title, origin: "popup", openerTabId });
+    activateTab(id);
+    return id;
   }
 
   /**
    * Sync the strip from a runtime page inventory. Pages not present are
-   * dropped; new pages are added as top-level tabs; the first reported page
-   * becomes active if none is. Runtime tab ids are preserved unchanged so
-   * they stay consistent for the life of the instance.
+   * dropped; new pages are added (preserving popup origin and opener when the
+   * runtime reports them); the first reported page becomes active if none is.
+   * Runtime tab ids are preserved unchanged so they stay consistent for the
+   * life of the instance.
    */
   function syncPages(
-    pages: ReadonlyArray<{ id: string; url: string; title?: string }>,
+    pages: ReadonlyArray<{
+      id: string;
+      url: string;
+      title?: string;
+      origin?: BrowserTabOrigin;
+      openerTabId?: string | null;
+    }>,
   ) {
     const next = new Map<string, BrowserTab>();
     const nextOrder: string[] = [];
@@ -155,8 +165,8 @@ export function createBrowserTabStrip(options: BrowserTabStripOptions = {}) {
             tabId: page.id,
             url: page.url,
             title: page.title ?? "",
-            origin: "page",
-            openerTabId: null,
+            origin: page.origin ?? "page",
+            openerTabId: page.openerTabId ?? null,
           };
       next.set(page.id, tab);
       nextOrder.push(page.id);

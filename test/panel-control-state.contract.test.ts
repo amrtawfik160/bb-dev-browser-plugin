@@ -143,6 +143,35 @@ describe("Panel Control State", () => {
     session.dispose();
   });
 
+  it("requires explicit reclaim after a controller reconnect within the 10s window", async () => {
+    const { session, clock } = setup({ reclaimWindowMs: 10_000 });
+    session.connectPanel("panel-1", "session-1");
+    session.connectPanel("panel-2", "session-2");
+
+    // Controller disconnects: input freezes and the role drops to spectator so
+    // a reconnect cannot silently re-grant input.
+    session.disconnectPanel("panel-1");
+    expect(session.state().controllerPanelId).toBeNull();
+    expect(session.role("panel-1")).toBe("spectator");
+
+    // Reconnect the same panel WITHOUT reclaiming: it stays view-only.
+    clock.now = () => 1_000;
+    session.connectPanel("panel-1", "session-1");
+    expect(session.role("panel-1")).toBe("spectator");
+    expect(session.canInput("panel-1")).toBe(false);
+    expect(session.state().controllerPanelId).toBeNull();
+
+    // During the reclaim window, a different panel still cannot take control.
+    await expect(session.takeControl("panel-2")).resolves.toBe(false);
+
+    // Only an explicit reclaim by the same panel restores input.
+    expect(session.reclaimControl("panel-1")).toBe(true);
+    expect(session.role("panel-1")).toBe("controller");
+    expect(session.canInput("panel-1")).toBe(true);
+    expect(session.state().controllerPanelId).toBe("panel-1");
+    session.dispose();
+  });
+
   it("opens control to anyone after the reclaim window expires", async () => {
     const { session, clock } = setup({ reclaimWindowMs: 10_000 });
     session.connectPanel("panel-1", "session-1");
