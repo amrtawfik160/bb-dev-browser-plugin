@@ -78,11 +78,13 @@ expiry, worker restart, or profile lifecycle operations. Traversal, symlink
 escape, special files, changed-after-selection files, oversized files, and
 low-disk conditions all fail closed.
 
-Stage or cancel a workspace transfer from a project thread:
+Stage, watch, or cancel a transfer from a project thread:
 
 ```text
-bb browser transfer --kind workspace --source <path> --environment-root <path> [--profile <id>] [--json]
-bb browser transfer --cancel --transfer-id <id> [--profile <id>] [--json]
+bb browser transfer --kind workspace --environment <id> --path <relative-path> [--profile <id>] [--host <id>] [--json]
+bb browser transfer --kind client --file <local-path> [--profile <id>] [--host <id>] [--json]
+bb browser transfer --progress --transfer-id <id> [--profile <id>] [--host <id>] [--json]
+bb browser transfer --cancel --transfer-id <id> [--profile <id>] [--host <id>] [--json]
 ```
 
 The output is privacy-safe: it shows the transfer ID, kind, size, content
