@@ -17,19 +17,11 @@ rm -rf node_modules dist && npm ci && npm run release-gate
 ```
 
 `npm run release-gate` (`scripts/release-gate.sh`) runs, in order and
-fail-fast:
-
-1. `prettier --check .` — formatting
-2. `npm run lint` — ESLint
-3. `npm run typecheck` — `tsc --noEmit`
-4. `npm run build` — `bb plugin build` → `dist/`
-5. `npx vitest run --retry 2` — Vitest. `--retry 2` re-runs a failed test in
-   isolation; the issue #22 suite has several pre-existing tests with tight
-   fixed waits (5 ms / 20 ms) that intermittently miss an event under
-   full-suite load but pass reliably on an isolated retry. Deterministic
-   regressions still fail consistently across retries, so the retry tolerates
-   pre-existing timing noise without masking real failures. (Hardening those
-   waits is a separate follow-up.)
+fail-fast: Prettier, ESLint, `tsc --noEmit`, the production build, then
+`npx vitest run`. The contract suites poll for the real event/signal with a
+bounded timeout (see `test/wait.ts`) instead of tight fixed waits, so the
+suite is deterministic under full-suite load and needs no `--retry`. The
+script header is the single source for the step order and rationale.
 
 What the automated proof establishes:
 
@@ -65,8 +57,10 @@ What the automated proof establishes:
   restorable-session) and the issues #2–#20 contract suites continue to pass.
 
 The review axes (clean-code, test-quality, documentation, security boundary,
-blast-radius) are wired in [`release-review-checklist.md`](release-review-checklist.md)
-against a fixed revision and are performed by the review-fix gate, not here.
+blast-radius) were run against the fixed revision `39a3182`; see
+[`release-review-checklist.md`](release-review-checklist.md) for the
+per-axis outcome and the review-fix-loop artifacts
+(`findings-issue-23.md` and `closure-issue-23.md`) that evidence AC4 and AC5.
 
 ## 2. Current-host steps awaiting owner confirmation
 

@@ -16,7 +16,7 @@
  */
 import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { join, relative } from "node:path";
+import { basename, join, relative } from "node:path";
 import { describe, expect, it } from "vitest";
 
 const ROOT = process.cwd();
@@ -59,6 +59,46 @@ function scan(files: string[], pattern: RegExp): Hit[] {
   for (const file of files) {
     const lines = readFileSync(file, "utf8").split("\n");
     lines.forEach((line, index) => {
+      const found = line.match(pattern);
+      if (found !== null) {
+        hits.push({
+          file: relative(ROOT, file).replace(/\\/gu, "/"),
+          line: line.trim(),
+          lineNumber: index + 1,
+          match: found[0],
+        });
+      }
+    });
+  }
+  return hits;
+}
+
+/**
+ * Scan only the plugin's OWN code in the built dist/*.js bundles for a pattern.
+ *
+ * The bundler marks each bundled module with a `// <source-path>` comment;
+ * root .ts/.tsx modules are the plugin's own code, while `node_modules/...`
+ * segments are bundled third-party code (ws, zod). This walks those segments
+ * and applies the pattern only to the plugin-owned ones, so the credential and
+ * telemetry scans prove "no debug credential/telemetry in the production
+ * build" against the plugin's own built code without third-party noise.
+ */
+function scanPluginOwnedDist(pattern: RegExp): Hit[] {
+  const pluginSources = new Set(listCodeFiles().map((path) => basename(path)));
+  const moduleMarker = /^\/\/\s+([a-zA-Z0-9_./-]+\.(?:ts|tsx|js))$/u;
+  const hits: Hit[] = [];
+  for (const file of listDistFiles()) {
+    const lines = readFileSync(file, "utf8").split("\n");
+    let owned = false;
+    lines.forEach((line, index) => {
+      const marker = line.match(moduleMarker);
+      if (marker !== null) {
+        // Entering a new bundled module segment; own it only if the marker
+        // names one of the plugin's root source files (not node_modules/).
+        owned = pluginSources.has(marker[1]!);
+        return;
+      }
+      if (!owned) return;
       const found = line.match(pattern);
       if (found !== null) {
         hits.push({
@@ -136,16 +176,55 @@ describe("release scan (issue #23 AC3)", () => {
   it("treats 0.0.0.0/[::] only as the documented private-network grant list", () => {
     // The private-network/localhost grant origin list (RAW_LOCALHOST_HOSTS in
     // authorization.ts) legitimately contains 0.0.0.0 and [::]. They must
-    // never appear as a bind host for a listening socket.
+    // never appear as a bind host for a listening socket, and never outside
+    // the RAW_LOCALHOST_HOSTS grant-list literal in authorization.ts.
     const pattern = /0\.0\.0\.0|\[::\]/u;
-    const codeHits = scan(code, pattern).filter(
-      (hit) => hit.file === "authorization.ts",
-    );
-    // No 0.0.0.0/[::] in any shipped source other than authorization.ts.
     const otherCode = scan(code, pattern).filter(
       (hit) => hit.file !== "authorization.ts",
     );
+    // No 0.0.0.0/[::] in any shipped source other than authorization.ts.
     expect(otherCode, `unexpected 0.0.0.0/[::] in shipped source`).toEqual([]);
+
+    // Every 0.0.0.0/[::] hit in authorization.ts must be a member line of
+    // the RAW_LOCALHOST_HOSTS grant-list literal (a quoted array member
+    // inside its `new Set([...])` body), not any other occurrence in the
+    // file. A future non-loopback use added anywhere else in the file would
+    // fail this assertion.
+    const authPath = join(ROOT, "authorization.ts");
+    const authLines = readFileSync(authPath, "utf8").split("\n");
+    const setStart = authLines.findIndex((line) =>
+      /RAW_LOCALHOST_HOSTS\s*=\s*new\s+Set\(\[/u.test(line),
+    );
+    expect(
+      setStart,
+      "RAW_LOCALHOST_HOSTS grant-list literal exists",
+    ).toBeGreaterThanOrEqual(0);
+    // Find the close of the Set literal body (first `];` at/after setStart).
+    let setEnd = setStart + 1;
+    while (
+      setEnd < authLines.length &&
+      !/^\s*\];?\s*$/u.test(authLines[setEnd] ?? "")
+    ) {
+      setEnd += 1;
+    }
+    const grantListHits = scan(code, pattern).filter(
+      (hit) => hit.file === "authorization.ts",
+    );
+    expect(
+      grantListHits.length,
+      "grant-list literal ships the hosts",
+    ).toBeGreaterThan(0);
+    const grantMemberPattern = /^\s*"(?:0\.0\.0\.0|\[::\])"\s*,?\s*$/u;
+    for (const hit of grantListHits) {
+      expect(
+        hit.lineNumber > setStart && hit.lineNumber <= setEnd,
+        `${hit.file}:${hit.lineNumber} is inside RAW_LOCALHOST_HOSTS`,
+      ).toBe(true);
+      expect(
+        grantMemberPattern.test(hit.line),
+        `${hit.file}:${hit.lineNumber} is a RAW_LOCALHOST_HOSTS member line`,
+      ).toBe(true);
+    }
 
     // In the bundles, 0.0.0.0/[::] must never be the bind host of a
     // .listen( call (it is only the bundled RAW_LOCALHOST_HOSTS array).
@@ -157,16 +236,22 @@ describe("release scan (issue #23 AC3)", () => {
     ).toEqual([]);
     // Sanity: the grant-list literal still ships in the bundle.
     expect(scan(listDistFiles(), pattern).length).toBeGreaterThan(0);
-    expect(codeHits.length).toBeGreaterThan(0);
   });
 
-  it("contains no telemetry SDK, endpoint, or beacon in shipped code", () => {
+  it("contains no telemetry SDK, endpoint, or beacon in shipped code or the built bundles", () => {
     const telemetryPattern =
       /\bsentry\b|\bamplitude\b|segment\.io|mixpanel|datadog|google-analytics|googletagmanager|posthog|doubleclick|facebook\.(?:com|net)\/tr|\/v1\/events\b|crashreport|newrelic|hotjar|heap\.io|datadoghq|applicationinsights|opentelemetry|otlp\b|crashlytics|firefox\.pocket/giu;
-    const hits = scan(code, telemetryPattern);
+    // Scan shipped plugin source AND the plugin's own built code in dist/
+    // (the production build), so "no telemetry in the production build" is
+    // proven against the built artifact, not just unbuilt source. Bundled
+    // third-party code (ws, zod) is excluded by scanPluginOwnedDist.
+    const hits = [
+      ...scan(code, telemetryPattern),
+      ...scanPluginOwnedDist(telemetryPattern),
+    ];
     expect(
       hits,
-      `telemetry SDK/endpoint in shipped code: ${JSON.stringify(hits)}`,
+      `telemetry SDK/endpoint in shipped code or built bundles: ${JSON.stringify(hits)}`,
     ).toEqual([]);
   });
 
@@ -188,19 +273,18 @@ describe("release scan (issue #23 AC3)", () => {
     // excluded. CLI/Chrome flag strings are not assignments and do not match.
     const credentialPattern =
       /(?:password|api[_-]?key|secret|access[_-]?token|auth[_-]?token)\s*[:=]\s*["'][^"'/]{6,}["']/iu;
-    const credentialHits = scan(
-      [...code, ...listDistFiles()],
-      credentialPattern,
-    );
-    // The bundled `ws` library and other third-party code may contain
-    // incidental matches; allow-list none of the plugin's own code. Filter
-    // hits to the plugin source files only to avoid third-party noise.
-    const pluginCredentialHits = credentialHits.filter((hit) =>
-      /\.(?:ts|tsx)$/u.test(hit.file),
-    );
+    // Scan shipped plugin source AND the plugin's own built code in dist/
+    // (the production build), so "no debug credential in the production
+    // build" is proven against the built artifact. scanPluginOwnedDist
+    // excludes bundled third-party code (ws, zod) that may carry incidental
+    // matches, so only the plugin's own code is asserted.
+    const pluginCredentialHits = [
+      ...scan(code, credentialPattern),
+      ...scanPluginOwnedDist(credentialPattern),
+    ];
     expect(
       pluginCredentialHits,
-      `hardcoded credential in plugin source: ${JSON.stringify(pluginCredentialHits)}`,
+      `hardcoded credential in plugin source or built bundles: ${JSON.stringify(pluginCredentialHits)}`,
     ).toEqual([]);
   });
 });

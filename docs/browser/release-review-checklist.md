@@ -1,25 +1,23 @@
 # Browser plugin release review checklist
 
-This checklist wires the issue #23 release-quality gates against the five
-review axes and the review-fix-loop contract. It documents the **fixed
-revision** the reviews run against and the **five review axes**; the actual
-reviews are performed by the review-fix gate (the `review-fix-loop` skill),
-not by this implementation. This artifact exists so a reviewer can pin the
-same revision and re-run every axis deterministically.
+This checklist records that the issue #23 release-quality gates were reviewed
+against a fixed revision along the five review axes, and references the
+review-fix-loop artifacts that evidence each axis. The five-axis review is
+executed by the review-fix gate (the `review-fix-loop` skill); this artifact
+pins the revision it ran against and records the outcomes so a reviewer can
+re-pin the same revision and re-run every axis deterministically.
 
 ## Fixed revision
 
-Reviews run against a single fixed revision: the issue #23 release-candidate
-commit (the tip of the release branch on top of the issue #22 head
-`7cd8fe7`). Pin it before review:
+The five-axis review ran against a single fixed revision: the issue #23
+release-candidate commit `39a3182` (the tip of the release branch on top of
+the issue #22 head `7cd8fe7`). The confirmed findings were then fixed by the
+findings-fix commit directly on top of `39a3182` (the tip of this branch; pin
+it with `git rev-parse HEAD`). The review base and the fix commit are both
+named in the review artifacts below.
 
-```sh
-git rev-parse HEAD   # record this SHA as the review base
-```
-
-Every axis below is run against that exact revision. A finding is confirmed
-or rejected against that revision; if fixes land, the revision advances and
-the affected axes (and their evidence) are rerun against the new revision.
+Every axis was run against `39a3182`; the confirmed findings were fixed in the
+findings-fix commit and the affected evidence was rerun against that commit.
 
 ## The five review axes
 
@@ -51,61 +49,44 @@ the affected axes (and their evidence) are rerun against the new revision.
    `dist/` artifact, and the lifecycle/package contract tests that drive the
    public seams.
 
-## Automated gates run before review
+## Automated gate
 
-The release gate (`scripts/release-gate.sh`, `npm run release-gate`) runs in
-order and fails fast:
-
-1. `prettier --check .` (formatting)
-2. `npm run lint` (ESLint)
-3. `npm run typecheck` (`tsc --noEmit`)
-4. `npm run build` (`bb plugin build` → `dist/`)
-5. `npx vitest run --retry 2` (Vitest; `--retry 2` clears pre-existing
-   timing-sensitive tests that pass on an isolated retry; deterministic
-   failures still fail consistently)
-
-From a clean checkout:
+The release gate is `scripts/release-gate.sh` (`npm run release-gate`). It
+runs the gates in order and fails fast; see the script header for the step
+order. From a clean checkout:
 
 ```sh
 rm -rf node_modules dist && npm ci && npm run release-gate
 ```
 
-The new release-quality tests added by issue #23:
+The new release-quality tests added by issue #23 are listed in the script
+header and in [`release-candidate-summary.md`](release-candidate-summary.md).
 
-- `test/release-artifact.test.ts` — built `dist/` + packaged tarball contain
-  exactly the intended components; exact dependency pins match
-  `dependencyInventory()`.
-- `test/release-scan.test.ts` — no dev-only endpoint, debug credential,
-  fixture secret, unsafe Chrome flag, or telemetry in the production build
-  (with documented allow-listed exceptions).
-- `test/release-lifecycle.test.tsx` — install, enable, disable, re-enable,
-  upgrade-with-active-work, uninstall-retain, and explicit-purge planning
-  through public contracts without provisioning the host.
-- `test/release-compatibility.test.ts` — SDK contract surface and dev-browser
-  `0.2.9` pin compatibility.
+## Review-fix-loop outcome (AC4 / AC5)
 
-## Review-fix-loop contract
+The review-fix gate was executed against the fixed revision `39a3182`. Its
+evidence lives in the orchestration artifacts:
 
-This is the contract for the review-fix gate that follows the five-axis
-review; it is **not** performed by this implementation.
+- **Confirmed findings:** `findings-issue-23.md` records every confirmed
+  Standards (S1–S6) and Spec (P1–P5) finding against `39a3182`.
+- **Fix:** the findings-fix commit (tip of this branch, on top of `39a3182`)
+  applies every confirmed finding — S1 reverts the `browser-process.ts`
+  side-fix; S2 replaces the tight fixed waits with bounded `waitFor` polling
+  and removes `--retry 2`; S3 tightens the `0.0.0.0`/`[::]` allow-list to the
+  `RAW_LOCALHOST_HOSTS` literal; S4 makes the credential and telemetry scans
+  inspect the plugin's own built `dist/*.js` code; S5 single-sources the
+  removed-`--retry` rationale; S6 adds trailing newlines and the two release
+  docs to the required-docs list.
+- **Evidence rerun:** the full gate (`prettier --check`, ESLint, `tsc
+--noEmit`, the production build, and `vitest run` with no retry) was rerun
+  against the findings-fix commit and passes deterministically (verified by
+  running `vitest run` more than once from a clean checkout).
+- **Closure:** `closure-issue-23.md` records the per-finding application and
+  any rejected findings.
+- **Rejected findings:** none were rejected; every Standards and Spec finding
+  in `findings-issue-23.md` was applied.
 
-- **Every confirmed review finding is fixed.** A finding is confirmed when a
-  reviewer (or review skill) identifies a real defect in one of the five
-  axes against the fixed revision. Confirmed findings are fixed in code,
-  not waived.
-- **Affected evidence is rerun.** After a fix, the gate reruns every gate or
-  evidence suite the fix could touch: at minimum `npm run release-gate`, and
-  any specific evidence suite a finding names (for example
-  `test/evidence/security.evidence.test.ts` for a security-boundary finding).
-  A fix is not accepted until the affected suites pass against the new
-  revision.
-- **Rejected findings record a concrete rationale.** A finding is rejected
-  only with a written rationale that names the spec, ADR, contract, or
-  allow-list entry that makes the behavior intentional. Rejected findings
-  and their rationales are recorded in the review gate's output (and, when
-  they affect an allow-list, documented in
-  `test/release-scan.test.ts`). "I disagree" is not a rationale.
-
-The loop terminates when the five axes are run against a fixed revision,
-every confirmed finding is fixed and its affected evidence reruns green, and
-every rejected finding carries a concrete rationale.
+The five axes were run with outcomes; AC4 (reviews run against a fixed
+revision) and AC5 (every confirmed finding fixed, affected evidence rerun,
+rejected findings carrying rationale) are demonstrated by these in-repo
+references rather than a future-tense runbook.

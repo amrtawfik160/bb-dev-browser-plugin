@@ -21,6 +21,7 @@ import {
   type ScreencastFrame,
   type ScreencastSource,
 } from "../panel-transport.js";
+import { waitFor } from "./wait.js";
 
 const hostId = "host-transport";
 const profileId = "profile-transport";
@@ -131,6 +132,24 @@ function onceMessage(socket: WebSocket): Promise<string> {
     };
     socket.on("message", handler);
   });
+}
+
+/**
+ * Collect every streamed message so a fast burst (frames at ~1 ms intervals) is
+ * not lost between awaits. onceMessage attaches its handler too late if a
+ * message already arrived, so it can miss the first frame; collectMessages
+ * buffers from the start and polls a predicate via the shared waitFor helper
+ * (issue #23 S2).
+ */
+function collectMessages(socket: WebSocket) {
+  const messages: string[] = [];
+  socket.on("message", (raw) => {
+    messages.push(raw.toString());
+  });
+  return {
+    waitFor: (predicate: (raw: string) => boolean, timeoutMs = 2_000) =>
+      waitFor(() => messages.find(predicate), { timeoutMs }),
+  };
 }
 
 describe("Panel transport server contract", () => {
@@ -244,9 +263,17 @@ describe("Panel transport server contract", () => {
         hostId,
         profileId,
       });
+      const inbox = collectMessages(socket);
       send(socket, redeemMessage(issued));
-      await onceMessage(socket); // ready
-      const frameRaw = await onceMessage(socket);
+      await inbox.waitFor(
+        (raw) => decode<{ type: string }>(raw).type === "ready",
+      );
+      // Frames stream at ~1 ms intervals; collect from the start and poll for
+      // the first frame so a burst is never lost between awaits.
+      const frameRaw = await inbox.waitFor(
+        (raw) =>
+          decode<{ type: string; sequence?: number }>(raw).type === "frame",
+      );
       const frame = decode<{
         type: string;
         sequence: number;
@@ -259,7 +286,11 @@ describe("Panel transport server contract", () => {
       expect(Buffer.from(frame.data, "base64").toString()).toBe("frame-1");
       // Forwarded input reaches the source after gateway validation.
       send(socket, { type: "input", sequence: 1, payload: { kind: "click" } });
-      await new Promise((resolve) => setTimeout(resolve, 20));
+      await waitFor(() =>
+        source.inputs.some(
+          (input) => (input as { kind?: string }).kind === "click",
+        ),
+      );
       expect(source.inputs).toEqual([{ kind: "click" }]);
       socket.close();
     } finally {

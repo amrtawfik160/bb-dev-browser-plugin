@@ -8,6 +8,7 @@ import {
   type ScreencastSource,
 } from "../panel-transport.js";
 import type { BrowserContextAction, BrowserDialogEvent } from "../contracts.js";
+import { waitFor, waitForSettled } from "./wait.js";
 
 const hostId = "host-dialog-transport";
 const profileId = "profile-dialog-transport";
@@ -128,20 +129,12 @@ function collectMessages(socket: WebSocket): {
   socket.on("message", (raw) => {
     messages.push(raw.toString());
   });
-  async function waitFor(
-    predicate: (raw: string) => boolean,
-    timeoutMs = 2_000,
-  ): Promise<string> {
-    const deadline = Date.now() + timeoutMs;
-    for (;;) {
-      const found = messages.find(predicate);
-      if (found !== undefined) return found;
-      if (Date.now() >= deadline)
-        throw new Error("Timed out waiting for a streamed message.");
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-  }
-  return { waitFor };
+  return {
+    // Delegate to the shared bounded poll helper instead of a local fixed
+    // interval, so streamed-message waiting stays deterministic under load.
+    waitFor: (predicate, timeoutMs = 2_000) =>
+      waitFor(() => messages.find(predicate), { timeoutMs }),
+  };
 }
 
 function setup(
@@ -220,7 +213,14 @@ describe("Panel transport dialog and context-action contract", () => {
         accept: true,
         text: "answer",
       });
-      await new Promise((resolve) => setTimeout(resolve, 20));
+      await waitFor(() =>
+        source.responses.find(
+          (response) =>
+            response.dialogId === "d1" &&
+            response.accept === true &&
+            response.text === "answer",
+        ),
+      );
       expect(source.responses).toEqual([
         { dialogId: "d1", accept: true, text: "answer" },
       ]);
@@ -250,7 +250,11 @@ describe("Panel transport dialog and context-action contract", () => {
         dialogId: "d1",
         accept: true,
       });
-      await new Promise((resolve) => setTimeout(resolve, 20));
+      // A view-only spectator's dialog response is dropped with no ack and
+      // no side effect. Poll the source for a bounded window: a broken drop
+      // would push to source.responses (failing fast); a correct drop keeps
+      // it empty.
+      await waitForSettled(() => source.responses.length === 0);
       expect(source.responses).toEqual([]);
       socket.close();
     } finally {
@@ -372,7 +376,11 @@ describe("Panel transport dialog and context-action contract", () => {
       expect(message.queryId).toBe("q1");
       expect(message.actions[0]?.kind).toBe("open-link-new-tab");
       send(socket, { type: "context_action", actionId: "open-link-new-tab" });
-      await new Promise((resolve) => setTimeout(resolve, 20));
+      await waitFor(() =>
+        source.performedActions.some(
+          (action) => action === "open-link-new-tab",
+        ),
+      );
       expect(source.performedActions).toEqual(["open-link-new-tab"]);
       socket.close();
     } finally {
@@ -388,7 +396,10 @@ describe("Panel transport dialog and context-action contract", () => {
       send(socket, redeemMessage(issued));
       await onceMessage(socket); // ready
       send(socket, { type: "context_query", queryId: "q1", x: 5, y: 9 });
-      await new Promise((resolve) => setTimeout(resolve, 30));
+      // A view-only spectator's context query is dropped with no ack and no
+      // side effect; poll for a bounded window (a broken drop would push to
+      // source.performedActions and fail fast).
+      await waitForSettled(() => source.performedActions.length === 0);
       expect(source.performedActions).toEqual([]);
       socket.close();
     } finally {
@@ -441,7 +452,12 @@ describe("Panel transport dialog and context-action contract", () => {
         dialogId: "first",
         accept: false,
       });
-      await new Promise((resolve) => setTimeout(resolve, 20));
+      await waitFor(() =>
+        source.responses.find(
+          (response) =>
+            response.dialogId === "first" && response.accept === false,
+        ),
+      );
       expect(source.responses).toContainEqual({
         dialogId: "first",
         accept: false,
@@ -489,7 +505,13 @@ describe("Panel transport dialog and context-action contract", () => {
           dialogs.push(message.dialog);
       });
       send(reconnected, redeemMessage(second.issued));
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      await waitFor(() => dialogs.some((dialog) => dialog.dialogId === "solo"));
+      // Dedup: the open dialog must arrive exactly once. Poll for a bounded
+      // window; a missing dedup would push a second copy and fail fast.
+      await waitForSettled(
+        () =>
+          dialogs.filter((dialog) => dialog.dialogId === "solo").length === 1,
+      );
       expect(
         dialogs.filter((dialog) => dialog.dialogId === "solo"),
       ).toHaveLength(1);
@@ -526,7 +548,16 @@ describe("Panel transport dialog and context-action contract", () => {
           dialogs.push(message.dialog);
       });
       send(socket, redeemMessage(issued));
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      await waitFor(() =>
+        dialogs.some((dialog) => dialog.dialogId === "preopen"),
+      );
+      // Dedup: the pre-open dialog must arrive exactly once. Poll for a
+      // bounded window; a missing dedup would push a second copy and fail.
+      await waitForSettled(
+        () =>
+          dialogs.filter((dialog) => dialog.dialogId === "preopen").length ===
+          1,
+      );
       expect(
         dialogs.filter((dialog) => dialog.dialogId === "preopen"),
       ).toHaveLength(1);
@@ -617,7 +648,12 @@ describe("Panel transport dialog and context-action contract", () => {
       );
       // Lease end dismisses open dialogs with the fail-closed default.
       transport.dismissOpenDialogs?.();
-      await new Promise((resolve) => setTimeout(resolve, 20));
+      await waitFor(() =>
+        source.responses.find(
+          (response) =>
+            response.dialogId === "open-confirm" && response.accept === false,
+        ),
+      );
       expect(source.responses).toContainEqual({
         dialogId: "open-confirm",
         accept: false,

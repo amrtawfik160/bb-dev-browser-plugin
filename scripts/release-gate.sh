@@ -36,14 +36,10 @@ npm run typecheck
 step "build (bb plugin build)"
 npm run build
 
-step "test (vitest run, with retry for pre-existing timing-sensitive tests)"
-# The issue #22 suite has several pre-existing tests with tight fixed waits
-# (e.g. 5 ms / 20 ms) that intermittently miss an event under full-suite load
-# but pass reliably on an isolated retry. `--retry 2` re-runs only a failed
-# test in isolation, so a pre-existing timing flake clears on retry while a
-# deterministic regression fails all retries. This keeps the release gate
-# reliable without masking real failures; hardening those waits is a separate
-# follow-up.
-npx vitest run --retry 2
+step "test (vitest run)"
+# The contract suites poll for the real event/signal with a bounded timeout
+# (test/wait.ts) instead of tight fixed waits, so the suite is deterministic
+# under full-suite load and does not need --retry. See issue #23 S2.
+npx vitest run
 
 printf '\n\033[1;32m=== release-gate passed ===\033[0m\n'

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { WebSocketServer, type WebSocket } from "ws";
 import { createCdpScreencastSource } from "../browser-screencast.js";
+import { waitFor } from "./wait.js";
 
 /**
  * A minimal CDP endpoint stub: it answers the target/attach/startScreencast
@@ -124,12 +125,10 @@ async function waitForStartScreencast(
   stub: Awaited<ReturnType<typeof createCdpEndpointStub>>,
   count = 1,
 ) {
-  const deadline = Date.now() + 2_000;
-  while (Date.now() < deadline) {
-    if (stub.startScreencastCalls.length >= count) return;
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-  throw new Error("Page.startScreencast was not issued in time.");
+  await waitFor(
+    () => (stub.startScreencastCalls.length >= count ? true : undefined),
+    { timeoutMs: 2_000, intervalMs: 5 },
+  );
 }
 
 describe("CDP screencast source contract", () => {
@@ -202,7 +201,13 @@ describe("CDP screencast source contract", () => {
       await waitForStartScreencast(stub);
       await source.resolveContextActions?.({ x: 0, y: 0 });
       source.performContextAction?.("open-link-new-tab");
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await waitFor(() =>
+        opened.find(
+          (entry) =>
+            entry.targetId === "created-target" &&
+            entry.url === "https://example.test/link",
+        ),
+      );
       // The created target is reported for shared-strip enrollment.
       expect(opened).toEqual([
         { targetId: "created-target", url: "https://example.test/link" },
@@ -235,7 +240,11 @@ describe("CDP screencast source contract", () => {
       // Prime a save-image action through the context-action store.
       await source.resolveContextActions?.({ x: 0, y: 0 });
       source.performContextAction?.("save-image");
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await waitFor(() =>
+        stub.commands.some(
+          (command) => command.method === "Page.setDownloadBehavior",
+        ),
+      );
       expect(
         stub.commands.some(
           (command) => command.method === "Page.setDownloadBehavior",
@@ -278,13 +287,19 @@ describe("CDP screencast source contract", () => {
         message: "Leave?",
         url: "https://example.test/page",
       });
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      expect(dialogs[0]?.type).toBe("beforeunload");
-      const dialogId = dialogs[0]?.dialogId;
+      const beforeunload = await waitFor(() =>
+        dialogs.find((dialog) => dialog.type === "beforeunload"),
+      );
+      expect(beforeunload.type).toBe("beforeunload");
+      const dialogId = beforeunload.dialogId;
       expect(dialogId).toBeDefined();
       // Dismiss open dialogs with the fail-closed default (stay).
       source.dismissOpenDialogs?.();
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await waitFor(() =>
+        stub.commands.some(
+          (command) => command.method === "Page.handleJavaScriptDialog",
+        ),
+      );
       const handle = stub.commands.find(
         (command) => command.method === "Page.handleJavaScriptDialog",
       );
@@ -317,7 +332,11 @@ describe("CDP screencast source contract", () => {
       // Make the clipboard evaluate reject so the honest-failure path runs.
       stub.rejectNextEvaluate = true;
       source.performContextAction?.("copy-link");
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await waitFor(() =>
+        results.some(
+          (result) => result.actionId === "copy-link" && result.ok === false,
+        ),
+      );
       expect(results).toContainEqual({ actionId: "copy-link", ok: false });
     } finally {
       controller.abort();

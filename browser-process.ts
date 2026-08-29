@@ -208,17 +208,7 @@ async function waitForDevToolsEndpoint(
   const discovered = (async () => {
     for await (const change of changes) {
       if (change.filename !== DEVTOOLS_PORT_FILE) continue;
-      let endpoint: string | null;
-      try {
-        endpoint = await activeDevToolsEndpoint(profileDirectory);
-      } catch {
-        // The DevTools port file can be observed mid-write (an empty or
-        // partially-written first line while the browser is still flushing
-        // the port and path). Keep watching for a complete write rather than
-        // failing the Automation Mode readiness probe on a transient partial
-        // read; a genuinely malformed file surfaces once the browser exits.
-        continue;
-      }
+      const endpoint = await activeDevToolsEndpoint(profileDirectory);
       if (endpoint !== null) return endpoint;
     }
     throw new Error("Chrome stopped exposing Automation Mode readiness.");

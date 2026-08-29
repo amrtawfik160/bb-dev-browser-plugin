@@ -117,6 +117,8 @@ describe("release artifact (issue #23 AC2)", () => {
       "docs/browser/limitations.md",
       "docs/browser/third-party-notices.md",
       "docs/browser/verification-report.md",
+      "docs/browser/release-candidate-summary.md",
+      "docs/browser/release-review-checklist.md",
     ];
     const missing = required.filter((path) => !files.includes(path));
     expect(
