@@ -31,6 +31,7 @@ describe("Browser package contract", () => {
       allow: [
         /^@eslint\/js$/,
         /^@get-bb\/plugin-sdk\/testing(?:\/(?:app|host))?$/,
+        /^@testing-library\/react$/,
         /^better-sqlite3$/,
         /^react$/,
         /^typescript-eslint$/,

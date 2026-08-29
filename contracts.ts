@@ -4,6 +4,229 @@ import { z } from "zod";
 export const DEFAULT_PROFILE_ID = "bb-personal";
 export const SETUP_REQUIRED_MESSAGE =
   "Browser host setup has not been completed.";
+export const BROWSER_STORAGE_ROOT = "/var/lib/bb-browser";
+export const BROWSER_CONFIGURATION_ROOT = "/etc/bb-browser";
+export const STOP_BROWSER_CONFIRMATION = "Stop Browser processes";
+
+export function browserHostStorageSegment(hostId: string) {
+  return encodeURIComponent(hostId).replaceAll(".", "%2E");
+}
+
+export const SETUP_STEP_IDS = [
+  "dedicated-user",
+  "system-packages",
+  "protected-storage",
+] as const;
+
+export const setupStepIdSchema = z.enum(SETUP_STEP_IDS);
+export type SetupStepId = z.infer<typeof setupStepIdSchema>;
+
+export const SETUP_STEP_DEFINITIONS = [
+  {
+    id: "dedicated-user",
+    label: "Create the dedicated browser user",
+    description:
+      "Create bb-browser with a non-login shell and no administrative privileges.",
+    confirmationText: "Create bb-browser",
+  },
+  {
+    id: "system-packages",
+    label: "Install Browser system packages",
+    description:
+      "Install the pinned Browser runtime and Safe Login display helpers.",
+    confirmationText: "Install Browser packages",
+  },
+  {
+    id: "protected-storage",
+    label: "Configure protected Browser storage",
+    description:
+      "Create installation- and host-scoped storage owned only by bb-browser.",
+    confirmationText: "Configure protected Browser storage",
+  },
+] as const satisfies readonly {
+  id: SetupStepId;
+  label: string;
+  description: string;
+  confirmationText: string;
+}[];
+
+export const browserSetupStepSchema = z
+  .object({
+    id: setupStepIdSchema,
+    label: z.string().min(1),
+    description: z.string().min(1),
+    confirmationText: z.string().min(1),
+    state: z.enum(["pending", "completed", "failed"]),
+    failure: z.string().min(1).nullable(),
+  })
+  .strict();
+
+export const browserSetupPlanSchema = z
+  .object({
+    hostId: z.string().min(1),
+    profileId: z.string().min(1),
+    installationId: z.string().min(1),
+    state: z.enum(["pending", "in-progress", "partial-failure", "ready"]),
+    nextStepId: setupStepIdSchema.nullable(),
+    storageRoot: z.string().min(1),
+    hostStoragePath: z.string().min(1),
+    storageOwner: z.literal("bb-browser"),
+    storageMode: z.literal("0700"),
+    configurationPath: z.string().min(1),
+    runtime: z
+      .object({
+        runAsUser: z.literal("bb-browser"),
+        homeDirectory: z.string().min(1),
+        shell: z.literal("/usr/sbin/nologin"),
+        sandbox: z.literal("required"),
+        noSandbox: z.literal(false),
+      })
+      .strict(),
+    packages: z
+      .array(
+        z
+          .object({
+            name: z.string().min(1),
+            purpose: z.string().min(1),
+          })
+          .strict(),
+      )
+      .length(4),
+    steps: z.array(browserSetupStepSchema).length(3),
+  })
+  .strict();
+
+export const browserSetupRequestSchema = z
+  .object({
+    hostId: z.string().min(1),
+    profileId: z.string().min(1),
+    stepId: setupStepIdSchema,
+    confirmation: z.string().min(1),
+  })
+  .strict();
+
+export const browserSetupResponseSchema = z
+  .object({
+    outcome: z.enum([
+      "confirmation-required",
+      "blocked",
+      "progressed",
+      "completed",
+      "already-complete",
+      "partial-failure",
+    ]),
+    message: z.string().min(1),
+    plan: browserSetupPlanSchema,
+  })
+  .strict();
+
+export const browserLifecycleRequestSchema = z
+  .object({
+    hostId: z.string().min(1),
+    profileId: z.string().min(1),
+    confirmation: z.string().min(1),
+  })
+  .strict();
+
+export const browserLifecycleResponseSchema = z
+  .object({
+    action: z.enum(["disable", "uninstall"]),
+    outcome: z.enum([
+      "confirmation-required",
+      "stopped",
+      "already-stopped",
+      "failed",
+    ]),
+    message: z.string().min(1),
+    confirmationText: z.string().min(1),
+    profilesRetained: z.literal(true),
+  })
+  .strict();
+
+export const browserPurgeTargetSchema = z.discriminatedUnion("kind", [
+  z
+    .object({
+      kind: z.literal("processes"),
+      id: z.literal("stop-owned-processes"),
+      scope: z.literal("Browser-owned processes"),
+      state: z.enum(["pending", "completed", "failed"]),
+      failure: z.string().min(1).nullable(),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("browser-data"),
+      id: z.literal("browser-data"),
+      path: z.string().min(1),
+      state: z.enum(["pending", "completed", "failed"]),
+      failure: z.string().min(1).nullable(),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("configuration"),
+      id: z.literal("configuration"),
+      path: z.string().min(1),
+      state: z.enum(["pending", "completed", "failed"]),
+      failure: z.string().min(1).nullable(),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("system-user"),
+      id: z.literal("dedicated-user"),
+      username: z.literal("bb-browser"),
+      state: z.enum(["pending", "completed", "failed"]),
+      failure: z.string().min(1).nullable(),
+    })
+    .strict(),
+]);
+
+export const browserPurgePlanSchema = z
+  .object({
+    hostId: z.string().min(1),
+    profileId: z.string().min(1),
+    installationId: z.string().min(1),
+    state: z.enum(["pending", "in-progress", "partial-failure", "purged"]),
+    confirmationText: z.string().min(1),
+    targets: z.array(browserPurgeTargetSchema).length(4),
+  })
+  .strict();
+
+export const browserPurgeRequestSchema = z
+  .object({
+    hostId: z.string().min(1),
+    profileId: z.string().min(1),
+    confirmation: z.string().min(1),
+  })
+  .strict();
+
+export const browserPurgeResponseSchema = z
+  .object({
+    outcome: z.enum([
+      "confirmation-required",
+      "progressed",
+      "purged",
+      "already-purged",
+      "partial-failure",
+    ]),
+    message: z.string().min(1),
+    plan: browserPurgePlanSchema,
+  })
+  .strict();
+
+export type BrowserSetupPlan = z.infer<typeof browserSetupPlanSchema>;
+export type BrowserSetupRequest = z.infer<typeof browserSetupRequestSchema>;
+export type BrowserSetupResponse = z.infer<typeof browserSetupResponseSchema>;
+export type BrowserLifecycleRequest = z.infer<
+  typeof browserLifecycleRequestSchema
+>;
+export type BrowserLifecycleResponse = z.infer<
+  typeof browserLifecycleResponseSchema
+>;
+export type BrowserPurgePlan = z.infer<typeof browserPurgePlanSchema>;
+export type BrowserPurgeRequest = z.infer<typeof browserPurgeRequestSchema>;
+export type BrowserPurgeResponse = z.infer<typeof browserPurgeResponseSchema>;
 
 export const readinessCapabilityIdSchema = z.enum([
   "operating-system",
@@ -161,6 +384,26 @@ export const browserDiagnosticsSchema = z
 
 export type BrowserDiagnostics = z.infer<typeof browserDiagnosticsSchema>;
 
+export const browserActivityRecordSchema = z
+  .object({
+    id: z.number().int().positive(),
+    occurredAt: z.string().datetime(),
+    actor: z.literal("owner"),
+    hostId: z.string().min(1),
+    profileId: z.string().min(1),
+    kind: z.enum(["setup", "lifecycle", "purge"]),
+    action: z.string().min(1),
+    outcome: z.string().min(1),
+    interrupted: z.boolean(),
+  })
+  .strict();
+
+export const browserActivityRecordsSchema = z
+  .array(browserActivityRecordSchema)
+  .max(10_000);
+
+export type BrowserActivityRecord = z.infer<typeof browserActivityRecordSchema>;
+
 export function setupRequiredStatus(
   target: BrowserStatusTarget,
 ): BrowserStatus {
@@ -242,6 +485,34 @@ export const rpcContract = defineRpcContract({
   browser_diagnostics: {
     input: browserStatusTargetSchema,
     output: browserDiagnosticsSchema,
+  },
+  browser_activity_records: {
+    input: browserHostTargetSchema,
+    output: browserActivityRecordsSchema,
+  },
+  browser_setup_plan: {
+    input: browserHostTargetSchema,
+    output: browserSetupPlanSchema,
+  },
+  browser_setup: {
+    input: browserSetupRequestSchema,
+    output: browserSetupResponseSchema,
+  },
+  browser_disable: {
+    input: browserLifecycleRequestSchema,
+    output: browserLifecycleResponseSchema,
+  },
+  browser_uninstall: {
+    input: browserLifecycleRequestSchema,
+    output: browserLifecycleResponseSchema,
+  },
+  browser_purge_plan: {
+    input: browserHostTargetSchema,
+    output: browserPurgePlanSchema,
+  },
+  browser_purge: {
+    input: browserPurgeRequestSchema,
+    output: browserPurgeResponseSchema,
   },
 });
 

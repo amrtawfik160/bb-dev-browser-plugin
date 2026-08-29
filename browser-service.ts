@@ -2,11 +2,22 @@ import type Database from "better-sqlite3";
 import type { BbPluginApi, PluginAgentToolContext } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import {
+  browserActivityRecordSchema,
+  browserActivityRecordsSchema,
   browserScriptParametersSchema,
   DEFAULT_PROFILE_ID,
   hostOfflineStatus,
   hostProbeFailedStatus,
   setupRequiredStatus,
+  type BrowserHostTarget,
+  type BrowserActivityRecord,
+  type BrowserLifecycleRequest,
+  type BrowserPurgePlan,
+  type BrowserPurgeRequest,
+  type BrowserPurgeResponse,
+  type BrowserSetupPlan,
+  type BrowserSetupRequest,
+  type BrowserSetupResponse,
   type BrowserDiagnostics,
   type BrowserStatus,
   type BrowserStatusInput,
@@ -21,11 +32,132 @@ const migrations = [
   )`,
   `INSERT INTO browser_preferences (singleton, default_profile_id)
    VALUES (1, '${DEFAULT_PROFILE_ID}')`,
+  `CREATE TABLE browser_activity_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    occurred_at TEXT NOT NULL,
+    actor TEXT NOT NULL CHECK (actor = 'owner'),
+    host_id TEXT NOT NULL,
+    profile_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('setup', 'lifecycle', 'purge')),
+    action TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    interrupted INTEGER NOT NULL CHECK (interrupted IN (0, 1))
+  )`,
+  `CREATE TABLE browser_activity_outbox (
+    record_id INTEGER PRIMARY KEY,
+    occurred_at TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    acknowledged_at TEXT
+  )`,
 ];
 
 const profileRowSchema = z.object({ default_profile_id: z.string().min(1) });
+const activityRowSchema = z
+  .object({
+    id: z.number().int().positive(),
+    occurred_at: z.string().datetime(),
+    actor: z.literal("owner"),
+    host_id: z.string().min(1),
+    profile_id: z.string().min(1),
+    kind: z.enum(["setup", "lifecycle", "purge"]),
+    action: z.string().min(1),
+    outcome: z.string().min(1),
+    interrupted: z.number().int().min(0).max(1),
+  })
+  .strict();
 type BrowserScriptParameters = z.output<typeof browserScriptParametersSchema>;
 type BrowserIdentity = { projectId?: string; threadId?: string };
+type ActivityRecordInput = Omit<BrowserActivityRecord, "id">;
+
+function activityRecordFromRow(row: unknown): BrowserActivityRecord {
+  const parsed = activityRowSchema.parse(row);
+  return browserActivityRecordSchema.parse({
+    id: parsed.id,
+    occurredAt: parsed.occurred_at,
+    actor: parsed.actor,
+    hostId: parsed.host_id,
+    profileId: parsed.profile_id,
+    kind: parsed.kind,
+    action: parsed.action,
+    outcome: parsed.outcome,
+    interrupted: parsed.interrupted === 1,
+  });
+}
+
+function appendActivityRecord(
+  database: Database.Database,
+  input: ActivityRecordInput,
+): BrowserActivityRecord {
+  const append = database.transaction(() => {
+    const inserted = database
+      .prepare(
+        `INSERT INTO browser_activity_records
+          (occurred_at, actor, host_id, profile_id, kind, action, outcome, interrupted)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        input.occurredAt,
+        input.actor,
+        input.hostId,
+        input.profileId,
+        input.kind,
+        input.action,
+        input.outcome,
+        input.interrupted ? 1 : 0,
+      );
+    const record = browserActivityRecordSchema.parse({
+      ...input,
+      id: Number(inserted.lastInsertRowid),
+    });
+    database
+      .prepare(
+        `INSERT INTO browser_activity_outbox
+          (record_id, occurred_at, payload)
+         VALUES (?, ?, ?)`,
+      )
+      .run(record.id, record.occurredAt, JSON.stringify(record));
+    database
+      .prepare(
+        `DELETE FROM browser_activity_records
+         WHERE profile_id = ?
+           AND id NOT IN (
+             SELECT id FROM browser_activity_records
+             WHERE profile_id = ? ORDER BY id DESC LIMIT 10000
+           )`,
+      )
+      .run(record.profileId, record.profileId);
+    database
+      .prepare(
+        `DELETE FROM browser_activity_records
+         WHERE profile_id = ? AND occurred_at < datetime('now', '-30 days')`,
+      )
+      .run(record.profileId);
+    database
+      .prepare(
+        `DELETE FROM browser_activity_outbox
+         WHERE record_id NOT IN (SELECT id FROM browser_activity_records)`,
+      )
+      .run();
+    return record;
+  });
+  return append();
+}
+
+function listActivityRecords(
+  database: Database.Database,
+  target: BrowserHostTarget,
+): BrowserActivityRecord[] {
+  const rows = database
+    .prepare(
+      `SELECT id, occurred_at, actor, host_id, profile_id, kind, action,
+              outcome, interrupted
+       FROM browser_activity_records
+       WHERE host_id = ? AND profile_id = ?
+       ORDER BY id ASC`,
+    )
+    .all(target.hostId, target.profileId);
+  return browserActivityRecordsSchema.parse(rows.map(activityRecordFromRow));
+}
 
 function defaultProfileId(database: Database.Database): string {
   const row = database
@@ -118,6 +250,23 @@ export function createBrowserService(bb: BbPluginApi) {
     }
   }
 
+  async function requireConnectedHost(hostId: string, signal?: AbortSignal) {
+    if ((await hostConnection(hostId, signal)) !== "connected") {
+      throw new Error(`Workspace host ${hostId} is not connected.`);
+    }
+  }
+
+  async function resolveTarget(
+    identity: BrowserIdentity,
+    profileId: string,
+  ): Promise<BrowserHostTarget> {
+    const hostId = await resolvedHostId(bb, identity);
+    if (hostId === null) {
+      throw new Error("Select a workspace host before changing Browser setup.");
+    }
+    return { hostId, profileId };
+  }
+
   async function status(
     identity: BrowserIdentity,
     profileId = defaultProfileId(database),
@@ -133,6 +282,45 @@ export function createBrowserService(bb: BbPluginApi) {
     return Promise.all(
       hosts.map((candidate) => hostStatus(candidate.id, profileId)),
     );
+  }
+
+  async function activityRecords(target: BrowserHostTarget) {
+    return listActivityRecords(database, target);
+  }
+
+  async function recordAdministrativeActivity<T extends { outcome: string }>(
+    target: BrowserHostTarget,
+    kind: BrowserActivityRecord["kind"],
+    action: string,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const occurredAt = new Date().toISOString();
+    try {
+      const response = await operation();
+      appendActivityRecord(database, {
+        occurredAt,
+        actor: "owner",
+        hostId: target.hostId,
+        profileId: target.profileId,
+        kind,
+        action,
+        outcome: response.outcome,
+        interrupted: false,
+      });
+      return response;
+    } catch (error) {
+      appendActivityRecord(database, {
+        occurredAt,
+        actor: "owner",
+        hostId: target.hostId,
+        profileId: target.profileId,
+        kind,
+        action,
+        outcome: "failed",
+        interrupted: false,
+      });
+      throw error;
+    }
   }
 
   async function diagnostics(
@@ -155,6 +343,84 @@ export function createBrowserService(bb: BbPluginApi) {
     } catch {
       return unavailableDiagnostics(hostProbeFailedStatus(target));
     }
+  }
+
+  async function setupPlan(
+    target: BrowserHostTarget,
+    signal?: AbortSignal,
+  ): Promise<BrowserSetupPlan> {
+    await requireConnectedHost(target.hostId, signal);
+    return host.call("setupPlan", target, { hostId: target.hostId, signal });
+  }
+
+  async function setup(
+    request: BrowserSetupRequest,
+    signal?: AbortSignal,
+  ): Promise<BrowserSetupResponse> {
+    const target = {
+      hostId: request.hostId,
+      profileId: request.profileId,
+    };
+    return recordAdministrativeActivity(
+      target,
+      "setup",
+      request.stepId,
+      async () => {
+        await requireConnectedHost(request.hostId, signal);
+        return host.call("setup", request, {
+          hostId: request.hostId,
+          signal,
+        });
+      },
+    );
+  }
+
+  async function lifecycle(
+    method: "disable" | "uninstall",
+    request: BrowserLifecycleRequest,
+    signal?: AbortSignal,
+  ) {
+    const target = {
+      hostId: request.hostId,
+      profileId: request.profileId,
+    };
+    return recordAdministrativeActivity(
+      target,
+      "lifecycle",
+      method,
+      async () => {
+        await requireConnectedHost(request.hostId, signal);
+        return host.call(method, request, {
+          hostId: request.hostId,
+          signal,
+        });
+      },
+    );
+  }
+
+  async function purgePlan(
+    target: BrowserHostTarget,
+    signal?: AbortSignal,
+  ): Promise<BrowserPurgePlan> {
+    await requireConnectedHost(target.hostId, signal);
+    return host.call("purgePlan", target, { hostId: target.hostId, signal });
+  }
+
+  async function purge(
+    request: BrowserPurgeRequest,
+    signal?: AbortSignal,
+  ): Promise<BrowserPurgeResponse> {
+    const target = {
+      hostId: request.hostId,
+      profileId: request.profileId,
+    };
+    return recordAdministrativeActivity(target, "purge", "purge", async () => {
+      await requireConnectedHost(request.hostId, signal);
+      return host.call("purge", request, {
+        hostId: request.hostId,
+        signal,
+      });
+    });
   }
 
   async function browserScript(
@@ -185,7 +451,19 @@ export function createBrowserService(bb: BbPluginApi) {
     );
   }
 
-  return { browserScript, diagnostics, settingsStatuses, status };
+  return {
+    browserScript,
+    activityRecords,
+    diagnostics,
+    lifecycle,
+    purge,
+    purgePlan,
+    resolveTarget,
+    settingsStatuses,
+    setup,
+    setupPlan,
+    status,
+  };
 }
 
 export type BrowserService = ReturnType<typeof createBrowserService>;
