@@ -6,12 +6,16 @@ import {
   ACTIVITY_RETENTION_DAYS,
   browserActivityEventSchema,
   browserActivityExportSchema,
+  browserActivityGrantElevationsSchema,
   browserActivityRecordSchema,
   browserActivityRecordsSchema,
+  browserOriginScopeSchema,
+  browserProfileGrantIdSchema,
   type BrowserActivityEvent,
   type BrowserActivityExport,
   type BrowserActivityRecord,
 } from "./contracts.js";
+import { BROWSER_AUTHORIZATION_MIGRATIONS } from "./authorization.js";
 
 export { browserActivityEventFromOutboxItem as activityEventFromOutboxItem } from "./contracts.js";
 
@@ -97,10 +101,18 @@ CREATE INDEX browser_activity_tombstones_host
   ON browser_activity_tombstones (host_id, cleared_at);
 `;
 
+const activityGrantMetadataMigration = `
+ALTER TABLE browser_activity_records ADD COLUMN grant_id TEXT;
+ALTER TABLE browser_activity_records ADD COLUMN grant_scope TEXT;
+ALTER TABLE browser_activity_records ADD COLUMN grant_elevations TEXT;
+`;
+
 export const BROWSER_DATABASE_MIGRATIONS = [
   ...legacyDatabaseMigrations,
   activityRecordsMigration,
   activityTombstonesMigration,
+  ...BROWSER_AUTHORIZATION_MIGRATIONS,
+  activityGrantMetadataMigration,
 ] as const;
 
 const activityRowSchema = z
@@ -111,6 +123,9 @@ const activityRowSchema = z
     project_id: z.string().min(1).nullable(),
     host_id: z.string().min(1),
     profile_id: z.string().min(1),
+    grant_id: browserProfileGrantIdSchema.nullable(),
+    grant_scope: browserOriginScopeSchema.nullable(),
+    grant_elevations: z.string().nullable(),
     destination_origin: z.string().min(1).nullable(),
     occurred_at: z.string().datetime(),
     kind: z.enum([
@@ -180,6 +195,12 @@ export function newActivityEventId(prefix: string) {
 
 function activityRecordFromRow(activityRow: unknown): BrowserActivityRecord {
   const parsed = activityRowSchema.parse(activityRow);
+  const grantElevations =
+    parsed.grant_elevations === null
+      ? null
+      : browserActivityGrantElevationsSchema.parse(
+          JSON.parse(parsed.grant_elevations),
+        );
   return browserActivityRecordSchema.parse({
     id: parsed.id,
     eventId: parsed.event_id,
@@ -187,6 +208,9 @@ function activityRecordFromRow(activityRow: unknown): BrowserActivityRecord {
     projectId: parsed.project_id,
     hostId: parsed.host_id,
     profileId: parsed.profile_id,
+    grantId: parsed.grant_id,
+    grantScope: parsed.grant_scope,
+    grantElevations,
     destinationOrigin: parsed.destination_origin,
     occurredAt: parsed.occurred_at,
     kind: parsed.kind,
@@ -208,6 +232,10 @@ function sameActivityEvent(
     record.projectId === event.projectId &&
     record.hostId === event.hostId &&
     record.profileId === event.profileId &&
+    (record.grantId ?? null) === (event.grantId ?? null) &&
+    (record.grantScope ?? null) === (event.grantScope ?? null) &&
+    JSON.stringify(record.grantElevations ?? null) ===
+      JSON.stringify(event.grantElevations ?? null) &&
     record.destinationOrigin === event.destinationOrigin &&
     record.occurredAt === event.occurredAt &&
     record.kind === event.kind &&
@@ -226,6 +254,11 @@ function activityEventValues(event: BrowserActivityEvent) {
     event.projectId,
     event.hostId,
     event.profileId,
+    event.grantId ?? null,
+    event.grantScope ?? null,
+    event.grantElevations === undefined || event.grantElevations === null
+      ? null
+      : JSON.stringify(event.grantElevations),
     event.destinationOrigin,
     event.occurredAt,
     event.kind,
@@ -358,7 +391,8 @@ function findActivityRecord(
   const activityRow = database
     .prepare(
       `SELECT id, event_id, actor, project_id, host_id, profile_id,
-              destination_origin, occurred_at, kind, action, outcome,
+              grant_id, grant_scope, grant_elevations, destination_origin,
+              occurred_at, kind, action, outcome,
               interrupted, interruption_reason, duration_ms
        FROM browser_activity_records
        WHERE event_id = ?`,
@@ -388,14 +422,18 @@ function insertActivityEvent(
     .prepare(
       `INSERT INTO browser_activity_records
         (event_id, actor, project_id, host_id, profile_id,
-         destination_origin, occurred_at, kind, action, outcome,
-         interrupted, interruption_reason, duration_ms)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         grant_id, grant_scope, grant_elevations, destination_origin,
+         occurred_at, kind, action, outcome, interrupted,
+         interruption_reason, duration_ms)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(...activityEventValues(event));
   return browserActivityRecordSchema.parse({
     id: Number(inserted.lastInsertRowid),
     ...event,
+    grantId: event.grantId ?? null,
+    grantScope: event.grantScope ?? null,
+    grantElevations: event.grantElevations ?? null,
   });
 }
 
@@ -472,7 +510,8 @@ function selectActivityRecords(
   const rows = database
     .prepare(
       `SELECT id, event_id, actor, project_id, host_id, profile_id,
-              destination_origin, occurred_at, kind, action, outcome,
+              grant_id, grant_scope, grant_elevations, destination_origin,
+              occurred_at, kind, action, outcome,
               interrupted, interruption_reason, duration_ms
        FROM browser_activity_records
        WHERE host_id = ? AND profile_id = ?

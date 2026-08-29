@@ -317,10 +317,14 @@ function isBrowserCommand(
   );
 }
 
-function parsedCommand(positional: string[]): BrowserCommand | null {
-  if (positional.length !== 1) return null;
-  const command = positional[0];
-  return isBrowserCommand(command) ? command : null;
+function parsedCommand(
+  positional: string[],
+): { command: BrowserCommand } | null {
+  if (positional.length === 1) {
+    const command = positional[0];
+    return isBrowserCommand(command) ? { command } : null;
+  }
+  return null;
 }
 
 function validateCliCommandOptions(
@@ -439,13 +443,13 @@ function parseCliArguments(argv: string[]): CliArgumentParseResult {
     }
     parseState.positional.push(argument);
   }
-  const command = parsedCommand(parseState.positional);
-  if (command === null) return { error: CLI_USAGE };
-  const optionError = validateCliCommandOptions(command, parseState);
+  const parsed = parsedCommand(parseState.positional);
+  if (parsed === null) return { error: CLI_USAGE };
+  const optionError = validateCliCommandOptions(parsed.command, parseState);
   if (optionError !== null) return { error: optionError };
   return {
     arguments: {
-      command,
+      command: parsed.command,
       json: parseState.json,
       profileId: parseState.profileId,
       hostId: parseState.hostId,
@@ -1026,7 +1030,8 @@ function registerAgentTool(bb: BbPluginApi, browser: BrowserService) {
 }
 
 export default function plugin(bb: BbPluginApi) {
-  const browser = createBrowserService(bb);
+  const ownerAuthority = Symbol("browser-owner-settings");
+  const browser = createBrowserService(bb, ownerAuthority);
   bb.rpc.register(rpcContract, {
     browser_status: (input) =>
       input.profileSelection === "selected"
@@ -1045,6 +1050,11 @@ export default function plugin(bb: BbPluginApi) {
     browser_purge_plan: (input) => browser.purgePlan(input),
     browser_purge: (input) => browser.purge(input),
     browser_profiles: (input) => browser.profiles(input),
+    browser_grants: (input) => browser.grants(ownerAuthority, input),
+    browser_grant_create: (input) => browser.createGrant(ownerAuthority, input),
+    browser_grant_inspect: (input) =>
+      browser.inspectGrant(ownerAuthority, input.grantId),
+    browser_grant_revoke: (input) => browser.revokeGrant(ownerAuthority, input),
     browser_profile_create: (input) => browser.createProfile(input),
     browser_profile_rename: (input) => browser.renameProfile(input),
     browser_profile_select: (input) => browser.selectProfile(input),
