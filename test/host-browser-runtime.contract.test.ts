@@ -33,7 +33,100 @@ function healthyStatus(): BrowserStatus {
 }
 
 describe("Browser host runtime boundary", () => {
-  it("wakes the selected Browser Profile and returns the attached dev-browser result", async () => {
+  it("issue #12 exposes lifecycle state and pins a visible Browser Panel", async () => {
+    const rootDirectory = await mkdtemp(join(tmpdir(), "host-panel-runtime-"));
+    let lifecycleState: "sleeping" | "running" = "sleeping";
+    const runtime = {
+      start: async () => {
+        throw new Error("not used");
+      },
+      stop: async () => {},
+      execute: async () => {
+        throw new Error("not used");
+      },
+      navigate: async () => {
+        throw new Error("not used");
+      },
+      status: async ({
+        hostId,
+        profileId,
+      }: {
+        hostId: string;
+        profileId: string;
+      }) => ({
+        state: lifecycleState,
+        hostId,
+        profileId,
+      }),
+      pinPanel: async () => {
+        lifecycleState = "running";
+        return {} as never;
+      },
+      unpinPanel: async () => {
+        lifecycleState = "sleeping";
+      },
+      hostDisconnected: () => {},
+      hostReconnected: async () => {},
+      dispose: async () => {},
+    };
+    const profiles = createFileBrowserProfileStore({
+      rootDirectory,
+      installationId: "installation-panel-runtime",
+    });
+    await profiles.initialize(HOST_ID);
+    const host = experimental_createHostEntryHarness(
+      createBrowserHostEntry(
+        {
+          inspect: healthyStatus,
+          diagnostics: () => {
+            throw new Error("not used");
+          },
+        },
+        profiles,
+        undefined,
+        runtime,
+      ),
+      {
+        experimental_paths: {
+          dataDir: rootDirectory,
+          tempDir: join(rootDirectory, "tmp"),
+        },
+      },
+    );
+    try {
+      await expect(
+        host.experimental_call("status", {
+          hostId: HOST_ID,
+          profileId: DEFAULT_PROFILE_ID,
+        }),
+      ).resolves.toMatchObject({
+        state: "sleeping",
+        label: "Sleeping",
+        message:
+          "This Browser Instance is sleeping and will wake without changing its Browser Profile.",
+      });
+      await expect(
+        host.experimental_call("panelVisibility", {
+          hostId: HOST_ID,
+          profileId: DEFAULT_PROFILE_ID,
+          panelId: "panel-visible",
+          visibility: "visible",
+        }),
+      ).resolves.toMatchObject({ state: "healthy" });
+      await expect(
+        host.experimental_call("panelVisibility", {
+          hostId: HOST_ID,
+          profileId: DEFAULT_PROFILE_ID,
+          panelId: "panel-visible",
+          visibility: "hidden",
+        }),
+      ).resolves.toMatchObject({ state: "sleeping" });
+    } finally {
+      await host.experimental_dispose();
+      await rm(rootDirectory, { recursive: true, force: true });
+    }
+  });
+  it("issue #12 keeps one Browser Instance across the production host reconnect bridge", async () => {
     const rootDirectory = await mkdtemp(join(tmpdir(), "host-runtime-"));
     const profiles = createFileBrowserProfileStore({
       rootDirectory,
@@ -43,6 +136,7 @@ describe("Browser host runtime boundary", () => {
     const browserExecutable = join(rootDirectory, "chrome-fixture");
     await writeFile(browserExecutable, "fixture");
     await chmod(browserExecutable, 0o755);
+    let launchCount = 0;
     const runtime = createBrowserInstanceRuntime({
       rootDirectory,
       installationId: "installation-runtime",
@@ -53,6 +147,7 @@ describe("Browser host runtime boundary", () => {
         effectiveUserId: 1001,
         effectiveGroupId: 1001,
         async launch() {
+          launchCount += 1;
           return {
             pid: 4200,
             automationEndpoint: "http://127.0.0.1:14200",
@@ -107,6 +202,51 @@ describe("Browser host runtime boundary", () => {
           timeoutMs: 5_000,
         }),
       ).resolves.toEqual({ ok: true, result: "fixture-output" });
+
+      await host.experimental_call("hostConnection", {
+        hostId: HOST_ID,
+        generation: 1,
+        state: "disconnected",
+      });
+      await expect(
+        host.experimental_call("browserScript", {
+          purpose: "Inspect the disconnected fixture",
+          code: "console.log(await browser.listPages())",
+          hostId: HOST_ID,
+          projectId: "project-runtime",
+          threadId: "thread-runtime",
+          activityEventId: "runtime-event-2",
+          activityOccurredAt: "2026-08-28T00:00:01.000Z",
+          profileId: DEFAULT_PROFILE_ID,
+          timeoutMs: 5_000,
+        }),
+      ).rejects.toMatchObject({ code: "host-offline" });
+      await host.experimental_call("hostConnection", {
+        hostId: HOST_ID,
+        generation: 2,
+        state: "connected",
+      });
+      await expect(
+        host.experimental_call("hostConnection", {
+          hostId: HOST_ID,
+          generation: 1,
+          state: "disconnected",
+        }),
+      ).resolves.toMatchObject({ applied: false });
+      await expect(
+        host.experimental_call("browserScript", {
+          purpose: "Inspect the reconnected fixture",
+          code: "console.log(await browser.listPages())",
+          hostId: HOST_ID,
+          projectId: "project-runtime",
+          threadId: "thread-runtime",
+          activityEventId: "runtime-event-3",
+          activityOccurredAt: "2026-08-28T00:00:02.000Z",
+          profileId: DEFAULT_PROFILE_ID,
+          timeoutMs: 5_000,
+        }),
+      ).resolves.toEqual({ ok: true, result: "fixture-output" });
+      expect(launchCount).toBe(1);
     } finally {
       await host.experimental_dispose();
       await rm(rootDirectory, { recursive: true, force: true });
@@ -129,6 +269,23 @@ describe("Browser host runtime boundary", () => {
         navigate: async () => {
           throw new Error("not used");
         },
+        status: async ({
+          hostId,
+          profileId,
+        }: {
+          hostId: string;
+          profileId: string;
+        }) => ({
+          state: "sleeping" as const,
+          hostId,
+          profileId,
+        }),
+        pinPanel: async () => {
+          throw new Error("not used");
+        },
+        unpinPanel: async () => {},
+        hostDisconnected: () => {},
+        hostReconnected: async () => {},
         dispose: async () => {
           calls.push("runtime-disposed");
         },

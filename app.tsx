@@ -36,6 +36,7 @@ import {
 
 const panelParams = { profileId: DEFAULT_PROFILE_ID } as const;
 const GRANT_REQUEST_REFRESH_INTERVAL_MS = 1_000;
+let nextBrowserPanelId = 1;
 
 function ReadinessChecklist({ status }: { status: BrowserStatus }) {
   return (
@@ -209,6 +210,7 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
   const [navigationLocation, setNavigationLocation] = useState<string | null>(
     null,
   );
+  const [panelId] = useState(() => `browser-panel-${nextBrowserPanelId++}`);
 
   const statusRequest: BrowserStatusInput =
     selectedHostId === undefined
@@ -279,6 +281,38 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
     setStatus(null);
     void rpc.call("browser_status", statusRequest).then(setStatus);
   }, [request, selectedHostId, rpc]);
+
+  useEffect(() => {
+    if (status === null) return;
+    const hostId = status.hostId;
+    if (
+      hostId === null ||
+      !["healthy", "sleeping", "waking"].includes(status.state)
+    ) {
+      return;
+    }
+    const target = { hostId, profileId: status.profileId, panelId };
+    let mounted = true;
+    void rpc
+      .call("browser_panel_visibility", { ...target, visibility: "visible" })
+      .then((nextStatus) => {
+        if (mounted) setStatus(nextStatus);
+      })
+      .catch((error: unknown) => {
+        if (mounted) setProfileError(administrationErrorMessage(error));
+      });
+    return () => {
+      mounted = false;
+      void rpc
+        .call("browser_panel_visibility", {
+          ...target,
+          visibility: "hidden",
+        })
+        .catch((error: unknown) => {
+          console.warn("Browser Panel visibility release failed.", error);
+        });
+    };
+  }, [panelId, rpc, status?.hostId, status?.profileId, status?.state]);
 
   useEffect(() => {
     if (status?.hostId !== null || status === null) {

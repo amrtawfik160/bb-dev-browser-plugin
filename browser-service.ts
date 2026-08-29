@@ -81,6 +81,7 @@ import {
   type BrowserProfileGrantRevokeRequest,
   type BrowserProfileGrantRevokeResponse,
   type BrowserPanelNavigationInput,
+  type BrowserPanelVisibilityRequest,
   type BrowserNavigationResponse,
 } from "./contracts.js";
 import { browserHostContract } from "./host-contract.js";
@@ -481,6 +482,7 @@ export function createBrowserService(
   const activeGrantCalls = new Map<string, Set<AbortController>>();
   const profileLifecycleEpochs = new Map<string, number>();
   const inactiveProfileKeys = new Set<string>();
+  const hostConnectionGenerations = new Map<string, number>();
   let grantStateQueue: Promise<void> = Promise.resolve();
   const host = bb.hosts.experimental_client({ contract: browserHostContract });
 
@@ -746,15 +748,6 @@ export function createBrowserService(
     }
   }
 
-  async function syncConnectedHosts(signal?: AbortSignal) {
-    const hosts = await bb.sdk.hosts.list({ signal });
-    for (const candidate of hosts) {
-      if (candidate.status === "connected") {
-        await syncActivity(candidate.id, signal);
-      }
-    }
-  }
-
   function recordSystemGrantRevocation(
     grant: BrowserProfileGrant,
     action:
@@ -882,20 +875,57 @@ export function createBrowserService(
     return originDeniedResponse(call, decision.message, decision.grantRequest);
   }
 
-  function subscribeToHostReconnects() {
+  function nextHostConnectionGeneration(hostId: string) {
+    const generation = (hostConnectionGenerations.get(hostId) ?? 0) + 1;
+    hostConnectionGenerations.set(hostId, generation);
+    return generation;
+  }
+
+  async function bridgeHostConnection(
+    hostId: string,
+    state: "connected" | "disconnected",
+  ) {
+    const generation = nextHostConnectionGeneration(hostId);
+    await host
+      .call("hostConnection", { hostId, generation, state }, { hostId })
+      .catch(() => {
+        bb.log.warn(
+          `Browser host ${state} transition is pending generation reconciliation.`,
+        );
+      });
+  }
+
+  async function connectedHostChanged(hostId: string) {
+    await bridgeHostConnection(hostId, "connected");
+    await syncActivity(hostId).catch(() => {
+      bb.log.warn(
+        "Browser activity synchronization failed; pending events will retry.",
+      );
+    });
+  }
+
+  async function reconcileConnectedHosts() {
+    const hosts = await bb.sdk.hosts.list();
+    await Promise.all(
+      hosts
+        .filter(({ status }) => status === "connected")
+        .map(({ id }) => connectedHostChanged(id)),
+    );
+  }
+
+  function subscribeToHostConnections() {
     const unsubscribe = bb.sdk.subscribe({
       event: "host:changed",
       callback: (event) => {
+        if (event.changes.includes("host-disconnected")) {
+          return event.id === undefined
+            ? undefined
+            : bridgeHostConnection(event.id, "disconnected");
+        }
         if (!event.changes.includes("host-connected")) return;
-        const synchronization =
-          event.id === undefined
-            ? syncConnectedHosts()
-            : syncActivity(event.id);
-        return synchronization.catch(() => {
-          bb.log.warn(
-            "Browser activity synchronization failed; pending events will retry.",
-          );
-        });
+        return event.id === undefined
+          ? reconcileConnectedHosts()
+          : connectedHostChanged(event.id);
       },
     });
     bb.onDispose(unsubscribe);
@@ -2194,12 +2224,24 @@ export function createBrowserService(
     );
   }
 
-  subscribeToHostReconnects();
+  async function panelVisibility(
+    request: BrowserPanelVisibilityRequest,
+    signal?: AbortSignal,
+  ) {
+    await requireConnectedHost(request.hostId, signal);
+    return host.call("panelVisibility", request, {
+      hostId: request.hostId,
+      signal,
+    });
+  }
+
+  subscribeToHostConnections();
   subscribeToProjectDeletion();
 
   return {
     browserScript,
     navigate,
+    panelVisibility,
     grants,
     createGrant,
     inspectGrant,

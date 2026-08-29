@@ -124,6 +124,37 @@ function deferred<T>() {
 }
 
 describe("Browser public plugin contract", () => {
+  it.each([
+    ["sleeping", "sleeping", "Sleeping"],
+    ["waking", "waking", "Waking"],
+  ] as const)(
+    "issue #12 exposes the %s transition through the Browser Panel and CLI",
+    async (state, code, label) => {
+      const browser = await createPublicPluginHarness({
+        status: browserStatusSchema.parse({
+          ...healthyStatus,
+          state,
+          code,
+          label,
+        }),
+      });
+      try {
+        const panel = await browser.openExistingThreadPanel();
+        const cli = await browser.runStatusCli();
+
+        await panel.panel.findByRole("status", { name: label });
+        expect(browserStatusSchema.parse(JSON.parse(cli.stdout))).toMatchObject(
+          {
+            state,
+            code,
+            label,
+          },
+        );
+      } finally {
+        await browser.dispose();
+      }
+    },
+  );
   it("reports a healthy supported host through the panel and CLI", async () => {
     const browser = await createPublicPluginHarness({
       snapshot: preparedSnapshot,
@@ -3150,6 +3181,36 @@ describe("Browser public plugin contract", () => {
     ).toEqual([]);
     expect(await browser.runBrowserActivityRecords()).toEqual([]);
     await browser.dispose();
+  });
+
+  it("issue #12 bridges host disconnect and reconnect generations to the retained host runtime", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+    });
+    try {
+      await browser.runBrowserStatus({
+        surface: "thread",
+        threadId: "thread-browser-test",
+        profileId: DEFAULT_PROFILE_ID,
+      });
+      await browser.emitHostConnection("host-disconnected");
+      await browser.emitHostConnection("host-connected");
+
+      expect(browser.hostConnectionRequests).toEqual([
+        {
+          hostId: "host-browser-test",
+          generation: 1,
+          state: "disconnected",
+        },
+        {
+          hostId: "host-browser-test",
+          generation: 2,
+          state: "connected",
+        },
+      ]);
+    } finally {
+      await browser.dispose();
+    }
   });
 
   it("reviews, exports, and clears activity through authenticated CLI surfaces", async () => {

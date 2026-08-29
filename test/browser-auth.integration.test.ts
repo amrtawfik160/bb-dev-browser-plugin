@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { createServer, type Server } from "node:http";
-import { access, readFile, rm } from "node:fs/promises";
+import { access, readFile, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { expect, it } from "vitest";
@@ -10,11 +10,21 @@ import {
   createDefaultHostSnapshotReader,
   createHostReadinessBoundary,
   hostInstallationId,
+  provisionedBrowserStorageRoot,
 } from "../readiness.js";
 
 const integrationEnabled = process.env.BB_BROWSER_REAL_INTEGRATION === "1";
 const integrationRequired =
   process.env.BB_BROWSER_REAL_INTEGRATION_REQUIRED === "1";
+const lifecycleProfileSuffixes = [
+  "lru-b",
+  "lru-c",
+  "lru-d",
+  "pinned-refused",
+  "crash-loop",
+  "corrupt",
+  "reload",
+] as const;
 if (integrationRequired && !integrationEnabled) {
   throw new Error("The mandatory real-browser gate cannot be skipped.");
 }
@@ -84,6 +94,22 @@ type WorkerReport = {
   helperProcess: { pid: number; status: string; socketReady: boolean } | null;
   navigation?: { before: { id?: unknown }[]; after: unknown[]; tabId: string };
   recovery?: { crashedPid: number; recoveredPid: number } | null;
+  lifecycle?: {
+    initialPid: number;
+    lruState: string;
+    pinnedLimitCode: string | null;
+    disconnectedCode: string | null;
+    reconciledPid: number;
+    idleStates: string[];
+    crashPids: number[];
+    crashLoopState: {
+      state: string;
+      diagnostics?: { crashCount: number; windowMs: number };
+    };
+    corruptCode: string | null;
+    lazyState: string;
+    reloadPids: number[];
+  };
   postStop?: {
     ownedProcesses: { pid: number; command: string; status: string }[];
     browserPresent: boolean;
@@ -126,6 +152,17 @@ function assertDedicatedIdentity(report: WorkerReport) {
   expect(report.helperProcess?.status).toMatch(
     new RegExp(`^Gid:\\s+${report.gid}\\s`, "mu"),
   );
+}
+
+async function assertProtectedProfileOwnership(
+  path: string,
+  report: WorkerReport,
+) {
+  const metadata = await stat(path);
+  expect(metadata.isDirectory()).toBe(true);
+  expect(metadata.uid).toBe(report.uid);
+  expect(metadata.gid).toBe(report.gid);
+  expect(metadata.mode & 0o7777).toBe(0o700);
 }
 
 async function assertLoopbackSocket(endpoint: string) {
@@ -175,12 +212,40 @@ function assertStopped(report: WorkerReport) {
   });
 }
 
+async function cleanupFixtureProfiles(options: {
+  rootDirectory: string;
+  installationId: string;
+  hostId: string;
+  profileId: string;
+}) {
+  const profileIds = [
+    options.profileId,
+    ...lifecycleProfileSuffixes.map(
+      (suffix) => `${options.profileId}-${suffix}`,
+    ),
+  ];
+  for (const profileId of profileIds) {
+    const paths = profileStoragePaths({ ...options, profileId });
+    await Promise.all([
+      rm(paths.profileDirectory, { recursive: true, force: true }),
+      rm(paths.runtimeManifestPath, { force: true }),
+      rm(`${paths.runtimeManifestPath}.crashes.json`, { force: true }),
+      rm(`${paths.runtimeManifestPath}.instance.lock`, { force: true }),
+      rm(join(paths.runtimeManifestsDirectory, `bb-${profileId}`), {
+        recursive: true,
+        force: true,
+      }),
+    ]);
+  }
+}
+
 it.runIf(integrationEnabled)(
   "mandatory provisioned host preserves authentication across a real worker restart",
   async () => {
     const dataDirectory = requiredEnvironment("BB_BROWSER_HOST_DATA_DIR");
-    const rootDirectory =
-      process.env.BB_BROWSER_REAL_ROOT ?? "/var/lib/bb-browser";
+    const rootDirectory = provisionedBrowserStorageRoot(
+      process.env.BB_BROWSER_REAL_ROOT,
+    );
     const hostId = process.env.BB_BROWSER_REAL_HOST_ID ?? "ci-browser-host";
     const profileId =
       process.env.BB_BROWSER_REAL_PROFILE_ID ?? "ci-auth-fixture";
@@ -218,9 +283,13 @@ it.runIf(integrationEnabled)(
       BB_BROWSER_REAL_PROJECT_ID: projectId,
       BB_BROWSER_FIXTURE_ADDRESS: fixtureAddress,
     };
-    const crashHistoryPath = `${paths.runtimeManifestPath}.crashes.json`;
-    await rm(paths.profileDirectory, { recursive: true, force: true });
-    await rm(crashHistoryPath, { force: true });
+    const fixtureProfiles = {
+      rootDirectory,
+      installationId,
+      hostId,
+      profileId,
+    };
+    await cleanupFixtureProfiles(fixtureProfiles);
     let cleanupRequired = false;
     try {
       cleanupRequired = true;
@@ -238,6 +307,9 @@ it.runIf(integrationEnabled)(
           : "playwright-chromium",
       );
       assertDedicatedIdentity(first);
+      await assertProtectedProfileOwnership(paths.hostStoragePath, first);
+      await assertProtectedProfileOwnership(paths.profileDirectory, first);
+      await assertProtectedProfileOwnership(paths.browserDataPath, first);
       await assertLoopbackSocket(first.instance.automationEndpoint);
       expect(first.navigation?.after).toHaveLength(
         first.navigation?.before.length ?? -1,
@@ -271,6 +343,31 @@ it.runIf(integrationEnabled)(
       assertStopped(restored);
       await assertLoopbackSocketClosed(first.instance.automationEndpoint);
       await assertLoopbackSocketClosed(restored.instance.automationEndpoint);
+
+      const lifecycle = await runWorker({
+        ...workerEnvironment,
+        BB_BROWSER_WORKER_ACTION: "lifecycle",
+      });
+      expect(lifecycle.lifecycle).toMatchObject({
+        lruState: "sleeping",
+        pinnedLimitCode: "awake-limit",
+        disconnectedCode: "host-offline",
+        idleStates: ["sleeping", "sleeping", "sleeping"],
+        crashLoopState: {
+          state: "repair-required",
+          diagnostics: { crashCount: 3, windowMs: 5 * 60 * 1_000 },
+        },
+        corruptCode: "repair-required",
+        lazyState: "sleeping",
+      });
+      expect(lifecycle.lifecycle?.reconciledPid).toBe(
+        lifecycle.lifecycle?.initialPid,
+      );
+      expect(new Set(lifecycle.lifecycle?.crashPids).size).toBe(3);
+      expect(lifecycle.lifecycle?.reloadPids[0]).not.toBe(
+        lifecycle.lifecycle?.reloadPids[1],
+      );
+      assertStopped(lifecycle);
       cleanupRequired = false;
       await expect(access(paths.runtimeManifestPath)).rejects.toMatchObject({
         code: "ENOENT",
@@ -286,9 +383,8 @@ it.runIf(integrationEnabled)(
         });
       }
       await close(server);
-      await rm(paths.profileDirectory, { recursive: true, force: true });
-      await rm(crashHistoryPath, { force: true });
+      await cleanupFixtureProfiles(fixtureProfiles);
     }
   },
-  120_000,
+  240_000,
 );

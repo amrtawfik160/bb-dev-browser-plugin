@@ -36,12 +36,19 @@ import {
   DEFAULT_PROFILE_ID,
   STOP_BROWSER_CONFIRMATION,
   browserProfileUnavailableStatus,
+  hostOfflineStatus,
+  hostProbeFailedStatus,
+  sleepingBrowserStatus,
+  wakingBrowserStatus,
   type BrowserActivityEvent,
   type BrowserScriptRequest,
   type BrowserScriptResponse,
   type BrowserNavigationRequest,
+  type BrowserPanelVisibilityRequest,
+  type BrowserStatus,
 } from "./contracts.js";
 import {
+  BrowserInstanceError,
   createBrowserInstanceRuntime,
   type BrowserInstanceRuntime,
 } from "./browser-runtime.js";
@@ -143,6 +150,36 @@ async function recordExpiredProfiles(
   }
 }
 
+async function runtimeBrowserStatus(
+  readiness: BrowserStatus,
+  browserRuntime: BrowserInstanceRuntime | undefined,
+) {
+  if (readiness.state !== "healthy" || browserRuntime === undefined) {
+    return readiness;
+  }
+  if (readiness.hostId === null) return readiness;
+  const lifecycle = await browserRuntime.status({
+    hostId: readiness.hostId,
+    profileId: readiness.profileId,
+  });
+  if (lifecycle.state === "sleeping") return sleepingBrowserStatus(readiness);
+  if (lifecycle.state === "waking") return wakingBrowserStatus(readiness);
+  if (lifecycle.state === "host-offline") {
+    return hostOfflineStatus(readiness);
+  }
+  if (lifecycle.state === "repair-required") {
+    return crashRepairStatus(readiness, lifecycle.diagnostics.crashCount);
+  }
+  return readiness;
+}
+
+function crashRepairStatus(readiness: BrowserStatus, crashCount: number) {
+  return {
+    ...hostProbeFailedStatus(readiness),
+    message: `Browser crash recovery stopped after ${crashCount} crashes within five minutes. Generate redacted diagnostics and repair this profile.`,
+  };
+}
+
 export function createBrowserHostEntry(
   source: HostBoundarySource,
   profileSource?: ProfileStoreSource,
@@ -156,6 +193,7 @@ export function createBrowserHostEntry(
   let retainedOutbox: ActivityOutbox | undefined;
   let retainedRuntime: BrowserInstanceRuntime | undefined =
     typeof runtimeSource === "object" ? runtimeSource : undefined;
+  const hostConnectionGenerations = new Map<string, number>();
   function administration(dataDir: string) {
     if (retainedBoundary !== undefined) return retainedBoundary;
     const boundary = typeof source === "function" ? source(dataDir) : source;
@@ -192,6 +230,39 @@ export function createBrowserHostEntry(
     const current = retainedRuntime;
     retainedRuntime = undefined;
     await current?.dispose();
+  }
+  function hostConnectionGenerationIsNewer(hostId: string, generation: number) {
+    const previousGeneration = hostConnectionGenerations.get(hostId);
+    return previousGeneration === undefined || generation > previousGeneration;
+  }
+  async function applyRuntimeHostConnection(
+    browserRuntime: BrowserInstanceRuntime,
+    request: {
+      hostId: string;
+      state: "connected" | "disconnected";
+    },
+  ) {
+    browserRuntime.hostDisconnected(request.hostId);
+    if (request.state === "connected") {
+      await browserRuntime.hostReconnected(request.hostId);
+    }
+  }
+  async function reconcileHostConnection(
+    request: {
+      hostId: string;
+      generation: number;
+      state: "connected" | "disconnected";
+    },
+    dataDir: string,
+  ) {
+    if (!hostConnectionGenerationIsNewer(request.hostId, request.generation)) {
+      return { ...request, applied: false };
+    }
+    const browserRuntime = runtime(dataDir);
+    if (browserRuntime === undefined) return { ...request, applied: false };
+    hostConnectionGenerations.set(request.hostId, request.generation);
+    await applyRuntimeHostConnection(browserRuntime, request);
+    return { ...request, applied: true };
   }
   async function runInstallationLifecycle(
     action: "disable" | "uninstall",
@@ -278,6 +349,62 @@ export function createBrowserHostEntry(
       request.input,
     );
   }
+  async function setPanelVisibility(
+    request: BrowserPanelVisibilityRequest,
+    dataDir: string,
+  ) {
+    const readiness = await administration(dataDir).inspect({
+      hostId: request.hostId,
+      profileId: request.profileId,
+    });
+    const browserRuntime = runtime(dataDir);
+    if (readiness.state !== "healthy" || browserRuntime === undefined) {
+      return readiness;
+    }
+    const target = await panelRuntimeTarget(request, dataDir);
+    if (target === null) return browserProfileUnavailableStatus(request);
+    if (request.visibility === "visible")
+      return pinVisiblePanel(request, target, readiness, browserRuntime);
+    await browserRuntime.unpinPanel(target, request.panelId);
+    return runtimeBrowserStatus(readiness, browserRuntime);
+  }
+  async function panelRuntimeTarget(
+    request: BrowserPanelVisibilityRequest,
+    dataDir: string,
+  ) {
+    const inventory = await profiles(dataDir).listProfiles(request.hostId);
+    const profile = inventory.profiles.find(
+      ({ profileId, state }) =>
+        profileId === request.profileId && state === "active",
+    );
+    return profile === undefined
+      ? null
+      : {
+          hostId: request.hostId,
+          profileId: request.profileId,
+          locale: profile.locale,
+          timezone: profile.timezone,
+        };
+  }
+  async function pinVisiblePanel(
+    request: BrowserPanelVisibilityRequest,
+    target: Parameters<BrowserInstanceRuntime["pinPanel"]>[0],
+    readiness: BrowserStatus,
+    browserRuntime: BrowserInstanceRuntime,
+  ) {
+    try {
+      await browserRuntime.pinPanel(target, request.panelId);
+    } catch (error) {
+      if (
+        error instanceof BrowserInstanceError &&
+        error.code === "repair-required"
+      ) {
+        return runtimeBrowserStatus(readiness, browserRuntime);
+      }
+      throw error;
+    }
+    return runtimeBrowserStatus(readiness, browserRuntime);
+  }
   function retainWorker(context: {
     experimental_retainWorker(): { dispose(): Promise<void> };
   }) {
@@ -286,10 +413,19 @@ export function createBrowserHostEntry(
   return experimental_defineHostEntry({
     contract: browserHostContract,
     handlers: {
-      status: (target, context) => {
+      hostConnection: (request, context) => {
         retainWorker(context);
-        return administration(context.experimental_paths.dataDir).inspect(
-          target,
+        return reconcileHostConnection(
+          request,
+          context.experimental_paths.dataDir,
+        );
+      },
+      status: async (target, context) => {
+        retainWorker(context);
+        const dataDir = context.experimental_paths.dataDir;
+        return runtimeBrowserStatus(
+          await administration(dataDir).inspect(target),
+          runtime(dataDir),
         );
       },
       diagnostics: (target, context) => {
@@ -414,6 +550,10 @@ export function createBrowserHostEntry(
       navigate: async (request, context) => {
         retainWorker(context);
         return navigateBrowser(request, context.experimental_paths.dataDir);
+      },
+      panelVisibility: async (request, context) => {
+        retainWorker(context);
+        return setPanelVisibility(request, context.experimental_paths.dataDir);
       },
       activityOutbox: async ({ limit }, context) => {
         retainWorker(context);

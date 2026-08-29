@@ -15,11 +15,12 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { DEFAULT_PROFILE_ID } from "../contracts.js";
+import { BROWSER_STORAGE_ROOT, DEFAULT_PROFILE_ID } from "../contracts.js";
 import {
   createDefaultHostSnapshotReader,
   createHostReadinessBoundary,
   hostInstallationId,
+  provisionedBrowserStorageRoot,
   type HostProbePaths,
   type HostProbeSnapshot,
 } from "../readiness.js";
@@ -169,6 +170,15 @@ async function hostFingerprint(root: string) {
 }
 
 describe("Workspace Browser host readiness contract", () => {
+  it("issue #12 rejects a mandatory Chromium root that readiness did not protect", () => {
+    expect(provisionedBrowserStorageRoot(undefined)).toBe(BROWSER_STORAGE_ROOT);
+    expect(provisionedBrowserStorageRoot(BROWSER_STORAGE_ROOT)).toBe(
+      BROWSER_STORAGE_ROOT,
+    );
+    expect(() =>
+      provisionedBrowserStorageRoot("/tmp/unverified-browser-root"),
+    ).toThrow("must use the protected Browser storage root");
+  });
   it("classifies a fully prepared Ubuntu x64 host as healthy without mutation", async () => {
     const fixture = await createRealProbeFixture();
     const host = createRealProbeHost(fixture);

@@ -10,6 +10,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
+import { act } from "@testing-library/react";
 import {
   createFakePluginHost,
   makeThreadResponse,
@@ -32,10 +33,12 @@ import {
   browserLifecycleResponseSchema,
   browserNavigationRequestSchema,
   browserNavigationResponseSchema,
+  browserPanelVisibilityRequestSchema,
   browserPurgeRequestSchema,
   browserScriptRequestSchema,
   browserSetupRequestSchema,
   browserHostTargetSchema,
+  browserHostConnectionRequestSchema,
   browserPurgePlanSchema,
   browserPurgeResponseSchema,
   browserProfileCreateRequestSchema,
@@ -286,6 +289,9 @@ export async function createPublicPluginHarness(options?: {
         })
       : Promise.resolve();
   const hostRpcFailures = new Map<string, string>();
+  const hostConnectionRequests: z.output<
+    typeof browserHostConnectionRequestSchema
+  >[] = [];
   const setupInspectionTargets: BrowserHostTarget[] = [];
   const expectedStatus =
     options?.status ??
@@ -440,6 +446,11 @@ export async function createPublicPluginHarness(options?: {
       const failure = hostRpcFailures.get(method);
       if (failure !== undefined) throw new Error(failure);
       if (method === "browserScript") options?.browserScriptStarted?.();
+      if (method === "hostConnection") {
+        const request = browserHostConnectionRequestSchema.parse(input);
+        hostConnectionRequests.push(request);
+        return host.experimental_call("hostConnection", request, { signal });
+      }
       if (
         method === "browserScript" &&
         options?.browserScriptResponse !== undefined
@@ -453,6 +464,13 @@ export async function createPublicPluginHarness(options?: {
           {
             signal,
           },
+        );
+      }
+      if (method === "panelVisibility") {
+        return host.experimental_call(
+          "panelVisibility",
+          browserPanelVisibilityRequestSchema.parse(input),
+          { signal },
         );
       }
       if (method === "diagnostics") {
@@ -662,6 +680,16 @@ export async function createPublicPluginHarness(options?: {
       backend.harness.behavior.callRpc("browser_navigate", input) as Promise<
         ReturnType<typeof browserNavigationResponseSchema.parse>
       >,
+    browser_panel_visibility: (input: {
+      hostId: string;
+      profileId: string;
+      panelId: string;
+      visibility: "visible" | "hidden";
+    }) =>
+      backend.harness.behavior.callRpc(
+        "browser_panel_visibility",
+        input,
+      ) as Promise<BrowserStatus>,
     browser_settings_status: (input: { profileId: string }) =>
       backend.harness.behavior.callRpc(
         "browser_settings_status",
@@ -1392,6 +1420,7 @@ export async function createPublicPluginHarness(options?: {
       for (const panel of threadPanels.values()) panel.lifecycle.unmount();
       for (const panel of newThreadPanels.values()) panel.lifecycle.unmount();
       for (const panel of settingsPanels) panel.lifecycle.unmount();
+      await act(async () => undefined);
       await backend.harness.lifecycle.dispose();
       await host.experimental_dispose();
     } finally {
@@ -1433,6 +1462,9 @@ export async function createPublicPluginHarness(options?: {
     },
     get navigationRequests() {
       return [...navigationRequests];
+    },
+    get hostConnectionRequests() {
+      return [...hostConnectionRequests];
     },
     openExistingThreadPanel,
     openNewThreadPanel,

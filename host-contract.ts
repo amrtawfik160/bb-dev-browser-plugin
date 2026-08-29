@@ -7,6 +7,8 @@ import {
   browserActivityOutboxSchema,
   browserActivityReconciliationRequestSchema,
   browserHostTargetSchema,
+  browserHostConnectionRequestSchema,
+  browserHostConnectionResponseSchema,
   browserLifecycleRequestSchema,
   browserLifecycleResponseSchema,
   browserPurgePlanSchema,
@@ -19,6 +21,7 @@ import {
   browserScriptRequestSchema,
   browserNavigationRequestSchema,
   browserNavigationResponseSchema,
+  browserPanelVisibilityRequestSchema,
   browserProfileCreateRequestSchema,
   browserProfileDeleteRequestSchema,
   browserProfileExpiryResponseSchema,
@@ -38,6 +41,10 @@ import {
 } from "./contracts.js";
 
 export const browserHostContract = defineRpcContract({
+  hostConnection: {
+    input: browserHostConnectionRequestSchema,
+    output: browserHostConnectionResponseSchema,
+  },
   status: {
     input: browserHostTargetSchema,
     output: browserStatusSchema,
@@ -77,6 +84,10 @@ export const browserHostContract = defineRpcContract({
   navigate: {
     input: browserNavigationRequestSchema,
     output: browserNavigationResponseSchema,
+  },
+  panelVisibility: {
+    input: browserPanelVisibilityRequestSchema,
+    output: browserStatusSchema,
   },
   activityOutbox: {
     input: browserActivityOutboxRequestSchema,
