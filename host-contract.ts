@@ -18,9 +18,13 @@ import {
   browserScriptResponseSchema,
   browserScriptRequestSchema,
   browserProfileCreateRequestSchema,
+  browserProfileBackupRequestSchema,
   browserProfileHostTargetSchema,
+  browserProfileImportRequestSchema,
   browserProfileInventorySchema,
   browserProfileRenameRequestSchema,
+  browserProfileRecoveryResponseSchema,
+  browserProfileRestoreRequestSchema,
   browserProfileSchema,
   browserProfileSelectRequestSchema,
   browserStatusSchema,
@@ -90,5 +94,17 @@ export const browserHostContract = defineRpcContract({
   selectProfile: {
     input: browserProfileSelectRequestSchema,
     output: browserProfileInventorySchema,
+  },
+  backupProfile: {
+    input: browserProfileBackupRequestSchema,
+    output: browserProfileRecoveryResponseSchema,
+  },
+  restoreProfile: {
+    input: browserProfileRestoreRequestSchema,
+    output: browserProfileRecoveryResponseSchema,
+  },
+  importProfile: {
+    input: browserProfileImportRequestSchema,
+    output: browserProfileRecoveryResponseSchema,
   },
 });

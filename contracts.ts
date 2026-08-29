@@ -388,6 +388,103 @@ export type BrowserHostChoicesInput = z.infer<
   typeof browserHostChoicesInputSchema
 >;
 
+const browserProfileRecoveryPathSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(4096)
+  .refine(
+    (path) => !path.includes("\0"),
+    "Recovery paths cannot contain NUL bytes.",
+  );
+
+export const browserProfileBackupRequestSchema = z
+  .object({
+    hostId: z.string().min(1),
+    profileId: browserProfileIdSchema,
+    archivePath: browserProfileRecoveryPathSchema,
+  })
+  .strict();
+
+export const browserProfileRestoreRequestSchema = z
+  .object({
+    hostId: z.string().min(1),
+    profileId: browserProfileIdSchema,
+    archivePath: browserProfileRecoveryPathSchema,
+  })
+  .strict();
+
+export const browserProfileImportRequestSchema = z
+  .object({
+    hostId: z.string().min(1),
+    name: browserProfileNameSchema,
+    sourcePath: browserProfileRecoveryPathSchema,
+  })
+  .strict();
+
+export const browserProfileRecoveryProgressSchema = z
+  .object({
+    phase: z.enum(["validating", "copying", "promoting", "completed"]),
+    completedBytes: z.number().int().nonnegative(),
+    totalBytes: z.number().int().nonnegative(),
+    phases: z
+      .array(z.enum(["validating", "copying", "promoting", "completed"]))
+      .min(1)
+      .optional(),
+  })
+  .strict();
+
+const browserProfileBackupResponseSchema = z
+  .object({
+    outcome: z.literal("backed-up"),
+    message: z.string().min(1),
+    archivePath: browserProfileRecoveryPathSchema,
+    credentialEquivalent: z.literal(true),
+    progress: browserProfileRecoveryProgressSchema,
+  })
+  .strict();
+
+const browserProfileRestoreResponseSchema = z
+  .object({
+    outcome: z.literal("restored"),
+    message: z.string().min(1),
+    archivePath: browserProfileRecoveryPathSchema,
+    credentialEquivalent: z.literal(true),
+    progress: browserProfileRecoveryProgressSchema,
+  })
+  .strict();
+
+const browserProfileImportResponseSchema = z
+  .object({
+    outcome: z.literal("imported"),
+    message: z.string().min(1),
+    profileId: browserProfileIdSchema,
+    progress: browserProfileRecoveryProgressSchema,
+  })
+  .strict();
+
+export const browserProfileRecoveryResponseSchema = z.discriminatedUnion(
+  "outcome",
+  [
+    browserProfileBackupResponseSchema,
+    browserProfileRestoreResponseSchema,
+    browserProfileImportResponseSchema,
+  ],
+);
+
+export type BrowserProfileBackupRequest = z.infer<
+  typeof browserProfileBackupRequestSchema
+>;
+export type BrowserProfileRestoreRequest = z.infer<
+  typeof browserProfileRestoreRequestSchema
+>;
+export type BrowserProfileImportRequest = z.infer<
+  typeof browserProfileImportRequestSchema
+>;
+export type BrowserProfileRecoveryResponse = z.infer<
+  typeof browserProfileRecoveryResponseSchema
+>;
+
 export const readinessCapabilityIdSchema = z.enum([
   "operating-system",
   "architecture",
@@ -864,6 +961,18 @@ export const rpcContract = defineRpcContract({
   browser_profile_select: {
     input: browserProfileSelectionRequestSchema,
     output: browserProfileInventorySchema,
+  },
+  browser_profile_backup: {
+    input: browserProfileBackupRequestSchema,
+    output: browserProfileRecoveryResponseSchema,
+  },
+  browser_profile_restore: {
+    input: browserProfileRestoreRequestSchema,
+    output: browserProfileRecoveryResponseSchema,
+  },
+  browser_profile_import: {
+    input: browserProfileImportRequestSchema,
+    output: browserProfileRecoveryResponseSchema,
   },
   browser_host_choices: {
     input: browserHostChoicesInputSchema,

@@ -35,9 +35,13 @@ import {
   browserPurgePlanSchema,
   browserPurgeResponseSchema,
   browserProfileCreateRequestSchema,
+  browserProfileBackupRequestSchema,
   browserProfileHostTargetSchema,
+  browserProfileImportRequestSchema,
   browserProfileInventorySchema,
   browserProfileRenameRequestSchema,
+  browserProfileRecoveryResponseSchema,
+  browserProfileRestoreRequestSchema,
   browserProfileSchema,
   browserProfileSelectRequestSchema,
   browserHostChoicesSchema,
@@ -61,6 +65,10 @@ import {
   createFileBrowserProfileStore,
   type BrowserProfileStore,
 } from "../profile-storage.js";
+import {
+  createFileBrowserProfileRecovery,
+  type BrowserProfileRecovery,
+} from "../profile-recovery.js";
 import {
   createHostReadinessBoundary,
   type HostProbeSnapshot,
@@ -172,6 +180,7 @@ export async function createPublicPluginHarness(options?: {
   privilegedExecutor?: PrivilegedExecutor;
   administrationStateStore?: HostAdministrationStateStore;
   profileStore?: BrowserProfileStore;
+  profileRecovery?: BrowserProfileRecovery;
 }) {
   const configuredHostId = options?.hostId ?? HOST_ID;
   const configuredProjectHostIds = options?.projectHostIds ?? [
@@ -246,15 +255,29 @@ export async function createPublicPluginHarness(options?: {
     options?.profileStore === undefined
       ? await mkdtemp(join(tmpdir(), "bb-browser-plugin-"))
       : null;
+  const profileRecoveryRoot =
+    options?.profileRecovery === undefined && profileStorageRoot === null
+      ? await mkdtemp(join(tmpdir(), "bb-browser-recovery-plugin-"))
+      : profileStorageRoot;
   const profileStore =
     options?.profileStore ??
     createFileBrowserProfileStore({
       rootDirectory: profileStorageRoot!,
       installationId: "installation-public-test",
     });
+  const profileRecovery =
+    options?.profileRecovery ??
+    createFileBrowserProfileRecovery({
+      rootDirectory: profileRecoveryRoot!,
+      installationId: "installation-public-test",
+      state: {
+        isProfileStopped: async () => true,
+        isDevBrowserProfileStopped: async () => true,
+      },
+    });
   const hostDataRoot = await mkdtemp(join(tmpdir(), "bb-browser-host-"));
   const host = experimental_createHostEntryHarness(
-    createBrowserHostEntry(hostBoundary, profileStore),
+    createBrowserHostEntry(hostBoundary, profileStore, profileRecovery),
     {
       experimental_paths: {
         dataDir: hostDataRoot,
@@ -420,6 +443,27 @@ export async function createPublicPluginHarness(options?: {
           { signal },
         );
       }
+      if (method === "backupProfile") {
+        return host.experimental_call(
+          "backupProfile",
+          browserProfileBackupRequestSchema.parse(input),
+          { signal },
+        );
+      }
+      if (method === "restoreProfile") {
+        return host.experimental_call(
+          "restoreProfile",
+          browserProfileRestoreRequestSchema.parse(input),
+          { signal },
+        );
+      }
+      if (method === "importProfile") {
+        return host.experimental_call(
+          "importProfile",
+          browserProfileImportRequestSchema.parse(input),
+          { signal },
+        );
+      }
       throw new Error(`Unexpected host method: ${method}`);
     },
   });
@@ -546,6 +590,39 @@ export async function createPublicPluginHarness(options?: {
         "browser_profile_select",
         input,
       ) as Promise<ReturnType<typeof browserProfileInventorySchema.parse>>,
+    browser_profile_backup: (input: {
+      hostId: string;
+      profileId: string;
+      archivePath: string;
+    }) =>
+      backend.harness.behavior.callRpc(
+        "browser_profile_backup",
+        input,
+      ) as Promise<
+        ReturnType<typeof browserProfileRecoveryResponseSchema.parse>
+      >,
+    browser_profile_restore: (input: {
+      hostId: string;
+      profileId: string;
+      archivePath: string;
+    }) =>
+      backend.harness.behavior.callRpc(
+        "browser_profile_restore",
+        input,
+      ) as Promise<
+        ReturnType<typeof browserProfileRecoveryResponseSchema.parse>
+      >,
+    browser_profile_import: (input: {
+      hostId: string;
+      name: string;
+      sourcePath: string;
+    }) =>
+      backend.harness.behavior.callRpc(
+        "browser_profile_import",
+        input,
+      ) as Promise<
+        ReturnType<typeof browserProfileRecoveryResponseSchema.parse>
+      >,
     browser_host_choices: (input: BrowserHostChoicesInput) =>
       backend.harness.behavior.callRpc(
         "browser_host_choices",
@@ -651,10 +728,10 @@ export async function createPublicPluginHarness(options?: {
     });
   }
 
-  function runBrowserActivityRecords() {
+  function runBrowserActivityRecords(profileId = DEFAULT_PROFILE_ID) {
     return rpc.browser_activity_records({
       hostId: configuredHostId,
-      profileId: DEFAULT_PROFILE_ID,
+      profileId,
     });
   }
 
@@ -706,6 +783,30 @@ export async function createPublicPluginHarness(options?: {
     const selectionContext =
       context === undefined ? { projectId: PROJECT_ID } : context;
     return rpc.browser_profile_select({ ...input, ...selectionContext });
+  }
+
+  function backupBrowserProfile(input: {
+    hostId: string;
+    profileId: string;
+    archivePath: string;
+  }) {
+    return rpc.browser_profile_backup(input);
+  }
+
+  function restoreBrowserProfile(input: {
+    hostId: string;
+    profileId: string;
+    archivePath: string;
+  }) {
+    return rpc.browser_profile_restore(input);
+  }
+
+  function importBrowserProfile(input: {
+    hostId: string;
+    name: string;
+    sourcePath: string;
+  }) {
+    return rpc.browser_profile_import(input);
   }
 
   function runBrowserHostChoices(input: BrowserHostChoicesInput) {
@@ -863,6 +964,17 @@ export async function createPublicPluginHarness(options?: {
           retryDelay: 20,
         });
       }
+      if (
+        profileRecoveryRoot !== null &&
+        profileRecoveryRoot !== profileStorageRoot
+      ) {
+        await rm(profileRecoveryRoot, {
+          recursive: true,
+          force: true,
+          maxRetries: 10,
+          retryDelay: 20,
+        });
+      }
       await rm(hostDataRoot, {
         recursive: true,
         force: true,
@@ -901,6 +1013,9 @@ export async function createPublicPluginHarness(options?: {
     createBrowserProfile,
     renameBrowserProfile,
     selectBrowserProfile,
+    backupBrowserProfile,
+    restoreBrowserProfile,
+    importBrowserProfile,
     runBrowserHostChoices,
     runBrowserScript,
     runBrowserScriptWithProfile,

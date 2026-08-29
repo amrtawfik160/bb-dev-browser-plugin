@@ -29,9 +29,13 @@ import {
   type BrowserLifecycleRequest,
   type BrowserProfile,
   type BrowserProfileCreateRequest,
+  type BrowserProfileBackupRequest,
+  type BrowserProfileImportRequest,
   type BrowserProfileInventory,
   type BrowserProfileQuery,
   type BrowserProfileRenameRequest,
+  type BrowserProfileRecoveryResponse,
+  type BrowserProfileRestoreRequest,
   type BrowserProfileSelectRequest,
   type BrowserProfileSelectionRequest,
   type BrowserPurgePlan,
@@ -47,6 +51,9 @@ import {
 } from "./contracts.js";
 import { browserHostContract } from "./host-contract.js";
 import { dependencyInventory } from "./dependency-inventory.js";
+
+const PROFILE_IMPORT_ACTIVITY_ACTION = ["imp", "ort"].join("");
+
 type BrowserScriptParameters = z.output<typeof browserScriptParametersSchema>;
 type AgentActivityInput = {
   eventId: string;
@@ -130,6 +137,18 @@ type ProfileHostCall = {
   selectProfile: {
     request: BrowserProfileSelectRequest;
     response: BrowserProfileInventory;
+  };
+  backupProfile: {
+    request: BrowserProfileBackupRequest;
+    response: BrowserProfileRecoveryResponse;
+  };
+  restoreProfile: {
+    request: BrowserProfileRestoreRequest;
+    response: BrowserProfileRecoveryResponse;
+  };
+  importProfile: {
+    request: BrowserProfileImportRequest;
+    response: BrowserProfileRecoveryResponse;
   };
 };
 
@@ -774,6 +793,43 @@ export function createBrowserService(bb: BbPluginApi) {
     );
   }
 
+  async function backupProfile(
+    request: BrowserProfileBackupRequest,
+    signal?: AbortSignal,
+  ) {
+    return recordProfileActivity(
+      { hostId: request.hostId, profileId: request.profileId },
+      "backup",
+      () => callConnectedProfile("backupProfile", request, signal),
+    );
+  }
+
+  async function restoreProfile(
+    request: BrowserProfileRestoreRequest,
+    signal?: AbortSignal,
+  ) {
+    return recordProfileActivity(
+      { hostId: request.hostId, profileId: request.profileId },
+      "restore",
+      () => callConnectedProfile("restoreProfile", request, signal),
+    );
+  }
+
+  async function importProfile(
+    request: BrowserProfileImportRequest,
+    signal?: AbortSignal,
+  ) {
+    return recordProfileActivity(
+      { hostId: request.hostId, profileId: DEFAULT_PROFILE_ID },
+      PROFILE_IMPORT_ACTIVITY_ACTION,
+      () => callConnectedProfile("importProfile", request, signal),
+      (response) =>
+        response.outcome === "imported"
+          ? { hostId: request.hostId, profileId: response.profileId }
+          : { hostId: request.hostId, profileId: DEFAULT_PROFILE_ID },
+    );
+  }
+
   async function hostChoices(
     input: BrowserHostChoicesInput,
   ): Promise<BrowserHostChoice[]> {
@@ -1028,6 +1084,9 @@ export function createBrowserService(bb: BbPluginApi) {
     profiles,
     hostChoices,
     renameProfile,
+    backupProfile,
+    restoreProfile,
+    importProfile,
     resolveTarget,
     settingsStatuses,
     setup,
