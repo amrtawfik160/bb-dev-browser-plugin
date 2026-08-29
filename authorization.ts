@@ -452,6 +452,9 @@ function isIpv6Loopback(hostname: string) {
   return hextets[6]! >= 0x7f00 && hextets[6]! <= 0x7fff;
 }
 
+export const AGENT_EXACT_ORIGIN_REQUIRED =
+  "Pass destinationOrigin as an exact web origin such as https://example.com.";
+
 function denial(
   message: string,
   grantRequest: BrowserGrantRequest | null = null,
@@ -728,7 +731,7 @@ function authorizeAgainstGrants(
 ): BrowserAuthorizationDecision {
   const origin = normalizedAuthorizationOrigin(request);
   if (origin === null) {
-    return denial("The agent destination is not an exact web origin.");
+    return denial(AGENT_EXACT_ORIGIN_REQUIRED);
   }
   const matching = grantsForOrigin(grants, origin);
   if (matching.length === 0) {

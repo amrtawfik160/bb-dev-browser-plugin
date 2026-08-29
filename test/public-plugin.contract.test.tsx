@@ -37,7 +37,10 @@ import {
   type BrowserStatus,
 } from "../contracts.js";
 import { createPublicPluginHarness } from "./public-plugin-harness.js";
-import { projectLoopbackAlias } from "../authorization.js";
+import {
+  projectLoopbackAlias,
+  AGENT_EXACT_ORIGIN_REQUIRED,
+} from "../authorization.js";
 import { createSimulatedPrivilegedExecutor } from "../host-operations.js";
 import {
   createFileBrowserProfileStore,
@@ -207,6 +210,50 @@ describe("Browser public plugin contract", () => {
       }
     },
   );
+
+  it.each(["sleeping", "waking"] as const)(
+    "wakes a %s Browser Instance for browser_script instead of treating the status as a failure",
+    async (state) => {
+      const runtime: BrowserInstanceRuntime = {
+        ...publicRuntime(async () => ({ title: "woke" })),
+        status: async (target) => ({
+          state,
+          hostId: target.hostId,
+          profileId: target.profileId,
+        }),
+      };
+      const browser = await createPublicPluginHarness({
+        snapshot: preparedSnapshot,
+        browserRuntime: runtime,
+      });
+      try {
+        await grantDefaultProfileOrigin(browser, "https://example.com");
+        const tool = await browser.runBrowserScriptWithProfile(undefined, {
+          purpose: "Wake the sleeping instance",
+          code: "return document.title;",
+          destinationOrigin: "https://example.com",
+        });
+        expect(tool.isError).toBe(false);
+        expect(JSON.parse(tool.content[0]!.text)).toEqual({ title: "woke" });
+
+        const cli = await browser.runBrowserCli([
+          "script",
+          "--purpose",
+          "Wake the sleeping instance",
+          "--code",
+          "return document.title;",
+          "--origin",
+          "https://example.com",
+          "--json",
+        ]);
+        expect(cli.exitCode).toBe(0);
+        expect(JSON.parse(cli.stdout)).toEqual({ title: "woke" });
+      } finally {
+        await browser.dispose();
+      }
+    },
+  );
+
   it("issue #18 states Safe Login limitations on the panel for hardware-bound passkeys, DRM, corporate device policy, and site-specific anti-automation behavior", async () => {
     const browser = await createPublicPluginHarness({
       status: browserStatusSchema.parse({
@@ -357,9 +404,29 @@ describe("Browser public plugin contract", () => {
 
     expect(status.state).toBe("repair-required");
     expect(status.message).toContain("readiness checks failed");
-    expect(browser.setupInspectionTargets).toEqual([
-      { hostId: "host-browser-test", profileId: DEFAULT_PROFILE_ID },
-    ]);
+    expect(browser.setupInspectionTargets.length).toBeGreaterThan(0);
+    for (const target of browser.setupInspectionTargets) {
+      expect(target).toEqual({
+        hostId: "host-browser-test",
+        profileId: DEFAULT_PROFILE_ID,
+      });
+    }
+    await browser.dispose();
+  });
+
+  it("waits out a restarting worker instead of reporting Repair required", async () => {
+    // The retained worker restarts on every plugin reload, and the probe that
+    // lands during that window throws. Accusing the host of needing repair
+    // sent owners to diagnostics that came back healthy a second later.
+    const browser = await createPublicPluginHarness({
+      probeFailuresBeforeReady: 2,
+    });
+
+    const cli = await browser.runStatusCli();
+    const status = browserStatusSchema.parse(JSON.parse(cli.stdout));
+
+    expect(status.state).not.toBe("repair-required");
+    expect(browser.setupInspectionTargets.length).toBe(3);
     await browser.dispose();
   });
 
@@ -557,7 +624,7 @@ describe("Browser public plugin contract", () => {
     await browser.dispose();
   });
 
-  it("keeps grant administration off the agent-facing CLI and on Settings RPC", async () => {
+  it("offers grant administration on both the CLI and Settings RPC", async () => {
     const browser = await createPublicPluginHarness({
       snapshot: preparedSnapshot,
     });
@@ -566,10 +633,31 @@ describe("Browser public plugin contract", () => {
       name: "Owner authority target",
     });
 
-    const cli = await browser.runBrowserCli(["grant", "list"]);
-    expect(cli.exitCode).not.toBe(0);
-    expect(cli.stderr).toContain("Usage: bb browser");
-    expect(cli.stderr).not.toContain("|grant|");
+    // Approval used to exist only as an authenticated Settings action, so an
+    // agent denied an origin could do nothing but wait for someone to open a
+    // panel. The owner can now decide from a terminal too; the trade is that
+    // anything able to run `bb` can grant itself the browser.
+    const help = await browser.runBrowserCli([]);
+    expect(help.stderr).toContain("trust [--origin <scope>]");
+    expect(help.stderr).toContain("approve --request <id>");
+    const registeredNames = browser
+      .registeredBrowserCliCommands()
+      .map((command) => command.name);
+    for (const name of [
+      "trust",
+      "untrust",
+      "grants",
+      "grant",
+      "revoke",
+      "approve",
+      "deny",
+    ]) {
+      expect(registeredNames).toContain(name);
+    }
+
+    const missingOrigin = await browser.runBrowserCli(["grant"]);
+    expect(missingOrigin.exitCode).not.toBe(0);
+    expect(missingOrigin.stderr).toContain("grant requires --origin");
 
     const created = await browser.createBrowserGrant({
       projectId: "project-browser-test",
@@ -2117,6 +2205,45 @@ describe("Browser public plugin contract", () => {
       ]);
       expect(cli).toMatchObject({ exitCode: 0 });
       expect(JSON.parse(cli.stdout)).toBe("hello from Browser");
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("requires an exact --origin on the script CLI and destinationOrigin on browser_script", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+    });
+
+    try {
+      await browser.createBrowserProfile({
+        hostId: "host-browser-test",
+        name: "Default",
+      });
+      const missingFlag = await browser.runBrowserCli([
+        "script",
+        "--purpose",
+        "Read the page title",
+        "--code",
+        "return await page.title()",
+      ]);
+      expect(missingFlag).toMatchObject({ exitCode: 1 });
+      expect(missingFlag.stderr).toContain(
+        "script requires --origin <exact origin, e.g. https://example.com>.",
+      );
+
+      const tool = await browser.runBrowserScriptWithProfile(undefined, {
+        purpose: "Read the page title",
+        code: "return await page.title()",
+      });
+      expect(tool.isError).toBe(true);
+      const denied = browserScriptFailureSchema.parse(
+        JSON.parse(tool.content[0]!.text),
+      );
+      expect(denied.error).toMatchObject({
+        code: "origin_denied",
+        message: AGENT_EXACT_ORIGIN_REQUIRED,
+      });
     } finally {
       await browser.dispose();
     }

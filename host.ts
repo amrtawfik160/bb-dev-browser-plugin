@@ -1,8 +1,7 @@
 import { experimental_defineHostEntry } from "@get-bb/plugin-sdk/host";
 import { randomUUID } from "node:crypto";
-import { createRequire } from "node:module";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import {
   createActivityOutbox,
   type ActivityOutbox,
@@ -101,6 +100,11 @@ import {
   type RuntimeBrowserPage,
 } from "./browser-runtime.js";
 import { createProductionBrowserProcessBoundary } from "./browser-process.js";
+import {
+  daemonRootFromHostDataDir,
+  readDaemonPluginSourcePath,
+} from "./daemon-data.js";
+import { requireDevBrowserRuntime } from "./dev-browser-runtime.js";
 import { PINNED_BROWSER_RUNTIME } from "./dependency-inventory.js";
 import {
   SafeLoginAgentDeniedError,
@@ -326,6 +330,48 @@ const scriptRuntimeErrorLabels: Record<
   safe_login_denied: "Safe Login active",
 };
 
+export const SCRIPT_FAILURE_MESSAGE_LIMIT = 500;
+const SCRIPT_FAILURE_MESSAGE_HEAD = 140;
+const SCRIPT_FAILURE_ELISION = "\n  … ";
+const STACK_FRAME_LINE = /^\s+at\s/u;
+
+/**
+ * Drop the trailing JavaScript stack trace from a script failure.
+ *
+ * QuickJS appends frames that point into the bundled Playwright shim rather
+ * than the agent's own code, so they are never actionable and they crowd out
+ * the diagnostic text that is.
+ */
+function withoutStackFrames(message: string) {
+  const lines = message.split("\n");
+  let end = lines.length;
+  while (end > 1 && STACK_FRAME_LINE.test(lines[end - 1] ?? "")) end -= 1;
+  const stripped = lines.slice(0, end).join("\n").trimEnd();
+  return stripped.length === 0 ? message.trim() : stripped;
+}
+
+/**
+ * Keep a bounded failure message readable from both ends.
+ *
+ * A Playwright timeout puts its summary first and the reason an action never
+ * completed — an overlay intercepting pointer events, an element detaching —
+ * last, at the end of a call log that is easily longer than the whole budget.
+ * Cutting only the head discarded exactly the line that explains the failure,
+ * so the bound now spends part of its budget on the tail.
+ */
+export function boundScriptFailureMessage(message: string) {
+  const trimmed = withoutStackFrames(message.trim());
+  if (trimmed.length <= SCRIPT_FAILURE_MESSAGE_LIMIT) return trimmed;
+  const tailLength =
+    SCRIPT_FAILURE_MESSAGE_LIMIT -
+    SCRIPT_FAILURE_MESSAGE_HEAD -
+    SCRIPT_FAILURE_ELISION.length;
+  return [
+    trimmed.slice(0, SCRIPT_FAILURE_MESSAGE_HEAD).trimEnd(),
+    trimmed.slice(trimmed.length - tailLength).trimStart(),
+  ].join(SCRIPT_FAILURE_ELISION);
+}
+
 function scriptRuntimeFailure(
   request: BrowserScriptRequest,
   error: unknown,
@@ -342,7 +388,7 @@ function scriptRuntimeFailure(
       ? error.message
       : "The Browser script failed.";
   const boundedMessage =
-    message.trim().slice(0, 500) || "The Browser script failed.";
+    boundScriptFailureMessage(message) || "The Browser script failed.";
   return {
     ok: false,
     error: {
@@ -2007,15 +2053,18 @@ export function createBrowserHostEntry(
   });
 }
 
-const require = createRequire(import.meta.url);
-const devBrowserPackageDirectory = dirname(
-  require.resolve("dev-browser/package.json"),
-);
-const devBrowserExecutable = join(
-  devBrowserPackageDirectory,
-  "bin",
-  "dev-browser.js",
-);
+function productionDevBrowserRuntime(dataDir: string) {
+  const daemonRoot = daemonRootFromHostDataDir(dataDir);
+  const pluginSource = readDaemonPluginSourcePath(daemonRoot, "browser");
+  return requireDevBrowserRuntime({
+    extraSearchRoots: [
+      dataDir,
+      daemonRoot,
+      ...(pluginSource === null ? [] : [pluginSource]),
+    ],
+  });
+}
+
 const playwrightChromiumSetupSource = join(
   process.env.PLAYWRIGHT_BROWSERS_PATH ??
     join(homedir(), ".cache", "ms-playwright"),
@@ -2060,8 +2109,9 @@ export default createBrowserHostEntry(
       },
       ownership: createBrowserUserProfileOwnershipBoundary(),
     }),
-  (dataDir) =>
-    createBrowserInstanceRuntime({
+  (dataDir) => {
+    const devBrowser = productionDevBrowserRuntime(dataDir);
+    return createBrowserInstanceRuntime({
       rootDirectory: BROWSER_STORAGE_ROOT,
       installationId: hostInstallationId(dataDir),
       chromeStablePaths: [
@@ -2069,8 +2119,9 @@ export default createBrowserHostEntry(
         "/usr/bin/google-chrome",
       ],
       launchBoundary: createProductionBrowserProcessBoundary({
-        devBrowserExecutable,
-        devBrowserPackageDirectory,
+        devBrowserExecutable: devBrowser.executable,
+        devBrowserPackageDirectory: devBrowser.packageDirectory,
       }),
-    }),
+    });
+  },
 );

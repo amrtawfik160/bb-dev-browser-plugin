@@ -9,7 +9,7 @@ import {
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { promisify } from "node:util";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { z } from "zod";
 import {
@@ -297,22 +297,35 @@ async function installOwnedDirectory(run: ExecuteFile, path: string) {
   ]);
 }
 
-async function installFallbackExecutable(
+async function installFallbackPack(
   run: ExecuteFile,
   fallback: Extract<
     PrivilegedOperation,
     { kind: "configure-protected-storage" }
   >["fallback"],
 ) {
+  const sourceDirectory = dirname(fallback.sourcePath);
+  await run("/usr/bin/cp", [
+    "-a",
+    join(sourceDirectory, "."),
+    fallback.directory,
+  ]);
+  await run("/usr/bin/chown", [
+    "-R",
+    `${BROWSER_USER}:${BROWSER_USER}`,
+    fallback.directory,
+  ]);
+  await run("/usr/bin/chmod", ["0700", fallback.directory]);
+  await run("/usr/bin/chmod", ["0755", fallback.executablePath]);
   await run("/usr/bin/install", [
     "-m",
-    "0755",
+    "4755",
     "-o",
-    BROWSER_USER,
+    "root",
     "-g",
-    BROWSER_USER,
-    fallback.sourcePath,
-    fallback.executablePath,
+    "root",
+    join(dirname(fallback.sourcePath), "chrome_sandbox"),
+    join(fallback.directory, "chrome-sandbox"),
   ]);
 }
 
@@ -354,7 +367,7 @@ async function configureProtectedStorage(
   for (const directory of [operation.path, operation.fallback.directory]) {
     await installOwnedDirectory(run, directory);
   }
-  await installFallbackExecutable(run, operation.fallback);
+  await installFallbackPack(run, operation.fallback);
   const temporaryDirectory = await mkdtemp(join(tmpdir(), "bb-browser-setup-"));
   try {
     const { hostStatePath, manifestPath } = await writeSetupEvidence(
@@ -376,10 +389,75 @@ async function configureProtectedStorage(
   }
 }
 
+async function createDedicatedUser(
+  run: ExecuteFile,
+  operation: Extract<PrivilegedOperation, { kind: "create-dedicated-user" }>,
+) {
+  try {
+    await run("/usr/sbin/useradd", [
+      "--system",
+      "--shell",
+      operation.shell,
+      "--home",
+      operation.homeDirectory,
+      operation.username,
+    ]);
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === 9) return;
+    throw error;
+  }
+}
+
+function stderrOf(error: unknown): string {
+  if (typeof error === "object" && error !== null && "stderr" in error) {
+    const stderr = (error as { stderr: unknown }).stderr;
+    if (typeof stderr === "string") return stderr;
+    if (Buffer.isBuffer(stderr)) return stderr.toString("utf8");
+  }
+  return error instanceof Error ? error.message : "";
+}
+
+function isMissingAptPackage(error: unknown, packageName: string): boolean {
+  return stderrOf(error).includes(`Unable to locate package ${packageName}`);
+}
+
+async function installSystemPackages(
+  run: ExecuteFile,
+  operation: Extract<PrivilegedOperation, { kind: "install-system-packages" }>,
+) {
+  for (const packageName of operation.packages) {
+    try {
+      await run("/usr/bin/apt-get", [
+        "install",
+        "-y",
+        "--no-remove",
+        packageName,
+      ]);
+    } catch (error) {
+      // Chrome Stable is the preferred browser but is not in the default
+      // Ubuntu/Debian archive. Setup still completes so the pinned Playwright
+      // Chromium fallback can be copied during protected-storage.
+      if (
+        packageName === "google-chrome-stable" &&
+        isMissingAptPackage(error, packageName)
+      ) {
+        continue;
+      }
+      throw error;
+    }
+  }
+}
+
 async function executeProductionOperation(
   run: ExecuteFile,
   operation: PrivilegedOperation,
 ) {
+  if (operation.kind === "create-dedicated-user") {
+    return createDedicatedUser(run, operation);
+  }
+  if (operation.kind === "install-system-packages") {
+    return installSystemPackages(run, operation);
+  }
   if (operation.kind === "stop-profile-processes") {
     return stopMatchingProcesses(run, profileStopArguments(operation));
   }

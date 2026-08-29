@@ -1,98 +1,173 @@
 ---
 name: browser
-description: Use the host-local Workspace Browser for authorized webpage interaction, bounded Playwright automation, native screenshots, or setup and diagnostics checks.
+description: Drive a real Chromium on this host — open pages, click, type, read, and screenshot — with Playwright through the browser_script tool or the bb browser CLI. Use for web automation, testing a running app, checking a deployed page, or any task that needs a real browser.
 ---
 
 # Browser
 
-Check readiness with `bb browser status --json` before diagnosing availability. Use
-`bb browser diagnostics --json` when the status asks for repair details.
+A real Chromium runs on the workspace host under a dedicated user. It keeps its
+own logins and cookies in a Browser Profile, so a site you signed into once
+stays signed in for later automation.
 
-## Agent tool
-
-Use the statically registered `browser_script` tool. Supply:
-
-- `purpose`: required, human-readable reason shown to the owner only while the
-  Control Lease is live.
-- `code`: QuickJS Playwright code. It has no Node, modules, process access, or
-  arbitrary host-filesystem or workspace access.
-- `profileId`: optional host-local Browser Profile ID. Omit it to use the
-  selected profile.
-- `tabId`: optional opaque ID from `browser.listPages()`. Omit it to use the
-  active tab; list tabs again after a Browser runtime restart because tab IDs
-  are runtime-only.
-- `destinationOrigin`: the exact HTTP(S) origin being automated. Access is
-  denied until the owner grants that origin to this project, installation, and
-  profile. Grant changes apply to the next call and never resume a denied call.
-- `timeoutMs`: optional integer from 1 through 30000; the default is 30000.
-- `screenshot`: set `true` to request native screenshot output explicitly.
-- `fileTransfer` and `invalidCertificate`: separate optional elevation
-  requests; each needs its own owner grant, and certificate approval is per
-  exact origin.
-
-Return text or bounded JSON from the tool. An explicitly requested screenshot
-is ordinary thread image output; the plugin does not persist a second copy.
-
-## Equivalent CLI
-
-Run the same boundary from a project thread:
+## Start here
 
 ```text
-bb browser script --purpose "Read the checkout total" --code "..." [--profile <id>] [--tab <id>] [--origin <origin>] [--timeout <ms>] [--screenshot] [--file-transfer] [--invalid-certificate] [--json]
+bb browser trust                       # once per project: unlock automation
+bb browser open https://example.com    # navigate, then report url + title
 ```
 
-The CLI derives project and host from BB context and does not accept `--host`.
-Without `--json`, text results are printed directly. Use `--json` for a JSON
-result or the screenshot envelope. `bb browser status` and
-`bb browser diagnostics` expose the same host readiness and live lease state.
+`trust` creates a persistent whole-web Profile Grant for this project and the
+selected profile. Until it exists, scripts fail `origin_denied`. `bb browser
+untrust` revokes it. Scope it narrower with `bb browser trust --origin
+https://example.com` or `--origin 'https://*.example.com'`.
 
-## Control and records
+`open` navigates as the owner, so it works before anything is trusted and wakes
+a sleeping browser. With no argument it reports the tab the profile is already
+on. Bare text goes to the profile's configured search engine, and says so when
+the profile has none — pass a URL in that case.
 
-Every script holds one atomic Control Lease for its host and profile. Owner
-navigation takes priority immediately. A competing agent waits at most five
-seconds, then receives typed `browser_busy`; queued work is never retained.
-Timeout and revocation are typed runtime failures. The live actor and purpose
-appear in status, diagnostics, and the Browser Panel only while the lease is
-active. Activity Records retain metadata and interruption status, never the
-purpose, source code, page contents, or screenshots.
+## Automating a page
 
-Use `bb browser list`, `bb browser create`, `bb browser rename`, and `bb browser
-select` to manage profiles. Profiles and authenticated state stay on the
-workspace host and are not synchronized through BB server storage.
+Use the `browser_script` tool. `page` is the active tab, already bound and
+brought to front. Whatever you `return` becomes the tool result.
 
-Owners manage grants in authenticated Browser Settings. Grant exact origins or
-explicit subdomain patterns such as `https://*.example.test`; paths are not
-grantable. Project loopback aliases are project-specific. Raw
-`http://localhost:<port>` is available only when explicitly granted as a
-fallback.
+```javascript
+await page.goto("https://example.com", { waitUntil: "domcontentloaded" });
+await page.locator("#email").fill("user@example.com");
+await page.locator("button[type=submit]").click();
+await page.waitForURL(/\/dashboard/);
+return JSON.stringify({
+  url: page.url(),
+  heading: await page.locator("h1").innerText(),
+});
+```
 
-Treat `setup_required` as final for the current call. Report that host setup is required; do not retry, provision packages, launch a browser through another path, or seek a raw browser endpoint.
+Required fields: `purpose` (shown to the owner while you hold control) and
+`destinationOrigin` (the exact origin you are driving, e.g.
+`https://example.com`). Optional: `profileId`, `tabId`, `timeoutMs` (1–30000,
+default 30000), `screenshot: true`, `fileTransfer`, `invalidCertificate`.
+
+The same boundary from a shell:
+
+```text
+bb browser script --purpose "Read the checkout total" --origin https://shop.example.com \
+  --code "return await page.locator('.total').innerText()"
+```
+
+## What the sandbox gives you
+
+QuickJS with Playwright. No Node, no modules, no `process`, no filesystem, no
+workspace access.
+
+- No `document` global — read the DOM with `page.evaluate(() => document.title)`
+  or locators.
+- `browser.listPages()` lists tabs; `browser.getPage(id)` binds one. Tab IDs are
+  runtime-only and change when the browser restarts.
+- Tab state persists between scripts. If a tab is already on your granted
+  origin, `page` binds to it — read it instead of navigating again.
+- `page.setDefaultTimeout` and `page.setDefaultNavigationTimeout` are already
+  set 5s below your script timeout, so a stuck action fails with a Playwright
+  call log instead of an opaque transport error.
+
+## Things that actually bite
+
+**Overlays swallow clicks.** Autocomplete dropdowns, cookie banners, and modals
+sit over the element you want, and Playwright waits for them rather than
+clicking through. The call log says `… subtree intercepts pointer events`.
+Dismiss it first:
+
+```javascript
+await page.keyboard.press("Escape");
+const consent = page.locator('button:has-text("Accept all")').first();
+if ((await consent.count()) > 0) await consent.click();
+```
+
+**Keep one script under ~25 seconds of real work.** The whole script shares one
+deadline. Split long flows into several calls — the tab keeps its state between
+them.
+
+**Prefer `fill` + `press` over `click` on inputs.** `fill` does not need the
+element to be clickable, which sidesteps most overlay problems.
+
+**Wait for the thing, not for time.** `page.waitForURL`, `waitForSelector`, and
+`locator.waitFor` beat `waitForTimeout`, which burns your deadline.
+
+**Search boxes submit through the keyboard.** Race the navigation against the
+keypress so you do not miss it:
+
+```javascript
+await Promise.all([page.waitForURL(/\/search\?/), box.press("Enter")]);
+```
+
+## Failures and what to do
+
+| Code                | Meaning                           | Do                                                                 |
+| ------------------- | --------------------------------- | ------------------------------------------------------------------ |
+| `origin_denied`     | No grant covers that origin       | Run `bb browser trust`, then retry. Never resumes on its own       |
+| `browser_busy`      | Someone else holds control        | Wait and retry once; queued work is not kept                       |
+| `browser_timeout`   | Script hit its deadline           | Split the work or wait on a condition instead of a timer           |
+| `script_failed`     | Playwright error                  | Read the call log at the end of the message — it names the reason  |
+| `tab_invalid`       | Tab belongs to a previous runtime | `browser.listPages()` again                                        |
+| `setup_required`    | Host is not provisioned           | Report it. Do not retry, install packages, or find another browser |
+| `safe_login_denied` | Owner-only Safe Login is active   | Wait for the owner; you cannot see or drive the browser            |
+
+`bb browser status` reports host readiness and live control state; `bb browser
+diagnostics` adds repair detail.
+
+## Grants
+
+```text
+bb browser grants                        # what this project may drive
+bb browser trust [--origin <scope>]      # unlock (default: whole web)
+bb browser untrust [--origin <scope>]    # revoke
+bb browser grant --origin <scope>        # add one scope
+bb browser revoke --grant <id>           # remove one grant
+bb browser requests                      # pending grant requests
+bb browser approve --request <id>        # approve (add --one-hour for temporary)
+bb browser deny --request <id>
+```
+
+Grantable scopes are exact origins (`https://example.com`) or explicit
+subdomain patterns (`https://*.example.com`) or `*`. Paths are not grantable.
+Grants can also be managed in authenticated Browser Settings. A grant change
+applies to the next call and never resumes a denied one.
+
+Owners can manage grants from a terminal, which means an agent with shell
+access on this host can grant itself the browser. Treat the Browser Profile as
+reachable by anything that can run `bb`.
+
+## Control, profiles, and records
+
+Every script holds one atomic Control Lease per host and profile. Owner
+navigation wins immediately. A competing agent waits at most five seconds, then
+gets `browser_busy`. Your purpose and identity are visible in status,
+diagnostics, and the Browser Panel only while the lease is live.
+
+Activity Records keep metadata and interruption status — never your purpose,
+source code, page contents, or screenshots.
+
+Manage profiles with `bb browser list`, `create`, `rename`, and `select`.
+Profiles stay on the workspace host and are never synchronized through BB
+server storage.
 
 ## Files and clipboard
 
-The browser operating-system user has no ambient repository access. An
-explicit workspace upload resolves through BB environment file APIs, must
-remain inside the environment after realpath resolution, and is copied into
-one-use Transfer Staging that is removed after use, cancellation, failure,
-expiry, worker restart, or profile lifecycle operations. Traversal, symlink
-escape, special files, changed-after-selection files, oversized files, and
-low-disk conditions all fail closed.
-
-Stage, watch, or cancel a transfer from a project thread:
+The browser OS user has no repository access. Uploads go through one-use
+Transfer Staging, resolved via BB environment file APIs and removed after use,
+cancellation, failure, expiry, worker restart, or a profile lifecycle
+operation. Traversal, symlink escape, special files, files changed after
+selection, oversized files, and low disk all fail closed.
 
 ```text
-bb browser transfer --kind workspace --environment <id> --path <relative-path> [--profile <id>] [--host <id>] [--json]
-bb browser transfer --kind client --file <local-path> [--profile <id>] [--host <id>] [--json]
-bb browser transfer --progress --transfer-id <id> [--profile <id>] [--host <id>] [--json]
-bb browser transfer --cancel --transfer-id <id> [--profile <id>] [--host <id>] [--json]
+bb browser transfer --kind workspace --environment <id> --path <relative-path> [--json]
+bb browser transfer --kind client --file <local-path> [--json]
+bb browser transfer --progress --transfer-id <id> [--json]
+bb browser transfer --cancel --transfer-id <id> [--json]
 ```
 
-The output is privacy-safe: it shows the transfer ID, kind, size, content
-type, and outcome only. The staged path and unrelated workspace paths are
-never printed. Agent-initiated transfers additionally require the
-`file-transfer` grant and an active Control Lease; owner transfers require
-neither.
+Agent-initiated transfers need the `file-transfer` grant and an active Control
+Lease; owner transfers need neither. Output reports transfer ID, kind, size,
+content type, and outcome — never staged or unrelated paths.
 
-Clipboard text moves only through explicit owner copy or paste actions in the
-Browser Panel; the plugin never continuously synchronizes clipboards. Outcomes
-report byte counts, never contents.
+Clipboard text moves only through explicit owner copy or paste in the Browser
+Panel. Outcomes report byte counts, never contents.

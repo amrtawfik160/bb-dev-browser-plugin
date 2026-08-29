@@ -4,7 +4,14 @@ import { access, lstat, readFile, stat, statfs } from "node:fs/promises";
 import { createServer } from "node:net";
 import { join, resolve } from "node:path";
 import { z } from "zod";
-import { inspectFallbackBrowser } from "./browser-fallback.js";
+import {
+  inspectFallbackBrowser,
+  fallbackBrowserPaths,
+} from "./browser-fallback.js";
+import {
+  daemonRootFromHostDataDir,
+  readDaemonConnectPairing,
+} from "./daemon-data.js";
 import {
   BROWSER_STORAGE_ROOT,
   browserHostStorageSegment,
@@ -442,11 +449,17 @@ async function fallbackBrowserAvailability(
     gid: browserUser.gid,
   });
   if (installed === null) {
-    return {
-      name: "Pinned Playwright Chromium",
-      version: null,
-      compatible: false,
-    };
+    const fallbackPaths = fallbackBrowserPaths(hostStorage);
+    try {
+      await lstat(fallbackPaths.executablePath);
+      return {
+        name: "Pinned Playwright Chromium",
+        version: null,
+        compatible: false,
+      };
+    } catch {
+      return null;
+    }
   }
   return {
     name: "Pinned Playwright Chromium",
@@ -616,11 +629,19 @@ function hostStoragePath(
 }
 
 async function connectEnrollment(dataDir: string) {
+  if (process.env.BB_CONNECT_MACHINE_CREDENTIAL?.trim()) {
+    return { enrolled: true };
+  }
   const configPath = resolve(dataDir, "../../../config.json");
   const contents = await readFile(configPath, "utf8").catch(() => null);
-  if (contents === null) return { enrolled: false };
+  if (
+    contents !== null &&
+    connectConfigSchema.safeParse(jsonDocument(contents)).success
+  ) {
+    return { enrolled: true };
+  }
   return {
-    enrolled: connectConfigSchema.safeParse(jsonDocument(contents)).success,
+    enrolled: readDaemonConnectPairing(daemonRootFromHostDataDir(dataDir)),
   };
 }
 

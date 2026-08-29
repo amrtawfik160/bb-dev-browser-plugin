@@ -4,19 +4,38 @@ import type { OriginScopeMatcher } from "./authorization.js";
  * Origin Scope enforcement during real browser navigation.
  *
  * The server resolves a Profile Grant into an {@link OriginScopeMatcher} and
- * hands it to the host, which injects the {@link enforcementPreambleScript}
- * into the QuickJS-sandboxed Playwright code before the agent script runs. The
- * preamble registers context-level request interception that aborts any
- * navigation request whose destination origin is outside the matcher before
- * its content commits, then signals the denial back to the host through a
- * unique stdout marker so the host can return a typed `origin_denied` result.
+ * hands it to the host, which injects {@link enforcementPreambleScript} and
+ * {@link enforcementPostambleScript} around the QuickJS-sandboxed agent code.
+ * A destination the matcher rejects is refused, and the denial is signalled
+ * back through a unique stdout marker so the host returns a typed
+ * `origin_denied` result and discards whatever the script produced.
  *
- * Only navigation requests (top-level documents, redirects, popups, and
- * sub-document frames) are checked; ordinary cross-origin subresources such as
- * images, scripts, styles, fonts, and XHR continue to render. The matcher is
- * the same normalized policy the server grant store uses, so exact scheme,
- * host, and port matching, explicit subdomain patterns, Project Loopback
- * Aliases, raw localhost fallback, and whole-web access share one policy.
+ * Enforcement is expressed as a policy check rather than request
+ * interception. The sandbox cannot call back into agent-supplied JavaScript,
+ * so `BrowserContext.route` never invoked its handler: every intercepted
+ * request hung until the script deadline, which meant grant-scoped automation
+ * could not navigate at all and no origin was ever actually checked. Two
+ * callback-free pieces replace it:
+ *
+ * 1. `page.goto` on the bound page is guarded, so the common out-of-scope
+ *    navigation fails immediately with a clear message. This is a fast path,
+ *    not the boundary — the frozen `browser` global cannot be wrapped, so a
+ *    page the script fetches itself is not guarded.
+ * 2. After the script finishes, every tab that this call opened or moved is
+ *    checked against the scope. That is the boundary: a redirect, an in-page
+ *    navigation, a link click, or a popup that lands out of scope denies the
+ *    call and discards its result.
+ *
+ * The difference from request interception is honest and worth stating: an
+ * out-of-scope page loads before the second check sees it. The agent never
+ * receives the result, but the request did happen. Only top-level navigation
+ * is in scope either way — ordinary cross-origin subresources are not
+ * checked, and neither is reading a tab the call never moved.
+ *
+ * The matcher is the same normalized policy the server grant store uses, so
+ * exact scheme, host, and port matching, explicit subdomain patterns, Project
+ * Loopback Aliases, raw localhost fallback, and whole-web access share one
+ * policy.
  */
 
 const DENIAL_MARKER_PREFIX = "__bbOriginDenied";
@@ -26,18 +45,55 @@ const DENIAL_MARKER_PREFIX = "__bbOriginDenied";
  * mirrors {@link matcherPermitsOrigin} for the QuickJS sandbox. It is written
  * as a self-contained string so it can be evaluated in a Node `vm` for parity
  * tests and embedded verbatim in the generated preamble.
+ *
+ * It parses the origin itself rather than reading properties off `new URL`.
+ * The sandbox's `URL` exposes only part of the WHATWG surface — `hostname` is
+ * absent — so every policy decision that touched it threw a `TypeError` and
+ * failed the script. Parsing the scheme, host, and port from the string keeps
+ * the policy identical to {@link matcherPermitsOrigin} without depending on
+ * which accessors the sandbox happens to implement; the parity tests hold both
+ * to the same table.
  */
 export function originPermittedFunctionSource(): string {
-  return String.raw`function __bbOriginPermitted(origin, matcher) {
-  var url;
-  try { url = new URL(origin); } catch (error) { return false; }
-  var hostname = url.hostname.toLowerCase();
-  if (matcher.kind === "whole-web") return !__bbIsRawLocalhost(hostname, matcher.rawLocalhostHosts);
+  return String.raw`function __bbUrlParts(value) {
+  var match = /^([A-Za-z][A-Za-z0-9+.-]*):\/\/([^/?#]*)/.exec(String(value));
+  if (match === null) return null;
+  var protocol = match[1].toLowerCase();
+  var authority = match[2];
+  var at = authority.lastIndexOf("@");
+  if (at !== -1) authority = authority.slice(at + 1);
+  var hostname = "";
+  var port = "";
+  if (authority.charAt(0) === "[") {
+    var close = authority.indexOf("]");
+    if (close === -1) return null;
+    hostname = authority.slice(0, close + 1).toLowerCase();
+    var rest = authority.slice(close + 1);
+    if (rest.charAt(0) === ":") port = rest.slice(1);
+    else if (rest !== "") return null;
+  } else {
+    var colon = authority.indexOf(":");
+    hostname = (colon === -1 ? authority : authority.slice(0, colon)).toLowerCase();
+    if (colon !== -1) port = authority.slice(colon + 1);
+  }
+  if (hostname === "") return null;
+  if (port !== "" && !/^\d+$/.test(port)) return null;
+  if ((protocol === "http" && port === "80") || (protocol === "https" && port === "443")) port = "";
+  return {
+    protocol: protocol,
+    hostname: hostname,
+    port: port,
+    origin: protocol + "://" + hostname + (port === "" ? "" : ":" + port)
+  };
+}
+function __bbOriginPermitted(origin, matcher) {
+  var parts = __bbUrlParts(origin);
+  if (parts === null) return false;
+  if (matcher.kind === "whole-web") return !__bbIsRawLocalhost(parts.hostname, matcher.rawLocalhostHosts);
   if (matcher.kind === "never") return false;
-  if (matcher.kind === "exact") return matcher.origin === url.origin;
-  var protocol = matcher.protocol + ":";
-  var portMatches = matcher.port === url.port || (matcher.port === "" && url.port === "");
-  return url.protocol === protocol && portMatches && hostname !== matcher.baseHost && hostname.endsWith("." + matcher.baseHost);
+  if (matcher.kind === "exact") return matcher.origin === parts.origin;
+  var portMatches = matcher.port === parts.port || (matcher.port === "" && parts.port === "");
+  return parts.protocol === matcher.protocol && portMatches && parts.hostname !== matcher.baseHost && parts.hostname.endsWith("." + matcher.baseHost);
 }
 function __bbIsRawLocalhost(hostname, rawLocalhostHosts) {
   var h = hostname.toLowerCase();
@@ -122,8 +178,8 @@ export function originRequiresCertificateBypass(
  */
 export function originRequiresCertificateBypassSource(): string {
   return String.raw`function __bbOriginRequiresCertificateBypass(origin, origins) {
-  var url;
-  try { url = new URL(origin); } catch (error) { return false; }
+  var url = __bbUrlParts(origin);
+  if (url === null) return false;
   if (!origins) return false;
   for (var index = 0; index < origins.length; index += 1) {
     if (origins[index] === url.origin) return true;
@@ -133,24 +189,16 @@ export function originRequiresCertificateBypassSource(): string {
 }
 
 /**
- * Builds the QuickJS preamble that enforces one Origin Scope during real
- * navigation. The preamble registers a context-level route that aborts any
- * navigation request whose destination origin the matcher rejects, and prints
- * a unique denial marker line to stdout so the host can surface a typed
- * `origin_denied` result. A context-level route covers top-level documents,
- * redirects, sub-document frames, and popup pages that share the context, so
- * no per-popup re-registration is needed. It must wrap the agent code so the
- * route is registered first.
+ * Builds the QuickJS preamble that establishes one Origin Scope policy.
  *
- * Per-origin invalid-certificate opt-ins use the same normalized policy: a
- * navigation to an in-scope origin that the grant also approved for invalid
- * certificates is fetched through the shared context request context with
- * `ignoreHTTPSErrors` and fulfilled to the page so it loads despite a bad
- * certificate, while every other navigation continues normally so a bad
- * certificate still surfaces naturally. The dev-browser sandbox strips
- * `ignoreHTTPSErrors` from `route.continue`, so the context request context is
- * the one mechanism that honors per-origin certificate bypass for a connected
- * browser.
+ * It defines the matcher, the denial reporting, and the snapshot of where
+ * every tab sat before the agent code ran. It must run first so the snapshot
+ * describes the state this call inherited rather than the state it produced.
+ *
+ * Per-origin invalid-certificate opt-ins are recorded here so the policy can
+ * distinguish an approved bad-certificate origin from an out-of-scope one; the
+ * connected browser applies its own certificate handling, which the sandbox
+ * cannot override per request.
  */
 export function enforcementPreambleScript(
   matcher: OriginScopeMatcher,
@@ -166,43 +214,94 @@ ${bypass}
 const __bbMatcher = ${matcherJson};
 const __bbDenialMarker = ${JSON.stringify(denialMarker)};
 const __bbInvalidCertificateOrigins = ${originsJson};
+let __bbDeniedOrigin = null;
 function __bbReportOriginDenied(origin) {
   console.log(JSON.stringify({ ${JSON.stringify(DENIAL_MARKER_PREFIX)}: __bbDenialMarker, origin }));
 }
-async function __bbEnforceOriginScope(context) {
-  await context.route("**/*", async (route) => {
-    const request = route.request();
-    if (!request.isNavigationRequest()) {
-      await route.continue();
-      return;
-    }
-    let origin;
-    try { origin = new URL(request.url()).origin; }
-    catch { await route.continue(); return; }
-    if (!__bbOriginPermitted(origin, __bbMatcher)) {
-      __bbReportOriginDenied(origin);
-      await route.abort("blockedbyclient");
-      return;
-    }
-    if (__bbOriginRequiresCertificateBypass(origin, __bbInvalidCertificateOrigins)) {
-      const response = await context.request.fetch(request.url(), {
-        ignoreHTTPSErrors: true,
-        method: request.method(),
-        headers: request.headers(),
-        // Let redirects re-fire the route so each hop is re-checked against scope.
-        maxRedirects: 0,
-        timeout: 30000
-      });
-      await route.fulfill({ response });
-      return;
-    }
-    await route.continue();
-  });
+function __bbPageOrigin(value) {
+  const parts = __bbUrlParts(value);
+  return parts === null ? null : parts.origin;
 }
-const __bbEnforcementPages = await browser.listPages();
-if (__bbEnforcementPages.length === 0) throw new Error("The Browser Profile has no open tabs");
-const __bbEnforcementPage = await browser.getPage(__bbEnforcementPages[0].id);
-await __bbEnforceOriginScope(__bbEnforcementPage.context());
+/** Origins that carry no page content and are never worth denying. */
+function __bbIsBlankLocation(value) {
+  return typeof value !== "string" || value === "" || value === "about:blank" || value.indexOf("about:") === 0 || value.indexOf("chrome://") === 0;
+}
+function __bbDenyNavigation(target) {
+  const origin = __bbPageOrigin(target);
+  __bbDeniedOrigin = origin === null ? String(target) : origin;
+  const error = new Error("Origin Scope denies navigation to " + __bbDeniedOrigin + ".");
+  error.__bbOriginDenied = true;
+  throw error;
+}
+function __bbGuardNavigation(target) {
+  if (__bbIsBlankLocation(target)) return;
+  const origin = __bbPageOrigin(target);
+  if (origin === null || !__bbOriginPermitted(origin, __bbMatcher)) __bbDenyNavigation(target);
+}
+/**
+ * Where every tab sat before the agent code ran.
+ *
+ * The browser global is frozen, so its accessors cannot be wrapped and the
+ * tabs a script binds cannot be recorded. Comparing this snapshot against the
+ * final state identifies exactly what the call changed — a tab it navigated
+ * or a tab it opened — without depending on any patch, and without denying
+ * over an unrelated tab the owner left open and the call never moved.
+ */
+const __bbTabsBefore = await browser.listPages();
+function __bbUrlBefore(id) {
+  for (const __bbEntry of __bbTabsBefore) {
+    if (__bbEntry.id === id) return typeof __bbEntry.url === "string" ? __bbEntry.url : "";
+  }
+  return null;
+}
+`;
+}
+
+/**
+ * Guards `page.goto` on the tab bound for the agent script.
+ *
+ * Page objects are patchable even though the `browser` global is frozen, so
+ * the common case — the script navigating the page it was handed — fails
+ * immediately with a clear message instead of running to completion and being
+ * denied afterwards. This is a fast path, not the boundary: a page the script
+ * fetches itself through `browser.getPage` cannot be patched, which is why
+ * {@link enforcementPostambleScript} is what actually enforces the scope.
+ */
+export function boundPageGuardScript(): string {
+  return `if (typeof page === "object" && page !== null) {
+  const __bbOriginalGoto = page.goto.bind(page);
+  page.goto = function (target, options) { __bbGuardNavigation(target); return __bbOriginalGoto(target, options); };
+}
+`;
+}
+
+/**
+ * Builds the QuickJS postamble that re-checks where the browser actually
+ * ended up.
+ *
+ * A refused `page.goto` throws out of the agent code carrying the denied
+ * origin; anything else — a redirect, a link click, a script-driven
+ * navigation — is caught afterwards by re-reading the tabs this call bound,
+ * plus any tab it opened. Tabs the call never touched are left alone, because
+ * denying over an unrelated tab the owner happens to have open would make a
+ * narrow grant unusable. Either way the denial marker goes to stdout and the
+ * host discards the script result.
+ */
+export function enforcementPostambleScript(): string {
+  return `if (__bbDeniedOrigin === null) {
+  for (const __bbEntry of await browser.listPages()) {
+    const __bbBefore = __bbUrlBefore(__bbEntry.id);
+    // A tab this call neither opened nor moved is not this call's doing.
+    if (__bbBefore === __bbEntry.url) continue;
+    if (__bbIsBlankLocation(__bbEntry.url)) continue;
+    const __bbEntryOrigin = __bbPageOrigin(__bbEntry.url);
+    if (__bbEntryOrigin === null || !__bbOriginPermitted(__bbEntryOrigin, __bbMatcher)) {
+      __bbDeniedOrigin = __bbEntryOrigin === null ? String(__bbEntry.url) : __bbEntryOrigin;
+      break;
+    }
+  }
+}
+if (__bbDeniedOrigin !== null) __bbReportOriginDenied(__bbDeniedOrigin);
 `;
 }
 

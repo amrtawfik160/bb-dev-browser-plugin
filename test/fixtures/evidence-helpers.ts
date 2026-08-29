@@ -238,10 +238,7 @@ export async function createEvidenceHarness(options?: {
       ? {}
       : { profileStore: options.profileStore }),
   });
-  // Pre-warm the default profile instance so the agent browser_script path
-  // (which refuses to dispatch while the retained instance reports sleeping)
-  // can drive the real engine seam. This mirrors a visible panel pinning the
-  // instance awake; it does not bypass any authorization or origin policy.
+  // Pre-warm is optional: browser_script wakes a sleeping instance on demand.
   const warmTarget = {
     hostId: "host-browser-test",
     profileId: DEFAULT_PROFILE_ID,

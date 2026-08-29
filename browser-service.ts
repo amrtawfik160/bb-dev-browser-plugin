@@ -36,6 +36,7 @@ import {
   DEFAULT_PROFILE_ID,
   hostOfflineStatus,
   hostProbeFailedStatus,
+  hostCanDispatchAutomation,
   setupRequiredStatus,
   type BrowserHostTarget,
   type BrowserActivityEvent,
@@ -261,12 +262,30 @@ const profilePreferenceRowSchema = z
   .object({ profile_id: browserProfileIdSchema })
   .strict();
 const SETTINGS_PROJECT_ID = "__browser_settings__";
+/**
+ * How hard a readiness probe tries before it reports a repair. Three attempts
+ * spaced 400ms apart cover a worker restart without making a genuinely broken
+ * host feel unresponsive.
+ */
+const HOST_STATUS_PROBE_ATTEMPTS = 3;
+const HOST_STATUS_PROBE_RETRY_MS = 400;
 type BrowserIdentity = {
   projectId?: string;
   threadId?: string;
   hostId?: string;
 };
 type ProfileContext = Pick<BrowserProfileQuery, "projectId" | "threadId">;
+/**
+ * The fully resolved project, host, installation, and profile one grant
+ * operation applies to. Every field is required, unlike the grant query shape
+ * it is passed to.
+ */
+export type BrowserGrantScope = {
+  projectId: string;
+  hostId: string;
+  installationId: string;
+  profileId: string;
+};
 type ProfileAuthoritySnapshot = {
   key: string;
   epoch: number;
@@ -1068,7 +1087,7 @@ export function createBrowserService(
       call.profileId,
       call.context.signal,
     );
-    if (readiness.state !== "healthy") {
+    if (!hostCanDispatchAutomation(readiness)) {
       return { ok: false as const, error: readiness };
     }
     const inventory = await profileInventory(
@@ -1275,6 +1294,15 @@ export function createBrowserService(
     );
   }
 
+  /**
+   * Probe host readiness, tolerating a worker that is still coming up.
+   *
+   * The retained host worker restarts whenever the plugin reloads or the
+   * daemon recycles it, and the first probe to land during that window throws.
+   * Reporting "Repair required" for a worker that is merely starting sent
+   * owners to diagnostics that immediately came back healthy, so a probe now
+   * retries briefly before it accuses the host of anything.
+   */
   async function hostStatus(
     hostId: string,
     profileId: string,
@@ -1284,11 +1312,30 @@ export function createBrowserService(
     if ((await hostConnection(hostId, signal)) !== "connected") {
       return hostOfflineStatus(target);
     }
-    try {
-      return await host.call("status", target, { hostId, signal });
-    } catch {
-      return hostProbeFailedStatus(target);
+    for (let attempt = 0; attempt < HOST_STATUS_PROBE_ATTEMPTS; attempt += 1) {
+      try {
+        return await host.call("status", target, { hostId, signal });
+      } catch {
+        if (attempt + 1 === HOST_STATUS_PROBE_ATTEMPTS) break;
+        await delay(HOST_STATUS_PROBE_RETRY_MS, signal);
+        if (signal?.aborted === true) break;
+      }
     }
+    return hostProbeFailedStatus(target);
+  }
+
+  function delay(milliseconds: number, signal?: AbortSignal) {
+    return new Promise<void>((resolve) => {
+      const timer = setTimeout(() => {
+        signal?.removeEventListener("abort", onAbort);
+        resolve();
+      }, milliseconds);
+      function onAbort() {
+        clearTimeout(timer);
+        resolve();
+      }
+      signal?.addEventListener("abort", onAbort, { once: true });
+    });
   }
 
   async function requireConnectedHost(hostId: string, signal?: AbortSignal) {
@@ -1519,10 +1566,22 @@ export function createBrowserService(
     return browserProfileGrantsSchema.parse(grantStore.list(query));
   }
 
-  async function agentGrantRequestScope(
+  /**
+   * Resolve the project, host, installation, and Browser Profile a CLI-issued
+   * grant operation applies to.
+   *
+   * Grant Requests always target the selected profile, so the request-reading
+   * paths pass no override. Owner grant management accepts `--profile` and
+   * `--host`, so those callers may name a different profile on the same host.
+   */
+  async function grantScope(
     context: PluginCliContext,
-  ): Promise<BrowserGrantRequestQuery> {
-    const hostId = await resolvedHostId(bb, context);
+    overrides: { profileId?: string; hostId?: string } = {},
+  ): Promise<BrowserGrantScope> {
+    const hostId = await resolvedHostId(bb, {
+      ...context,
+      ...(overrides.hostId === undefined ? {} : { hostId: overrides.hostId }),
+    });
     if (hostId === null) {
       throw new Error(
         "Select a workspace host before reading Browser Grant Requests.",
@@ -1537,12 +1596,27 @@ export function createBrowserService(
       },
       context.signal,
     );
+    const profileId = overrides.profileId ?? inventory.selectedProfileId;
+    if (
+      overrides.profileId !== undefined &&
+      !inventory.profiles.some(
+        (profile) => profile.profileId === overrides.profileId,
+      )
+    ) {
+      throw new Error(
+        `Browser Profile ${overrides.profileId} does not exist on ${hostId}.`,
+      );
+    }
     return {
       projectId,
       hostId,
       installationId: inventory.installationId,
-      profileId: inventory.selectedProfileId,
+      profileId,
     };
+  }
+
+  async function agentGrantRequestScope(context: PluginCliContext) {
+    return grantScope(context);
   }
 
   async function listAgentGrantRequests(context: PluginCliContext) {
@@ -2418,7 +2492,7 @@ export function createBrowserService(
           "Enroll this host in BB Connect before opening the Browser Panel.",
       };
     }
-    if (status.state !== "healthy") {
+    if (!hostCanDispatchAutomation(status)) {
       return {
         outcome: "unavailable",
         reason:
@@ -2852,6 +2926,7 @@ export function createBrowserService(
     releaseControl,
     reclaimControl,
     grants,
+    grantScope,
     createGrant,
     inspectGrant,
     revokeGrant,

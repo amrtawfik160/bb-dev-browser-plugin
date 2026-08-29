@@ -1527,6 +1527,14 @@ export function wakingBrowserStatus(ready: BrowserStatus): BrowserStatus {
   };
 }
 
+export function hostCanDispatchAutomation(status: BrowserStatus): boolean {
+  return (
+    status.state === "healthy" ||
+    status.state === "sleeping" ||
+    status.state === "waking"
+  );
+}
+
 export function hostProbeFailedStatus(
   target: BrowserStatusTarget,
 ): BrowserStatus {

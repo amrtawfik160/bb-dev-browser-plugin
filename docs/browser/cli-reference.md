@@ -14,6 +14,24 @@ Common conventions:
 - `--profile <id>` (where shown) selects a Browser Profile; omit it to use the
   selected profile.
 
+## Opening the browser
+
+```text
+bb browser open [url] [--profile <id>] [--timeout <ms>] [--screenshot] [--json]
+```
+
+Navigates the active tab and reports the resulting URL, page title, and tab ID.
+Navigation runs as the owner, so it needs no Profile Grant and wakes a sleeping
+Browser Instance.
+
+With no argument, `open` reports the tab the profile is already on without
+navigating; a profile with no open tab yet says so and asks for a URL. Bare text
+resolves through the profile's configured search engine and reports
+`Chrome's configured search engine is unavailable.` when the profile has none.
+
+Reading the page back does need a grant. Until one exists, `open` still reports
+the navigation and prints a one-line hint pointing at `bb browser trust`.
+
 ## Readiness and diagnostics
 
 ```text
@@ -31,13 +49,16 @@ bb browser diagnostics [--profile <id>] [--host <id>] [--json]
 ## Agent script
 
 ```text
-bb browser script --purpose <text> --code <source> \
-  [--profile <id>] [--tab <id>] [--origin <origin>] [--timeout <ms>] \
+bb browser script --purpose <text> --code <source> --origin <origin> \
+  [--profile <id>] [--tab <id>] [--timeout <ms>] \
   [--screenshot] [--file-transfer] [--invalid-certificate] [--json]
 ```
 
-`--purpose` and `--code` are required. `--timeout` must be an integer from 1 to 30000. `--host` and `--confirm` are invalid for `script`. See
-[agent-reference.md](agent-reference.md) for typed results.
+`--purpose`, `--code`, and `--origin` are required. `--origin` must be an exact
+web origin such as `https://example.com`. `--timeout` must be an integer from 1
+to 30000. `--host` and `--confirm` are invalid for `script`. The script runs with
+Playwright `page` bound to the active tab; `return` values print as the result.
+See [agent-reference.md](agent-reference.md) for typed results.
 
 ## Activity records
 
@@ -49,15 +70,35 @@ bb browser activity-clear [--profile <id>] --confirm "Clear Browser activity rec
 
 `activity-clear` requires the literal confirmation text shown above.
 
-## Grant requests
+## Grants and grant requests
 
 ```text
+bb browser trust [--origin <scope>] [--profile <id>] [--host <id>] [--file-transfer] [--json]
+bb browser untrust [--origin <scope>] [--profile <id>] [--host <id>] [--json]
+bb browser grants [--profile <id>] [--host <id>] [--all] [--json]
+bb browser grant --origin <scope> [--profile <id>] [--host <id>] [--file-transfer] [--json]
+bb browser revoke --grant <id> [--json]
 bb browser requests [--json]
 bb browser request-status --request <id> [--json]
+bb browser approve --request <id> [--one-hour] [--json]
+bb browser deny --request <id> [--json]
 ```
 
-Grant approval itself happens in authenticated Browser Settings; the CLI exposes
-inspection only. `--request` is only valid for `request-status`.
+`trust` creates a persistent whole-web Profile Grant for the current project and
+profile; it is idempotent and reports the existing grant instead of stacking
+duplicates. `grant` requires `--origin` and creates the same grant narrowed to
+one Origin Scope. Grantable scopes are exact origins (`https://example.com`),
+explicit subdomain patterns (`https://*.example.com`), or `*`. Paths are not
+grantable.
+
+`approve` persists by default and supplies the persistence confirmation for you;
+`--one-hour` approves temporarily instead. `--request` is valid for
+`request-status`, `approve`, and `deny`. `--grant` is valid only for `revoke`.
+`--all` is valid only for `grants`.
+
+The same decisions remain available in authenticated Browser Settings. Because
+they are also on the CLI, anything that can run `bb` on this host can grant
+itself the browser — see [security.md](security.md).
 
 ## Profiles
 

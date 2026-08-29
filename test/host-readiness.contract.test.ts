@@ -13,7 +13,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { BROWSER_STORAGE_ROOT, DEFAULT_PROFILE_ID } from "../contracts.js";
 import {
@@ -239,6 +239,55 @@ describe("Workspace Browser host readiness contract", () => {
     } finally {
       await host.experimental_dispose();
       expect(host.experimental_getRetainedWorkerLeaseCount()).toBe(0);
+      await fixture.cleanup();
+    }
+  });
+
+  it("treats a Connect plugin pairing in bb.db as BB Connect enrollment", async () => {
+    const fixture = await createRealProbeFixture();
+    await writeFile(fixture.daemonConfig, JSON.stringify({}));
+    const { DatabaseSync } = await import("node:sqlite");
+    const database = new DatabaseSync(
+      join(dirname(fixture.daemonConfig), "bb.db"),
+    );
+    try {
+      database.exec(
+        "CREATE TABLE plugin_kv (plugin_id TEXT, key TEXT, value TEXT, updated_at INTEGER)",
+      );
+      database
+        .prepare("INSERT INTO plugin_kv VALUES (?, ?, ?, ?)")
+        .run("connect", "credential", "paired-connect-token", 1);
+    } finally {
+      database.close();
+    }
+    const host = createRealProbeHost(fixture);
+
+    try {
+      const status = await host.experimental_call("status", target);
+
+      expect(
+        status.capabilities.find((item) => item.id === "bb-connect"),
+      ).toMatchObject({ status: "ready" });
+    } finally {
+      await host.experimental_dispose();
+      await fixture.cleanup();
+    }
+  });
+
+  it("treats an absent Chromium fallback as Setup required, not Repair required", async () => {
+    const fixture = await createRealProbeFixture();
+    await unlink(fixture.paths.chromeStable);
+    await writeFile(fixture.paths.packageStatus, "");
+    const host = createRealProbeHost(fixture);
+
+    try {
+      const status = await host.experimental_call("status", target);
+      expect(status.state).toBe("setup-required");
+      expect(
+        status.capabilities.find((item) => item.id === "browser"),
+      ).toMatchObject({ status: "missing" });
+    } finally {
+      await host.experimental_dispose();
       await fixture.cleanup();
     }
   });
@@ -500,6 +549,8 @@ describe("Workspace Browser host readiness contract", () => {
       await writeFile(join(fallbackDirectory, "chrome"), "fixture executable");
       await chmod(join(fallbackDirectory, "chrome"), 0o755);
       await chown(join(fallbackDirectory, "chrome"), 1001, 1001);
+      await writeFile(join(fallbackDirectory, "icudtl.dat"), "fixture icu");
+      await chown(join(fallbackDirectory, "icudtl.dat"), 1001, 1001);
       await writeFile(join(fallbackDirectory, "version.json"), versionEvidence);
       await chmod(join(fallbackDirectory, "version.json"), 0o600);
       await chown(join(fallbackDirectory, "version.json"), 1001, 1001);
@@ -518,6 +569,40 @@ describe("Workspace Browser host readiness contract", () => {
       }
     },
   );
+
+  it("issue #3 treats a chrome-only Playwright fallback as Repair required", async () => {
+    const fixture = await createRealProbeFixture();
+    const fallbackDirectory = join(fixture.hostStorage, "browsers", "chromium");
+    await unlink(fixture.paths.chromeStable);
+    await mkdir(fallbackDirectory, { recursive: true });
+    await writeFile(join(fallbackDirectory, "chrome"), "fixture executable");
+    await chmod(join(fallbackDirectory, "chrome"), 0o755);
+    await chown(join(fallbackDirectory, "chrome"), 1001, 1001);
+    await writeFile(
+      join(fallbackDirectory, "version.json"),
+      JSON.stringify({
+        playwrightVersion: "1.58.2",
+        chromiumRevision: "1208",
+        chromiumVersion: "145.0.7632.6",
+        executableSha256:
+          "6f1af2dfc4d7f16dacf404b1f6c9fd4a65cfffb8edde6dcf957463a0e41fb1ed",
+      }),
+    );
+    await chmod(join(fallbackDirectory, "version.json"), 0o600);
+    await chown(join(fallbackDirectory, "version.json"), 1001, 1001);
+    const host = createRealProbeHost(fixture);
+
+    try {
+      const status = await host.experimental_call("status", target);
+      expect(status.state).toBe("repair-required");
+      expect(
+        status.capabilities.find((item) => item.id === "browser"),
+      ).toMatchObject({ status: "failed" });
+    } finally {
+      await host.experimental_dispose();
+      await fixture.cleanup();
+    }
+  });
 
   it("returns only redacted diagnostics through the retained host contract", async () => {
     const host = experimental_createHostEntryHarness(

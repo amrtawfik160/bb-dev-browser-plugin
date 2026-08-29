@@ -53,6 +53,27 @@ each.
 - Automation Mode is adaptive 5–15 FPS up to 1920×1080 with no audio. Safe Login
   uses an X display and VNC stream. Neither promises high-fidelity media.
 
+## Origin Scope enforcement
+
+- Origin Scope is enforced as a policy check on navigation, not as request
+  interception. A navigation the agent script requests is refused before it is
+  issued, and every page is re-checked after the script finishes. An
+  out-of-scope page reached by **in-page navigation loads** before that second
+  check sees it — the agent never receives the result, but the request
+  happened. See [security.md](security.md) for why interception is not
+  available in the sandbox.
+- The **per-origin invalid-certificate bypass no longer loads** a
+  bad-certificate origin. The grant and its approved origins are still recorded
+  and reach the policy, but the mechanism that was meant to fulfil such a
+  navigation depended on the same unavailable interception.
+
+## Anti-automation defenses
+
+- Major search engines and other sites serve bot-detection challenges to an
+  automated Chromium from a datacenter address. This is the remote site's
+  policy, not a plugin failure; the browser is driven normally and the
+  challenge page is what loads.
+
 ## Device permissions
 
 - Camera, microphone, geolocation, notifications, and device permissions are

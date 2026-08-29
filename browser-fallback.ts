@@ -35,13 +35,16 @@ export async function inspectFallbackBrowser(input: {
 }) {
   const paths = fallbackBrowserPaths(input.hostStoragePath);
   try {
-    const [executableMetadata, manifestMetadata, manifest] = await Promise.all([
-      lstat(paths.executablePath),
-      lstat(paths.manifestPath),
-      readFile(paths.manifestPath, "utf8").then((contents) =>
-        fallbackBrowserManifestSchema.parse(JSON.parse(contents)),
-      ),
-    ]);
+    const icuDataPath = join(paths.directory, "icudtl.dat");
+    const [executableMetadata, manifestMetadata, icuMetadata, manifest] =
+      await Promise.all([
+        lstat(paths.executablePath),
+        lstat(paths.manifestPath),
+        lstat(icuDataPath),
+        readFile(paths.manifestPath, "utf8").then((contents) =>
+          fallbackBrowserManifestSchema.parse(JSON.parse(contents)),
+        ),
+      ]);
     const secureExecutable =
       executableMetadata.isFile() &&
       executableMetadata.uid === input.uid &&
@@ -52,9 +55,13 @@ export async function inspectFallbackBrowser(input: {
       manifestMetadata.uid === input.uid &&
       manifestMetadata.gid === input.gid &&
       (manifestMetadata.mode & 0o7777) === 0o600;
+    const presentIcu =
+      icuMetadata.isFile() &&
+      icuMetadata.uid === input.uid &&
+      icuMetadata.gid === input.gid;
     const intact =
       (await sha256(paths.executablePath)) === manifest.executableSha256;
-    return secureExecutable && secureManifest && intact
+    return secureExecutable && secureManifest && presentIcu && intact
       ? { paths, manifest }
       : null;
   } catch (error) {

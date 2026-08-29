@@ -28,26 +28,34 @@ import { dirname } from "node:path";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { enforcementPreambleScript } from "../../origin-scope.js";
+import {
+  enforcementPostambleScript,
+  enforcementPreambleScript,
+} from "../../origin-scope.js";
 import {
   integrationEnabled,
   realBrowserProvisioned,
 } from "../fixtures/evidence-helpers.js";
 
 describe("issue #21 AC3 Security matrix", () => {
-  it("enforces origin scope at the context level so new pages share interception", () => {
+  it("enforces origin scope over every page the profile ends on", () => {
     const preamble = enforcementPreambleScript(
       { kind: "exact", origin: "https://app.example.test" },
       "bb-security-denial",
       [],
     );
-    // The enforcement route is registered at the context level before agent
-    // code runs, so a newPage() the agent opens shares interception.
-    expect(preamble).toContain('await context.route("**/*"');
-    const wrapped = `${preamble}\nawait browser.newPage()`;
-    expect(wrapped.indexOf("__bbEnforceOriginScope")).toBeLessThan(
+    const postamble = enforcementPostambleScript();
+    // The navigation guard is installed before agent code runs, and the
+    // postamble re-checks every page afterwards, so a page the agent opened
+    // is covered. Request interception is not available: the sandbox never
+    // calls back into an agent-supplied route handler.
+    expect(preamble).not.toContain(".route(");
+    const wrapped = `${preamble}\nawait browser.newPage()\n${postamble}`;
+    expect(wrapped.indexOf("__bbGuardNavigation")).toBeLessThan(
       wrapped.indexOf("browser.newPage()"),
     );
+    expect(postamble).toContain("browser.listPages()");
+    expect(postamble).toContain("__bbReportOriginDenied");
   });
 
   it("proves QuickJS isolation: the dev-browser sandbox browser global is frozen with no newContext", async () => {

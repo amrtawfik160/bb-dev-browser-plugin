@@ -82,11 +82,43 @@ Profile Grant**.
 
 Origin Scope uses exact `scheme://host:port` origins and optional explicit
 subdomain patterns (ADR 0004, ADR 0013). URL paths do not narrow a grant; each
-localhost port is separate; `*` is a distinct whole-web permission. Disallowed
-top-level navigation, redirects, and popups are blocked **before commit** and
-fail the operation. Cross-origin subresources may render normally, but agents
-cannot target a cross-origin frame without a matching grant. A denied origin
-produces a typed `origin_denied` result and a non-blocking Grant Request.
+localhost port is separate; `*` is a distinct whole-web permission. Cross-origin
+subresources may render normally. A denied origin produces a typed
+`origin_denied` result and a non-blocking Grant Request.
+
+Enforcement is a policy check on navigation, not request interception:
+
+- `page.goto` on the tab bound for the script is guarded, so the common
+  out-of-scope navigation fails immediately and never reaches the network.
+  This is a fast path, not the boundary — the sandbox `browser` global is
+  frozen and cannot be wrapped, so a page the script fetches itself through
+  `browser.getPage` is not guarded.
+- After the script finishes, **every tab this call opened or navigated** is
+  checked against the scope. That is the boundary: a redirect, an in-page
+  navigation, a link click, a popup, or a navigation through an unguarded page
+  denies the call and discards the result.
+
+Two limits are worth stating plainly:
+
+- An out-of-scope page **loads** before the second check sees it. The agent
+  never receives the result, but the request happened.
+- A tab the call never moved is not checked, so Origin Scope constrains
+  agent-controlled **navigation**, not reading a tab the owner already had
+  open. Checking untouched tabs instead would deny every call whenever an
+  unrelated tab sits outside the scope — including a raw `localhost` tab under
+  a whole-web grant.
+
+This is a deliberate change from the earlier design, which registered a
+`BrowserContext.route` intended to abort out-of-scope navigation before commit.
+The sandbox does not call back into agent-supplied JavaScript, so that handler
+never ran: every intercepted request hung until the script deadline,
+grant-scoped automation could not navigate at all, and no origin was ever
+actually checked.
+
+The same limitation removed the per-origin invalid-certificate bypass. Approved
+origins are still recorded and reach the policy, but the fulfil-through-fetch
+path that was supposed to load them despite a bad certificate depended on the
+same route handler and never executed.
 
 ### Control Leases
 

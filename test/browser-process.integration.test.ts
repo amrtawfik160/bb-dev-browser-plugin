@@ -224,6 +224,64 @@ describe("production browser process boundary", () => {
   );
 
   it.runIf(integrationEnabled)(
+    "recovers the live owner when the runtime manifest names a dead process",
+    async () => {
+      const rootDirectory = await mkdtemp(join(tmpdir(), "browser-stale-"));
+      const fixtureExecutable = join(rootDirectory, "chrome");
+      const passwdPath = join(rootDirectory, "passwd");
+      const userId = process.getuid?.() === 0 ? 65534 : process.getuid!();
+      const groupId = process.getgid?.() === 0 ? 65534 : process.getgid!();
+      await chmod(rootDirectory, 0o755);
+      await writeFile(fixtureExecutable, browserFixtureSource);
+      await chmod(fixtureExecutable, 0o755);
+      await writeFile(
+        passwdPath,
+        `bb-browser:x:${userId}:${groupId}::${rootDirectory}:/usr/sbin/nologin\n`,
+      );
+      const request = {
+        kind: "playwright-chromium" as const,
+        executablePath: fixtureExecutable,
+        browserName: "bb-stale-fixture",
+        profileDirectory: join(rootDirectory, "profile"),
+        runtimeDirectory: join(rootDirectory, "runtime"),
+        locale: "en-GB",
+        timezone: "Europe/London",
+        chromeArguments: [
+          `--user-data-dir=${join(rootDirectory, "profile")}`,
+          "--remote-debugging-address=127.0.0.1",
+          "--remote-debugging-port=0",
+        ],
+      };
+      const boundary = createProductionBrowserProcessBoundary({
+        devBrowserExecutable: "/bin/true",
+        passwdPath,
+      });
+      const launched = await boundary.launch(request);
+      try {
+        // A host worker restart leaves the record describing whichever process
+        // it last wrote — here a relaunch that never came up — while the real
+        // owner keeps running. Recovery has to find the owner anyway, or the
+        // relaunch that follows is rejected by the profile singleton.
+        const recovered = await boundary.recover(
+          request,
+          {
+            pid: 2 ** 22 - 1,
+            startedAtTicks: "1",
+            commandHash: "0".repeat(64),
+          },
+          null,
+        );
+        expect(recovered).not.toBeNull();
+        expect(recovered?.pid).toBe(launched.pid);
+        await recovered?.stop();
+      } finally {
+        await launched.stop();
+        await rm(rootDirectory, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.runIf(integrationEnabled)(
     "runs the dev-browser attachment helper as the same unprivileged identity",
     async () => {
       const rootDirectory = await mkdtemp(join(tmpdir(), "browser-helper-"));

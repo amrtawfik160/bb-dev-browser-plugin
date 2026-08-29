@@ -31,8 +31,15 @@ import {
 } from "./authorization.js";
 import {
   enforcementPreambleScript,
+  enforcementPostambleScript,
+  boundPageGuardScript,
   extractOriginDenial,
 } from "./origin-scope.js";
+import {
+  prepareAgentExecution,
+  preferredTabOrigin,
+  TAB_INVALID_MESSAGE,
+} from "./agent-script.js";
 import { inspectFallbackBrowser } from "./browser-fallback.js";
 import {
   BROWSER_SCRIPT_MAX_SCREENSHOT_BYTES,
@@ -856,9 +863,6 @@ function executionRequest(
   };
 }
 
-const TAB_INVALID_MESSAGE =
-  "Browser Tab is invalid or belongs to a previous runtime";
-
 /**
  * Classifies a worker-execution error from a typed signal this runtime owns.
  * Typed {@link BrowserScriptExecutionError} instances (timeout, result bounds)
@@ -874,52 +878,6 @@ function classifyExecutionError(error: unknown): unknown {
     return new BrowserScriptExecutionError("tab_invalid", error.message);
   }
   return error;
-}
-
-function targetedTabPreamble(tabId: string) {
-  return `const __bbTargetPages = await browser.listPages();
-if (!__bbTargetPages.some((entry) => entry.id === ${JSON.stringify(tabId)})) throw new Error(${JSON.stringify(
-    TAB_INVALID_MESSAGE,
-  )});
-const __bbTargetPage = await browser.getPage(${JSON.stringify(tabId)});
-await __bbTargetPage.bringToFront();`;
-}
-
-function activateTargetedTab(tabId: string, code: string) {
-  return `${targetedTabPreamble(tabId)}
-${code}`;
-}
-
-function appendNativeScreenshot(
-  code: string,
-  tabId: string | undefined,
-  screenshot: NonNullable<BrowserExecutionRequest["screenshot"]>,
-) {
-  const suffix = screenshot.marker.replace(/[^A-Za-z0-9]/gu, "");
-  const pageVariable = `__bbScreenshotPage${suffix}`;
-  const entryVariable = `__bbScreenshotEntry${suffix}`;
-  const pagesVariable = `__bbScreenshotPages${suffix}`;
-  const markerLine = JSON.stringify({ __bbScreenshot: screenshot.marker });
-  const pageSelection =
-    tabId === undefined
-      ? `const ${pagesVariable} = await browser.listPages();
-if (${pagesVariable}.length === 0) throw new Error("The Browser Profile has no open tabs");
-let ${pageVariable} = await browser.getPage(${pagesVariable}[0].id);
-for (const ${entryVariable} of ${pagesVariable}) {
-  const candidate = await browser.getPage(${entryVariable}.id);
-  if (await candidate.evaluate(() => document.visibilityState === "visible")) {
-    ${pageVariable} = candidate;
-    break;
-  }
-}`
-      : `const ${pageVariable} = __bbTargetPage;`;
-  return `try {
-${code}
-} finally {
-${pageSelection}
-await saveScreenshot(await ${pageVariable}.screenshot({ type: "png" }), ${JSON.stringify(screenshot.fileName)});
-console.log(${JSON.stringify(markerLine)});
-}`;
 }
 
 function linkedOperationSignal(options: BrowserOperationOptions) {
@@ -1591,23 +1549,26 @@ export function createBrowserInstanceRuntime(
           : originScopeMatcher(operationOptions.originScope);
       const denialMarker =
         matcher === undefined ? undefined : `bb-denial-${randomUUID()}`;
-      const codeForTarget =
-        target.tabId === undefined
-          ? code
-          : activateTargetedTab(target.tabId, code);
-      const enforcedCode =
+      const originPreamble =
         matcher === undefined || denialMarker === undefined
-          ? codeForTarget
+          ? ""
           : `${enforcementPreambleScript(
               matcher,
               denialMarker,
               operationOptions.invalidCertificateOrigins ?? [],
             )}
-${codeForTarget}`;
-      const executionCode =
-        screenshot === undefined
-          ? enforcedCode
-          : appendNativeScreenshot(enforcedCode, target.tabId, screenshot);
+`;
+      const executionCode = prepareAgentExecution({
+        code,
+        tabId: target.tabId,
+        preferredOrigin: preferredTabOrigin(operationOptions.originScope),
+        originPreamble,
+        boundPageGuard: matcher === undefined ? "" : boundPageGuardScript(),
+        originPostamble:
+          matcher === undefined ? "" : enforcementPostambleScript(),
+        timeoutMs,
+        screenshot,
+      });
       const operationSignal = linkedOperationSignal(operationOptions);
       try {
         try {

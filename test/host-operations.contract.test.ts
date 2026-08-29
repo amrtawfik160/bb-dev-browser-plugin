@@ -1,5 +1,5 @@
 import { experimental_createHostEntryHarness } from "@get-bb/plugin-sdk/testing/host";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -12,6 +12,7 @@ import {
   type BrowserHostTarget,
   type BrowserStatus,
 } from "../contracts.js";
+import { fallbackBrowserPaths } from "../browser-fallback.js";
 import { createBrowserHostEntry } from "../host.js";
 import {
   BROWSER_SYSTEM_PACKAGES,
@@ -428,6 +429,156 @@ describe("Browser host administration contract", () => {
         confirmation: "Authenticated owner profile lifecycle",
       }),
     ).resolves.toBeUndefined();
+  });
+
+  it("production setup execution creates the dedicated user and installs packages", async () => {
+    const commands: { file: string; arguments: readonly string[] }[] = [];
+    const executor = createProductionPrivilegedExecutor({
+      executeFile: async (file, arguments_) => {
+        commands.push({ file, arguments: arguments_ });
+      },
+    });
+
+    await executor.execute({
+      kind: "create-dedicated-user",
+      username: BROWSER_USER,
+      homeDirectory: BROWSER_USER_HOME,
+      shell: BROWSER_USER_SHELL,
+      privilege: "unprivileged",
+      confirmation: "Create bb-browser",
+    });
+    await executor.execute({
+      kind: "install-system-packages",
+      packages: BROWSER_SYSTEM_PACKAGES.map((item) => item.name),
+      repository: "signed-system-repository",
+      confirmation: "Install Browser packages",
+    });
+
+    expect(commands).toEqual([
+      {
+        file: "/usr/sbin/useradd",
+        arguments: [
+          "--system",
+          "--shell",
+          BROWSER_USER_SHELL,
+          "--home",
+          BROWSER_USER_HOME,
+          BROWSER_USER,
+        ],
+      },
+      ...BROWSER_SYSTEM_PACKAGES.map((item) => ({
+        file: "/usr/bin/apt-get",
+        arguments: ["install", "-y", "--no-remove", item.name],
+      })),
+    ]);
+
+    const alreadyExists = createProductionPrivilegedExecutor({
+      executeFile: async () => {
+        throw Object.assign(new Error("user exists"), { code: 9 });
+      },
+    });
+    await expect(
+      alreadyExists.execute({
+        kind: "create-dedicated-user",
+        username: BROWSER_USER,
+        homeDirectory: BROWSER_USER_HOME,
+        shell: BROWSER_USER_SHELL,
+        privilege: "unprivileged",
+        confirmation: "Create bb-browser",
+      }),
+    ).resolves.toBeUndefined();
+
+    const chromeMissing = createProductionPrivilegedExecutor({
+      executeFile: async (_file, arguments_) => {
+        if (arguments_.includes("google-chrome-stable")) {
+          throw Object.assign(new Error("missing"), {
+            stderr: "Unable to locate package google-chrome-stable",
+          });
+        }
+      },
+    });
+    await expect(
+      chromeMissing.execute({
+        kind: "install-system-packages",
+        packages: ["google-chrome-stable", "xvfb"],
+        repository: "signed-system-repository",
+        confirmation: "Install Browser packages",
+      }),
+    ).resolves.toBeUndefined();
+  });
+
+  it("production protected-storage copies the Playwright Chromium pack, not only chrome", async () => {
+    const sourceDirectory = await mkdtemp(join(tmpdir(), "chromium-pack-"));
+    const commands: { file: string; arguments: readonly string[] }[] = [];
+    try {
+      await writeFile(join(sourceDirectory, "chrome"), "chrome");
+      const executor = createProductionPrivilegedExecutor({
+        executeFile: async (file, arguments_) => {
+          commands.push({ file, arguments: arguments_ });
+        },
+      });
+      const paths = browserInstallationPaths(installationId, target.hostId);
+      const fallback = fallbackBrowserPaths(paths.hostStoragePath);
+      await executor.execute({
+        kind: "configure-protected-storage",
+        path: paths.hostStoragePath,
+        owner: BROWSER_USER,
+        mode: 0o700,
+        installationId,
+        hostId: target.hostId,
+        confirmation: "Configure protected Browser storage",
+        fallback: {
+          sourcePath: join(sourceDirectory, "chrome"),
+          ...fallback,
+        },
+      });
+      expect(commands).toEqual(
+        expect.arrayContaining([
+          {
+            file: "/usr/bin/cp",
+            arguments: ["-a", join(sourceDirectory, "."), fallback.directory],
+          },
+          {
+            file: "/usr/bin/chown",
+            arguments: [
+              "-R",
+              `${BROWSER_USER}:${BROWSER_USER}`,
+              fallback.directory,
+            ],
+          },
+          {
+            file: "/usr/bin/chmod",
+            arguments: ["0700", fallback.directory],
+          },
+          {
+            file: "/usr/bin/chmod",
+            arguments: ["0755", fallback.executablePath],
+          },
+          {
+            file: "/usr/bin/install",
+            arguments: [
+              "-m",
+              "4755",
+              "-o",
+              "root",
+              "-g",
+              "root",
+              join(sourceDirectory, "chrome_sandbox"),
+              join(fallback.directory, "chrome-sandbox"),
+            ],
+          },
+        ]),
+      );
+      expect(
+        commands.some(
+          (command) =>
+            command.file === "/usr/bin/install" &&
+            command.arguments.includes(join(sourceDirectory, "chrome")),
+        ),
+      ).toBe(false);
+    } finally {
+      await rm(sourceDirectory, { recursive: true, force: true });
+    }
   });
 
   it("purges only the installation-scoped targets after typed confirmation", async () => {

@@ -18,21 +18,35 @@ to `dev-browser`.
 
 Parameters are defined by `browserScriptParametersSchema` (`.strict()`):
 
-| Parameter            | Required | Type / bounds                     | Notes                                                                                                                  |
-| -------------------- | -------- | --------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| `purpose`            | yes      | string, trimmed, 1–200 chars      | Human-readable reason. Shown to the owner only while the Control Lease is live, then discarded.                        |
-| `code`               | yes      | string, non-empty                 | QuickJS Playwright code. No Node, modules, process, or filesystem access.                                              |
-| `destinationOrigin`  | no       | exact `scheme://host:port` origin | Access is denied until the owner grants that origin to this project and profile. Grant changes apply to the next call. |
-| `profileId`          | no       | string                            | Host-local Browser Profile ID. Omit to use the selected profile (`bb-personal` by default).                            |
-| `tabId`              | no       | string                            | Opaque runtime-only tab ID from `browser.listPages()`. Omit to use the active tab.                                     |
-| `timeoutMs`          | no       | integer 1–30000                   | Default `30000` (`BROWSER_SCRIPT_MAX_TIMEOUT_MS`).                                                                     |
-| `screenshot`         | no       | boolean (default false)           | Request up to 3 native screenshots explicitly.                                                                         |
-| `fileTransfer`       | no       | boolean (default false)           | Separate elevation; needs its own owner grant.                                                                         |
-| `invalidCertificate` | no       | boolean (default false)           | Per-origin opt-in; needs its own owner grant.                                                                          |
+| Parameter            | Required | Type / bounds                     | Notes                                                                                                                                                       |
+| -------------------- | -------- | --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `purpose`            | yes      | string, trimmed, 1–200 chars      | Human-readable reason. Shown to the owner only while the Control Lease is live, then discarded.                                                             |
+| `code`               | yes      | string, non-empty                 | QuickJS Playwright code. No Node, modules, process, or filesystem access.                                                                                   |
+| `destinationOrigin`  | no       | exact `scheme://host:port` origin | Omitting it returns `origin_denied`. Access is denied until the owner grants that origin to this project and profile. Grant changes apply to the next call. |
+| `profileId`          | no       | string                            | Host-local Browser Profile ID. Omit to use the selected profile (`bb-personal` by default).                                                                 |
+| `tabId`              | no       | string                            | Opaque runtime-only tab ID from `browser.listPages()`. Omit to use the active tab.                                                                          |
+| `timeoutMs`          | no       | integer 1–30000                   | Default `30000` (`BROWSER_SCRIPT_MAX_TIMEOUT_MS`).                                                                                                          |
+| `screenshot`         | no       | boolean (default false)           | Request up to 3 native screenshots explicitly.                                                                                                              |
+| `fileTransfer`       | no       | boolean (default false)           | Separate elevation; needs its own owner grant.                                                                                                              |
+| `invalidCertificate` | no       | boolean (default false)           | Per-origin opt-in; needs its own owner grant. The approval is recorded but no longer loads a bad-certificate origin — see [security.md](security.md).       |
+
+The script runs with Playwright `page` bound to the active tab (or `tabId`).
+`return` values become the tool result. There is no `document` global.
+
+`page.setDefaultTimeout` and `page.setDefaultNavigationTimeout` are set 5s below
+the script timeout before your code runs, so a locator action that never becomes
+possible fails with the Playwright call log naming the reason instead of
+outliving the call. That call log is the most useful part of a failure message,
+so failures keep its tail and drop the sandbox stack frames.
+
+```javascript
+return await page.title();
+```
 
 ```text
-bb browser script --purpose "Read the checkout total" --code "..." \
-  [--profile <id>] [--tab <id>] [--origin <origin>] [--timeout <ms>] \
+bb browser script --purpose "Read the page title" --code "return await page.title()" \
+  --origin https://example.com \
+  [--profile <id>] [--tab <id>] [--timeout <ms>] \
   [--screenshot] [--file-transfer] [--invalid-certificate] [--json]
 ```
 
@@ -47,8 +61,12 @@ The CLI derives project and host from BB context and does **not** accept
 
 The bundled skill lives at [`skills/browser/SKILL.md`](../../skills/browser/SKILL.md)
 and is configured for agents via `bb.agents.configure(() => ({ tools: ["browser_script"], skills: ["browser"] }))`.
-It tells agents to check readiness with `bb browser status --json` first and
-to use `bb browser diagnostics --json` when the status asks for repair details.
+It opens with the two commands that get an agent working — `bb browser trust`
+once per project, then `bb browser open <url>` — followed by the automation
+recipes and the failure table. It carries the gotchas that cost real time:
+overlays that swallow clicks, keeping one script under ~25 seconds, preferring
+`fill` over `click` on inputs, and waiting on conditions rather than timers.
+
 Its guidance for `setup_required` is **final**: report that host setup is
 required; do not retry, provision packages, launch a browser through another
 path, or seek a raw browser endpoint.
@@ -76,9 +94,12 @@ additional copy.
 
 The `error` is one of:
 
-1. **`BrowserStatus`** — a host/instance state such as `setup_required`,
-   `host_offline`, `repair_required`, `unsupported`, `sleeping`, `waking`, or
+1. **`BrowserStatus`** — a blocking host/instance state such as
+   `setup_required`, `host_offline`, `repair_required`, `unsupported`, or
    `safe_login_elsewhere`. `setup_required` is final for the current call.
+   `sleeping` and `waking` appear on `bb browser status` while the instance is
+   idle or starting; they do not fail `browser_script`. The instance wakes on
+   demand.
 2. **Origin denied** (`state: "origin-denied"`, `code: "origin_denied"`) —
    includes the denied `origin` and a non-blocking `grantRequest` for the owner
    to approve.
@@ -112,7 +133,9 @@ diagnostics, or the database (verified by the sensitive-data evidence suite).
 
 ## Time and result bounds
 
-- Script timeout is capped at **30 seconds**.
+- Script timeout is capped at **30 seconds**. Playwright navigation waits are
+  set five seconds below that timeout so a hung `page.goto` fails as
+  `script_failed` instead of a host deadline.
 - Structured results are capped at **256 KiB**.
 - Screenshots: at most **3** per call, each ≤ 1 MiB, PNG/JPEG/WebP only, and only
   when explicitly requested (`screenshot: true`).

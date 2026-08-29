@@ -108,7 +108,10 @@ function launchFixture(
       if (request.screenshot !== undefined) {
         compileFunction(`return async function () {\n${request.code}\n}`);
       }
-      if (request.code.includes("document.visibilityState")) {
+      if (
+        request.code.includes("document.visibilityState") &&
+        request.code.includes("active ?? pages[0]")
+      ) {
         return JSON.stringify({
           id: "actual-active-tab",
           url: "about:blank",
@@ -593,6 +596,8 @@ describe("Browser Instance runtime", () => {
     await writeFile(fallback.executablePath, "fixture executable");
     await chmod(fallback.executablePath, 0o755);
     await chown(fallback.executablePath, 1001, 1001);
+    await writeFile(join(fallback.directory, "icudtl.dat"), "fixture icu");
+    await chown(join(fallback.directory, "icudtl.dat"), 1001, 1001);
     await writeFile(
       fallback.manifestPath,
       JSON.stringify({
@@ -692,10 +697,15 @@ describe("Browser Instance runtime", () => {
       expect(fixture.processFixture.executions).toEqual([
         expect.objectContaining({
           endpoint: "http://127.0.0.1:12001",
-          code: "console.log(await browser.listPages())",
           timeoutMs: 5_000,
         }),
       ]);
+      expect(fixture.processFixture.executions[0]?.code).toContain(
+        "console.log(await browser.listPages())",
+      );
+      expect(fixture.processFixture.executions[0]?.code).toContain(
+        "__bbResult",
+      );
       expect(fixture.processFixture.stopped).toEqual([]);
 
       await fixture.runtime.stop(fixture.target);
@@ -978,7 +988,7 @@ describe("Browser Instance runtime", () => {
         'browser.getPage("tab-agent")',
       );
       expect(fixture.processFixture.executions[0]?.code).toContain(
-        "await __bbTargetPage.bringToFront()",
+        "await page.bringToFront()",
       );
       expect(fixture.processFixture.executions[1]?.code).toContain(
         'browser.getPage("tab-agent")',
@@ -1003,6 +1013,11 @@ describe("Browser Instance runtime", () => {
           { screenshot: true },
         ),
       ).resolves.toEqual({ output: "attached" });
+      const screenshotCode = fixture.processFixture.executions[0]!.code;
+      expect(screenshotCode.indexOf("const page")).toBeLessThan(
+        screenshotCode.indexOf("try {"),
+      );
+      expect(screenshotCode).toContain("page.screenshot");
     } finally {
       await fixture.dispose();
     }
@@ -1315,11 +1330,13 @@ describe("Browser Instance runtime Origin Scope enforcement", () => {
       const enforcedCode = fixture.processFixture.executions[0]!.code;
       expect(enforcedCode).toContain("__bbOriginRequiresCertificateBypass");
       expect(enforcedCode).toContain(JSON.stringify([grantedOrigin]));
-      expect(enforcedCode).toContain("context.request.fetch");
-      expect(enforcedCode).toContain("ignoreHTTPSErrors: true");
-      expect(enforcedCode).toContain("route.fulfill");
+      // The bypass used to fulfil the navigation through the context request
+      // context from inside a route handler. The sandbox never calls back into
+      // an agent-supplied handler, so that path never executed; the approved
+      // origins now reach the policy without a route.
+      expect(enforcedCode).not.toContain("route.fulfill");
       expect(enforcedCode.indexOf("return page.url()")).toBeGreaterThan(
-        enforcedCode.indexOf("__bbEnforceOriginScope"),
+        enforcedCode.indexOf("__bbGuardNavigation"),
       );
     } finally {
       await fixture.dispose();

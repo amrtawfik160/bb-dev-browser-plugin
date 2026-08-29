@@ -13,6 +13,17 @@ import {
   type BrowserService,
 } from "./browser-service.js";
 import {
+  GRANT_CLI_COMMANDS,
+  isGrantCliCommand,
+  runGrantCliCommand,
+  type GrantCliArguments,
+} from "./grant-cli.js";
+import {
+  openBrowserScript,
+  openCliText,
+  parseOpenPageState,
+} from "./browser-open.js";
+import {
   BROWSER_SCRIPT_MAX_TIMEOUT_MS,
   browserScriptParametersSchema,
   browserScriptResultSchema,
@@ -25,6 +36,7 @@ import {
   type BrowserProfileInventory,
   type BrowserProfileRecoveryResponse,
   type BrowserProfileRestoreRequest,
+  type BrowserNavigationResponse,
   rpcContract,
   setupStepIdSchema,
   type BrowserScriptFailure,
@@ -37,8 +49,16 @@ import {
 } from "./contracts.js";
 
 const CLI_USAGE = [
-  "Usage: bb browser <status|diagnostics|script|activity|activity-export|activity-clear|requests|request-status|list|create|rename|select|backup|restore|import|archive|restore-archived|reset|delete|setup|disable|uninstall|purge> [options]",
-  "  script --purpose <text> --code <source> [--profile <id>] [--tab <id>] [--origin <origin>] [--timeout <ms>] [--screenshot] [--file-transfer] [--invalid-certificate] [--json]",
+  "Usage: bb browser <open|trust|untrust|grants|grant|revoke|approve|deny|status|diagnostics|script|activity|activity-export|activity-clear|requests|request-status|list|create|rename|select|backup|restore|import|archive|restore-archived|reset|delete|setup|disable|uninstall|purge> [options]",
+  "  open [url] [--profile <id>] [--timeout <ms>] [--screenshot] [--json]",
+  "  trust [--origin <scope>] [--profile <id>] [--host <id>] [--file-transfer] [--json]",
+  "  untrust [--origin <scope>] [--profile <id>] [--host <id>] [--json]",
+  "  grants [--profile <id>] [--host <id>] [--all] [--json]",
+  "  grant --origin <scope> [--profile <id>] [--host <id>] [--file-transfer] [--json]",
+  "  revoke --grant <id> [--json]",
+  "  approve --request <id> [--one-hour] [--json]",
+  "  deny --request <id> [--json]",
+  "  script --purpose <text> --code <source> --origin <origin> [--profile <id>] [--tab <id>] [--timeout <ms>] [--screenshot] [--file-transfer] [--invalid-certificate] [--json]",
   "  setup [--profile <id>] [--step <id> --confirm <text>] [--json]",
   "  purge [--profile <id>] [--confirm <text>] [--json]",
   "  disable|uninstall [--profile <id>] --confirm <text> [--json]",
@@ -62,6 +82,8 @@ const CLI_USAGE = [
 const PROFILE_IMPORT_COMMAND = ["imp", "ort"].join("");
 type BrowserScriptParameters = z.output<typeof browserScriptParametersSchema>;
 const BROWSER_COMMANDS = [
+  "open",
+  ...GRANT_CLI_COMMANDS,
   "status",
   "diagnostics",
   "script",
@@ -110,6 +132,10 @@ type ParsedCliArguments = {
   screenshot?: boolean;
   fileTransfer?: boolean;
   invalidCertificate?: boolean;
+  grantId?: string;
+  includeRevoked?: boolean;
+  oneHour?: boolean;
+  address?: string;
 };
 
 type CliArgumentParseResult =
@@ -254,6 +280,7 @@ type CliOptionName =
   | "--tab"
   | "--origin"
   | "--timeout"
+  | "--grant"
   | "confirmation";
 type ParsedCliOption = {
   name: CliOptionName;
@@ -280,7 +307,8 @@ function cliOptionName(argument: string): CliOptionName | null {
     argument === "--timezone" ||
     argument === "--archive" ||
     argument === "--source" ||
-    argument === "--request"
+    argument === "--request" ||
+    argument === "--grant"
   ) {
     return argument;
   }
@@ -323,6 +351,9 @@ type CliParseState = {
   screenshot?: boolean;
   fileTransfer?: boolean;
   invalidCertificate?: boolean;
+  grantId?: string;
+  includeRevoked?: boolean;
+  oneHour?: boolean;
 };
 
 function applyCliOption(
@@ -369,6 +400,10 @@ function applyCliOption(
     parseState.requestId = option.optionValue;
     return null;
   }
+  if (option.name === "--grant") {
+    parseState.grantId = option.optionValue;
+    return null;
+  }
   if (option.name === "--purpose") {
     parseState.purpose = option.optionValue;
     return null;
@@ -409,12 +444,71 @@ function isBrowserCommand(
   );
 }
 
+/**
+ * `open` is the one command that takes a positional value, because typing
+ * `bb browser open example.com` is how a browser address bar behaves. Every
+ * other command keeps the single-positional shape.
+ */
 function parsedCommand(
   positional: string[],
-): { command: BrowserCommand } | null {
-  if (positional.length === 1) {
-    const command = positional[0];
-    return isBrowserCommand(command) ? { command } : null;
+): { command: BrowserCommand; address?: string } | null {
+  const command = positional[0];
+  if (!isBrowserCommand(command)) return null;
+  if (command === "open") {
+    return positional.length > 2
+      ? null
+      : {
+          command,
+          ...(positional[1] === undefined ? {} : { address: positional[1] }),
+        };
+  }
+  return positional.length === 1 ? { command } : null;
+}
+
+/**
+ * `--origin` names a destination for `script` and an Origin Scope for the
+ * grant commands; `--file-transfer` is a script elevation and a grant
+ * elevation. Both are shared rather than duplicated under new names.
+ */
+const ORIGIN_OPTION_COMMANDS = ["script", "trust", "untrust", "grant"];
+const FILE_TRANSFER_OPTION_COMMANDS = ["script", "trust", "grant"];
+
+function validateGrantCommandOptions(
+  command: BrowserCommand,
+  parseState: CliParseState,
+): string | null {
+  if (!isGrantCliCommand(command)) {
+    if (parseState.grantId !== undefined) {
+      return `--grant is only valid for revoke.\n${CLI_USAGE}`;
+    }
+    if (parseState.includeRevoked !== undefined) {
+      return `--all is only valid for grants.\n${CLI_USAGE}`;
+    }
+    if (parseState.oneHour !== undefined) {
+      return `--one-hour is only valid for approve.\n${CLI_USAGE}`;
+    }
+    return null;
+  }
+  if (command === "grant" && parseState.destinationOrigin === undefined) {
+    return `grant requires --origin <scope>. Use trust for whole-web access.\n${CLI_USAGE}`;
+  }
+  if (command === "revoke" && parseState.grantId === undefined) {
+    return `revoke requires --grant <id>.\n${CLI_USAGE}`;
+  }
+  if (
+    ["approve", "deny"].includes(command) &&
+    parseState.requestId === undefined
+  ) {
+    return `${command} requires --request <id>.\n${CLI_USAGE}`;
+  }
+  if (command !== "grants" && parseState.includeRevoked !== undefined) {
+    return `--all is only valid for grants.\n${CLI_USAGE}`;
+  }
+  if (command !== "approve" && parseState.oneHour !== undefined) {
+    return `--one-hour is only valid for approve.\n${CLI_USAGE}`;
+  }
+  if (command !== "revoke" && parseState.grantId !== undefined) {
+    return `--grant is only valid for revoke.\n${CLI_USAGE}`;
   }
   return null;
 }
@@ -423,21 +517,33 @@ function validateCliCommandOptions(
   command: BrowserCommand,
   parseState: CliParseState,
 ): string | null {
+  const grantError = validateGrantCommandOptions(command, parseState);
+  if (grantError !== null) return grantError;
   const scriptOptions = [
     parseState.purpose,
     parseState.code,
     parseState.tabId,
-    parseState.destinationOrigin,
-    parseState.timeoutMs,
-    parseState.screenshot,
-    parseState.fileTransfer,
     parseState.invalidCertificate,
   ];
+  const openOptions = [parseState.timeoutMs, parseState.screenshot];
   if (
     command !== "script" &&
-    scriptOptions.some((value) => value !== undefined)
+    (scriptOptions.some((value) => value !== undefined) ||
+      (command !== "open" && openOptions.some((value) => value !== undefined)))
   ) {
     return `Script options are only valid for script.\n${CLI_USAGE}`;
+  }
+  if (
+    !ORIGIN_OPTION_COMMANDS.includes(command) &&
+    parseState.destinationOrigin !== undefined
+  ) {
+    return `--origin is only valid for script, trust, untrust, or grant.\n${CLI_USAGE}`;
+  }
+  if (
+    !FILE_TRANSFER_OPTION_COMMANDS.includes(command) &&
+    parseState.fileTransfer !== undefined
+  ) {
+    return `--file-transfer is only valid for script, trust, or grant.\n${CLI_USAGE}`;
   }
   if (command === "script") {
     if (parseState.hostId !== undefined) {
@@ -449,6 +555,9 @@ function validateCliCommandOptions(
     if (parseState.code === undefined) {
       return `script requires --code.\n${CLI_USAGE}`;
     }
+    if (parseState.destinationOrigin === undefined) {
+      return `script requires --origin <exact origin, e.g. https://example.com>.\n${CLI_USAGE}`;
+    }
     if (parseState.confirmation !== undefined) {
       return `--confirm is not valid for script.\n${CLI_USAGE}`;
     }
@@ -457,15 +566,27 @@ function validateCliCommandOptions(
     return `--step is only valid for setup.\n${CLI_USAGE}`;
   }
   if (
-    ["status", "diagnostics", "activity", "activity-export", "list"].includes(
-      command,
-    ) &&
+    [
+      "status",
+      "diagnostics",
+      "activity",
+      "activity-export",
+      "list",
+      "open",
+      ...GRANT_CLI_COMMANDS,
+    ].includes(command) &&
     parseState.confirmation !== undefined
   ) {
     return `Confirmation is not valid for ${command}.\n${CLI_USAGE}`;
   }
-  if (command !== "request-status" && parseState.requestId !== undefined) {
-    return "--request is only valid for request inspection.\n" + CLI_USAGE;
+  if (
+    !["request-status", "approve", "deny"].includes(command) &&
+    parseState.requestId !== undefined
+  ) {
+    return (
+      "--request is only valid for request-status, approve, or deny.\n" +
+      CLI_USAGE
+    );
   }
   if (command === "request-status" && parseState.requestId === undefined) {
     return `request-status requires --request.\n${CLI_USAGE}`;
@@ -582,6 +703,14 @@ function parseCliArguments(argv: string[]): CliArgumentParseResult {
       parseState.invalidCertificate = true;
       continue;
     }
+    if (argument === "--all") {
+      parseState.includeRevoked = true;
+      continue;
+    }
+    if (argument === "--one-hour") {
+      parseState.oneHour = true;
+      continue;
+    }
     const option = readCliOption(argv, index, argument);
     if (option !== null) {
       if ("error" in option) return option;
@@ -602,6 +731,10 @@ function parseCliArguments(argv: string[]): CliArgumentParseResult {
   return {
     arguments: {
       command: parsed.command,
+      address: parsed.address,
+      grantId: parseState.grantId,
+      includeRevoked: parseState.includeRevoked,
+      oneHour: parseState.oneHour,
       json: parseState.json,
       profileId: parseState.profileId,
       hostId: parseState.hostId,
@@ -725,6 +858,138 @@ async function runBrowserScriptCli(
         ? browserScriptJson(response.result)
         : browserScriptText(response.result),
   };
+}
+
+/**
+ * Navigate as the owner, then try to read the page back as an agent.
+ *
+ * Navigation never needs a Profile Grant, so `open` still works on a brand new
+ * install. The follow-up read does, which is why a denial degrades to the
+ * navigation result and an unlock hint rather than failing the command.
+ *
+ * With no address, `open` wakes the browser and reports where it already is
+ * rather than navigating anywhere — the same thing raising a browser window
+ * does.
+ */
+async function runOpenCli(
+  browser: BrowserService,
+  cliArguments: ParsedCliArguments,
+  context: PluginCliContext,
+) {
+  if (context.threadId === undefined) {
+    throw new Error(
+      "browser open requires BB thread context; invoke it from a project thread.",
+    );
+  }
+  const target = await browser.grantScope(context, {
+    ...(cliArguments.profileId === undefined
+      ? {}
+      : { profileId: cliArguments.profileId }),
+    ...(cliArguments.hostId === undefined
+      ? {}
+      : { hostId: cliArguments.hostId }),
+  });
+  const navigation =
+    cliArguments.address === undefined
+      ? await currentOpenTab(browser, target, context)
+      : await browser.navigate(
+          {
+            surface: "thread",
+            threadId: context.threadId,
+            hostId: target.hostId,
+            profileId: target.profileId,
+            input: cliArguments.address,
+          },
+          context.signal,
+        );
+  const page = await readOpenedPage(
+    browser,
+    target,
+    navigation,
+    cliArguments,
+    context,
+  );
+  if (cliArguments.json) {
+    return {
+      exitCode: 0,
+      stdout: JSON.stringify({
+        url: page?.url ?? navigation.address.url,
+        title: page?.title ?? null,
+        tabId: navigation.tabId,
+        profileId: target.profileId,
+        hostId: target.hostId,
+        trusted: page !== null,
+      }),
+    };
+  }
+  return {
+    exitCode: 0,
+    stdout: openCliText(navigation, page, page === null),
+  };
+}
+
+/**
+ * Describe the tab `open` would have navigated, shaped like a navigation
+ * result so the caller does not branch on whether an address was given.
+ */
+async function currentOpenTab(
+  browser: BrowserService,
+  target: { hostId: string; profileId: string },
+  context: PluginCliContext,
+): Promise<BrowserNavigationResponse> {
+  const strip = await browser.tabs(
+    { hostId: target.hostId, profileId: target.profileId },
+    context.signal,
+  );
+  const active =
+    strip.tabs.find((tab) => tab.tabId === strip.activeTabId) ?? strip.tabs[0];
+  if (active === undefined) {
+    // A sleeping or freshly restarted instance reports no tabs until something
+    // navigates it, and there is nothing to report without an address.
+    throw new Error(
+      "This Browser Profile has no open tab yet. Pass a URL to open one: bb browser open <url>",
+    );
+  }
+  return {
+    address: { kind: "address", url: active.url },
+    location: null,
+    tabId: active.tabId,
+  };
+}
+
+async function readOpenedPage(
+  browser: BrowserService,
+  target: { hostId: string; profileId: string },
+  navigation: BrowserNavigationResponse,
+  cliArguments: ParsedCliArguments,
+  context: PluginCliContext,
+) {
+  if (context.projectId === undefined || context.threadId === undefined) {
+    return null;
+  }
+  const response = await browser.browserScript(
+    browserScriptParametersSchema.parse({
+      purpose: "Report the page the owner just opened",
+      code: openBrowserScript(),
+      destinationOrigin: new URL(navigation.address.url).origin,
+      profileId: target.profileId,
+      tabId: navigation.tabId,
+      ...(cliArguments.timeoutMs === undefined
+        ? {}
+        : { timeoutMs: cliArguments.timeoutMs }),
+      ...(cliArguments.screenshot === undefined
+        ? {}
+        : { screenshot: cliArguments.screenshot }),
+    }),
+    {
+      projectId: context.projectId,
+      threadId: context.threadId,
+      signal: context.signal ?? new AbortController().signal,
+    },
+  );
+  return response.ok
+    ? parseOpenPageState(browserScriptText(response.result))
+    : null;
 }
 
 async function runActivityCli(
@@ -1181,9 +1446,43 @@ async function runAdministrationCli(
   return runLifecycleCli(browser, target, cliArguments, context.signal);
 }
 
+function grantCliArguments(
+  cliArguments: ParsedCliArguments,
+): GrantCliArguments {
+  return {
+    command: cliArguments.command as GrantCliArguments["command"],
+    json: cliArguments.json,
+    ...(cliArguments.profileId === undefined
+      ? {}
+      : { profileId: cliArguments.profileId }),
+    ...(cliArguments.hostId === undefined
+      ? {}
+      : { hostId: cliArguments.hostId }),
+    ...(cliArguments.destinationOrigin === undefined
+      ? {}
+      : { originScope: cliArguments.destinationOrigin }),
+    ...(cliArguments.grantId === undefined
+      ? {}
+      : { grantId: cliArguments.grantId }),
+    ...(cliArguments.requestId === undefined
+      ? {}
+      : { requestId: cliArguments.requestId }),
+    ...(cliArguments.fileTransfer === undefined
+      ? {}
+      : { fileTransfer: cliArguments.fileTransfer }),
+    ...(cliArguments.includeRevoked === undefined
+      ? {}
+      : { includeRevoked: cliArguments.includeRevoked }),
+    ...(cliArguments.oneHour === undefined
+      ? {}
+      : { oneHour: cliArguments.oneHour }),
+  };
+}
+
 async function runCli(
   bb: BbPluginApi,
   browser: BrowserService,
+  ownerAuthority: unknown,
   argv: string[],
   context: PluginCliContext,
 ) {
@@ -1197,6 +1496,17 @@ async function runCli(
   if ("error" in parsed) return { exitCode: 1, stderr: parsed.error };
   const { command, json, profileId, hostId, requestId } = parsed.arguments;
   try {
+    if (isGrantCliCommand(command)) {
+      return await runGrantCliCommand(
+        browser,
+        ownerAuthority,
+        grantCliArguments(parsed.arguments),
+        context,
+      );
+    }
+    if (command === "open") {
+      return await runOpenCli(browser, parsed.arguments, context);
+    }
     if (command === "status") {
       return await runStatusCli(browser, profileId, hostId, json, context);
     }
@@ -1781,11 +2091,60 @@ async function runBrowserScript(
   return response.ok ? toolSuccess(response.result) : toolFailure(response);
 }
 
-function registerCli(bb: BbPluginApi, browser: BrowserService) {
+function registerCli(
+  bb: BbPluginApi,
+  browser: BrowserService,
+  ownerAuthority: unknown,
+) {
   bb.cli.register({
     name: "browser",
     summary: "Inspect and manage Browser host state",
     commands: [
+      {
+        name: "open",
+        summary: "Open the Workspace Browser on a URL or search",
+        usage:
+          "bb browser open [url] [--profile <id>] [--timeout <ms>] [--screenshot] [--json]",
+      },
+      {
+        name: "trust",
+        summary: "Let this project's agents automate the Browser",
+        usage:
+          "bb browser trust [--origin <scope>] [--profile <id>] [--host <id>] [--file-transfer] [--json]",
+      },
+      {
+        name: "untrust",
+        summary: "Revoke this project's Browser Profile Grants",
+        usage:
+          "bb browser untrust [--origin <scope>] [--profile <id>] [--host <id>] [--json]",
+      },
+      {
+        name: "grants",
+        summary: "List Browser Profile Grants for this project",
+        usage:
+          "bb browser grants [--profile <id>] [--host <id>] [--all] [--json]",
+      },
+      {
+        name: "grant",
+        summary: "Grant one Origin Scope to this project",
+        usage:
+          "bb browser grant --origin <scope> [--profile <id>] [--host <id>] [--file-transfer] [--json]",
+      },
+      {
+        name: "revoke",
+        summary: "Revoke one Browser Profile Grant",
+        usage: "bb browser revoke --grant <id> [--json]",
+      },
+      {
+        name: "approve",
+        summary: "Approve a pending Browser Grant Request",
+        usage: "bb browser approve --request <id> [--one-hour] [--json]",
+      },
+      {
+        name: "deny",
+        summary: "Deny a pending Browser Grant Request",
+        usage: "bb browser deny --request <id> [--json]",
+      },
       {
         name: "status",
         summary: "Report Browser host readiness",
@@ -1800,7 +2159,7 @@ function registerCli(bb: BbPluginApi, browser: BrowserService) {
         name: "script",
         summary: "Run bounded Playwright code in the host-local Browser",
         usage:
-          "bb browser script --purpose <text> --code <source> [--profile <id>] [--tab <id>] [--origin <origin>] [--timeout <ms>] [--screenshot] [--file-transfer] [--invalid-certificate] [--json]",
+          "bb browser script --purpose <text> --code <source> --origin <origin> [--profile <id>] [--tab <id>] [--timeout <ms>] [--screenshot] [--file-transfer] [--invalid-certificate] [--json]",
       },
       {
         name: "activity",
@@ -1920,16 +2279,17 @@ function registerCli(bb: BbPluginApi, browser: BrowserService) {
           "bb browser transfer --kind workspace --environment <id> --path <relative-path> | --kind client --file <local-path> | --cancel --transfer-id <id> | --progress --transfer-id <id> [--json]",
       },
     ],
-    run: (argv, context) => runCli(bb, browser, argv, context),
+    run: (argv, context) => runCli(bb, browser, ownerAuthority, argv, context),
   });
 }
 
 function registerAgentTool(bb: BbPluginApi, browser: BrowserService) {
   bb.agents.registerTool({
     name: "browser_script",
-    description: "Run Playwright code in the host-local Workspace Browser.",
+    description:
+      "Run Playwright code in the host-local Workspace Browser. Pass destinationOrigin as an exact origin such as https://example.com. The script gets `page` for the active tab; returned values become the tool result.",
     instructions:
-      "Provide a purpose and QuickJS-compatible Playwright code. Report typed failures without retrying setup.",
+      "Provide a purpose, an exact destinationOrigin, and QuickJS Playwright code. `page` is the active tab. `return` values become the result. Report typed failures without retrying setup.",
     presentation: {
       label: {
         pending: "Running browser script",
@@ -2030,7 +2390,7 @@ export default function plugin(bb: BbPluginApi) {
     browser_host_choices: (input: BrowserHostChoicesInput) =>
       browser.hostChoices(input),
   });
-  registerCli(bb, browser);
+  registerCli(bb, browser, ownerAuthority);
   registerAgentTool(bb, browser);
   bb.agents.configure(() => ({
     tools: ["browser_script"],

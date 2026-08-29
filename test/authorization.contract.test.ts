@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   createProfileGrantStore,
   projectLoopbackAlias,
+  AGENT_EXACT_ORIGIN_REQUIRED,
 } from "../authorization.js";
 import { createBrowserService } from "../browser-service.js";
 import { BROWSER_DATABASE_MIGRATIONS } from "../activity-records.js";
@@ -132,6 +133,20 @@ describe("Browser Profile Grant public authorization contract", () => {
           origin: "https://app.example.test",
         }),
       ).toMatchObject({ allowed: false, code: "origin_denied" });
+      expect(
+        store.authorize({
+          projectId: "project-a",
+          hostId: "host-a",
+          installationId: "installation-a",
+          profileId: "profile-a",
+          origin: "",
+        }),
+      ).toMatchObject({
+        allowed: false,
+        code: "origin_denied",
+        message: AGENT_EXACT_ORIGIN_REQUIRED,
+        grantRequest: null,
+      });
 
       store.create(grant());
 

@@ -7,6 +7,8 @@ import {
   type OriginScopeMatcher,
 } from "../authorization.js";
 import {
+  boundPageGuardScript,
+  enforcementPostambleScript,
   enforcementPreambleScript,
   extractOriginDenial,
   originPermittedFunctionSource,
@@ -230,23 +232,34 @@ describe("enforcement preamble and denial signaling", () => {
     origin: "https://app.example.test",
   };
 
-  it("registers context route interception before the agent code runs", () => {
+  it("snapshots the tabs and installs the guard before the agent code runs", () => {
     const preamble = enforcementPreambleScript(matcher, "bb-denial-marker");
     const agentCode = "console.log('agent ran');";
-    expect(preamble).toContain("__bbEnforceOriginScope");
-    expect(preamble).toContain("__bbEnforcementPage.context()");
+    expect(preamble).toContain("__bbGuardNavigation");
+    expect(preamble).toContain("__bbTabsBefore");
     expect(preamble).toContain('"kind":"exact"');
-    // The preamble precedes the agent code when concatenated.
-    expect(`${preamble}\n${agentCode}`).toMatch(
-      /__bbEnforceOriginScope\(__bbEnforcementPage\.context\(\)\)[\s\S]*agent ran/,
+    const wrapped = `${preamble}\n${boundPageGuardScript()}\n${agentCode}`;
+    expect(wrapped.indexOf("__bbTabsBefore")).toBeLessThan(
+      wrapped.indexOf("page.goto ="),
+    );
+    expect(wrapped.indexOf("page.goto =")).toBeLessThan(
+      wrapped.indexOf("agent ran"),
     );
   });
 
-  it("only intercepts navigation requests and lets non-document subresources continue", () => {
+  it("does not try to wrap the frozen browser global", () => {
     const preamble = enforcementPreambleScript(matcher, "bb-denial-marker");
-    expect(preamble).toContain("request.isNavigationRequest()");
-    expect(preamble).toContain('route.abort("blockedbyclient")');
-    expect(preamble).toContain("route.continue()");
+    // `browser` is frozen, so assigning to it is a silent no-op. Enforcement
+    // that depended on such a patch would look present and do nothing.
+    expect(preamble).not.toContain("browser.getPage =");
+  });
+
+  it("never intercepts requests, which the sandbox cannot service", () => {
+    const preamble = enforcementPreambleScript(matcher, "bb-denial-marker");
+    // A route handler is agent-supplied JavaScript the sandbox cannot call
+    // back into, so every intercepted request hung forever.
+    expect(preamble).not.toContain(".route(");
+    expect(preamble).not.toContain("route.continue");
   });
 
   it("extracts the denied origin from a script result carrying the marker", () => {
@@ -320,7 +333,9 @@ describe("per-origin invalid-certificate bypass policy", () => {
 
 describe("QuickJS sandbox cert-bypass parity", () => {
   const quickJsBypass = (() => {
-    const source = originRequiresCertificateBypassSource();
+    // Both sources share the sandbox origin parser, exactly as the generated
+    // preamble concatenates them.
+    const source = `${originPermittedFunctionSource()}\n${originRequiresCertificateBypassSource()}`;
     const factory = compileFunction(
       `${source}\nreturn __bbOriginRequiresCertificateBypass;`,
       [],
@@ -345,138 +360,201 @@ describe("QuickJS sandbox cert-bypass parity", () => {
   );
 });
 
-type RecordedRoute = {
-  fetch: { url: string; options: Record<string, unknown> } | null;
-  fulfill: { response: unknown } | null;
-  continueCount: number;
-  abortErrorCode: string | null;
-  deniedMarker: string | null;
+type EnforcementRun = {
+  attempted: string[];
+  denialLines: string[];
+  thrown: string | null;
 };
 
-async function enforcePreambleAgainst(
-  matcher: OriginScopeMatcher,
-  denialMarker: string,
-  invalidCertificateOrigins: readonly string[],
-  requestUrl: string,
-  isNavigation: boolean,
-): Promise<RecordedRoute> {
-  const recorded: RecordedRoute = {
-    fetch: null,
-    fulfill: null,
-    continueCount: 0,
-    abortErrorCode: null,
-    deniedMarker: null,
-  };
-  const mockRoute = {
-    request: () => ({
-      isNavigationRequest: () => isNavigation,
-      url: () => requestUrl,
-      method: () => "GET",
-      headers: () => [],
-      postData: () => null,
-    }),
-    continue: async () => {
-      recorded.continueCount += 1;
-    },
-    abort: async (errorCode?: string) => {
-      recorded.abortErrorCode = errorCode ?? null;
-    },
-    fulfill: async (options: { response: unknown }) => {
-      recorded.fulfill = options;
+/**
+ * Drive the real generated preamble, bound-page guard, and postamble against a
+ * stand-in `browser` global, so the enforcement the host injects is the
+ * enforcement under test rather than a paraphrase of it.
+ */
+async function runEnforcement(input: {
+  matcher: OriginScopeMatcher;
+  denialMarker: string;
+  invalidCertificateOrigins?: readonly string[];
+  /** Navigations the script attempts through the bound page. */
+  gotoTargets?: readonly string[];
+  /** Tabs open before the call, as `id -> url`. */
+  tabsBefore: Readonly<Record<string, string>>;
+  /** Tabs open after the call; defaults to the state before. */
+  tabsAfter?: Readonly<Record<string, string>>;
+}): Promise<EnforcementRun> {
+  const run: EnforcementRun = { attempted: [], denialLines: [], thrown: null };
+  const page = {
+    goto: async (url: string) => {
+      run.attempted.push(url);
     },
   };
-  const mockContext = {
-    request: {
-      fetch: async (url: string, options: Record<string, unknown>) => {
-        recorded.fetch = { url, options };
-        return { __bbFetchedResponse: true };
-      },
-    },
-    route: async (
-      _pattern: string,
-      handler: (route: typeof mockRoute) => Promise<void>,
-    ) => {
-      await handler(mockRoute);
-    },
-  };
-  const mockPage = { context: () => mockContext };
+  let listed = 0;
+  const toEntries = (tabs: Readonly<Record<string, string>>) =>
+    Object.entries(tabs).map(([id, url]) => ({ id, url }));
   const browserGlobal = {
-    listPages: async () => [{ id: "fixture-tab" }],
-    getPage: async () => mockPage,
+    listPages: async () => {
+      // The preamble snapshots first; the postamble lists again afterwards.
+      listed += 1;
+      return toEntries(
+        listed === 1 ? input.tabsBefore : (input.tabsAfter ?? input.tabsBefore),
+      );
+    },
+    getPage: async () => page,
   };
   const consoleMock = {
     log: (message: string) => {
-      recorded.deniedMarker = message;
+      run.denialLines.push(message);
     },
   };
-  const preamble = enforcementPreambleScript(
-    matcher,
-    denialMarker,
-    invalidCertificateOrigins,
-  );
+  const body = [
+    enforcementPreambleScript(
+      input.matcher,
+      input.denialMarker,
+      input.invalidCertificateOrigins ?? [],
+    ),
+    "const page = await browser.getPage('tab-0');",
+    boundPageGuardScript(),
+    "try {",
+    ...(input.gotoTargets ?? []).map(
+      (target) => `  await page.goto(${JSON.stringify(target)});`,
+    ),
+    "} catch (error) {",
+    "  if (error === null || typeof error !== 'object' || error.__bbOriginDenied !== true) throw error;",
+    "  __bbThrown = String(error.message);",
+    "}",
+    enforcementPostambleScript(),
+    "return __bbThrown;",
+  ].join("\n");
   const factory = compileFunction(
-    `return async (browser, console) => {\n${preamble}\n};`,
+    `return async (browser, console) => {\nlet __bbThrown = null;\n${body}\n};`,
     ["browser", "console"],
-    { filename: "enforcement-preamble.js" },
+    { filename: "enforcement.js" },
   );
-  await factory()(browserGlobal, consoleMock);
-  return recorded;
+  run.thrown = (await factory()(browserGlobal, consoleMock)) as string | null;
+  return run;
 }
 
-describe("enforcement preamble per-origin cert bypass and denial", () => {
+describe("Origin Scope navigation gate", () => {
   const grantedOrigin = "https://app.example.test:8443";
-  const matcher: OriginScopeMatcher = {
-    kind: "exact",
-    origin: grantedOrigin,
-  };
-  const denialMarker = "bb-denial-cert";
-  const invalidCertificateOrigins = [grantedOrigin];
+  const matcher: OriginScopeMatcher = { kind: "exact", origin: grantedOrigin };
+  const denialMarker = "bb-denial-gate";
 
-  it("issue #14 AC4 bypasses cert errors for a granted invalid-certificate origin so it can load", async () => {
-    const recorded = await enforcePreambleAgainst(
+  it("lets an in-scope navigation reach the browser", async () => {
+    const run = await runEnforcement({
       matcher,
       denialMarker,
-      invalidCertificateOrigins,
-      `${grantedOrigin}/account`,
-      true,
-    );
-    expect(recorded.fetch).not.toBeNull();
-    expect(recorded.fetch?.options.ignoreHTTPSErrors).toBe(true);
-    expect(recorded.fetch?.url).toBe(`${grantedOrigin}/account`);
-    expect(recorded.fulfill).toEqual({
-      response: { __bbFetchedResponse: true },
+      gotoTargets: [`${grantedOrigin}/account`],
+      tabsBefore: { "tab-0": `${grantedOrigin}/` },
+      tabsAfter: { "tab-0": `${grantedOrigin}/account` },
     });
-    expect(recorded.continueCount).toBe(0);
-    expect(recorded.abortErrorCode).toBeNull();
+    expect(run.attempted).toEqual([`${grantedOrigin}/account`]);
+    expect(run.denialLines).toEqual([]);
+    expect(run.thrown).toBeNull();
   });
 
-  it("issue #14 AC4 still blocks an ungranted out-of-scope invalid-certificate origin", async () => {
-    const recorded = await enforcePreambleAgainst(
+  it("refuses an out-of-scope navigation on the bound page before it is issued", async () => {
+    const run = await runEnforcement({
       matcher,
       denialMarker,
-      invalidCertificateOrigins,
-      "https://evil.example.test/account",
-      true,
-    );
-    expect(recorded.abortErrorCode).toBe("blockedbyclient");
-    expect(recorded.fetch).toBeNull();
-    expect(recorded.fulfill).toBeNull();
-    expect(recorded.continueCount).toBe(0);
-    expect(recorded.deniedMarker).toContain(denialMarker);
-    expect(recorded.deniedMarker).toContain("https://evil.example.test");
+      gotoTargets: ["https://evil.example.test/account"],
+      tabsBefore: { "tab-0": `${grantedOrigin}/` },
+    });
+    expect(run.attempted).toEqual([]);
+    expect(run.thrown).toContain("https://evil.example.test");
+    expect(run.denialLines.join("\n")).toContain(denialMarker);
+    expect(run.denialLines.join("\n")).toContain("https://evil.example.test");
   });
 
-  it("continues normally for an in-scope origin that lacks the invalid-certificate opt-in", async () => {
-    const recorded = await enforcePreambleAgainst(
+  it("denies a tab this call navigated out of scope by other means", async () => {
+    // A redirect or a link click moves the tab without page.goto, so the
+    // guard never sees it and the sweep is what catches it.
+    const run = await runEnforcement({
       matcher,
       denialMarker,
-      [],
-      `${grantedOrigin}/account`,
-      true,
+      tabsBefore: { "tab-0": `${grantedOrigin}/` },
+      tabsAfter: { "tab-0": "https://redirected.example.test/" },
+    });
+    expect(run.denialLines.join("\n")).toContain(denialMarker);
+    expect(run.denialLines.join("\n")).toContain(
+      "https://redirected.example.test",
     );
-    expect(recorded.continueCount).toBe(1);
-    expect(recorded.fetch).toBeNull();
-    expect(recorded.fulfill).toBeNull();
-    expect(recorded.abortErrorCode).toBeNull();
+  });
+
+  it("denies a tab this call opened", async () => {
+    const run = await runEnforcement({
+      matcher,
+      denialMarker,
+      tabsBefore: { "tab-0": `${grantedOrigin}/` },
+      tabsAfter: {
+        "tab-0": `${grantedOrigin}/`,
+        "tab-1": "https://popup.example.test/",
+      },
+    });
+    expect(run.denialLines.join("\n")).toContain("https://popup.example.test");
+  });
+
+  it("leaves a tab this call never moved alone, so a narrow grant stays usable", async () => {
+    // The owner keeps unrelated tabs open, including raw localhost that a
+    // whole-web grant excludes. Denying over a tab the call never touched
+    // would make every narrow grant fail the moment a second tab exists.
+    const unchanged = {
+      "tab-0": `${grantedOrigin}/`,
+      "tab-1": "https://unrelated.example.test/",
+    };
+    const run = await runEnforcement({
+      matcher,
+      denialMarker,
+      tabsBefore: unchanged,
+      tabsAfter: unchanged,
+    });
+    expect(run.denialLines).toEqual([]);
+  });
+
+  it("ignores blank and browser-internal locations", async () => {
+    const run = await runEnforcement({
+      matcher,
+      denialMarker,
+      gotoTargets: ["about:blank"],
+      tabsBefore: { "tab-0": `${grantedOrigin}/` },
+      tabsAfter: { "tab-0": "about:blank", "tab-1": "chrome://new-tab-page" },
+    });
+    expect(run.attempted).toEqual(["about:blank"]);
+    expect(run.denialLines).toEqual([]);
+  });
+
+  it("denies an unparseable navigation target", async () => {
+    const run = await runEnforcement({
+      matcher,
+      denialMarker,
+      gotoTargets: ["not-a-url"],
+      tabsBefore: { "tab-0": `${grantedOrigin}/` },
+    });
+    expect(run.attempted).toEqual([]);
+    expect(run.denialLines.join("\n")).toContain(denialMarker);
+  });
+
+  it("permits any public origin under a whole-web grant but still refuses raw localhost", async () => {
+    const wholeWeb: OriginScopeMatcher = {
+      kind: "whole-web",
+      rawLocalhostHosts: ["localhost", "localhost.", "0.0.0.0", "[::]"],
+    };
+    const allowed = await runEnforcement({
+      matcher: wholeWeb,
+      denialMarker,
+      gotoTargets: ["https://anywhere.test/page"],
+      tabsBefore: { "tab-0": "https://start.test/" },
+      tabsAfter: { "tab-0": "https://anywhere.test/page" },
+    });
+    expect(allowed.attempted).toEqual(["https://anywhere.test/page"]);
+    expect(allowed.denialLines).toEqual([]);
+
+    const refused = await runEnforcement({
+      matcher: wholeWeb,
+      denialMarker,
+      gotoTargets: ["http://localhost:3000/"],
+      tabsBefore: { "tab-0": "https://start.test/" },
+    });
+    expect(refused.attempted).toEqual([]);
+    expect(refused.denialLines.join("\n")).toContain("http://localhost:3000");
   });
 });
