@@ -102,6 +102,26 @@ import {
   type BrowserControlLeaseState,
   type BrowserFileTransferAuthorization,
   type BrowserFileTransferDecision,
+  type BrowserDownloadStartInput,
+  type BrowserDownloadStartResponse,
+  type BrowserDownloadAppendInput,
+  type BrowserDownloadAppendOutcome,
+  type BrowserDownloadCompleteInput,
+  type BrowserDownloadCompleteOutcome,
+  type BrowserDownloadFailInput,
+  type BrowserDownloadFailOutcome,
+  type BrowserDownloadCancelInput,
+  type BrowserDownloadCancelOutcome,
+  type BrowserDownloadListInput,
+  type BrowserDownloadListResult,
+  type BrowserDownloadLimitsInput,
+  type BrowserDownloadLimits,
+  type BrowserDownloadProgressResult,
+  type BrowserDownloadExportClientInput,
+  type BrowserDownloadExportWorkspaceInput,
+  type BrowserDownloadExportOutcome,
+  type BrowserDownloadPurgeInput,
+  type BrowserDownloadPurgeOutcome,
 } from "./contracts.js";
 import { browserHostContract } from "./host-contract.js";
 import { dependencyInventory } from "./dependency-inventory.js";
@@ -2650,6 +2670,166 @@ export function createBrowserService(
   }
 
   /**
+   * Agent export authorization (issue #20), mirroring the Transfer Staging
+   * gate. An agent-initiated Host Download export requires the file-transfer
+   * elevated grant and an active Control Lease; owner exports require neither.
+   * Returns `undefined` when authorized, or an unauthorized rejection.
+   */
+  async function authorizeAgentDownloadExport(
+    input: { hostId: string; actor?: "owner" | "agent"; profileId?: string },
+    signal?: AbortSignal,
+  ): Promise<BrowserDownloadExportOutcome | undefined> {
+    if ((input.actor ?? "owner") !== "agent") return undefined;
+    const hostId = input.hostId;
+    const profileId = input.profileId ?? DEFAULT_PROFILE_ID;
+    const fileTransferGranted = grantStore
+      .list({ hostId, profileId })
+      .some(
+        (grant) =>
+          grant.fileTransfer &&
+          grant.revokedAt === null &&
+          elevationIsActive(grant.fileTransferExpiresAt, new Date()),
+      );
+    const leaseState = await host.call(
+      "controlLeaseState",
+      { hostId, profileId },
+      { hostId, signal },
+    );
+    const decision = authorizeFileTransfer({
+      actor: "agent",
+      fileTransferGranted,
+      leaseActive: leaseState.active,
+    });
+    if (decision.authorized) return undefined;
+    return {
+      outcome: "rejected",
+      downloadId: "",
+      reason: "unauthorized",
+      message:
+        decision.reason === "file-transfer-grant-required"
+          ? "Agent export requires the file-transfer grant."
+          : "Agent export requires an active Control Lease.",
+    } as BrowserDownloadExportOutcome;
+  }
+
+  /**
+   * Host Downloads (issue #20). Browser downloads enter a profile-scoped
+   * quarantine and are never opened, executed, or exported automatically.
+   */
+  async function downloadStart(
+    input: BrowserDownloadStartInput,
+    signal?: AbortSignal,
+  ): Promise<BrowserDownloadStartResponse> {
+    await requireConnectedHost(input.hostId, signal);
+    return host.call("downloadStart", input, { hostId: input.hostId, signal });
+  }
+
+  async function downloadAppend(
+    input: BrowserDownloadAppendInput,
+    signal?: AbortSignal,
+  ): Promise<BrowserDownloadAppendOutcome> {
+    await requireConnectedHost(input.hostId, signal);
+    return host.call("downloadAppend", input, { hostId: input.hostId, signal });
+  }
+
+  async function downloadComplete(
+    input: BrowserDownloadCompleteInput,
+    signal?: AbortSignal,
+  ): Promise<BrowserDownloadCompleteOutcome> {
+    await requireConnectedHost(input.hostId, signal);
+    return host.call("downloadComplete", input, {
+      hostId: input.hostId,
+      signal,
+    });
+  }
+
+  async function downloadFail(
+    input: BrowserDownloadFailInput,
+    signal?: AbortSignal,
+  ): Promise<BrowserDownloadFailOutcome> {
+    await requireConnectedHost(input.hostId, signal);
+    return host.call("downloadFail", input, { hostId: input.hostId, signal });
+  }
+
+  async function downloadCancel(
+    input: BrowserDownloadCancelInput,
+    signal?: AbortSignal,
+  ): Promise<BrowserDownloadCancelOutcome> {
+    await requireConnectedHost(input.hostId, signal);
+    return host.call("downloadCancel", input, {
+      hostId: input.hostId,
+      signal,
+    });
+  }
+
+  async function downloadList(
+    input: BrowserDownloadListInput,
+    signal?: AbortSignal,
+  ): Promise<BrowserDownloadListResult> {
+    await requireConnectedHost(input.hostId, signal);
+    return host.call("downloadList", input, { hostId: input.hostId, signal });
+  }
+
+  async function downloadLimits(
+    input: BrowserDownloadLimitsInput,
+    signal?: AbortSignal,
+  ): Promise<BrowserDownloadLimits> {
+    await requireConnectedHost(input.hostId, signal);
+    return host.call("downloadLimits", input, { hostId: input.hostId, signal });
+  }
+
+  async function downloadProgress(
+    downloadId: string,
+    hostId: string,
+    signal?: AbortSignal,
+  ): Promise<BrowserDownloadProgressResult> {
+    await requireConnectedHost(hostId, signal);
+    return host.call(
+      "downloadProgress",
+      { hostId, downloadId },
+      { hostId, signal },
+    );
+  }
+
+  async function downloadExportClient(
+    input: BrowserDownloadExportClientInput,
+    signal?: AbortSignal,
+  ): Promise<BrowserDownloadExportOutcome> {
+    await requireConnectedHost(input.hostId, signal);
+    const denied = await authorizeAgentDownloadExport(input, signal);
+    if (denied !== undefined) {
+      return { ...denied, downloadId: input.downloadId };
+    }
+    return host.call("downloadExportClient", input, {
+      hostId: input.hostId,
+      signal,
+    });
+  }
+
+  async function downloadExportWorkspace(
+    input: BrowserDownloadExportWorkspaceInput,
+    signal?: AbortSignal,
+  ): Promise<BrowserDownloadExportOutcome> {
+    await requireConnectedHost(input.hostId, signal);
+    const denied = await authorizeAgentDownloadExport(input, signal);
+    if (denied !== undefined) {
+      return { ...denied, downloadId: input.downloadId };
+    }
+    return host.call("downloadExportWorkspace", input, {
+      hostId: input.hostId,
+      signal,
+    });
+  }
+
+  async function downloadPurge(
+    input: BrowserDownloadPurgeInput,
+    signal?: AbortSignal,
+  ): Promise<BrowserDownloadPurgeOutcome> {
+    await requireConnectedHost(input.hostId, signal);
+    return host.call("downloadPurge", input, { hostId: input.hostId, signal });
+  }
+
+  /**
    * Decide whether an actor may initiate a file transfer. Owner transfers
    * always pass; agent transfers additionally require the file-transfer
    * elevated grant and an active Control Lease. The decision is privacy-safe.
@@ -2713,6 +2893,17 @@ export function createBrowserService(
     transferProgress,
     controlLeaseState,
     fileTransferAuthorization,
+    downloadStart,
+    downloadAppend,
+    downloadComplete,
+    downloadFail,
+    downloadCancel,
+    downloadList,
+    downloadLimits,
+    downloadProgress,
+    downloadExportClient,
+    downloadExportWorkspace,
+    downloadPurge,
   };
 }
 

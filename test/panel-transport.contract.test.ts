@@ -513,4 +513,101 @@ describe("Panel transport server contract", () => {
       await transport.stop();
     }
   });
+
+  it("routes a panel download cancellation to the host (issue #20)", async () => {
+    const clock = { now: () => 1_000_000 };
+    const capabilities = createPanelCapabilityStore({ clock });
+    const gateway = createPanelGateway({
+      capabilities,
+      hostId,
+      profileId,
+      clock,
+    });
+    const stream = createAutomationStreamAdapter({ clock, capabilities });
+    const source = createFakeScreencastSource({ frameCount: 0 });
+    const cancelled: string[] = [];
+    const transport = createPanelTransportServer({
+      gateway,
+      stream,
+      source,
+      clock,
+      onDownloadCancel: async (downloadId) => {
+        cancelled.push(downloadId);
+      },
+    });
+    const port = await transport.start();
+    const issued = capabilities.issue({
+      ownerSessionId,
+      panelId,
+      hostId,
+      profileId,
+    });
+    try {
+      const socket = await connect(port);
+      send(socket, redeemMessage(issued));
+      await onceMessage(socket); // ready
+      send(socket, { type: "download_cancel", downloadId: "download-1" });
+      const ackRaw = await onceMessage(socket);
+      const ack = decode<{
+        type: string;
+        downloadId: string;
+        action: string;
+      }>(ackRaw);
+      expect(ack).toEqual({
+        type: "download_ack",
+        downloadId: "download-1",
+        action: "cancelled",
+      });
+      expect(cancelled).toEqual(["download-1"]);
+      socket.close();
+    } finally {
+      await transport.stop();
+    }
+  });
+
+  it("pushes live Host Downloads quarantine state to the panel (issue #20)", async () => {
+    const clock = { now: () => 1_000_000 };
+    const capabilities = createPanelCapabilityStore({ clock });
+    const gateway = createPanelGateway({
+      capabilities,
+      hostId,
+      profileId,
+      clock,
+    });
+    const stream = createAutomationStreamAdapter({ clock, capabilities });
+    const source = createFakeScreencastSource({ frameCount: 0 });
+    let pushCount = 0;
+    const transport = createPanelTransportServer({
+      gateway,
+      stream,
+      source,
+      clock,
+      subscribeDownloads: (onUpdate) => {
+        const interval = setInterval(() => {
+          pushCount += 1;
+          onUpdate({ downloads: [], limits: { maxFileBytes: 1 } });
+        }, 5);
+        return () => clearInterval(interval);
+      },
+    });
+    const port = await transport.start();
+    const issued = capabilities.issue({
+      ownerSessionId,
+      panelId,
+      hostId,
+      profileId,
+    });
+    try {
+      const socket = await connect(port);
+      send(socket, redeemMessage(issued));
+      await onceMessage(socket); // ready
+      const updateRaw = await onceMessage(socket);
+      const update = decode<{ type: string; update: unknown }>(updateRaw);
+      expect(update.type).toBe("downloads_update");
+      expect(pushCount).toBeGreaterThan(0);
+      socket.close();
+    } finally {
+      await transport.stop();
+    }
+  });
 });

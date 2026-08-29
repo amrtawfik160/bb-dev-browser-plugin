@@ -20,6 +20,8 @@ import {
   BROWSER_PANEL_STREAM_DISCLOSURE,
   type BrowserContextAction,
   type BrowserDialogEvent,
+  type BrowserDownloadListingEntry,
+  type BrowserDownloadLimits,
   type BrowserHostChoice,
   type BrowserHostChoicesInput,
   type BrowserDiagnostics,
@@ -42,6 +44,7 @@ import {
 import {
   PanelDialogLayer,
   PanelContextMenu,
+  PanelDownloadsSurface,
   usePrefersReducedMotion,
   isBbGlobalShortcut,
 } from "./panel-chrome.js";
@@ -273,6 +276,23 @@ function PanelStreamSurface({
     actions: BrowserContextAction[];
   } | null>(null);
   const [isController, setIsController] = useState(false);
+  // Host Downloads quarantine state (issue #20): progress, quarantine state,
+  // limits, expiry, export, cancellation, and errors surfaced from the host.
+  const [downloads, setDownloads] = useState<
+    (BrowserDownloadListingEntry & { error?: string | null })[]
+  >([]);
+  const [downloadsLimits, setDownloadsLimits] =
+    useState<BrowserDownloadLimits | null>(null);
+  // The per-download error is surfaced inline in the listing (download.error).
+  // There is no separate top-level download-error state (issue #20 findings,
+  // S4): the previous downloadError state was dead — set but never displayed.
+  // P2 (issue #20 findings): export control state. An in-flight download
+  // disables its export button; an export failure is shown briefly above the
+  // listing.
+  const [exportInFlightDownloadId, setExportInFlightDownloadId] = useState<
+    string | null
+  >(null);
+  const [exportError, setExportError] = useState<string | null>(null);
   // The deterministic test environment has no real BB Connect tunnel; opening a
   // WebSocket there would attempt a real network call. The stream is exercised
   // against the provisioned host through the real-browser integration suite.
@@ -444,6 +464,25 @@ function PanelStreamSurface({
           }
           return;
         }
+        if (message.type === "downloads_update") {
+          // The host pushed the live Host Downloads quarantine listing. Only
+          // metadata (id, safe name, size, state, limits, expiry, errors) is
+          // carried — never file contents or full URLs (issue #20).
+          const payload = message as {
+            update?: {
+              downloads?: BrowserDownloadListingEntry[];
+              limits?: BrowserDownloadLimits;
+            } | null;
+          };
+          const update = payload.update ?? {};
+          if (Array.isArray(update.downloads)) {
+            setDownloads(update.downloads);
+          }
+          if (update.limits !== undefined) {
+            setDownloadsLimits(update.limits);
+          }
+          return;
+        }
         if (message.type === "control") {
           // The host pushed the live shared control state and tab strip; derive
           // this panel's own role from the panel list so the surface updates
@@ -557,6 +596,73 @@ function PanelStreamSurface({
     setContextMenu(null);
   }
 
+  /**
+   * Cancel a quarantined download through the low-latency panel transport
+   * (issue #20). Exports go through the server RPC because they resolve BB
+   * environments; cancellation is controller-gated like transfer cancellation.
+   */
+  function cancelDownload(downloadId: string) {
+    if (!isController) return;
+    sendStream({ type: "download_cancel", downloadId });
+  }
+
+  /**
+   * P2 (issue #20 findings): export a quarantined download to the displaying
+   * client through the existing server RPC. The bytes leave quarantine only on
+   * this explicit owner decision and are saved in the browser as a download.
+   */
+  async function exportDownloadToClient(downloadId: string) {
+    if (!isController || status.hostId === null) return;
+    setExportError(null);
+    setExportInFlightDownloadId(downloadId);
+    try {
+      const outcome = await rpc.call("browser_download_export_client", {
+        hostId: status.hostId,
+        downloadId,
+        ...(status.profileId === undefined
+          ? {}
+          : { profileId: status.profileId }),
+      });
+      if (outcome.outcome !== "exported") {
+        setExportError(
+          outcome.outcome === "rejected"
+            ? `Export rejected: ${outcome.reason}.`
+            : "Export failed.",
+        );
+        return;
+      }
+      saveExportedBytes(outcome.safeName, outcome.contentType, outcome.data);
+    } catch (error) {
+      setExportError(error instanceof Error ? error.message : "Export failed.");
+    } finally {
+      setExportInFlightDownloadId(null);
+    }
+  }
+
+  /**
+   * Save the exported client bytes as a browser download so the owner receives
+   * the file. Privacy-safe: the bytes are the owner's own quarantined file.
+   */
+  function saveExportedBytes(
+    safeName: string,
+    contentType: string | null | undefined,
+    data: string | undefined,
+  ) {
+    if (data === undefined) return;
+    const bytes = new Uint8Array(Buffer.from(data, "base64"));
+    const blob = new Blob([bytes], {
+      type: contentType === null ? undefined : (contentType ?? undefined),
+    });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = safeName;
+    document.body.appendChild(anchor);
+    anchor.click();
+    document.body.removeChild(anchor);
+    URL.revokeObjectURL(url);
+  }
+
   if (capability?.outcome === "issued") {
     return (
       <section
@@ -610,6 +716,17 @@ function PanelStreamSurface({
             onClose={() => setContextMenu(null)}
           />
         )}
+        <PanelDownloadsSurface
+          downloads={downloads}
+          limits={downloadsLimits}
+          isController={isController}
+          exportState={{
+            inFlightDownloadId: exportInFlightDownloadId,
+            error: exportError,
+          }}
+          onCancel={cancelDownload}
+          onExportClient={exportDownloadToClient}
+        />
       </section>
     );
   }

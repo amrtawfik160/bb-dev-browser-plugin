@@ -62,6 +62,27 @@ export const BROWSER_TRANSFER_STAGING_FILE_MODE = 0o600;
 /** Maximum text the explicit clipboard exchange carries per action. */
 export const BROWSER_CLIPBOARD_MAX_BYTES = 4 * 1024 * 1024;
 
+/**
+ * Host Downloads constants (issue #20). Browser downloads enter a
+ * profile-scoped Host Downloads quarantine owned by `bb-browser` with
+ * restrictive permissions (0600 file / 0700 directory) and are never opened,
+ * executed, or exported automatically. Defaults are 1 GiB per file, 5 GiB per
+ * profile, and a seven-day expiry; the owner may configure bounded limits. New
+ * instances and downloads are refused below the host low-free-space threshold.
+ */
+export const BROWSER_DOWNLOAD_MAX_FILE_BYTES = 1 * 1024 * 1024 * 1024;
+export const BROWSER_DOWNLOAD_MAX_PROFILE_BYTES = 5 * 1024 * 1024 * 1024;
+export const BROWSER_DOWNLOAD_TTL_MS = 7 * 24 * 60 * 60_000;
+export const BROWSER_DOWNLOAD_LOW_DISK_MARGIN_BYTES =
+  BROWSER_TRANSFER_LOW_DISK_MARGIN_BYTES;
+export const BROWSER_DOWNLOAD_DIR_MODE = 0o700;
+export const BROWSER_DOWNLOAD_FILE_MODE = 0o600;
+/** Upper bound the owner may raise a configured limit to. */
+export const BROWSER_DOWNLOAD_MAX_FILE_BYTES_LIMIT = 16 * 1024 * 1024 * 1024;
+export const BROWSER_DOWNLOAD_MAX_PROFILE_BYTES_LIMIT = 64 * 1024 * 1024 * 1024;
+/** Smallest configured limit (1 byte) so an owner may effectively disable. */
+export const BROWSER_DOWNLOAD_MIN_LIMIT_BYTES = 1;
+
 export function browserHostStorageSegment(hostId: string) {
   return encodeURIComponent(hostId).replaceAll(".", "%2E");
 }
@@ -1126,6 +1147,7 @@ export const browserActivityEventIdSchema = z
   .regex(/^[A-Za-z0-9][A-Za-z0-9:_-]{0,127}$/u);
 
 export const browserActivityOriginSchema = browserExactOriginSchema;
+export type BrowserActivityOrigin = z.infer<typeof browserActivityOriginSchema>;
 
 export const browserActivityActorSchema = z.enum(["owner", "agent", "system"]);
 export const browserActivityKindSchema = z.enum([
@@ -2398,6 +2420,413 @@ export type BrowserFileTransferDecision = z.infer<
 >;
 
 /**
+ * Host Downloads (issue #20). Browser downloads enter a profile-scoped
+ * quarantine owned by `bb-browser` with restrictive permissions and are never
+ * opened, executed, or exported automatically. The owner may explicitly
+ * export a quarantined download to the displaying client or workspace; an
+ * existing workspace target requires a separate overwrite confirmation, and
+ * an agent export additionally requires the file-transfer grant. Rejections,
+ * progress, and listing are metadata-only: they never carry file contents,
+ * full URLs, page data, or clipboard data.
+ */
+export const browserDownloadRejectionSchema = z.enum([
+  "invalid-name",
+  "oversized",
+  "quota-exceeded",
+  "low-disk",
+  "not-found",
+  "already-completed",
+  "cancelled",
+  "unauthorized",
+  "outside-environment",
+  "exists-without-confirmation",
+  "failed",
+]);
+export type BrowserDownloadRejection = z.infer<
+  typeof browserDownloadRejectionSchema
+>;
+
+export const browserDownloadPhaseSchema = z.enum([
+  "downloading",
+  "quarantined",
+  "cancelled",
+  "failed",
+  "expired",
+  "exported",
+]);
+export type BrowserDownloadPhase = z.infer<typeof browserDownloadPhaseSchema>;
+
+export const browserDownloadStartRequestSchema = z
+  .object({
+    downloadId: z.string().min(1).max(120),
+    profileId: z.string().min(1).max(120),
+    /** Untrusted suggested filename from the browser; normalized safely. */
+    suggestedName: z.string().min(1).max(1024),
+    contentType: z.string().min(1).max(200).nullable(),
+    /** Declared total bytes when known; null when unknown (streamed). */
+    totalBytes: z.number().int().nonnegative().nullable(),
+  })
+  .strict();
+export type BrowserDownloadStartRequest = z.infer<
+  typeof browserDownloadStartRequestSchema
+>;
+
+export const browserDownloadStartInputSchema =
+  browserDownloadStartRequestSchema.extend({
+    hostId: z.string().min(1),
+  });
+export type BrowserDownloadStartInput = z.infer<
+  typeof browserDownloadStartInputSchema
+>;
+
+export const browserDownloadAppendInputSchema = z
+  .object({
+    hostId: z.string().min(1),
+    downloadId: z.string().min(1).max(120),
+    /** Base64-encoded chunk bytes appended to the quarantined file. */
+    data: z.string(),
+    /** Declared chunk byte length; must match the decoded bytes. */
+    chunkBytes: z.number().int().nonnegative(),
+  })
+  .strict();
+export type BrowserDownloadAppendInput = z.infer<
+  typeof browserDownloadAppendInputSchema
+>;
+
+export const browserDownloadCompleteInputSchema = z
+  .object({
+    hostId: z.string().min(1),
+    downloadId: z.string().min(1).max(120),
+  })
+  .strict();
+export type BrowserDownloadCompleteInput = z.infer<
+  typeof browserDownloadCompleteInputSchema
+>;
+
+export const browserDownloadFailInputSchema = z
+  .object({
+    hostId: z.string().min(1),
+    downloadId: z.string().min(1).max(120),
+    /** Privacy-safe reason text; never file contents or a full URL. */
+    reason: z.string().min(1).max(200),
+  })
+  .strict();
+export type BrowserDownloadFailInput = z.infer<
+  typeof browserDownloadFailInputSchema
+>;
+
+/**
+ * Outcome of failing a quarantined download (issue #20 findings, S1). Carries
+ * the real result from the manager — not a fabricated purge outcome. A
+ * `failed` outcome removes the quarantine file (`removed: 1`) and reports the
+ * owning profile; a `missing` outcome reports `removed: 0` and `profileId:
+ * null` because no record existed to clean up.
+ */
+export const browserDownloadFailOutcomeSchema = z
+  .object({
+    outcome: z.enum(["failed", "missing"]),
+    downloadId: z.string().min(1).max(120),
+    profileId: z.string().min(1).max(120).nullable(),
+    removed: z.number().int().min(0).max(1),
+  })
+  .strict();
+export type BrowserDownloadFailOutcome = z.infer<
+  typeof browserDownloadFailOutcomeSchema
+>;
+
+export const browserDownloadCancelInputSchema = z
+  .object({
+    hostId: z.string().min(1),
+    downloadId: z.string().min(1).max(120),
+  })
+  .strict();
+export type BrowserDownloadCancelInput = z.infer<
+  typeof browserDownloadCancelInputSchema
+>;
+
+export const browserDownloadTargetInputSchema = z
+  .object({
+    hostId: z.string().min(1),
+    downloadId: z.string().min(1).max(120),
+  })
+  .strict();
+export type BrowserDownloadTargetInput = z.infer<
+  typeof browserDownloadTargetInputSchema
+>;
+
+export const browserDownloadListingEntrySchema = z
+  .object({
+    downloadId: z.string().min(1).max(120),
+    profileId: z.string().min(1).max(120),
+    safeName: z.string().min(1).max(255),
+    contentType: z.string().min(1).max(200).nullable(),
+    sizeBytes: z.number().int().nonnegative(),
+    totalBytes: z.number().int().nonnegative().nullable(),
+    phase: browserDownloadPhaseSchema,
+    createdAt: z.string().datetime(),
+    expiresAt: z.string().datetime(),
+    error: z.string().min(1).max(200).nullable(),
+  })
+  .strict();
+export type BrowserDownloadListingEntry = z.infer<
+  typeof browserDownloadListingEntrySchema
+>;
+
+export const browserDownloadListInputSchema = z
+  .object({
+    hostId: z.string().min(1),
+    profileId: z.string().min(1).max(120),
+  })
+  .strict();
+export type BrowserDownloadListInput = z.infer<
+  typeof browserDownloadListInputSchema
+>;
+
+export const browserDownloadLimitsSchema = z
+  .object({
+    maxFileBytes: z.number().int().positive(),
+    maxProfileBytes: z.number().int().positive(),
+    expiryMs: z.number().int().positive(),
+  })
+  .strict();
+export type BrowserDownloadLimits = z.infer<typeof browserDownloadLimitsSchema>;
+
+export const browserDownloadListResultSchema = z
+  .object({
+    downloads: z.array(browserDownloadListingEntrySchema),
+    limits: browserDownloadLimitsSchema,
+    freeSpaceBytes: z.number().int().nonnegative().nullable(),
+  })
+  .strict();
+export type BrowserDownloadListResult = z.infer<
+  typeof browserDownloadListResultSchema
+>;
+
+export const browserDownloadLimitsInputSchema = z
+  .object({
+    hostId: z.string().min(1),
+    profileId: z.string().min(1).max(120),
+    maxFileBytes: z.number().int().positive().optional(),
+    maxProfileBytes: z.number().int().positive().optional(),
+    expiryMs: z.number().int().positive().optional(),
+  })
+  .strict();
+export type BrowserDownloadLimitsInput = z.infer<
+  typeof browserDownloadLimitsInputSchema
+>;
+
+export const browserDownloadProgressSchema = z
+  .object({
+    downloadId: z.string().min(1).max(120),
+    phase: browserDownloadPhaseSchema,
+    bytesDownloaded: z.number().int().nonnegative(),
+    totalBytes: z.number().int().nonnegative().nullable(),
+  })
+  .strict();
+export type BrowserDownloadProgress = z.infer<
+  typeof browserDownloadProgressSchema
+>;
+export const browserDownloadProgressResultSchema =
+  browserDownloadProgressSchema.nullable();
+export type BrowserDownloadProgressResult = z.infer<
+  typeof browserDownloadProgressResultSchema
+>;
+
+export const browserDownloadStartResponseSchema = z.discriminatedUnion(
+  "outcome",
+  [
+    z
+      .object({
+        outcome: z.literal("quarantined"),
+        downloadId: z.string().min(1).max(120),
+        safeName: z.string().min(1).max(255),
+      })
+      .strict(),
+    z
+      .object({
+        outcome: z.literal("rejected"),
+        downloadId: z.string().min(1).max(120),
+        reason: browserDownloadRejectionSchema,
+        message: z.string().min(1).max(200),
+      })
+      .strict(),
+  ],
+);
+export type BrowserDownloadStartResponse = z.infer<
+  typeof browserDownloadStartResponseSchema
+>;
+
+export const browserDownloadAppendOutcomeSchema = z.discriminatedUnion(
+  "outcome",
+  [
+    z
+      .object({
+        outcome: z.literal("appended"),
+        downloadId: z.string().min(1).max(120),
+        bytesDownloaded: z.number().int().nonnegative(),
+      })
+      .strict(),
+    z
+      .object({
+        outcome: z.literal("rejected"),
+        downloadId: z.string().min(1).max(120),
+        reason: browserDownloadRejectionSchema,
+        message: z.string().min(1).max(200),
+      })
+      .strict(),
+  ],
+);
+export type BrowserDownloadAppendOutcome = z.infer<
+  typeof browserDownloadAppendOutcomeSchema
+>;
+
+export const browserDownloadCancelOutcomeSchema = z
+  .object({
+    outcome: z.enum(["cancelled", "missing"]),
+    downloadId: z.string().min(1).max(120),
+  })
+  .strict();
+export type BrowserDownloadCancelOutcome = z.infer<
+  typeof browserDownloadCancelOutcomeSchema
+>;
+
+export const browserDownloadCompleteOutcomeSchema = z.discriminatedUnion(
+  "outcome",
+  [
+    z
+      .object({
+        outcome: z.literal("quarantined"),
+        downloadId: z.string().min(1).max(120),
+      })
+      .strict(),
+    z
+      .object({
+        outcome: z.literal("rejected"),
+        downloadId: z.string().min(1).max(120),
+        reason: browserDownloadRejectionSchema,
+        message: z.string().min(1).max(200),
+      })
+      .strict(),
+    z
+      .object({
+        outcome: z.literal("missing"),
+        downloadId: z.string().min(1).max(120),
+      })
+      .strict(),
+  ],
+);
+export type BrowserDownloadCompleteOutcome = z.infer<
+  typeof browserDownloadCompleteOutcomeSchema
+>;
+
+export const browserDownloadExportActorSchema = z.enum(["owner", "agent"]);
+export type BrowserDownloadExportActor = z.infer<
+  typeof browserDownloadExportActorSchema
+>;
+
+export const browserDownloadExportClientInputSchema = z
+  .object({
+    hostId: z.string().min(1),
+    downloadId: z.string().min(1).max(120),
+    actor: browserDownloadExportActorSchema.optional(),
+    profileId: z.string().min(1).max(120).optional(),
+  })
+  .strict();
+export type BrowserDownloadExportClientInput = z.infer<
+  typeof browserDownloadExportClientInputSchema
+>;
+
+export const browserDownloadExportWorkspaceInputSchema = z
+  .object({
+    hostId: z.string().min(1),
+    downloadId: z.string().min(1).max(120),
+    actor: browserDownloadExportActorSchema.optional(),
+    profileId: z.string().min(1).max(120).optional(),
+    /**
+     * Resolved environment root path (the server resolves the BB environment
+     * id to its workspace path before calling the host).
+     */
+    environmentRoot: z.string().min(1).max(4096),
+    /** Path relative to the environment root after realpath containment. */
+    relativePath: z.string().min(1).max(4096),
+    /**
+     * Separate owner confirmation that an existing workspace target may be
+     * overwritten. The export is rejected with `exists-without-confirmation`
+     * when the target exists and this is not explicitly true.
+     */
+    overwriteConfirmed: z.boolean().optional(),
+  })
+  .strict();
+export type BrowserDownloadExportWorkspaceInput = z.infer<
+  typeof browserDownloadExportWorkspaceInputSchema
+>;
+
+export const browserDownloadExportOutcomeSchema = z.discriminatedUnion(
+  "outcome",
+  [
+    z
+      .object({
+        outcome: z.literal("exported"),
+        downloadId: z.string().min(1).max(120),
+        destination: z.enum(["client", "workspace"]),
+        safeName: z.string().min(1).max(255),
+        contentType: z.string().min(1).max(200).nullable(),
+        sizeBytes: z.number().int().nonnegative(),
+        /**
+         * Present only for a client export: base64-encoded file bytes so the
+         * displaying client may save them. The bytes leave quarantine only on
+         * this explicit owner decision. Workspace exports copy host-to-host and
+         * never return bytes.
+         */
+        data: z.string().optional(),
+      })
+      .strict(),
+    z
+      .object({
+        outcome: z.literal("rejected"),
+        downloadId: z.string().min(1).max(120),
+        reason: browserDownloadRejectionSchema,
+        message: z.string().min(1).max(200),
+      })
+      .strict(),
+  ],
+);
+export type BrowserDownloadExportOutcome = z.infer<
+  typeof browserDownloadExportOutcomeSchema
+>;
+
+export const browserDownloadPurgeInputSchema = z
+  .object({
+    hostId: z.string().min(1),
+    profileId: z.string().min(1).max(120).optional(),
+  })
+  .strict();
+export type BrowserDownloadPurgeInput = z.infer<
+  typeof browserDownloadPurgeInputSchema
+>;
+export const browserDownloadPurgeOutcomeSchema = z
+  .object({
+    outcome: z.literal("purged"),
+    profileId: z.string().min(1).max(120).nullable(),
+    removed: z.number().int().nonnegative(),
+  })
+  .strict();
+export type BrowserDownloadPurgeOutcome = z.infer<
+  typeof browserDownloadPurgeOutcomeSchema
+>;
+
+/** Panel → host request to cancel a quarantined download. */
+export const browserDownloadCancelMessageSchema = z
+  .object({
+    type: z.literal("download_cancel"),
+    downloadId: z.string().min(1).max(120),
+  })
+  .strict();
+export type BrowserDownloadCancelMessage = z.infer<
+  typeof browserDownloadCancelMessageSchema
+>;
+
+/**
  * Accessible-chrome constants (issue #17). Plugin chrome targets WCAG AA,
  * honors reduced motion, and yields BB global shortcuts; the streamed webpage
  * canvas is not fully screen-reader accessible in v1 and is disclosed as such.
@@ -2630,6 +3059,50 @@ export const rpcContract = defineRpcContract({
   browser_file_transfer_authorize: {
     input: browserFileTransferAuthorizationSchema,
     output: browserFileTransferDecisionSchema,
+  },
+  browser_download_start: {
+    input: browserDownloadStartInputSchema,
+    output: browserDownloadStartResponseSchema,
+  },
+  browser_download_append: {
+    input: browserDownloadAppendInputSchema,
+    output: browserDownloadAppendOutcomeSchema,
+  },
+  browser_download_complete: {
+    input: browserDownloadCompleteInputSchema,
+    output: browserDownloadCompleteOutcomeSchema,
+  },
+  browser_download_fail: {
+    input: browserDownloadFailInputSchema,
+    output: browserDownloadFailOutcomeSchema,
+  },
+  browser_download_cancel: {
+    input: browserDownloadCancelInputSchema,
+    output: browserDownloadCancelOutcomeSchema,
+  },
+  browser_download_list: {
+    input: browserDownloadListInputSchema,
+    output: browserDownloadListResultSchema,
+  },
+  browser_download_limits: {
+    input: browserDownloadLimitsInputSchema,
+    output: browserDownloadLimitsSchema,
+  },
+  browser_download_progress: {
+    input: browserDownloadTargetInputSchema,
+    output: browserDownloadProgressResultSchema,
+  },
+  browser_download_export_client: {
+    input: browserDownloadExportClientInputSchema,
+    output: browserDownloadExportOutcomeSchema,
+  },
+  browser_download_export_workspace: {
+    input: browserDownloadExportWorkspaceInputSchema,
+    output: browserDownloadExportOutcomeSchema,
+  },
+  browser_download_purge: {
+    input: browserDownloadPurgeInputSchema,
+    output: browserDownloadPurgeOutcomeSchema,
   },
 });
 

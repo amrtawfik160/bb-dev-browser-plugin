@@ -289,6 +289,32 @@ describe("Panel gateway contract", () => {
     }
   });
 
+  it("accepts a download cancellation after redemption (issue #20)", () => {
+    const { gateway, issued } = setupGateway();
+    gateway.validate(json(redeemMessage(issued)));
+    const result = gateway.validate(
+      json({ type: "download_cancel", downloadId: "download-1" }),
+    );
+    expect(result.outcome).toBe("accepted");
+    if (result.outcome === "accepted") {
+      expect(result.message).toEqual({
+        kind: "download_cancel",
+        downloadId: "download-1",
+      });
+    }
+  });
+
+  it("rejects a download cancellation before redemption", () => {
+    const { gateway } = setupGateway();
+    const result = gateway.validate(
+      json({ type: "download_cancel", downloadId: "download-1" }),
+    );
+    expect(result.outcome).toBe("rejected");
+    if (result.outcome === "rejected") {
+      expect(result.reason).toBe("unauthorized");
+    }
+  });
+
   it("rejects a malformed clipboard copy before redemption", () => {
     const { gateway } = setupGateway();
     const result = gateway.validate(json({ type: "clipboard_copy" }));

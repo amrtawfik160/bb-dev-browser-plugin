@@ -11,6 +11,10 @@ import {
   type BrowserTransferStagingRequest,
   type BrowserTransferStagingResponse,
 } from "./contracts.js";
+import {
+  createCleanupAndReject,
+  createLowDiskGuard,
+} from "./quarantine-guards.js";
 
 /**
  * Transfer Staging (issue #19, ADR 0011). The `bb-browser` user receives no
@@ -161,46 +165,19 @@ export function createTransferStagingManager(options: TransferStagingOptions) {
     await filesystem.rm(transfer.stagedPath, { recursive: true, force: true });
   }
 
-  /**
-   * Shared low-disk guard. Returns a `low-disk` rejection when the host does
-   * not have enough free space to stage `requiredBytes`, otherwise `undefined`.
-   * Failures reading free space fail open (allow staging) so a host without a
-   * `statfs` analogue (in-memory fakes, containers) is not blocked.
-   */
-  async function guardLowDisk(
-    transferId: string,
-    requiredBytes: number,
-  ): Promise<BrowserTransferStagingResponse | undefined> {
-    let available: number;
-    try {
-      available = await filesystem.availableBytes(stagingRoot);
-    } catch {
-      return undefined;
-    }
-    if (available < requiredBytes + lowDiskMarginBytes) {
-      return rejection(
-        transferId,
-        "low-disk",
-        "The host does not have enough free disk space to stage the transfer.",
-      );
-    }
-    return undefined;
-  }
-
-  /**
-   * Shared cleanup for a destination created during staging that must not leak
-   * when a later guard rejects. Removes the staged copy and reports the given
-   * rejection; the staged path is never left behind.
-   */
-  async function cleanupAndReject(
-    transferId: string,
-    destination: string,
-    reason: BrowserTransferRejection,
-    message: string,
-  ): Promise<BrowserTransferStagingResponse> {
-    await filesystem.rm(destination, { recursive: true, force: true });
-    return rejection(transferId, reason, message);
-  }
+  // Shared low-disk guard and staged-copy cleanup (issues #19/#20). The
+  // helpers live in `quarantine-guards.js` so Transfer Staging and Host
+  // Downloads do not duplicate the low-free-space refusal or staged-copy
+  // cleanup behavior; both brokers inject the same filesystem and supply a
+  // rejection constructor.
+  const guardLowDisk = createLowDiskGuard(
+    filesystem,
+    stagingRoot,
+    lowDiskMarginBytes,
+    rejection,
+    "low-disk",
+  );
+  const cleanupAndReject = createCleanupAndReject(filesystem, rejection);
 
   /**
    * Stage an explicitly selected workspace file. The selection must remain
