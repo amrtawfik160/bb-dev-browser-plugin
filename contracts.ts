@@ -1873,6 +1873,117 @@ export type BrowserPanelReleaseControlRequest = z.infer<
   typeof browserPanelReleaseControlRequestSchema
 >;
 
+/**
+ * Browser dialogs captured from the page and rendered as actionable BB panel
+ * chrome (issue #17). `Page.javascriptDialogOpening` events are forwarded to
+ * every panel over the Automation Mode stream; the controller responds, while
+ * spectators see the dialog read-only. Unresolved dialogs are dismissed when a
+ * Control Lease ends and survive bounded reconnects or fail closed without an
+ * invisible modal block. beforeunload mirrors the native leave/stay choice.
+ */
+export const browserDialogTypeSchema = z.enum([
+  "alert",
+  "confirm",
+  "prompt",
+  "beforeunload",
+]);
+export type BrowserDialogType = z.infer<typeof browserDialogTypeSchema>;
+
+export const browserDialogEventSchema = z
+  .object({
+    dialogId: z.string().min(1),
+    type: browserDialogTypeSchema,
+    message: z.string(),
+    /** Default text prefilled in a prompt dialog; empty for the other types. */
+    defaultValue: z.string().optional().default(""),
+    /** Page URL reported by CDP for the dialog, used for accessible labeling. */
+    url: z.string().min(1),
+  })
+  .strict();
+export type BrowserDialogEvent = z.infer<typeof browserDialogEventSchema>;
+
+/**
+ * Panel → host response to an open dialog. `accept` selects OK / confirm /
+ * stay; its negation selects Cancel / dismiss / leave. `text` carries the
+ * prompt answer and is ignored for the other dialog types.
+ */
+export const browserDialogResponseMessageSchema = z
+  .object({
+    type: z.literal("dialog_response"),
+    dialogId: z.string().min(1),
+    accept: z.boolean(),
+    text: z.string().max(10_000).optional(),
+  })
+  .strict();
+export type BrowserDialogResponseMessage = z.infer<
+  typeof browserDialogResponseMessageSchema
+>;
+
+/**
+ * Common link and image actions Automation Mode exposes without depending on
+ * native Chrome context menus (issue #17). The controller triggers a context
+ * query at a viewport point; the host inspects the element under it and reports
+ * the available actions, then executes the chosen one. `targetUrl` is the
+ * link href or image src the action applies to.
+ */
+export const browserContextActionKindSchema = z.enum([
+  "open-link-new-tab",
+  "copy-link",
+  "open-image-new-tab",
+  "copy-image-address",
+  "save-image",
+]);
+export type BrowserContextActionKind = z.infer<
+  typeof browserContextActionKindSchema
+>;
+
+export const browserContextActionSchema = z
+  .object({
+    actionId: z.string().min(1),
+    kind: browserContextActionKindSchema,
+    label: z.string().min(1).max(80),
+    targetUrl: z.string().min(1),
+  })
+  .strict();
+export type BrowserContextAction = z.infer<typeof browserContextActionSchema>;
+
+/** Panel → host request for the actions available under a viewport point. */
+export const browserContextQueryMessageSchema = z
+  .object({
+    type: z.literal("context_query"),
+    queryId: z.string().min(1),
+    x: z.number(),
+    y: z.number(),
+  })
+  .strict();
+export type BrowserContextQueryMessage = z.infer<
+  typeof browserContextQueryMessageSchema
+>;
+
+/** Panel → host request to perform a chosen context action. */
+export const browserContextActionMessageSchema = z
+  .object({
+    type: z.literal("context_action"),
+    actionId: z.string().min(1),
+  })
+  .strict();
+export type BrowserContextActionMessage = z.infer<
+  typeof browserContextActionMessageSchema
+>;
+
+/**
+ * Accessible-chrome constants (issue #17). Plugin chrome targets WCAG AA,
+ * honors reduced motion, and yields BB global shortcuts; the streamed webpage
+ * canvas is not fully screen-reader accessible in v1 and is disclosed as such.
+ */
+export const BROWSER_PANEL_DIALOG_RECONNECT_REPUSH_MS = PANEL_RECLAIM_WINDOW_MS;
+/** AA-contrast fallback colors used when theme tokens are unavailable. */
+export const BROWSER_PANEL_TEXT_CONTRAST = "#111827";
+export const BROWSER_PANEL_BORDER_CONTRAST = "#9ca3af";
+export const BROWSER_PANEL_ACCENT_CONTRAST = "#1d4ed8";
+export const BROWSER_PANEL_STREAM_DISCLOSURE =
+  "Streamed webpage pixels are not fully screen-reader accessible in version one.";
+
 export const browserNavigationResponseSchema = z
   .object({
     address: z.object({ kind: z.literal("address"), url: z.string().url() }),

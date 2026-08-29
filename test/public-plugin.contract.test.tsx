@@ -4425,6 +4425,11 @@ describe("Browser public plugin contract", () => {
       });
       expect(streamSection.textContent).toContain("5 and 15");
       expect(streamSection.textContent).toContain("1920");
+      // The panel clearly discloses that streamed webpage pixels are not fully
+      // screen-reader accessible in version one (issue #17).
+      expect(streamSection.textContent).toContain(
+        "not fully screen-reader accessible",
+      );
       const modeIndicator = panel.panel.getByRole("img", {
         name: "Browser mode indicator",
       });

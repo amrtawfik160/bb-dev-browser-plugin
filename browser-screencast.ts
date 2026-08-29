@@ -4,6 +4,8 @@ import {
   PANEL_MAX_FRAMES_PER_SECOND,
   PANEL_MAX_VIEWPORT_HEIGHT,
   PANEL_MAX_VIEWPORT_WIDTH,
+  type BrowserContextAction,
+  type BrowserDialogEvent,
 } from "./contracts.js";
 
 /**
@@ -76,6 +78,11 @@ export function createCdpScreencastSource(
     number,
     { resolve: (value: unknown) => void; reject: (error: Error) => void }
   >();
+  /** Open dialogs keyed by id, so reconnects re-push the still-open event. */
+  const openDialogs = new Map<string, BrowserDialogEvent>();
+  const dialogListeners = new Set<(event: BrowserDialogEvent) => void>();
+  /** Registered context actions keyed by id for later execution. */
+  const contextActions = new Map<string, BrowserContextAction>();
 
   function send(method: string, params: unknown, targetSessionId?: string) {
     return new Promise<unknown>((resolve, reject) => {
@@ -196,6 +203,147 @@ export function createCdpScreencastSource(
     }
   }
 
+  function mapDialogType(cdType: unknown): BrowserDialogEvent["type"] | null {
+    if (cdType === "alert") return "alert";
+    if (cdType === "confirm") return "confirm";
+    if (cdType === "prompt") return "prompt";
+    if (cdType === "beforeunload") return "beforeunload";
+    return null;
+  }
+
+  function handleDialogOpening(params: unknown) {
+    if (!isObject(params)) return;
+    const cdType = mapDialogType((params as { type?: unknown }).type);
+    if (cdType === null) return;
+    const messageText =
+      typeof (params as { message?: unknown }).message === "string"
+        ? (params as { message: string }).message
+        : "";
+    const dialogUrl =
+      typeof (params as { url?: unknown }).url === "string"
+        ? (params as { url: string }).url
+        : "about:blank";
+    const defaultValue =
+      typeof (params as { defaultPrompt?: unknown }).defaultPrompt === "string"
+        ? (params as { defaultPrompt: string }).defaultPrompt
+        : "";
+    const dialogId = `dialog-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const event: BrowserDialogEvent = {
+      dialogId,
+      type: cdType,
+      message: messageText,
+      defaultValue,
+      url: dialogUrl,
+    };
+    openDialogs.set(dialogId, event);
+    for (const listener of dialogListeners) listener(event);
+  }
+
+  async function inspectElementActions(point: {
+    x: number;
+    y: number;
+  }): Promise<BrowserContextAction[]> {
+    if (sessionId === undefined || socket === null) return [];
+    const session = sessionId;
+    // Find the topmost anchor or image under the viewport point using the
+    // page's own layout, then report common link/image actions for it. The
+    // element is inspected through the page, never through native Chrome UI.
+    const expression = `(() => {
+      const els = document.elementsFromPoint(${point.x}, ${point.y}) || [];
+      const anchor = els.find((e) => e instanceof HTMLAnchorElement && e.href);
+      const image = els.find((e) => e instanceof HTMLImageElement && e.src);
+      const out = {};
+      if (anchor) { out.link = anchor.href; }
+      if (image) { out.image = image.src; }
+      return out;
+    })()`;
+    const result = (await send(
+      "Runtime.evaluate",
+      { expression, returnByValue: true },
+      session,
+    ).catch(() => undefined)) as
+      { result?: { value?: { link?: string; image?: string } } } | undefined;
+    const value = result?.result?.value ?? {};
+    const actions: BrowserContextAction[] = [];
+    if (typeof value.link === "string" && value.link.length > 0) {
+      actions.push(
+        {
+          actionId: "open-link-new-tab",
+          kind: "open-link-new-tab",
+          label: "Open link in new tab",
+          targetUrl: value.link,
+        },
+        {
+          actionId: "copy-link",
+          kind: "copy-link",
+          label: "Copy link address",
+          targetUrl: value.link,
+        },
+      );
+    }
+    if (typeof value.image === "string" && value.image.length > 0) {
+      actions.push(
+        {
+          actionId: "open-image-new-tab",
+          kind: "open-image-new-tab",
+          label: "Open image in new tab",
+          targetUrl: value.image,
+        },
+        {
+          actionId: "copy-image-address",
+          kind: "copy-image-address",
+          label: "Copy image address",
+          targetUrl: value.image,
+        },
+        {
+          actionId: "save-image",
+          kind: "save-image",
+          label: "Save image",
+          targetUrl: value.image,
+        },
+      );
+    }
+    for (const action of actions) contextActions.set(action.actionId, action);
+    return actions;
+  }
+
+  async function performContextAction(actionId: string) {
+    const action = contextActions.get(actionId);
+    if (action === undefined || sessionId === undefined || socket === null)
+      return;
+    contextActions.delete(actionId);
+    if (
+      action.kind === "open-link-new-tab" ||
+      action.kind === "open-image-new-tab"
+    ) {
+      // Open the target URL in a new top-level tab owned by the shared strip.
+      await send("Target.createTarget", { url: action.targetUrl }).catch(
+        () => undefined,
+      );
+      return;
+    }
+    if (action.kind === "copy-link" || action.kind === "copy-image-address") {
+      // Copy through the page so the controller's clipboard carries the URL.
+      await send(
+        "Runtime.evaluate",
+        {
+          expression: `navigator.clipboard && navigator.clipboard.writeText(${JSON.stringify(action.targetUrl)})`,
+          returnByValue: true,
+        },
+        sessionId,
+      ).catch(() => undefined);
+      return;
+    }
+    if (action.kind === "save-image") {
+      // Download the image as a quarantined Host Download (never auto-opened).
+      await send(
+        "Page.navigate",
+        { url: action.targetUrl, transition: "download" },
+        sessionId,
+      ).catch(() => undefined);
+    }
+  }
+
   return {
     async start(onFrame, signal) {
       const endpoint = await resolveEndpoint();
@@ -244,6 +392,12 @@ export function createCdpScreencastSource(
             () => undefined,
           );
         }
+        if (
+          message.method === "Page.javascriptDialogOpening" &&
+          sessionId !== undefined
+        ) {
+          handleDialogOpening(message.params);
+        }
       });
       sessionId = await attachToPage();
       if (sessionId !== undefined) {
@@ -287,6 +441,48 @@ export function createCdpScreencastSource(
         socket = null;
       }
       pending.clear();
+      openDialogs.clear();
+      contextActions.clear();
+      dialogListeners.clear();
+    },
+    subscribeDialogs(onDialog) {
+      dialogListeners.add(onDialog);
+      // Re-emit any dialog that opened before the transport subscribed so a
+      // late subscriber (e.g. a reconnect) still observes the open dialog.
+      for (const event of openDialogs.values()) onDialog(event);
+      return () => {
+        dialogListeners.delete(onDialog);
+      };
+    },
+    respondToDialog(dialogId, accept, text) {
+      if (sessionId === undefined || socket === null) return;
+      openDialogs.delete(dialogId);
+      void send(
+        "Page.handleJavaScriptDialog",
+        { accept, promptText: text ?? "" },
+        sessionId,
+      ).catch(() => undefined);
+    },
+    dismissOpenDialogs() {
+      if (sessionId === undefined || socket === null) {
+        openDialogs.clear();
+        return;
+      }
+      const session = sessionId;
+      for (const dialogId of [...openDialogs.keys()]) {
+        openDialogs.delete(dialogId);
+        void send(
+          "Page.handleJavaScriptDialog",
+          { accept: true, promptText: "" },
+          session,
+        ).catch(() => undefined);
+      }
+    },
+    resolveContextActions(point) {
+      return inspectElementActions(point);
+    },
+    performContextAction(actionId) {
+      void performContextAction(actionId).catch(() => undefined);
     },
   };
 }

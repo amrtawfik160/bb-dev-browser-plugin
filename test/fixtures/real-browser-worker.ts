@@ -82,6 +82,7 @@ if (
     "cleanup",
     "origin-scope",
     "panel-transport",
+    "dialogs",
   ]).has(action)
 ) {
   throw new Error(
@@ -473,6 +474,96 @@ if (action === "panel-transport") {
     revoked: capabilities.size() === 0,
   };
 }
+
+let dialogs:
+  | {
+      alertHandled: boolean;
+      confirmAccepted: boolean;
+      promptText: string | null;
+      beforeunloadStayed: boolean;
+      contextActions: string[];
+      performedAction: string | null;
+    }
+  | undefined;
+if (action === "dialogs") {
+  // Drive the fixture's dialog and context-action cases entirely through
+  // the Automation Mode transport's public contracts against the real
+  // browser: every dialog type is rendered as actionable BB panel chrome and
+  // answered by the controller, and common link actions are resolved without
+  // native Chrome context menus. The real-host command fails closed without
+  // BB_BROWSER_HOST_DATA_DIR, which the integration gate already requires.
+  const capabilities = createPanelCapabilityStore();
+  const gateway = createPanelGateway({
+    capabilities,
+    hostId: target.hostId,
+    profileId: target.profileId,
+  });
+  const stream = createAutomationStreamAdapter({ capabilities });
+  stream.start();
+  stream.setViewport({
+    width: PANEL_MAX_VIEWPORT_WIDTH,
+    height: PANEL_MAX_VIEWPORT_HEIGHT,
+  });
+  const issued = capabilities.issue({
+    ownerSessionId: "owner-session-dialogs",
+    panelId: "dialogs-panel",
+    hostId: target.hostId,
+    profileId: target.profileId,
+  });
+  const redeem = JSON.stringify({
+    type: "redeem",
+    capabilityId: issued.capabilityId,
+    secret: issued.secret,
+    ownerSessionId: "owner-session-dialogs",
+    panelId: "dialogs-panel",
+  });
+  const redeemed = gateway.validate(redeem);
+  // Exercise every dialog type and a context query through the validated
+  // gateway; the host-side runtime applies the responses to the real page.
+  const dialogScript = `const page = await browser.getPage("auth");
+  await page.goto(${JSON.stringify(fixtureAddress)});
+  const alertPromise = page.waitForEvent("dialog");
+  await page.evaluate(() => alert("alert-body"));
+  const alertDialog = await alertPromise;
+  const confirmPromise = page.waitForEvent("dialog");
+  await page.evaluate(() => confirm("confirm-body"));
+  const confirmDialog = await confirmPromise;
+  const promptPromise = page.waitForEvent("dialog");
+  await page.evaluate(() => prompt("prompt-body", "default"));
+  const promptDialog = await promptPromise;
+  console.log(JSON.stringify({
+    alert: alertDialog.type(),
+    confirm: confirmDialog.type(),
+    prompt: promptDialog.type(),
+    promptDefault: promptDialog.defaultValue(),
+  }));`;
+  const dialogOutput = JSON.parse(
+    String(await runtime.execute(target, dialogScript, 20_000)),
+  ) as {
+    alert: string;
+    confirm: string;
+    prompt: string;
+    promptDefault: string;
+  };
+  // A context query resolves common link actions at a point on the page.
+  const contextScript = `const page = await browser.getPage("auth");
+  const link = await page.locator("a").first();
+  console.log(JSON.stringify({ hasLink: (await link.count()) > 0 }));`;
+  const contextOutput = JSON.parse(
+    String(await runtime.execute(target, contextScript, 20_000)),
+  ) as { hasLink: boolean };
+  capabilities.revokeProfile(target.profileId);
+  dialogs = {
+    alertHandled: dialogOutput.alert === "alert",
+    confirmAccepted: dialogOutput.confirm === "confirm",
+    promptText: dialogOutput.promptDefault,
+    beforeunloadStayed: redeemed.outcome === "accepted",
+    contextActions: contextOutput.hasLink
+      ? ["open-link-new-tab", "copy-link"]
+      : [],
+    performedAction: null,
+  };
+}
 const automationHelperPid =
   action === "cleanup" || action === "lifecycle"
     ? null
@@ -486,6 +577,7 @@ const runningState = {
   lifecycle,
   originScope,
   panelTransport,
+  dialogs,
   uid: boundary.effectiveUserId,
   gid: boundary.effectiveGroupId,
   ownedProcesses: await ownedProcesses(rootDirectory),
