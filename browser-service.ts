@@ -188,6 +188,7 @@ class ActivitySyncTransportError extends Error {
 
 function agentBrowserScriptRequest(
   call: AgentScriptCall,
+  originScope: string | undefined,
 ): BrowserScriptRequest {
   return {
     purpose: call.parameters.purpose,
@@ -208,6 +209,7 @@ function agentBrowserScriptRequest(
     hostId: call.hostId,
     projectId: call.context.projectId,
     threadId: call.context.threadId,
+    ...(originScope === undefined ? {} : { originScope }),
   };
 }
 
@@ -853,6 +855,7 @@ export function createBrowserService(
     call: AgentScriptCall,
     message: string,
     grantRequest: BrowserGrantRequest | null = null,
+    deniedOrigin: string | null = null,
   ): BrowserScriptResponse {
     const surfacedMessage =
       grantRequest === null
@@ -867,6 +870,7 @@ export function createBrowserService(
         hostId: call.hostId,
         profileId: call.profileId,
         message: surfacedMessage,
+        origin: deniedOrigin ?? call.parameters.destinationOrigin ?? null,
         grantRequest,
       },
     };
@@ -1097,6 +1101,7 @@ export function createBrowserService(
       revocationController.signal,
     ]);
     const untrack = trackGrantCall(grant.grantId, revocationController);
+    const originScope = (temporaryGrant ?? grant).originScope;
     try {
       const currentGrant = grantStore.inspect(grant.grantId);
       const currentTemporary =
@@ -1142,11 +1147,18 @@ export function createBrowserService(
           call.activity,
           call.hostId,
           linked.signal,
-          () =>
-            host.call("browserScript", agentBrowserScriptRequest(call), {
-              hostId: call.hostId,
-              signal: linked.signal,
-            }),
+          async () => {
+            const response = await host.call(
+              "browserScript",
+              agentBrowserScriptRequest(call, originScope),
+              { hostId: call.hostId, signal: linked.signal },
+            );
+            return enrichRealBrowserDenial(
+              call,
+              grant.installationId,
+              response,
+            );
+          },
         );
       } finally {
         if (expiryTimer !== null) clearTimeout(expiryTimer);
@@ -1155,6 +1167,41 @@ export function createBrowserService(
       untrack();
       linked.dispose();
     }
+  }
+
+  async function enrichRealBrowserDenial(
+    call: AgentScriptCall,
+    installationId: string,
+    response: BrowserScriptResponse,
+  ): Promise<BrowserScriptResponse> {
+    if (
+      response.ok ||
+      response.error.state !== "origin-denied" ||
+      response.error.grantRequest !== null
+    ) {
+      return response;
+    }
+    const deniedOrigin = response.error.origin;
+    if (deniedOrigin === null) return response;
+    const decision: BrowserAuthorizationDecision =
+      await withGrantStateSerialization(() =>
+        grantStore.authorize({
+          projectId: call.context.projectId,
+          hostId: call.hostId,
+          installationId,
+          profileId: call.profileId,
+          origin: deniedOrigin,
+          fileTransfer: call.parameters.fileTransfer,
+          invalidCertificate: call.parameters.invalidCertificate,
+        }),
+      );
+    if (decision.allowed) return response;
+    return originDeniedResponse(
+      call,
+      decision.message,
+      decision.grantRequest,
+      deniedOrigin,
+    );
   }
 
   async function runAgentBrowserScriptCall(call: AgentScriptCall) {

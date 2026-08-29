@@ -57,6 +57,7 @@ import {
 import {
   assertBrowserScriptResultWithinBounds,
   BrowserInstanceError,
+  BrowserOriginScopeDeniedError,
   BrowserScriptExecutionError,
   createBrowserInstanceRuntime,
   type BrowserInstanceRuntime,
@@ -133,6 +134,25 @@ function scriptRuntimeFailure(
       hostId: request.hostId,
       profileId: request.profileId,
       message: boundedMessage,
+    },
+  };
+}
+
+function originScopeDeniedFailure(
+  request: BrowserScriptRequest,
+  origin: string,
+): BrowserScriptResponse {
+  return {
+    ok: false,
+    error: {
+      state: "origin-denied",
+      code: "origin_denied",
+      label: "Origin denied",
+      hostId: request.hostId,
+      profileId: request.profileId,
+      message: `Browser navigation to ${origin} was denied by the active Profile Grant. The denied script will not resume automatically; after an owner decision, explicitly retry against current page state.`,
+      origin,
+      grantRequest: null,
     },
   };
 }
@@ -684,6 +704,9 @@ export function createBrowserHostEntry(
                     signal: context.signal,
                     leaseSignal: lease.signal,
                     screenshot: request.screenshot,
+                    ...(request.originScope === undefined
+                      ? {}
+                      : { originScope: request.originScope }),
                   },
                 ),
               );
@@ -696,6 +719,10 @@ export function createBrowserHostEntry(
               };
               return response;
             } catch (error) {
+              if (error instanceof BrowserOriginScopeDeniedError) {
+                response = originScopeDeniedFailure(request, error.origin);
+                return response;
+              }
               if (
                 (context.signal.aborted && !lease.signal.aborted) ||
                 (error instanceof BrowserInstanceError && !lease.signal.aborted)
