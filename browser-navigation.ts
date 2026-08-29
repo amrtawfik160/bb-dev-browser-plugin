@@ -72,7 +72,9 @@ export function browserNavigationScript(
   address: Extract<BrowserAddress, { kind: "address" }>,
   tabId: string,
 ) {
-  return `const page = await browser.getPage(${JSON.stringify(tabId)});
+  return `const pages = await browser.listPages();
+if (!pages.some((entry) => entry.id === ${JSON.stringify(tabId)})) throw new Error("Browser Tab is invalid or belongs to a previous runtime");
+const page = await browser.getPage(${JSON.stringify(tabId)});
 await page.bringToFront();
 await page.goto(${JSON.stringify(address.url)});
 console.log(JSON.stringify({ tabId: ${JSON.stringify(tabId)}, url: page.url() }));`;

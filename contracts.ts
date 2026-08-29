@@ -17,6 +17,12 @@ export const PROFILE_ARCHIVE_RETENTION_DAYS = 30;
 export const ACTIVITY_RECORD_LIMIT = 10_000;
 export const ACTIVITY_RETENTION_DAYS = 30;
 export const ACTIVITY_OUTBOX_BATCH_LIMIT = 100;
+export const BROWSER_SCRIPT_MAX_TIMEOUT_MS = 30_000;
+export const BROWSER_SCRIPT_RESULT_LIMIT_BYTES = 256 * 1024;
+export const BROWSER_SCRIPT_MAX_SCREENSHOTS = 3;
+export const BROWSER_SCRIPT_MAX_SCREENSHOT_BYTES = 1 * 1024 * 1024;
+export const BROWSER_SCRIPT_MAX_SCREENSHOT_BASE64_LENGTH =
+  4 * Math.ceil(BROWSER_SCRIPT_MAX_SCREENSHOT_BYTES / 3);
 
 export function browserHostStorageSegment(hostId: string) {
   return encodeURIComponent(hostId).replaceAll(".", "%2E");
@@ -1134,10 +1140,18 @@ export const browserActivityEventSchema = z
   .object(browserActivityMetadataShape)
   .strict();
 
+export const browserControlLeaseSchema = z
+  .object({
+    actor: z.enum(["owner", "agent"]),
+    purpose: z.string().trim().min(1).max(200).nullable(),
+  })
+  .strict();
+
 const browserStatusFields = {
   ...browserStatusTargetSchema.shape,
   capabilities: z.array(readinessCapabilitySchema).length(9),
   grantRequest: browserGrantRequestSchema.nullable().optional(),
+  controlLease: browserControlLeaseSchema.optional(),
 };
 
 export const browserStatusSchema = z.discriminatedUnion("state", [
@@ -1263,6 +1277,7 @@ export const browserDiagnosticsSchema = z
       })
       .strict(),
     exitLogs: z.array(z.string().max(500)).max(50),
+    controlLease: browserControlLeaseSchema.optional(),
   })
   .strict();
 
@@ -1702,7 +1717,13 @@ export const browserScriptParametersSchema = z
     invalidCertificate: z.boolean().default(false),
     profileId: z.string().min(1).optional(),
     tabId: z.string().min(1).optional(),
-    timeoutMs: z.number().int().positive().max(30_000).default(30_000),
+    timeoutMs: z
+      .number()
+      .int()
+      .positive()
+      .max(BROWSER_SCRIPT_MAX_TIMEOUT_MS)
+      .default(BROWSER_SCRIPT_MAX_TIMEOUT_MS),
+    screenshot: z.boolean().default(false),
   })
   .strict();
 
@@ -1717,10 +1738,34 @@ export const browserScriptRequestSchema = browserScriptParametersSchema
   })
   .strict();
 
+export const browserScriptRuntimeErrorSchema = z
+  .object({
+    state: z.literal("runtime-error"),
+    code: z.enum([
+      "browser_busy",
+      "browser_timeout",
+      "result_too_large",
+      "lease_revoked",
+      "tab_invalid",
+      "sandbox_violation",
+      "script_failed",
+    ]),
+    label: z.string().trim().min(1).max(80),
+    hostId: z.string().min(1),
+    profileId: z.string().min(1),
+    message: z.string().trim().min(1).max(500),
+    grantRequest: z.never().optional(),
+  })
+  .strict();
+
 export const browserScriptFailureSchema = z
   .object({
     ok: z.literal(false),
-    error: z.union([browserStatusSchema, browserOriginDeniedErrorSchema]),
+    error: z.union([
+      browserStatusSchema,
+      browserOriginDeniedErrorSchema,
+      browserScriptRuntimeErrorSchema,
+    ]),
   })
   .strict();
 
@@ -1736,6 +1781,30 @@ export const browserScriptResponseSchema = z.discriminatedUnion("ok", [
   browserScriptFailureSchema,
 ]);
 
+export const browserNativeScreenshotSchema = z
+  .object({
+    data: z.string().min(1).max(BROWSER_SCRIPT_MAX_SCREENSHOT_BASE64_LENGTH),
+    mimeType: z.enum(["image/png", "image/jpeg", "image/webp"]),
+  })
+  .strict();
+
+export const browserScriptResultSchema = z
+  .object({
+    output: z.string(),
+    screenshots: z
+      .array(browserNativeScreenshotSchema)
+      .max(BROWSER_SCRIPT_MAX_SCREENSHOTS),
+  })
+  .strict();
+
 export type BrowserScriptRequest = z.infer<typeof browserScriptRequestSchema>;
 export type BrowserScriptFailure = z.infer<typeof browserScriptFailureSchema>;
 export type BrowserScriptResponse = z.infer<typeof browserScriptResponseSchema>;
+export type BrowserControlLease = z.infer<typeof browserControlLeaseSchema>;
+export type BrowserScriptRuntimeError = z.infer<
+  typeof browserScriptRuntimeErrorSchema
+>;
+export type BrowserNativeScreenshot = z.infer<
+  typeof browserNativeScreenshotSchema
+>;
+export type BrowserScriptResult = z.infer<typeof browserScriptResultSchema>;

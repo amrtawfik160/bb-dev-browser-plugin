@@ -7,11 +7,13 @@ import {
   chown,
   cp,
   mkdir,
+  open,
   readFile,
   readdir,
   unlink,
   watch,
 } from "node:fs/promises";
+import type { FileHandle } from "node:fs/promises";
 import { join } from "node:path";
 import type {
   BrowserExecutionRequest,
@@ -20,10 +22,17 @@ import type {
   BrowserProcessIdentity,
   RunningBrowserProcess,
 } from "./browser-runtime.js";
+import { BrowserScriptExecutionError } from "./browser-runtime.js";
+import {
+  BROWSER_SCRIPT_MAX_SCREENSHOT_BYTES,
+  BROWSER_SCRIPT_RESULT_LIMIT_BYTES,
+} from "./contracts.js";
 
 const DEVTOOLS_PORT_FILE = "DevToolsActivePort";
-const MAX_BROWSER_RESULT_BYTES = 256 * 1024;
+const MAX_BROWSER_RESULT_BYTES = BROWSER_SCRIPT_RESULT_LIMIT_BYTES;
 const MAX_PROCESS_ERROR_BYTES = 64 * 1024;
+const MAX_SCREENSHOT_BYTES = BROWSER_SCRIPT_MAX_SCREENSHOT_BYTES;
+const SCREENSHOT_READ_CHUNK_BYTES = 64 * 1024;
 const HELPER_STOP_TIMEOUT_MS = 2_000;
 const BROWSER_CLOSE_TIMEOUT_MS = 2_000;
 
@@ -121,6 +130,7 @@ function ownedProcess(
   command: string,
   arguments_: readonly string[],
   environment: NodeJS.ProcessEnv,
+  cwd?: string,
 ) {
   return spawn(
     setprivExecutable,
@@ -132,7 +142,7 @@ function ownedProcess(
       command,
       ...arguments_,
     ],
-    { env: environment, stdio: ["pipe", "pipe", "pipe"] },
+    { cwd, env: environment, stdio: ["pipe", "pipe", "pipe"] },
   );
 }
 
@@ -490,15 +500,48 @@ async function helperIsRunning(helperHome: string) {
   }
 }
 
-function collectOutput(child: ChildProcessWithoutNullStreams) {
+function processAbortError(signal: AbortSignal) {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new Error("Browser script aborted.");
+}
+
+function collectOutput(
+  child: ChildProcessWithoutNullStreams,
+  signal?: AbortSignal,
+) {
   return new Promise<string>((resolve, reject) => {
     const chunks: Buffer[] = [];
     let length = 0;
+    let settled = false;
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener("abort", abort);
+      callback();
+    };
+    const abort = () => {
+      child.kill("SIGTERM");
+      finish(() => reject(processAbortError(signal!)));
+    };
+    if (signal?.aborted) {
+      abort();
+      return;
+    }
+    signal?.addEventListener("abort", abort, { once: true });
     child.stdout.on("data", (chunk: Buffer) => {
+      if (settled) return;
       length += chunk.length;
       if (length > MAX_BROWSER_RESULT_BYTES) {
         child.kill("SIGTERM");
-        reject(new Error("Browser Result exceeds the 256 KiB limit."));
+        finish(() =>
+          reject(
+            new BrowserScriptExecutionError(
+              "result_too_large",
+              `Browser Result exceeds the ${MAX_BROWSER_RESULT_BYTES / 1024} KiB limit.`,
+            ),
+          ),
+        );
         return;
       }
       chunks.push(chunk);
@@ -513,16 +556,19 @@ function collectOutput(child: ChildProcessWithoutNullStreams) {
         );
       }
     });
-    child.once("error", reject);
+    child.once("error", (error) => finish(() => reject(error)));
     child.once("exit", (code, signal) => {
+      if (settled) return;
       if (code === 0) {
-        resolve(Buffer.concat(chunks).toString("utf8").trimEnd());
+        finish(() => resolve(Buffer.concat(chunks).toString("utf8").trimEnd()));
         return;
       }
-      reject(
-        new Error(
-          standardError.trim() ||
-            `dev-browser exited with ${signal ?? code ?? "unknown"}.`,
+      finish(() =>
+        reject(
+          new Error(
+            standardError.trim() ||
+              `dev-browser exited with ${signal ?? code ?? "unknown"}.`,
+          ),
         ),
       );
     });
@@ -549,13 +595,34 @@ async function removeDevToolsPortFile(profileDirectory: string) {
   }
 }
 
+const SAFE_BROWSER_ENVIRONMENT_KEYS = [
+  "PATH",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "NO_PROXY",
+  "http_proxy",
+  "https_proxy",
+  "no_proxy",
+] as const;
+
+function restrictedEnvironment(overrides: NodeJS.ProcessEnv) {
+  const environment: NodeJS.ProcessEnv = {};
+  for (const key of SAFE_BROWSER_ENVIRONMENT_KEYS) {
+    const value = process.env[key];
+    if (value !== undefined) environment[key] = value;
+  }
+  return { ...environment, ...overrides };
+}
+
 function browserEnvironment(request: BrowserLaunchRequest) {
-  return {
-    ...process.env,
+  return restrictedEnvironment({
     HOME: request.runtimeDirectory,
     XDG_CONFIG_HOME: request.runtimeDirectory,
     TZ: request.timezone,
-  };
+  });
 }
 
 async function browserAutomationEndpoint(
@@ -601,7 +668,8 @@ async function stopAttachedHelper(
     identity,
     executable,
     ["stop"],
-    { ...process.env, HOME: helperHome },
+    restrictedEnvironment({ HOME: helperHome, XDG_CONFIG_HOME: helperHome }),
+    helperHome,
   );
   devBrowserProcess.stdin.end();
   try {
@@ -645,6 +713,7 @@ async function launchProductionBrowser(
     executablePath,
     ["--headless=new", ...request.chromeArguments],
     browserEnvironment(request),
+    request.runtimeDirectory,
   );
   try {
     await onSpawn(await processIdentity(browserProcess.pid!));
@@ -720,6 +789,11 @@ async function executeBrowserHelper(
     request.runtimeDirectory,
     identity,
   );
+  const screenshot = request.screenshot;
+  const screenshotPath =
+    screenshot === undefined
+      ? undefined
+      : safeScreenshotPath(helperHome, screenshot.fileName);
   const devBrowserProcess = ownedProcess(
     context.setprivExecutable,
     identity,
@@ -732,10 +806,130 @@ async function executeBrowserHelper(
       "--timeout",
       String(Math.ceil(request.timeoutMs / 1000)),
     ],
-    { ...process.env, HOME: helperHome },
+    restrictedEnvironment({ HOME: helperHome, XDG_CONFIG_HOME: helperHome }),
+    helperHome,
+  );
+  const executionSignal = timedExecutionSignal(
+    request.timeoutMs,
+    request.signal,
   );
   devBrowserProcess.stdin.end(request.code);
-  return collectOutput(devBrowserProcess);
+  try {
+    const output = await collectOutput(
+      devBrowserProcess,
+      executionSignal.signal,
+    );
+    if (screenshot === undefined) return output;
+    const screenshotFile = await open(
+      screenshotPath!,
+      constants.O_RDONLY | constants.O_NOFOLLOW,
+    );
+    let image: Buffer;
+    try {
+      const screenshotStats = await screenshotFile.stat();
+      if (!screenshotStats.isFile()) {
+        throw new Error("Browser Screenshot file is invalid.");
+      }
+      if (screenshotStats.size > MAX_SCREENSHOT_BYTES) {
+        throw new BrowserScriptExecutionError(
+          "result_too_large",
+          `Browser Screenshot exceeds the ${MAX_SCREENSHOT_BYTES / 1024 / 1024} MiB limit.`,
+        );
+      }
+      image = await readBoundedScreenshot(screenshotFile);
+    } finally {
+      await screenshotFile.close();
+    }
+    return {
+      output: removeScreenshotMarker(output, screenshot.marker),
+      screenshots: [
+        { data: image.toString("base64"), mimeType: screenshot.mimeType },
+      ],
+    };
+  } finally {
+    executionSignal.dispose();
+    await stopProcess(devBrowserProcess);
+    if (screenshotPath !== undefined) {
+      await unlink(screenshotPath).catch((error: unknown) => {
+        if (
+          error instanceof Error &&
+          "code" in error &&
+          error.code === "ENOENT"
+        ) {
+          return;
+        }
+        throw error;
+      });
+    }
+  }
+}
+
+function safeScreenshotPath(helperHome: string, fileName: string) {
+  if (!/^bb-screenshot-[0-9a-f-]+\.png$/u.test(fileName)) {
+    throw new Error("Browser screenshot filename is invalid.");
+  }
+  return join(helperHome, ".dev-browser", "tmp", fileName);
+}
+
+function removeScreenshotMarker(output: string, marker: string) {
+  const markerLine = JSON.stringify({ __bbScreenshot: marker });
+  return output
+    .split("\n")
+    .filter((line) => line !== markerLine)
+    .join("\n")
+    .trimEnd();
+}
+
+async function readBoundedScreenshot(screenshotFile: FileHandle) {
+  const chunks: Buffer[] = [];
+  let totalBytes = 0;
+  while (totalBytes <= MAX_SCREENSHOT_BYTES) {
+    const chunk = Buffer.alloc(
+      Math.min(
+        SCREENSHOT_READ_CHUNK_BYTES,
+        MAX_SCREENSHOT_BYTES + 1 - totalBytes,
+      ),
+    );
+    const { bytesRead } = await screenshotFile.read(
+      chunk,
+      0,
+      chunk.length,
+      null,
+    );
+    if (bytesRead === 0) return Buffer.concat(chunks, totalBytes);
+    totalBytes += bytesRead;
+    chunks.push(chunk.subarray(0, bytesRead));
+  }
+  throw new BrowserScriptExecutionError(
+    "result_too_large",
+    `Browser Screenshot exceeds the ${MAX_SCREENSHOT_BYTES / 1024 / 1024} MiB limit.`,
+  );
+}
+
+function timedExecutionSignal(timeoutMs: number, signal?: AbortSignal) {
+  const controller = new AbortController();
+  const abortFromCaller = () =>
+    controller.abort(signal === undefined ? undefined : signal.reason);
+  const timer = setTimeout(
+    () =>
+      controller.abort(
+        new BrowserScriptExecutionError(
+          "browser_timeout",
+          `Browser script timed out after ${timeoutMs}ms.`,
+        ),
+      ),
+    timeoutMs,
+  );
+  timer.unref?.();
+  if (signal?.aborted) abortFromCaller();
+  else signal?.addEventListener("abort", abortFromCaller, { once: true });
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abortFromCaller);
+    },
+  };
 }
 
 export function createProductionBrowserProcessBoundary(

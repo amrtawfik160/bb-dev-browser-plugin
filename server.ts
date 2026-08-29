@@ -10,7 +10,9 @@ import {
   type BrowserService,
 } from "./browser-service.js";
 import {
+  BROWSER_SCRIPT_MAX_TIMEOUT_MS,
   browserScriptParametersSchema,
+  browserScriptResultSchema,
   type BrowserActivityRecord,
   type BrowserHostChoicesInput,
   type BrowserGrantRequest,
@@ -32,7 +34,8 @@ import {
 } from "./contracts.js";
 
 const CLI_USAGE = [
-  "Usage: bb browser <status|diagnostics|activity|activity-export|activity-clear|requests|request-status|list|create|rename|select|backup|restore|import|archive|restore-archived|reset|delete|setup|disable|uninstall|purge> [options]",
+  "Usage: bb browser <status|diagnostics|script|activity|activity-export|activity-clear|requests|request-status|list|create|rename|select|backup|restore|import|archive|restore-archived|reset|delete|setup|disable|uninstall|purge> [options]",
+  "  script --purpose <text> --code <source> [--profile <id>] [--tab <id>] [--origin <origin>] [--timeout <ms>] [--screenshot] [--file-transfer] [--invalid-certificate] [--json]",
   "  setup [--profile <id>] [--step <id> --confirm <text>] [--json]",
   "  purge [--profile <id>] [--confirm <text>] [--json]",
   "  disable|uninstall [--profile <id>] --confirm <text> [--json]",
@@ -56,6 +59,7 @@ type BrowserScriptParameters = z.output<typeof browserScriptParametersSchema>;
 const BROWSER_COMMANDS = [
   "status",
   "diagnostics",
+  "script",
   "activity",
   "activity-export",
   "activity-clear",
@@ -92,6 +96,14 @@ type ParsedCliArguments = {
   stepId?: z.output<typeof setupStepIdSchema>;
   confirmation?: string;
   requestId?: string;
+  purpose?: string;
+  code?: string;
+  tabId?: string;
+  destinationOrigin?: string;
+  timeoutMs?: number;
+  screenshot?: boolean;
+  fileTransfer?: boolean;
+  invalidCertificate?: boolean;
 };
 
 type CliArgumentParseResult =
@@ -231,6 +243,11 @@ type CliOptionName =
   | "--archive"
   | "--source"
   | "--request"
+  | "--purpose"
+  | "--code"
+  | "--tab"
+  | "--origin"
+  | "--timeout"
   | "confirmation";
 type ParsedCliOption = {
   name: CliOptionName;
@@ -239,7 +256,17 @@ type ParsedCliOption = {
 };
 
 function cliOptionName(argument: string): CliOptionName | null {
-  if (argument === "--profile" || argument === "--step") return argument;
+  if (
+    argument === "--profile" ||
+    argument === "--step" ||
+    argument === "--purpose" ||
+    argument === "--code" ||
+    argument === "--tab" ||
+    argument === "--origin" ||
+    argument === "--timeout"
+  ) {
+    return argument;
+  }
   if (
     argument === "--host" ||
     argument === "--name" ||
@@ -282,6 +309,14 @@ type CliParseState = {
   stepId?: ParsedCliArguments["stepId"];
   confirmation?: string;
   requestId?: string;
+  purpose?: string;
+  code?: string;
+  tabId?: string;
+  destinationOrigin?: string;
+  timeoutMs?: number;
+  screenshot?: boolean;
+  fileTransfer?: boolean;
+  invalidCertificate?: boolean;
 };
 
 function applyCliOption(
@@ -328,6 +363,34 @@ function applyCliOption(
     parseState.requestId = option.optionValue;
     return null;
   }
+  if (option.name === "--purpose") {
+    parseState.purpose = option.optionValue;
+    return null;
+  }
+  if (option.name === "--code") {
+    parseState.code = option.optionValue;
+    return null;
+  }
+  if (option.name === "--tab") {
+    parseState.tabId = option.optionValue;
+    return null;
+  }
+  if (option.name === "--origin") {
+    parseState.destinationOrigin = option.optionValue;
+    return null;
+  }
+  if (option.name === "--timeout") {
+    const timeoutMs = Number(option.optionValue);
+    if (
+      !Number.isSafeInteger(timeoutMs) ||
+      timeoutMs <= 0 ||
+      timeoutMs > BROWSER_SCRIPT_MAX_TIMEOUT_MS
+    ) {
+      return `--timeout must be an integer from 1 to ${BROWSER_SCRIPT_MAX_TIMEOUT_MS}.\n${CLI_USAGE}`;
+    }
+    parseState.timeoutMs = timeoutMs;
+    return null;
+  }
   parseState.confirmation = option.optionValue;
   return null;
 }
@@ -354,6 +417,36 @@ function validateCliCommandOptions(
   command: BrowserCommand,
   parseState: CliParseState,
 ): string | null {
+  const scriptOptions = [
+    parseState.purpose,
+    parseState.code,
+    parseState.tabId,
+    parseState.destinationOrigin,
+    parseState.timeoutMs,
+    parseState.screenshot,
+    parseState.fileTransfer,
+    parseState.invalidCertificate,
+  ];
+  if (
+    command !== "script" &&
+    scriptOptions.some((value) => value !== undefined)
+  ) {
+    return `Script options are only valid for script.\n${CLI_USAGE}`;
+  }
+  if (command === "script") {
+    if (parseState.hostId !== undefined) {
+      return `script derives the host from BB context; --host is not valid.\n${CLI_USAGE}`;
+    }
+    if (parseState.purpose === undefined) {
+      return `script requires --purpose.\n${CLI_USAGE}`;
+    }
+    if (parseState.code === undefined) {
+      return `script requires --code.\n${CLI_USAGE}`;
+    }
+    if (parseState.confirmation !== undefined) {
+      return `--confirm is not valid for script.\n${CLI_USAGE}`;
+    }
+  }
   if (command !== "setup" && parseState.stepId !== undefined) {
     return `--step is only valid for setup.\n${CLI_USAGE}`;
   }
@@ -471,6 +564,18 @@ function parseCliArguments(argv: string[]): CliArgumentParseResult {
       parseState.json = true;
       continue;
     }
+    if (argument === "--screenshot") {
+      parseState.screenshot = true;
+      continue;
+    }
+    if (argument === "--file-transfer") {
+      parseState.fileTransfer = true;
+      continue;
+    }
+    if (argument === "--invalid-certificate") {
+      parseState.invalidCertificate = true;
+      continue;
+    }
     const option = readCliOption(argv, index, argument);
     if (option !== null) {
       if ("error" in option) return option;
@@ -502,6 +607,14 @@ function parseCliArguments(argv: string[]): CliArgumentParseResult {
       stepId: parseState.stepId,
       confirmation: parseState.confirmation,
       requestId: parseState.requestId,
+      purpose: parseState.purpose,
+      code: parseState.code,
+      tabId: parseState.tabId,
+      destinationOrigin: parseState.destinationOrigin,
+      timeoutMs: parseState.timeoutMs,
+      screenshot: parseState.screenshot,
+      fileTransfer: parseState.fileTransfer,
+      invalidCertificate: parseState.invalidCertificate,
     },
   };
 }
@@ -540,6 +653,72 @@ async function runDiagnosticsCli(
     ? JSON.stringify(diagnostics)
     : JSON.stringify(diagnostics, null, 2);
   return { exitCode: 0, stdout };
+}
+
+function browserScriptText(browserResult: unknown) {
+  const parsed = browserScriptResultSchema.safeParse(browserResult);
+  if (parsed.success) return parsed.data.output;
+  if (typeof browserResult === "string") return browserResult;
+  const serialized = JSON.stringify(browserResult);
+  return serialized === undefined ? "" : serialized;
+}
+
+function browserScriptJson(browserResult: unknown) {
+  const serialized = JSON.stringify(browserResult);
+  return serialized === undefined ? "" : serialized;
+}
+
+async function runBrowserScriptCli(
+  browser: BrowserService,
+  cliArguments: ParsedCliArguments,
+  context: PluginCliContext,
+) {
+  if (context.projectId === undefined || context.threadId === undefined) {
+    throw new Error(
+      "browser script requires BB project and thread context; invoke it from a project thread.",
+    );
+  }
+  const parameters = browserScriptParametersSchema.parse({
+    purpose: cliArguments.purpose,
+    code: cliArguments.code,
+    ...(cliArguments.destinationOrigin === undefined
+      ? {}
+      : { destinationOrigin: cliArguments.destinationOrigin }),
+    ...(cliArguments.fileTransfer === undefined
+      ? {}
+      : { fileTransfer: cliArguments.fileTransfer }),
+    ...(cliArguments.invalidCertificate === undefined
+      ? {}
+      : { invalidCertificate: cliArguments.invalidCertificate }),
+    ...(cliArguments.profileId === undefined
+      ? {}
+      : { profileId: cliArguments.profileId }),
+    ...(cliArguments.tabId === undefined ? {} : { tabId: cliArguments.tabId }),
+    ...(cliArguments.timeoutMs === undefined
+      ? {}
+      : { timeoutMs: cliArguments.timeoutMs }),
+    ...(cliArguments.screenshot === undefined
+      ? {}
+      : { screenshot: cliArguments.screenshot }),
+  });
+  const response = await browser.browserScript(parameters, {
+    projectId: context.projectId,
+    threadId: context.threadId,
+    signal: context.signal ?? new AbortController().signal,
+  });
+  if (!response.ok) {
+    return cliArguments.json
+      ? { exitCode: 1, stdout: JSON.stringify(response) }
+      : { exitCode: 1, stderr: response.error.message };
+  }
+  return {
+    exitCode: 0,
+    stdout:
+      cliArguments.json ||
+      browserScriptResultSchema.safeParse(response.result).success
+        ? browserScriptJson(response.result)
+        : browserScriptText(response.result),
+  };
 }
 
 async function runActivityCli(
@@ -1017,6 +1196,9 @@ async function runCli(
     if (command === "request-status") {
       return await runGrantRequestStatusCli(browser, requestId!, json, context);
     }
+    if (command === "script") {
+      return await runBrowserScriptCli(browser, parsed.arguments, context);
+    }
     return await runAdministrationCli(browser, parsed.arguments, context);
   } catch (error) {
     if (error instanceof Error) return { exitCode: 1, stderr: error.message };
@@ -1031,13 +1213,25 @@ function toolFailure(failure: BrowserScriptFailure) {
   };
 }
 
-function toolSuccess(result: unknown) {
-  const serialized = JSON.stringify(result);
+function toolSuccess(browserResult: unknown) {
+  const parsed = browserScriptResultSchema.safeParse(browserResult);
+  if (parsed.success) {
+    return {
+      content: [
+        { type: "text" as const, text: parsed.data.output },
+        ...parsed.data.screenshots.map((screenshot) => ({
+          type: "image" as const,
+          data: screenshot.data,
+          mimeType: screenshot.mimeType,
+        })),
+      ],
+    };
+  }
   return {
     content: [
       {
         type: "text" as const,
-        text: serialized === undefined ? "" : serialized,
+        text: browserScriptText(browserResult),
       },
     ],
   };
@@ -1069,6 +1263,12 @@ function registerCli(bb: BbPluginApi, browser: BrowserService) {
         name: "diagnostics",
         summary: "Generate redacted Browser host diagnostics",
         usage: "bb browser diagnostics [--profile <id>] [--host <id>] [--json]",
+      },
+      {
+        name: "script",
+        summary: "Run bounded Playwright code in the host-local Browser",
+        usage:
+          "bb browser script --purpose <text> --code <source> [--profile <id>] [--tab <id>] [--origin <origin>] [--timeout <ms>] [--screenshot] [--file-transfer] [--invalid-certificate] [--json]",
       },
       {
         name: "activity",

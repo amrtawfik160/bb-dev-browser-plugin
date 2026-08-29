@@ -1,5 +1,5 @@
 import { experimental_createHostEntryHarness } from "@get-bb/plugin-sdk/testing/host";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -355,4 +355,125 @@ describe("Browser host runtime boundary", () => {
       }
     },
   );
+
+  it("issue #13 records a Control Lease revocation as interruption context when a script completes before the lease aborts", async () => {
+    const rootDirectory = await mkdtemp(join(tmpdir(), "host-lease-race-"));
+    const profiles = createFileBrowserProfileStore({
+      rootDirectory,
+      installationId: "installation-lease-race",
+    });
+    await profiles.initialize(HOST_ID);
+    let executionStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      executionStarted = resolve;
+    });
+    const runtime = {
+      start: async () => {
+        throw new Error("not used");
+      },
+      stop: async () => {},
+      execute: async (
+        _target: unknown,
+        _code: string,
+        _timeoutMs: number,
+        options: { leaseSignal?: AbortSignal } | undefined,
+      ) => {
+        await new Promise<void>((resolve) => {
+          if (options?.leaseSignal?.aborted) {
+            resolve();
+            return;
+          }
+          executionStarted();
+          options?.leaseSignal?.addEventListener("abort", () => resolve(), {
+            once: true,
+          });
+        });
+        return "completed despite the lease revoking";
+      },
+      navigate: async (target: { tabId?: string }, input: string) => ({
+        address: {
+          kind: "address" as const,
+          url: "https://example.com/navigated",
+        },
+        location: { url: input },
+        tabId: target.tabId ?? "host-tab",
+      }),
+      status: async ({
+        hostId,
+        profileId,
+      }: {
+        hostId: string;
+        profileId: string;
+      }) => ({
+        state: "sleeping" as const,
+        hostId,
+        profileId,
+      }),
+      pinPanel: async () => {
+        throw new Error("not used");
+      },
+      unpinPanel: async () => {},
+      hostDisconnected: () => {},
+      hostReconnected: async () => {},
+      dispose: async () => {},
+    };
+    const readiness = {
+      inspect: healthyStatus,
+      diagnostics: () => {
+        throw new Error("diagnostics not used");
+      },
+    };
+    const host = experimental_createHostEntryHarness(
+      createBrowserHostEntry(readiness, profiles, undefined, runtime),
+      {
+        experimental_paths: {
+          dataDir: rootDirectory,
+          tempDir: join(rootDirectory, "tmp"),
+        },
+      },
+    );
+    try {
+      const operation = host.experimental_call("browserScript", {
+        purpose: "Complete before owner takeover",
+        code: "return page.url();",
+        hostId: HOST_ID,
+        projectId: "project-lease-race",
+        threadId: "thread-lease-race",
+        activityEventId: "lease-race-event-1",
+        activityOccurredAt: "2026-08-28T00:00:00.000Z",
+        profileId: DEFAULT_PROFILE_ID,
+        timeoutMs: 5_000,
+      });
+      await started;
+      await host.experimental_call("navigate", {
+        hostId: HOST_ID,
+        profileId: DEFAULT_PROFILE_ID,
+        projectId: "project-lease-race",
+        input: "https://example.com/owner-takes-control",
+        rawLocalhost: false,
+      });
+      const response = await operation;
+      expect(response).toEqual({
+        ok: true,
+        result: "completed despite the lease revoking",
+      });
+      const outboxState = JSON.parse(
+        await readFile(
+          join(rootDirectory, "browser-activity-outbox.json"),
+          "utf8",
+        ),
+      );
+      const scriptEvent = outboxState.events.find(
+        (event: { action: string }) => event.action === "browser-script",
+      );
+      expect(scriptEvent).toMatchObject({
+        outcome: "succeeded",
+        interrupted: true,
+        interruptionReason: "control-lease-revoked",
+      });
+    } finally {
+      await host.experimental_dispose();
+      await rm(rootDirectory, { recursive: true, force: true });
+    }
+  });
 });

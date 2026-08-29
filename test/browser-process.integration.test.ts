@@ -211,6 +211,8 @@ process.stdin.on("end", () => console.log(JSON.stringify({
   uid: process.getuid(),
   gid: process.getgid(),
   home: process.env.HOME,
+  cwd: process.cwd(),
+  secret: process.env.BB_BROWSER_TEST_SECRET,
   arguments: process.argv.slice(2),
   code,
 })));
@@ -226,6 +228,8 @@ process.stdin.on("end", () => console.log(JSON.stringify({
       passwdPath,
     });
     const runtimeDirectory = join(rootDirectory, "runtime");
+    const previousSecret = process.env.BB_BROWSER_TEST_SECRET;
+    process.env.BB_BROWSER_TEST_SECRET = "ambient-secret";
     try {
       const output = await boundary.execute({
         endpoint: "ws://127.0.0.1:9222/devtools/browser/fixture",
@@ -238,6 +242,8 @@ process.stdin.on("end", () => console.log(JSON.stringify({
         uid: userId,
         gid: groupId,
         home: join(runtimeDirectory, "bb-profile-a"),
+        cwd: join(runtimeDirectory, "bb-profile-a"),
+        secret: undefined,
         arguments: [
           "--browser",
           "bb-profile-a",
@@ -248,6 +254,76 @@ process.stdin.on("end", () => console.log(JSON.stringify({
         ],
         code: "console.log(await browser.listPages())",
       });
+    } finally {
+      if (previousSecret === undefined)
+        delete process.env.BB_BROWSER_TEST_SECRET;
+      else process.env.BB_BROWSER_TEST_SECRET = previousSecret;
+      await rm(rootDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("returns explicitly requested native screenshots and removes the temporary file", async () => {
+    const rootDirectory = await mkdtemp(join(tmpdir(), "browser-screenshot-"));
+    const helperExecutable = join(rootDirectory, "dev-browser-fixture.mjs");
+    const passwdPath = join(rootDirectory, "passwd");
+    const userId = process.getuid?.() === 0 ? 65534 : process.getuid!();
+    const groupId = process.getgid?.() === 0 ? 65534 : process.getgid!();
+    const fileName = "bb-screenshot-0123456789abcdef.png";
+    const marker = "bb-screenshot-fixture-marker";
+    await chmod(rootDirectory, 0o755);
+    await writeFile(
+      helperExecutable,
+      `#!/usr/bin/env node
+import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+
+const temporaryDirectory = join(process.env.HOME, ".dev-browser", "tmp");
+await mkdir(temporaryDirectory, { recursive: true });
+await writeFile(join(temporaryDirectory, "${fileName}"), Buffer.from("png-fixture"));
+console.log("fixture output");
+console.log(JSON.stringify({ __bbScreenshot: "${marker}" }));
+`,
+    );
+    await chmod(helperExecutable, 0o755);
+    await writeFile(
+      passwdPath,
+      `bb-browser:x:${userId}:${groupId}::${rootDirectory}:/usr/sbin/nologin\n`,
+    );
+    const boundary = createProductionBrowserProcessBoundary({
+      devBrowserExecutable: helperExecutable,
+      passwdPath,
+    });
+    const runtimeDirectory = join(rootDirectory, "runtime");
+    try {
+      await expect(
+        boundary.execute({
+          endpoint: "ws://127.0.0.1:9222/devtools/browser/fixture",
+          browserName: "bb-profile-a",
+          code: "console.log('fixture')",
+          timeoutMs: 5_000,
+          runtimeDirectory,
+          screenshot: { fileName, marker, mimeType: "image/png" },
+        }),
+      ).resolves.toEqual({
+        output: "fixture output",
+        screenshots: [
+          {
+            data: Buffer.from("png-fixture").toString("base64"),
+            mimeType: "image/png",
+          },
+        ],
+      });
+      await expect(
+        readFile(
+          join(
+            runtimeDirectory,
+            "bb-profile-a",
+            ".dev-browser",
+            "tmp",
+            fileName,
+          ),
+        ),
+      ).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
       await rm(rootDirectory, { recursive: true, force: true });
     }
