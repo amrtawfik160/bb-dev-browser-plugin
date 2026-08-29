@@ -82,6 +82,14 @@ import {
   createSafeLoginMode,
   type SafeLoginModeManager,
 } from "./safe-login.js";
+import {
+  createTransferStagingManager,
+  resolveTransferStagingRoot,
+  type TransferStagingManager,
+  type TransferStagingFilesystem,
+} from "./transfer-staging.js";
+import { createNodeTransferStagingFilesystem } from "./transfer-staging-filesystem.js";
+import { createClipboardExchange } from "./clipboard-exchange.js";
 
 export type HostSetupBoundary = HostReadinessBoundary;
 type HostBoundary = HostReadinessBoundary | HostAdministrationBoundary;
@@ -98,6 +106,8 @@ type BrowserRuntimeSource =
   BrowserInstanceRuntime | ((dataDir: string) => BrowserInstanceRuntime);
 type SafeLoginModeSource =
   SafeLoginModeManager | ((dataDir: string) => SafeLoginModeManager);
+type TransferStagingSource =
+  TransferStagingManager | ((dataDir: string) => TransferStagingManager);
 
 type ScriptSignalContext = { signal: AbortSignal };
 type ScriptActivityOutcome = "succeeded" | "failed" | "interrupted";
@@ -342,6 +352,7 @@ export function createBrowserHostEntry(
   recoverySource?: ProfileRecoverySource,
   runtimeSource?: BrowserRuntimeSource,
   safeLoginSource?: SafeLoginModeSource,
+  transferStagingSource?: TransferStagingSource,
 ) {
   let workerLease: { dispose(): Promise<void> } | undefined;
   let retainedBoundary: HostAdministrationBoundary | undefined;
@@ -350,6 +361,10 @@ export function createBrowserHostEntry(
   let retainedOutbox: ActivityOutbox | undefined;
   let retainedSafeLogin: SafeLoginModeManager | undefined =
     typeof safeLoginSource === "object" ? safeLoginSource : undefined;
+  let retainedTransferStaging: TransferStagingManager | undefined =
+    typeof transferStagingSource === "object"
+      ? transferStagingSource
+      : undefined;
   let retainedRuntime: BrowserInstanceRuntime | undefined =
     typeof runtimeSource === "object" ? runtimeSource : undefined;
   const controlLeases = createControlLeaseManager();
@@ -648,6 +663,26 @@ export function createBrowserHostEntry(
           : recoverySource;
     return retainedRecovery;
   }
+  function transferStaging(dataDir: string): TransferStagingManager | null {
+    if (retainedTransferStaging !== undefined) return retainedTransferStaging;
+    // Fail closed: the staging root is derived from the provisioned host data
+    // directory through `resolveTransferStagingRoot`, which returns `null` when
+    // the directory is absent so a non-provisioned host is never mutated.
+    const stagingRoot = resolveTransferStagingRoot(dataDir);
+    if (stagingRoot === null) return null;
+    const filesystem: TransferStagingFilesystem =
+      createNodeTransferStagingFilesystem();
+    retainedTransferStaging =
+      transferStagingSource === undefined
+        ? createTransferStagingManager({
+            filesystem,
+            stagingRoot,
+          })
+        : typeof transferStagingSource === "function"
+          ? transferStagingSource(dataDir)
+          : transferStagingSource;
+    return retainedTransferStaging;
+  }
   async function resolveActiveProfile(
     dataDir: string,
     hostId: string,
@@ -879,12 +914,36 @@ export function createBrowserHostEntry(
       // connected controller can send browser input.
       control.connectPanel(request.panelId, request.ownerSessionId);
       applyControllerViewport();
+      // Build the explicit clipboard exchange (issue #19) and route its effects
+      // to the CDP source's clipboard capabilities. The exchange is the policy
+      // (controller-only, no ambient sync); the source supplies the OS-clipboard
+      // read/write so clipboard text moves only through an explicit owner action.
+      const clipboardExchange = createClipboardExchange({
+        effects: {
+          readSelectionBytes: async (actor) =>
+            source.copyClipboard?.(actor) ?? 0,
+          writeClipboardToPage: async (actor, bytes) =>
+            source.pasteClipboard?.(actor, bytes) ?? 0,
+        },
+      });
+      const transferTarget = {
+        hostId: request.hostId,
+        profileId: request.profileId,
+      };
       const transport = createPanelTransportServer({
         gateway,
         stream,
         source,
         canInput: () => control.canInput(request.panelId),
         onDisconnect: () => control.disconnectPanel(request.panelId),
+        clipboardExchange,
+        onTransferCancel: async (transferId) => {
+          // Route panel transfer cancellation to the host staging manager so
+          // the one-use staged copy is removed at the controller's request.
+          const manager = transferStaging(dataDir);
+          await manager?.cancel(transferId).catch(() => undefined);
+          void transferTarget;
+        },
       });
       // Push live control transfers and tab changes to this panel so every
       // panel observes the shared state without re-fetching (ADR 0012).
@@ -1307,7 +1366,13 @@ export function createBrowserHostEntry(
         retainWorker(context);
         const dataDir = context.experimental_paths.dataDir;
         await requireReadyForProfileMutation(administration(dataDir), request);
-        return profiles(dataDir).archiveProfile(request);
+        const response = await profiles(dataDir).archiveProfile(request);
+        // A destructive profile lifecycle operation purges leftover staging so
+        // staged transfer data never outlives the profile it served.
+        await transferStaging(dataDir)
+          ?.purgeAll()
+          .catch(() => undefined);
+        return response;
       },
       restoreArchivedProfile: async (request, context) => {
         retainWorker(context);
@@ -1319,13 +1384,21 @@ export function createBrowserHostEntry(
         retainWorker(context);
         const dataDir = context.experimental_paths.dataDir;
         await requireReadyForProfileMutation(administration(dataDir), request);
-        return profiles(dataDir).resetProfile(request);
+        const response = await profiles(dataDir).resetProfile(request);
+        await transferStaging(dataDir)
+          ?.purgeAll()
+          .catch(() => undefined);
+        return response;
       },
       deleteProfile: async (request, context) => {
         retainWorker(context);
         const dataDir = context.experimental_paths.dataDir;
         await requireReadyForProfileMutation(administration(dataDir), request);
-        return profiles(dataDir).deleteProfile(request);
+        const response = await profiles(dataDir).deleteProfile(request);
+        await transferStaging(dataDir)
+          ?.purgeAll()
+          .catch(() => undefined);
+        return response;
       },
       expireArchivedProfiles: async (request, context) => {
         retainWorker(context);
@@ -1361,6 +1434,109 @@ export function createBrowserHostEntry(
         });
         return recovery(dataDir).importDevBrowserProfile(request);
       },
+      transferStage: async (request, context) => {
+        retainWorker(context);
+        const dataDir = context.experimental_paths.dataDir;
+        // Fail closed when the host has no provisioned data directory: the
+        // staging manager refuses to construct, and no host path is mutated.
+        const manager = transferStaging(dataDir);
+        if (manager === null) {
+          return {
+            outcome: "rejected" as const,
+            transferId: request.transferId,
+            reason: "cancelled" as const,
+            message:
+              "The host data directory is not provisioned for Transfer Staging.",
+          };
+        }
+        if (request.kind === "client") {
+          // A displaying-client upload arrives as base64 bytes from the active
+          // file chooser; decode and route to `stageClientFile` so the bytes
+          // are written into one-use staging rather than rejected.
+          const { hostId: _hostId, data, ...stagingRequest } = request;
+          void _hostId;
+          const clientData = new Uint8Array(Buffer.from(data, "base64"));
+          return manager.stage(stagingRequest, clientData);
+        }
+        const { hostId: _hostId, ...stagingRequest } = request;
+        void _hostId;
+        return manager.stage(stagingRequest);
+      },
+      transferConsume: async (request, context) => {
+        retainWorker(context);
+        const dataDir = context.experimental_paths.dataDir;
+        const manager = transferStaging(dataDir);
+        if (manager === null) {
+          return {
+            outcome: "missing" as const,
+            transferId: request.transferId,
+          };
+        }
+        // The staged path must leave the host so the browser can read it; the
+        // one-use copy is released only after the browser acknowledges the
+        // read through `transfer_release`. Releasing here would delete the
+        // file before the browser ever opens it.
+        const consume = await manager.consume(request.transferId);
+        if (consume.outcome === "used" && consume.stagedPath !== undefined) {
+          return {
+            outcome: "used" as const,
+            transferId: request.transferId,
+            stagedPath: consume.stagedPath,
+          };
+        }
+        return {
+          outcome: "missing" as const,
+          transferId: request.transferId,
+        };
+      },
+      transferRelease: async (request, context) => {
+        retainWorker(context);
+        const dataDir = context.experimental_paths.dataDir;
+        const manager = transferStaging(dataDir);
+        if (manager === null) {
+          return {
+            outcome: "missing" as const,
+            transferId: request.transferId,
+          };
+        }
+        await manager.release(request.transferId);
+        return {
+          outcome: "released" as const,
+          transferId: request.transferId,
+        };
+      },
+      transferCancel: async (request, context) => {
+        retainWorker(context);
+        const dataDir = context.experimental_paths.dataDir;
+        const manager = transferStaging(dataDir);
+        if (manager === null) {
+          return {
+            outcome: "missing" as const,
+            transferId: request.transferId,
+          };
+        }
+        const result = await manager.cancel(request.transferId);
+        return {
+          outcome: result.outcome,
+          transferId: request.transferId,
+        };
+      },
+      transferProgress: async (request, context) => {
+        retainWorker(context);
+        const dataDir = context.experimental_paths.dataDir;
+        const manager = transferStaging(dataDir);
+        if (manager === null) return null;
+        return manager.progress(request.transferId) ?? null;
+      },
+      controlLeaseState: async (request) => {
+        const key = controlLeaseKey(request);
+        const lease = controlLeases.state(key);
+        return {
+          active: lease !== undefined,
+          actor: lease?.actor ?? null,
+          purpose: lease?.purpose ?? null,
+        };
+      },
     },
     dispose: async () => {
       try {
@@ -1376,6 +1552,8 @@ export function createBrowserHostEntry(
         panelGateways.dispose();
         panelCapabilities.dispose();
         await disposeRuntime();
+        await retainedTransferStaging?.purgeAll().catch(() => undefined);
+        retainedTransferStaging = undefined;
         retainedSafeLogin?.dispose();
         retainedSafeLogin = undefined;
       } finally {

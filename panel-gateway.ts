@@ -7,6 +7,9 @@ import {
   browserDialogResponseMessageSchema,
   browserContextQueryMessageSchema,
   browserContextActionMessageSchema,
+  browserClipboardCopyMessageSchema,
+  browserClipboardPasteMessageSchema,
+  browserTransferCancelMessageSchema,
   browserPanelRedeemMessageSchema,
   type BrowserPanelRedeemMessage,
 } from "./contracts.js";
@@ -33,7 +36,10 @@ export type PanelGatewayMessage =
       text?: string;
     }
   | { kind: "context_query"; queryId: string; x: number; y: number }
-  | { kind: "context_action"; actionId: string };
+  | { kind: "context_action"; actionId: string }
+  | { kind: "clipboard_copy"; copyId: string }
+  | { kind: "clipboard_paste"; pasteId: string; bytes: number }
+  | { kind: "transfer_cancel"; transferId: string };
 
 export type PanelGatewayValidationResult =
   | { outcome: "accepted"; message: PanelGatewayMessage }
@@ -410,6 +416,76 @@ export function createPanelGateway(options: PanelGatewayOptions) {
         message: {
           kind: "context_action",
           actionId: actionResult.data.actionId,
+        },
+      };
+    }
+    if (envelope.type === "clipboard_copy") {
+      const copyResult = browserClipboardCopyMessageSchema.safeParse(parsed);
+      if (!copyResult.success) {
+        return {
+          outcome: "rejected",
+          reason: "malformed",
+          message: "Panel gateway clipboard copy failed shape validation.",
+        };
+      }
+      if (!admitChromeAction(clock.now())) {
+        return {
+          outcome: "rejected",
+          reason: "rate-limited",
+          message: `Panel gateway clipboard copy exceeded the ${inputMaxPerSecond}-per-second rate limit.`,
+        };
+      }
+      return {
+        outcome: "accepted",
+        message: { kind: "clipboard_copy", copyId: copyResult.data.copyId },
+      };
+    }
+    if (envelope.type === "clipboard_paste") {
+      const pasteResult = browserClipboardPasteMessageSchema.safeParse(parsed);
+      if (!pasteResult.success) {
+        return {
+          outcome: "rejected",
+          reason: "malformed",
+          message: "Panel gateway clipboard paste failed shape validation.",
+        };
+      }
+      if (!admitChromeAction(clock.now())) {
+        return {
+          outcome: "rejected",
+          reason: "rate-limited",
+          message: `Panel gateway clipboard paste exceeded the ${inputMaxPerSecond}-per-second rate limit.`,
+        };
+      }
+      return {
+        outcome: "accepted",
+        message: {
+          kind: "clipboard_paste",
+          pasteId: pasteResult.data.pasteId,
+          bytes: pasteResult.data.bytes,
+        },
+      };
+    }
+    if (envelope.type === "transfer_cancel") {
+      const cancelResult = browserTransferCancelMessageSchema.safeParse(parsed);
+      if (!cancelResult.success) {
+        return {
+          outcome: "rejected",
+          reason: "malformed",
+          message: "Panel gateway transfer cancel failed shape validation.",
+        };
+      }
+      if (!admitChromeAction(clock.now())) {
+        return {
+          outcome: "rejected",
+          reason: "rate-limited",
+          message: `Panel gateway transfer cancel exceeded the ${inputMaxPerSecond}-per-second rate limit.`,
+        };
+      }
+      return {
+        outcome: "accepted",
+        message: {
+          kind: "transfer_cancel",
+          transferId: cancelResult.data.transferId,
         },
       };
     }

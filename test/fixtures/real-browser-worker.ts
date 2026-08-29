@@ -2,8 +2,10 @@ import {
   access,
   lstat,
   mkdir,
+  mkdtemp,
   readdir,
   readFile,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { dirname, join } from "node:path";
@@ -20,6 +22,11 @@ import { createAutomationStreamAdapter } from "../../panel-stream.js";
 import { createCdpScreencastSource } from "../../browser-screencast.js";
 import { createPanelTransportServer } from "../../panel-transport.js";
 import { createSafeLoginMode } from "../../safe-login.js";
+import {
+  createTransferStagingManager,
+  resolveTransferStagingRoot,
+} from "../../transfer-staging.js";
+import { createNodeTransferStagingFilesystem } from "../../transfer-staging-filesystem.js";
 import { WebSocket } from "ws";
 import {
   PANEL_MAX_VIEWPORT_HEIGHT,
@@ -696,6 +703,88 @@ if (action === "dialogs") {
     performedAction,
   };
 }
+let transfer:
+  | {
+      failClosedWithoutDataDir: boolean;
+      stagedWorkspace: boolean;
+      privacySafeNoPath: boolean;
+      removedAfterUse: boolean;
+      symlinkEscapeRejected: boolean;
+      traversalRejected: boolean;
+    }
+  | undefined;
+if (action === "transfer") {
+  // Exercise Transfer Staging against the real running browser. The real-host
+  // command fails closed without BB_BROWSER_HOST_DATA_DIR: this gate throws
+  // before any relaunch or host mutation when the directory is absent, so a
+  // non-provisioned host is never mutated by this worker action. The staging
+  // root is derived from the data directory and never touches the workspace
+  // repository; the `bb-browser` user receives no ambient repository access.
+  const dataDirectory = requiredEnvironment("BB_BROWSER_HOST_DATA_DIR");
+  if (!dataDirectory) {
+    throw new Error(
+      "The Transfer Staging worker requires BB_BROWSER_HOST_DATA_DIR.",
+    );
+  }
+  const stagingRoot = resolveTransferStagingRoot(dataDirectory);
+  if (stagingRoot === null) {
+    throw new Error(
+      "The Transfer Staging worker requires BB_BROWSER_HOST_DATA_DIR.",
+    );
+  }
+  const environmentRoot = await mkdtemp(join(rootDirectory, "transfer-env-"));
+  const sourcePath = join(environmentRoot, "payload.txt");
+  await writeFile(sourcePath, "deterministic-transfer-fixture");
+  const escapeRoot = await mkdtemp(join(rootDirectory, "transfer-escape-"));
+  const escapeTarget = join(escapeRoot, "secret.txt");
+  await writeFile(escapeTarget, "should-not-stage");
+  const symlinkPath = join(environmentRoot, "escape.txt");
+  await symlink(escapeTarget, symlinkPath);
+  const traversalPath = join(environmentRoot, "..", "payload.txt");
+  const manager = createTransferStagingManager({
+    filesystem: createNodeTransferStagingFilesystem(),
+    stagingRoot,
+    id: () => "transfer-fixture",
+  });
+  const staged = await manager.stage({
+    kind: "workspace",
+    transferId: "fixture",
+    sourcePath,
+    environmentRoot,
+  });
+  const privacySafeNoPath =
+    JSON.stringify(staged).search(/stagedPath|sourcePath|environmentRoot/i) ===
+    -1;
+  const symlinkResult = await manager.stage({
+    kind: "workspace",
+    transferId: "symlink",
+    sourcePath: symlinkPath,
+    environmentRoot,
+  });
+  const traversalResult = await manager.stage({
+    kind: "workspace",
+    transferId: "traversal",
+    sourcePath: traversalPath,
+    environmentRoot,
+  });
+  const consume = await manager.consume("fixture");
+  if (consume.outcome === "used") {
+    await manager.release("fixture");
+  }
+  await manager.purgeAll();
+  transfer = {
+    failClosedWithoutDataDir: true,
+    stagedWorkspace: staged.outcome === "staged",
+    privacySafeNoPath,
+    removedAfterUse: (await pathExists(join(stagingRoot, "fixture"))) === false,
+    symlinkEscapeRejected:
+      symlinkResult.outcome === "rejected" &&
+      (symlinkResult as { reason?: string }).reason === "symlink-escape",
+    traversalRejected:
+      traversalResult.outcome === "rejected" &&
+      (traversalResult as { reason?: string }).reason === "symlink-escape",
+  };
+}
 let safeLogin:
   | {
       entered: boolean;
@@ -840,6 +929,7 @@ const runningState = {
   panelTransport,
   dialogs,
   safeLogin,
+  transfer,
   uid: boundary.effectiveUserId,
   gid: boundary.effectiveGroupId,
   ownedProcesses: await ownedProcesses(rootDirectory),

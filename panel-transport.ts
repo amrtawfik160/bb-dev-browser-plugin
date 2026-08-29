@@ -2,6 +2,10 @@ import { WebSocketServer, type WebSocket } from "ws";
 import { createServer, type Server } from "node:http";
 import type { PanelGateway } from "./panel-gateway.js";
 import type { PanelStreamAdapter } from "./panel-stream.js";
+import type {
+  ClipboardExchange,
+  TransferClipboardActor,
+} from "./clipboard-exchange.js";
 import {
   PANEL_GATEWAY_BIND_HOST,
   PANEL_RECLAIM_WINDOW_MS,
@@ -75,6 +79,21 @@ export interface ScreencastSource {
   }): Promise<BrowserContextAction[]>;
   /** Perform a chosen context action reported by {@link resolveContextActions}. */
   performContextAction?(actionId: string): void;
+  /**
+   * Read the active page selection length in bytes for an explicit owner
+   * copy (issue #19 clipboard exchange). Optional; sources without a real
+   * browser return 0 so the exchange denies the copy.
+   */
+  copyClipboard?(actor: TransferClipboardActor): Promise<number>;
+  /**
+   * Write `bytes` of the controller's clipboard into the page for an explicit
+   * owner paste (issue #19 clipboard exchange). Optional; sources without a
+   * real browser return 0 so the exchange denies the paste.
+   */
+  pasteClipboard?(
+    actor: TransferClipboardActor,
+    bytes: number,
+  ): Promise<number>;
 }
 
 export type PanelTransportServerOptions = {
@@ -98,6 +117,19 @@ export type PanelTransportServerOptions = {
    * can freeze input and start the same-panel reclaim window.
    */
   onDisconnect?: () => void;
+  /**
+   * Explicit clipboard exchange (issue #19). When provided, `clipboard_copy`
+   * and `clipboard_paste` messages dispatch to it so clipboard text moves only
+   * through an explicit owner action. The exchange is the authoritative
+   * policy; the source supplies the OS-clipboard effects.
+   */
+  clipboardExchange?: ClipboardExchange;
+  /**
+   * Called when the controller cancels a staged transfer through the panel, so
+   * the host removes the one-use staged copy. Distinct from input/dialog
+   * handling and gated to the controller.
+   */
+  onTransferCancel?: (transferId: string) => Promise<void>;
 };
 
 export type PanelTransportServer = {
@@ -136,6 +168,8 @@ export function createPanelTransportServer(
   const frameDeadlineMs = options.frameDeadlineMs ?? DEFAULT_FRAME_DEADLINE_MS;
   const canInput = options.canInput ?? (() => true);
   const onDisconnect = options.onDisconnect;
+  const clipboardExchange = options.clipboardExchange;
+  const onTransferCancel = options.onTransferCancel;
   let server: WebSocketServer | undefined;
   let httpServer: Server | undefined;
   let boundPort: number | undefined;
@@ -347,6 +381,42 @@ export function createPanelTransportServer(
     if (message.kind === "context_action") {
       if (!canInput()) return;
       source.performContextAction?.(message.actionId);
+      return;
+    }
+    if (message.kind === "clipboard_copy") {
+      // Explicit owner copy dispatches to the clipboard exchange policy; only
+      // the connected controller may copy.
+      if (!canInput() || clipboardExchange === undefined) return;
+      void clipboardExchange
+        .copy("owner-controller", message.copyId)
+        .then((outcome) =>
+          sendJson(socket, { type: "clipboard_outcome", outcome }),
+        )
+        .catch(() => undefined);
+      return;
+    }
+    if (message.kind === "clipboard_paste") {
+      if (!canInput() || clipboardExchange === undefined) return;
+      void clipboardExchange
+        .paste("owner-controller", message.bytes, message.pasteId)
+        .then((outcome) =>
+          sendJson(socket, { type: "clipboard_outcome", outcome }),
+        )
+        .catch(() => undefined);
+      return;
+    }
+    if (message.kind === "transfer_cancel") {
+      // The controller cancels a staged transfer through the panel; route to
+      // the host so the one-use staged copy is removed.
+      if (!canInput() || onTransferCancel === undefined) return;
+      void onTransferCancel(message.transferId)
+        .then(() =>
+          sendJson(socket, {
+            type: "transfer_cancel_ack",
+            transferId: message.transferId,
+          }),
+        )
+        .catch(() => undefined);
       return;
     }
     // ack and ping are accepted by the gateway but carry no transport action.

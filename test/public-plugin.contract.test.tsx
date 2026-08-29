@@ -4947,4 +4947,139 @@ describe("Browser public plugin contract", () => {
     await settings.findByText(/PURGE Browser installation/);
     await browser.dispose();
   });
+
+  it("stages and consumes a displaying-client upload end-to-end through Transfer Staging", async () => {
+    const browser = await createPublicPluginHarness();
+    try {
+      const data = Buffer.from("client-upload-fixture");
+      const staged = await browser.runBrowserTransferStage({
+        kind: "client",
+        transferId: "client-upload",
+        fileName: "client.txt",
+        sizeBytes: data.byteLength,
+        hostId: "host-browser-test",
+        data: data.toString("base64"),
+      });
+      expect(staged).toMatchObject({
+        outcome: "staged",
+        transferId: "client-upload",
+        kind: "client",
+      });
+      // Privacy-safe: the response never carries the staged or source path.
+      expect(JSON.stringify(staged)).not.toContain("stagedPath");
+
+      // Consume returns the staged path for the browser to read; the staged
+      // copy is NOT released yet.
+      const consume = await browser.runBrowserTransferConsume({
+        hostId: "host-browser-test",
+        transferId: "client-upload",
+      });
+      expect(consume.outcome).toBe("used");
+
+      // Progress surfaces the privacy-safe phase before release.
+      const progress = await browser.runBrowserTransferProgress({
+        hostId: "host-browser-test",
+        transferId: "client-upload",
+      });
+      expect(progress).not.toBeNull();
+      expect(progress?.phase).toBe("completed");
+      expect(JSON.stringify(progress)).not.toContain("stagedPath");
+
+      // Release removes the one-use staged copy.
+      const released = await browser.runBrowserTransferRelease({
+        hostId: "host-browser-test",
+        transferId: "client-upload",
+      });
+      expect(released).toMatchObject({
+        outcome: "released",
+        transferId: "client-upload",
+      });
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("rejects an agent-initiated transfer without the file-transfer grant or an active Control Lease", async () => {
+    const browser = await createPublicPluginHarness();
+    try {
+      const data = Buffer.from("agent-upload-fixture");
+      // No file-transfer grant and no active lease: an agent transfer is
+      // rejected as unauthorized before the host stages anything.
+      const rejected = await browser.runBrowserTransferStage({
+        kind: "client",
+        transferId: "agent-upload",
+        fileName: "agent.txt",
+        sizeBytes: data.byteLength,
+        hostId: "host-browser-test",
+        data: data.toString("base64"),
+        actor: "agent",
+        profileId: DEFAULT_PROFILE_ID,
+      });
+      expect(rejected.outcome).toBe("rejected");
+      if (rejected.outcome === "rejected") {
+        expect(rejected.reason).toBe("unauthorized");
+      }
+
+      // An owner transfer is authorized without a grant or lease.
+      const ownerStaged = await browser.runBrowserTransferStage({
+        kind: "client",
+        transferId: "owner-upload",
+        fileName: "owner.txt",
+        sizeBytes: data.byteLength,
+        hostId: "host-browser-test",
+        data: data.toString("base64"),
+        actor: "owner",
+      });
+      expect(ownerStaged.outcome).toBe("staged");
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("surfaces the transfer CLI cancel and progress commands", async () => {
+    const browser = await createPublicPluginHarness();
+    try {
+      // Cancellation routes to cancel() (not transferConsume) and requires an id.
+      const cancelWithoutId = await browser.runBrowserCli([
+        "transfer",
+        "--cancel",
+      ]);
+      expect(cancelWithoutId.exitCode).toBe(1);
+      expect(cancelWithoutId.stderr).toContain("--transfer-id");
+
+      // Progress requires a transfer id.
+      const progressWithoutId = await browser.runBrowserCli([
+        "transfer",
+        "--progress",
+      ]);
+      expect(progressWithoutId.exitCode).toBe(1);
+      expect(progressWithoutId.stderr).toContain("--transfer-id");
+
+      // Workspace staging resolves via the BB environment file APIs.
+      const workspaceWithoutEnv = await browser.runBrowserCli([
+        "transfer",
+        "--kind",
+        "workspace",
+      ]);
+      expect(workspaceWithoutEnv.exitCode).toBe(1);
+      expect(workspaceWithoutEnv.stderr).toContain("--environment");
+      expect(workspaceWithoutEnv.stderr).toContain("--path");
+
+      // Client staging requires --file.
+      const clientWithoutFile = await browser.runBrowserCli([
+        "transfer",
+        "--kind",
+        "client",
+      ]);
+      expect(clientWithoutFile.exitCode).toBe(1);
+      expect(clientWithoutFile.stderr).toContain("--file");
+
+      const registeredNames = browser
+        .registeredBrowserCliCommands()
+        .map((command) => command.name);
+      expect(registeredNames).toContain("transfer");
+    } finally {
+      await browser.dispose();
+    }
+  });
 });

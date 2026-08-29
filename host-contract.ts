@@ -48,6 +48,18 @@ import {
   browserProfileSelectRequestSchema,
   browserProfileTargetSchema,
   browserStatusSchema,
+  browserTransferStageInputSchema,
+  browserTransferConsumeInputSchema,
+  browserTransferStagingResponseSchema,
+  browserTransferOutcomeSchema,
+  browserTransferReleaseInputSchema,
+  browserTransferReleaseOutcomeSchema,
+  browserTransferCancelInputSchema,
+  browserTransferCancelOutcomeSchema,
+  browserTransferProgressInputSchema,
+  browserTransferProgressResultSchema,
+  browserControlLeaseStateInputSchema,
+  browserControlLeaseStateSchema,
 } from "./contracts.js";
 
 export const browserHostContract = defineRpcContract({
@@ -186,5 +198,29 @@ export const browserHostContract = defineRpcContract({
   importProfile: {
     input: browserProfileImportRequestSchema,
     output: browserProfileRecoveryResponseSchema,
+  },
+  transferStage: {
+    input: browserTransferStageInputSchema,
+    output: browserTransferStagingResponseSchema,
+  },
+  transferConsume: {
+    input: browserTransferConsumeInputSchema,
+    output: browserTransferOutcomeSchema,
+  },
+  transferRelease: {
+    input: browserTransferReleaseInputSchema,
+    output: browserTransferReleaseOutcomeSchema,
+  },
+  transferCancel: {
+    input: browserTransferCancelInputSchema,
+    output: browserTransferCancelOutcomeSchema,
+  },
+  transferProgress: {
+    input: browserTransferProgressInputSchema,
+    output: browserTransferProgressResultSchema,
+  },
+  controlLeaseState: {
+    input: browserControlLeaseStateInputSchema,
+    output: browserControlLeaseStateSchema,
   },
 });

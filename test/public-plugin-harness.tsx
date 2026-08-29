@@ -80,6 +80,19 @@ import {
   browserHostChoicesSchema,
   browserSetupPlanSchema,
   browserSetupResponseSchema,
+  browserTransferStagingResponseSchema,
+  browserTransferOutcomeSchema,
+  browserTransferReleaseOutcomeSchema,
+  browserTransferReleaseInputSchema,
+  browserTransferCancelOutcomeSchema,
+  browserTransferCancelInputSchema,
+  browserTransferProgressResultSchema,
+  browserTransferProgressInputSchema,
+  browserTransferStageInputSchema,
+  browserTransferConsumeInputSchema,
+  browserControlLeaseStateSchema,
+  browserControlLeaseStateInputSchema,
+  browserFileTransferDecisionSchema,
   DEFAULT_PROFILE_ID,
   setupRequiredStatus,
   type BrowserHostTarget,
@@ -728,6 +741,48 @@ export async function createPublicPluginHarness(options?: {
           { signal },
         );
       }
+      if (method === "transferStage") {
+        return host.experimental_call(
+          "transferStage",
+          browserTransferStageInputSchema.parse(input),
+          { signal },
+        );
+      }
+      if (method === "transferConsume") {
+        return host.experimental_call(
+          "transferConsume",
+          browserTransferConsumeInputSchema.parse(input),
+          { signal },
+        );
+      }
+      if (method === "transferRelease") {
+        return host.experimental_call(
+          "transferRelease",
+          browserTransferReleaseInputSchema.parse(input),
+          { signal },
+        );
+      }
+      if (method === "transferCancel") {
+        return host.experimental_call(
+          "transferCancel",
+          browserTransferCancelInputSchema.parse(input),
+          { signal },
+        );
+      }
+      if (method === "transferProgress") {
+        return host.experimental_call(
+          "transferProgress",
+          browserTransferProgressInputSchema.parse(input),
+          { signal },
+        );
+      }
+      if (method === "controlLeaseState") {
+        return host.experimental_call(
+          "controlLeaseState",
+          browserControlLeaseStateInputSchema.parse(input),
+          { signal },
+        );
+      }
       throw new Error(`Unexpected host method: ${method}`);
     },
   });
@@ -1097,6 +1152,75 @@ export async function createPublicPluginHarness(options?: {
         "browser_host_choices",
         input,
       ) as Promise<ReturnType<typeof browserHostChoicesSchema.parse>>,
+    browser_transfer_stage: (
+      input: Parameters<
+        typeof rpcContract.browser_transfer_stage.input.parse
+      >[0],
+    ) =>
+      backend.harness.behavior.callRpc(
+        "browser_transfer_stage",
+        input,
+      ) as Promise<
+        ReturnType<typeof browserTransferStagingResponseSchema.parse>
+      >,
+    browser_transfer_consume: (
+      input: Parameters<
+        typeof rpcContract.browser_transfer_consume.input.parse
+      >[0],
+    ) =>
+      backend.harness.behavior.callRpc(
+        "browser_transfer_consume",
+        input,
+      ) as Promise<ReturnType<typeof browserTransferOutcomeSchema.parse>>,
+    browser_transfer_release: (
+      input: Parameters<
+        typeof rpcContract.browser_transfer_release.input.parse
+      >[0],
+    ) =>
+      backend.harness.behavior.callRpc(
+        "browser_transfer_release",
+        input,
+      ) as Promise<
+        ReturnType<typeof browserTransferReleaseOutcomeSchema.parse>
+      >,
+    browser_transfer_cancel: (
+      input: Parameters<
+        typeof rpcContract.browser_transfer_cancel.input.parse
+      >[0],
+    ) =>
+      backend.harness.behavior.callRpc(
+        "browser_transfer_cancel",
+        input,
+      ) as Promise<ReturnType<typeof browserTransferCancelOutcomeSchema.parse>>,
+    browser_transfer_progress: (
+      input: Parameters<
+        typeof rpcContract.browser_transfer_progress.input.parse
+      >[0],
+    ) =>
+      backend.harness.behavior.callRpc(
+        "browser_transfer_progress",
+        input,
+      ) as Promise<
+        ReturnType<typeof browserTransferProgressResultSchema.parse>
+      >,
+    browser_control_lease_state: (
+      input: Parameters<
+        typeof rpcContract.browser_control_lease_state.input.parse
+      >[0],
+    ) =>
+      backend.harness.behavior.callRpc(
+        "browser_control_lease_state",
+        input,
+      ) as Promise<ReturnType<typeof browserControlLeaseStateSchema.parse>>,
+    browser_file_transfer_authorize: (
+      input: Parameters<
+        typeof rpcContract.browser_file_transfer_authorize.input.parse
+      >[0],
+    ) =>
+      backend.harness.behavior.callRpc(
+        "browser_file_transfer_authorize",
+        input,
+      ) as Promise<ReturnType<typeof browserFileTransferDecisionSchema.parse>>,
   };
 
   function renderSettings() {
@@ -1404,6 +1528,42 @@ export async function createPublicPluginHarness(options?: {
 
   function runBrowserHostChoices(input: BrowserHostChoicesInput) {
     return rpc.browser_host_choices(input);
+  }
+
+  function runBrowserTransferStage(
+    input: Parameters<typeof rpc.browser_transfer_stage>[0],
+  ) {
+    return rpc.browser_transfer_stage(input);
+  }
+  function runBrowserTransferConsume(
+    input: Parameters<typeof rpc.browser_transfer_consume>[0],
+  ) {
+    return rpc.browser_transfer_consume(input);
+  }
+  function runBrowserTransferRelease(
+    input: Parameters<typeof rpc.browser_transfer_release>[0],
+  ) {
+    return rpc.browser_transfer_release(input);
+  }
+  function runBrowserTransferCancel(
+    input: Parameters<typeof rpc.browser_transfer_cancel>[0],
+  ) {
+    return rpc.browser_transfer_cancel(input);
+  }
+  function runBrowserTransferProgress(
+    input: Parameters<typeof rpc.browser_transfer_progress>[0],
+  ) {
+    return rpc.browser_transfer_progress(input);
+  }
+  function runBrowserControlLeaseState(
+    input: Parameters<typeof rpc.browser_control_lease_state>[0],
+  ) {
+    return rpc.browser_control_lease_state(input);
+  }
+  function runBrowserFileTransferAuthorize(
+    input: Parameters<typeof rpc.browser_file_transfer_authorize>[0],
+  ) {
+    return rpc.browser_file_transfer_authorize(input);
   }
 
   function runBrowserPanelCapability(input: {
@@ -1755,6 +1915,13 @@ export async function createPublicPluginHarness(options?: {
     decideBrowserGrantRequest,
     revokeBrowserGrantRequest,
     runBrowserHostChoices,
+    runBrowserTransferStage,
+    runBrowserTransferConsume,
+    runBrowserTransferRelease,
+    runBrowserTransferCancel,
+    runBrowserTransferProgress,
+    runBrowserControlLeaseState,
+    runBrowserFileTransferAuthorize,
     runBrowserPanelCapability,
     runBrowserPanelControl,
     runBrowserTakeControl,

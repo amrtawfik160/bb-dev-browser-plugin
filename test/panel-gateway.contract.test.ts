@@ -242,4 +242,88 @@ describe("Panel gateway contract", () => {
     expect(gateway.redeemedCapabilityId).toBeUndefined();
     expect(capabilities.size()).toBe(0);
   });
+
+  it("accepts an explicit clipboard copy action after redemption", () => {
+    const { gateway, issued } = setupGateway();
+    gateway.validate(json(redeemMessage(issued)));
+    const result = gateway.validate(
+      json({ type: "clipboard_copy", copyId: "copy-1" }),
+    );
+    expect(result.outcome).toBe("accepted");
+    if (result.outcome === "accepted") {
+      expect(result.message).toEqual({
+        kind: "clipboard_copy",
+        copyId: "copy-1",
+      });
+    }
+  });
+
+  it("accepts an explicit clipboard paste action after redemption", () => {
+    const { gateway, issued } = setupGateway();
+    gateway.validate(json(redeemMessage(issued)));
+    const result = gateway.validate(
+      json({ type: "clipboard_paste", pasteId: "paste-1", bytes: 32 }),
+    );
+    expect(result.outcome).toBe("accepted");
+    if (result.outcome === "accepted") {
+      expect(result.message).toEqual({
+        kind: "clipboard_paste",
+        pasteId: "paste-1",
+        bytes: 32,
+      });
+    }
+  });
+
+  it("accepts a transfer cancellation after redemption", () => {
+    const { gateway, issued } = setupGateway();
+    gateway.validate(json(redeemMessage(issued)));
+    const result = gateway.validate(
+      json({ type: "transfer_cancel", transferId: "transfer-1" }),
+    );
+    expect(result.outcome).toBe("accepted");
+    if (result.outcome === "accepted") {
+      expect(result.message).toEqual({
+        kind: "transfer_cancel",
+        transferId: "transfer-1",
+      });
+    }
+  });
+
+  it("rejects a malformed clipboard copy before redemption", () => {
+    const { gateway } = setupGateway();
+    const result = gateway.validate(json({ type: "clipboard_copy" }));
+    expect(result.outcome).toBe("rejected");
+    if (result.outcome === "rejected")
+      expect(result.reason).toBe("unauthorized");
+  });
+
+  it("rejects a malformed clipboard paste shape after redemption", () => {
+    const { gateway, issued } = setupGateway();
+    gateway.validate(json(redeemMessage(issued)));
+    const result = gateway.validate(
+      json({ type: "clipboard_paste", pasteId: "paste-1" }),
+    );
+    expect(result.outcome).toBe("rejected");
+    if (result.outcome === "rejected") expect(result.reason).toBe("malformed");
+  });
+
+  it("rate-limits clipboard actions to the per-second cap", () => {
+    let now = 1_000_000;
+    const { gateway, issued } = setupGateway({ clock: { now: () => now } });
+    gateway.validate(json(redeemMessage(issued)));
+    let lastReason: string | undefined;
+    for (let i = 0; i <= PANEL_GATEWAY_INPUT_MAX_PER_SECOND; i += 1) {
+      const result = gateway.validate(
+        json({ type: "clipboard_copy", copyId: `copy-${i}` }),
+      );
+      if (result.outcome === "rejected") lastReason = result.reason;
+    }
+    expect(lastReason).toBe("rate-limited");
+    // After the window resets, clipboard actions are admitted again.
+    now += 1000;
+    const afterReset = gateway.validate(
+      json({ type: "clipboard_copy", copyId: "copy-next" }),
+    );
+    expect(afterReset.outcome).toBe("accepted");
+  });
 });
