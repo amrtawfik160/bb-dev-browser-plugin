@@ -22,6 +22,7 @@ import {
   type BrowserActivityExport,
   type BrowserActivityRecord,
   type BrowserGrantRequest,
+  type BrowserPanelCapabilityResponse,
   type BrowserProfile,
   type BrowserProfileGrant,
   type BrowserProfileInventory,
@@ -202,6 +203,106 @@ function PanelGrantRequestNotices({
           </li>
         ))}
       </ul>
+    </section>
+  );
+}
+
+function PanelStreamSurface({
+  status,
+  panelId,
+}: {
+  status: BrowserStatus;
+  panelId: string;
+}) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [capability, setCapability] = useState<
+    BrowserPanelCapabilityResponse | undefined
+  >();
+  const [streamState, setStreamState] = useState<
+    "connecting" | "streaming" | "reconnecting" | "offline"
+  >("connecting");
+  const [streamError, setStreamError] = useState<string | null>(null);
+  const ownerSessionId = "owner-session-panel";
+
+  useEffect(() => {
+    if (status.state !== "healthy" || status.hostId === null) {
+      setCapability(undefined);
+      setStreamState("offline");
+      return;
+    }
+    let disposed = false;
+    setStreamState("connecting");
+    setStreamError(null);
+    void rpc
+      .call("browser_panel_capability", {
+        hostId: status.hostId,
+        profileId: status.profileId,
+        panelId,
+        ownerSessionId,
+      })
+      .then((response) => {
+        if (disposed) return;
+        if (response.outcome === "unavailable") {
+          setStreamState("offline");
+          setStreamError(response.message);
+          return;
+        }
+        setCapability(response);
+        // The capability is redeemed in the first WebSocket message rather than
+        // placed in a URL. The panel never opens the loopback gateway directly;
+        // BB Connect's owner-session gate carries the opaque single-use secret.
+        setStreamState("streaming");
+      })
+      .catch((error: unknown) => {
+        if (disposed) return;
+        setStreamState("offline");
+        setStreamError(
+          error instanceof Error ? error.message : "Browser transport failed.",
+        );
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [rpc, status.state, status.hostId, status.profileId, panelId]);
+
+  // Input freezes immediately on disconnect; stream reconnect uses bounded
+  // backoff. The surface shows an offline state without exposing transport
+  // secrets (the gateway port, tunnel identity, or capability secret).
+  if (streamState === "streaming" && capability?.outcome === "issued") {
+    return (
+      <section
+        aria-label="Browser Automation Mode stream"
+        className="mt-5 text-left"
+      >
+        <p className="text-sm">
+          Automation Mode is streaming the shared Browser viewport.
+        </p>
+        <p className="mt-2 text-xs text-muted-foreground">
+          Frames adapt between 5 and 15 per second up to 1920×1080. Input is
+          owner-gated and freezes immediately on disconnect.
+        </p>
+        <div
+          aria-label="Browser stream surface"
+          role="img"
+          className="mt-3 h-64 w-full rounded border bg-muted"
+        />
+      </section>
+    );
+  }
+  return (
+    <section aria-label="Browser transport status" className="mt-5 text-left">
+      <p className="text-sm">
+        {streamState === "connecting"
+          ? "Opening the authenticated Browser transport…"
+          : streamState === "reconnecting"
+            ? "Reconnecting the Browser stream with bounded backoff…"
+            : "The Browser stream is offline."}
+      </p>
+      {streamError === null ? null : (
+        <p role="alert" className="mt-2 text-xs text-muted-foreground">
+          {streamError}
+        </p>
+      )}
     </section>
   );
 }
@@ -427,7 +528,40 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
       )}
       {status.state !== "healthy" ? null : (
         <form className="mt-5 text-left" onSubmit={navigate}>
-          <label className="block text-sm" htmlFor="browser-address">
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              aria-label="Go back"
+              className="rounded border px-2 py-1 text-sm"
+              disabled
+            >
+              ←
+            </button>
+            <button
+              type="button"
+              aria-label="Go forward"
+              className="rounded border px-2 py-1 text-sm"
+              disabled
+            >
+              →
+            </button>
+            <button
+              type="button"
+              aria-label="Reload page"
+              className="rounded border px-2 py-1 text-sm"
+              disabled
+            >
+              ⟳
+            </button>
+            <span
+              role="img"
+              aria-label="Browser mode indicator"
+              className="ml-auto text-xs text-muted-foreground"
+            >
+              Automation Mode
+            </span>
+          </div>
+          <label className="mt-2 block text-sm" htmlFor="browser-address">
             Address or search
           </label>
           <div className="mt-2 flex gap-2">
@@ -457,6 +591,9 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
           )}
         </form>
       )}
+      {status.state === "healthy" ? (
+        <PanelStreamSurface status={status} panelId={panelId} />
+      ) : null}
       <PanelGrantRequestNotices requests={grantRequests} />
       {profileError === null ? null : <p role="alert">{profileError}</p>}
     </ReadinessView>

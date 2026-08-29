@@ -14,6 +14,14 @@ import {
   createBrowserInstanceRuntime,
 } from "../../browser-runtime.js";
 import { profileStoragePaths } from "../../profile-storage.js";
+import { createPanelCapabilityStore } from "../../panel-capability.js";
+import { createPanelGateway } from "../../panel-gateway.js";
+import { createAutomationStreamAdapter } from "../../panel-stream.js";
+import {
+  PANEL_MAX_VIEWPORT_HEIGHT,
+  PANEL_MAX_VIEWPORT_WIDTH,
+  PANEL_RECLAIM_WINDOW_MS,
+} from "../../contracts.js";
 
 function requiredEnvironment(name: string) {
   const setting = process.env[name];
@@ -73,6 +81,7 @@ if (
     "lifecycle",
     "cleanup",
     "origin-scope",
+    "panel-transport",
   ]).has(action)
 ) {
   throw new Error(
@@ -368,6 +377,18 @@ let scriptOutput = "{}";
 let navigation:
   { before: unknown[]; after: unknown[]; tabId: string } | undefined;
 let lifecycle: Awaited<ReturnType<typeof lifecycleAcceptance>> | undefined;
+let panelTransport:
+  | {
+      gatewayBindHost: string;
+      redeemed: boolean;
+      replayed: boolean;
+      viewport: { width: number; height: number };
+      fps: number;
+      reconnectBackoffMs: number[];
+      reclaimWindowMs: number;
+      revoked: boolean;
+    }
+  | undefined;
 if (action === "start") {
   scriptOutput = String(await runtime.execute(target, signInScript, 20_000));
   const before = JSON.parse(
@@ -399,6 +420,59 @@ let originScope:
 if (action === "origin-scope") {
   originScope = await originScopeAcceptance();
 }
+if (action === "panel-transport") {
+  // Exercise the Panel Capability, loopback gateway, and Automation Mode
+  // stream policy against the real running browser through public contracts.
+  // The real-host command fails closed without BB_BROWSER_HOST_DATA_DIR, which
+  // the integration test harness already requires before spawning this worker.
+  const capabilities = createPanelCapabilityStore();
+  const gateway = createPanelGateway({
+    capabilities,
+    hostId: target.hostId,
+    profileId: target.profileId,
+  });
+  const stream = createAutomationStreamAdapter({ capabilities });
+  stream.start();
+  stream.setViewport({
+    width: PANEL_MAX_VIEWPORT_WIDTH,
+    height: PANEL_MAX_VIEWPORT_HEIGHT,
+  });
+  const issued = capabilities.issue({
+    ownerSessionId: "owner-session-real",
+    panelId: "real-panel",
+    hostId: target.hostId,
+    profileId: target.profileId,
+  });
+  const redeem = JSON.stringify({
+    type: "redeem",
+    capabilityId: issued.capabilityId,
+    secret: issued.secret,
+    ownerSessionId: "owner-session-real",
+    panelId: "real-panel",
+  });
+  const redeemed = gateway.validate(redeem);
+  const replayed = gateway.validate(redeem);
+  // A real Automation Mode frame stays within the viewport and FPS bounds.
+  const congestionFps = stream.applyCongestion(1);
+  const reconnectBackoffs = [
+    stream.nextReconnectDelayMs(),
+    stream.nextReconnectDelayMs(),
+    stream.nextReconnectDelayMs(),
+  ];
+  stream.freezeInput();
+  stream.reclaim(issued.capabilityId);
+  capabilities.revokeProfile(target.profileId);
+  panelTransport = {
+    gatewayBindHost: gateway.declaredBindHost(),
+    redeemed: redeemed.outcome === "accepted",
+    replayed: replayed.outcome === "rejected",
+    viewport: stream.viewport,
+    fps: congestionFps,
+    reconnectBackoffMs: reconnectBackoffs,
+    reclaimWindowMs: PANEL_RECLAIM_WINDOW_MS,
+    revoked: capabilities.size() === 0,
+  };
+}
 const automationHelperPid =
   action === "cleanup" || action === "lifecycle"
     ? null
@@ -411,6 +485,7 @@ const runningState = {
   navigation,
   lifecycle,
   originScope,
+  panelTransport,
   uid: boundary.effectiveUserId,
   gid: boundary.effectiveGroupId,
   ownedProcesses: await ownedProcesses(rootDirectory),

@@ -34,6 +34,7 @@ import {
   browserNavigationRequestSchema,
   browserNavigationResponseSchema,
   browserPanelVisibilityRequestSchema,
+  browserPanelTransportRequestSchema,
   browserPurgeRequestSchema,
   browserScriptRequestSchema,
   browserSetupRequestSchema,
@@ -59,6 +60,7 @@ import {
   browserProfileGrantQuerySchema,
   browserProfileGrantRevokeRequestSchema,
   type BrowserPanelNavigationInput,
+  type BrowserPanelCapabilityResponse,
   type BrowserNavigationRequest,
   browserProfileGrantRevokeResponseSchema,
   browserProfileGrantSchema,
@@ -406,6 +408,9 @@ export async function createPublicPluginHarness(options?: {
   const backend = createFakePluginHost({
     pluginId: "browser",
     agentSkillIds: ["browser"],
+    sharedPortTunnelIdentities: {
+      [configuredHostId]: { label: "ci-gate", baseDomain: "ci.getbb.app" },
+    },
     sdk: {
       subscribe: (args) => {
         if (args.event === "project:changed") {
@@ -485,6 +490,13 @@ export async function createPublicPluginHarness(options?: {
         return host.experimental_call(
           "panelVisibility",
           browserPanelVisibilityRequestSchema.parse(input),
+          { signal },
+        );
+      }
+      if (method === "panelTransport") {
+        return host.experimental_call(
+          "panelTransport",
+          browserPanelTransportRequestSchema.parse(input),
           { signal },
         );
       }
@@ -705,6 +717,16 @@ export async function createPublicPluginHarness(options?: {
         "browser_panel_visibility",
         input,
       ) as Promise<BrowserStatus>,
+    browser_panel_capability: (input: {
+      hostId: string;
+      profileId: string;
+      panelId: string;
+      ownerSessionId: string;
+    }) =>
+      backend.harness.behavior.callRpc(
+        "browser_panel_capability",
+        input,
+      ) as Promise<BrowserPanelCapabilityResponse>,
     browser_settings_status: (input: { profileId: string }) =>
       backend.harness.behavior.callRpc(
         "browser_settings_status",
@@ -1283,6 +1305,20 @@ export async function createPublicPluginHarness(options?: {
     return rpc.browser_host_choices(input);
   }
 
+  function runBrowserPanelCapability(input: {
+    hostId: string;
+    profileId: string;
+    panelId: string;
+    ownerSessionId?: string;
+  }) {
+    return rpc.browser_panel_capability({
+      hostId: input.hostId,
+      profileId: input.profileId,
+      panelId: input.panelId,
+      ownerSessionId: input.ownerSessionId ?? "owner-session-test",
+    });
+  }
+
   function runBrowserStatus(input: BrowserStatusInput) {
     return rpc.browser_status(input);
   }
@@ -1570,6 +1606,7 @@ export async function createPublicPluginHarness(options?: {
     decideBrowserGrantRequest,
     revokeBrowserGrantRequest,
     runBrowserHostChoices,
+    runBrowserPanelCapability,
     runBrowserScript,
     runBrowserScriptWithProfile,
     privilegedExecutor: options?.privilegedExecutor ?? null,

@@ -1415,6 +1415,7 @@ export default function plugin(bb: BbPluginApi) {
         : browser.status(panelIdentity(input), input.profileId),
     browser_navigate: (input) => browser.navigate(input),
     browser_panel_visibility: (input) => browser.panelVisibility(input),
+    browser_panel_capability: (input) => browser.panelCapability(input),
     browser_settings_status: (input) =>
       browser.settingsStatuses(input.profileId),
     browser_diagnostics: (input) => browser.diagnostics(input),

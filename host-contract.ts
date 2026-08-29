@@ -22,6 +22,8 @@ import {
   browserNavigationRequestSchema,
   browserNavigationResponseSchema,
   browserPanelVisibilityRequestSchema,
+  browserPanelTransportRequestSchema,
+  browserPanelTransportResponseSchema,
   browserProfileCreateRequestSchema,
   browserProfileDeleteRequestSchema,
   browserProfileExpiryResponseSchema,
@@ -88,6 +90,10 @@ export const browserHostContract = defineRpcContract({
   panelVisibility: {
     input: browserPanelVisibilityRequestSchema,
     output: browserStatusSchema,
+  },
+  panelTransport: {
+    input: browserPanelTransportRequestSchema,
+    output: browserPanelTransportResponseSchema,
   },
   activityOutbox: {
     input: browserActivityOutboxRequestSchema,

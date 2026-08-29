@@ -24,6 +24,28 @@ export const BROWSER_SCRIPT_MAX_SCREENSHOT_BYTES = 1 * 1024 * 1024;
 export const BROWSER_SCRIPT_MAX_SCREENSHOT_BASE64_LENGTH =
   4 * Math.ceil(BROWSER_SCRIPT_MAX_SCREENSHOT_BYTES / 3);
 
+/**
+ * Panel Capability transport constants (design §Transport). The capability is
+ * single-use, expires unredeemed after 60 seconds, binds to one owner session,
+ * panel instance, host, and profile, and is redeemed in the first WebSocket
+ * message rather than placed in a URL. Connected authorization rotates every
+ * five minutes and is revoked on panel close or profile switch.
+ */
+export const PANEL_CAPABILITY_TTL_MS = 60_000;
+export const PANEL_AUTH_ROTATION_MS = 5 * 60_000;
+export const PANEL_RECLAIM_WINDOW_MS = 10_000;
+export const PANEL_MAX_VIEWPORT_WIDTH = 1920;
+export const PANEL_MAX_VIEWPORT_HEIGHT = 1080;
+export const PANEL_MIN_FRAMES_PER_SECOND = 5;
+export const PANEL_MAX_FRAMES_PER_SECOND = 15;
+export const PANEL_GATEWAY_BIND_HOST = "127.0.0.1";
+export const PANEL_GATEWAY_MESSAGE_MAX_BYTES = 2 * 1024 * 1024;
+export const PANEL_GATEWAY_INPUT_MAX_PER_SECOND = 60;
+export const PANEL_GATEWAY_BANDWIDTH_BYTES_PER_SECOND =
+  PANEL_MAX_FRAMES_PER_SECOND * PANEL_GATEWAY_MESSAGE_MAX_BYTES;
+export const PANEL_RECONNECT_INITIAL_BACKOFF_MS = 500;
+export const PANEL_RECONNECT_MAX_BACKOFF_MS = 8_000;
+
 export function browserHostStorageSegment(hostId: string) {
   return encodeURIComponent(hostId).replaceAll(".", "%2E");
 }
@@ -1200,6 +1222,15 @@ export const browserStatusSchema = z.discriminatedUnion("state", [
   z
     .object({
       ...browserStatusFields,
+      state: z.literal("safe-login-elsewhere"),
+      code: z.literal("safe_login_elsewhere"),
+      label: z.literal("Safe Login elsewhere"),
+      message: z.string().min(1),
+    })
+    .strict(),
+  z
+    .object({
+      ...browserStatusFields,
       state: z.literal("repair-required"),
       code: z.literal("repair_required"),
       label: z.literal("Repair required"),
@@ -1554,6 +1585,132 @@ export type BrowserPanelVisibilityRequest = z.infer<
   typeof browserPanelVisibilityRequestSchema
 >;
 
+/**
+ * Request a single-use Panel Capability that bootstraps an authenticated stream
+ * connection. The capability binds to one owner session, panel instance, host,
+ * and profile, and is redeemed in the first WebSocket message rather than
+ * placed in a URL. BB Connect enrollment is required even for a locally
+ * displayed client so one authenticated transport serves web/PWA and desktop.
+ */
+export const browserPanelCapabilityRequestSchema = z
+  .object({
+    hostId: z.string().min(1),
+    profileId: z.string().min(1),
+    panelId: z.string().min(1),
+    ownerSessionId: z.string().min(1),
+  })
+  .strict();
+
+export const browserPanelCapabilityResponseSchema = z.discriminatedUnion(
+  "outcome",
+  [
+    z
+      .object({
+        outcome: z.literal("issued"),
+        capabilityId: z.string().min(1),
+        /**
+         * Opaque single-use secret redeemed in the first WebSocket message. It
+         * is never placed in a URL and carries no transport address.
+         */
+        secret: z.string().min(1),
+        /**
+         * Dynamic loopback gateway port the host chose for this worker
+         * generation. The server declares it to BB Connect for tunneling; the
+         * panel never opens it directly.
+         */
+        gatewayPort: z.number().int().positive().max(65535),
+        /**
+         * Read-only BB Connect tunnel identity for the host. The daemon owns
+         * the trusted enrollment; plugins cannot influence the destination.
+         */
+        tunnel: z
+          .object({
+            label: z.string().min(1),
+            baseDomain: z.string().min(1),
+          })
+          .strict(),
+        expiresAt: z.string().datetime(),
+        rotatesAt: z.string().datetime(),
+      })
+      .strict(),
+    z
+      .object({
+        outcome: z.literal("unavailable"),
+        /**
+         * A public reason that never exposes transport secrets. It mirrors the
+         * readiness state the owner already sees (setup-required, host-offline, or
+         * missing BB Connect enrollment).
+         */
+        reason: z.enum([
+          "setup-required",
+          "host-offline",
+          "bb-connect-required",
+        ]),
+        message: z.string().min(1),
+      })
+      .strict(),
+  ],
+);
+
+export type BrowserPanelCapabilityRequest = z.infer<
+  typeof browserPanelCapabilityRequestSchema
+>;
+export type BrowserPanelCapabilityResponse = z.infer<
+  typeof browserPanelCapabilityResponseSchema
+>;
+
+/**
+ * The first WebSocket message a panel sends after connecting through BB
+ * Connect. The Panel Capability is redeemed here, never in a URL. A bounded
+ * gateway validates this shape and size before authorizing the stream.
+ */
+export const browserPanelRedeemMessageSchema = z
+  .object({
+    type: z.literal("redeem"),
+    capabilityId: z.string().min(1),
+    secret: z.string().min(1),
+    ownerSessionId: z.string().min(1),
+    panelId: z.string().min(1),
+  })
+  .strict();
+
+export type BrowserPanelRedeemMessage = z.infer<
+  typeof browserPanelRedeemMessageSchema
+>;
+
+/**
+ * Host-side request to open a dynamic loopback gateway for a profile's panel
+ * transport. The host chooses a per-worker-generation port, binds it to
+ * loopback only, and returns it so the server can declare it to BB Connect.
+ * The host never exposes the gateway directly.
+ */
+export const browserPanelTransportRequestSchema = z
+  .object({
+    hostId: z.string().min(1),
+    profileId: z.string().min(1),
+    panelId: z.string().min(1),
+    ownerSessionId: z.string().min(1),
+  })
+  .strict();
+
+export const browserPanelTransportResponseSchema = z
+  .object({
+    gatewayPort: z.number().int().positive().max(65535),
+    bindHost: z.string().min(1),
+    capabilityId: z.string().min(1),
+    secret: z.string().min(1),
+    expiresAt: z.string().datetime(),
+    rotatesAt: z.string().datetime(),
+  })
+  .strict();
+
+export type BrowserPanelTransportRequest = z.infer<
+  typeof browserPanelTransportRequestSchema
+>;
+export type BrowserPanelTransportResponse = z.infer<
+  typeof browserPanelTransportResponseSchema
+>;
+
 export const browserNavigationResponseSchema = z
   .object({
     address: z.object({ kind: z.literal("address"), url: z.string().url() }),
@@ -1587,6 +1744,10 @@ export const rpcContract = defineRpcContract({
   browser_panel_visibility: {
     input: browserPanelVisibilityRequestSchema,
     output: browserStatusSchema,
+  },
+  browser_panel_capability: {
+    input: browserPanelCapabilityRequestSchema,
+    output: browserPanelCapabilityResponseSchema,
   },
   browser_settings_status: {
     input: z.object({ profileId: z.string().min(1) }).strict(),

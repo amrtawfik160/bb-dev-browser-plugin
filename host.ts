@@ -46,8 +46,11 @@ import {
   type BrowserScriptRuntimeError,
   type BrowserNavigationRequest,
   type BrowserPanelVisibilityRequest,
+  type BrowserPanelTransportRequest,
   type BrowserStatus,
 } from "./contracts.js";
+import { createPanelCapabilityStore } from "./panel-capability.js";
+import { createPanelGateway } from "./panel-gateway.js";
 import {
   ControlLeaseError,
   createControlLeaseManager,
@@ -329,6 +332,11 @@ export function createBrowserHostEntry(
   let retainedRuntime: BrowserInstanceRuntime | undefined =
     typeof runtimeSource === "object" ? runtimeSource : undefined;
   const controlLeases = createControlLeaseManager();
+  const panelCapabilities = createPanelCapabilityStore();
+  const panelGateways = new Map<
+    string,
+    ReturnType<typeof createPanelGateway>
+  >();
   const hostConnectionGenerations = new Map<string, number>();
   function administration(dataDir: string) {
     if (retainedBoundary !== undefined) return retainedBoundary;
@@ -558,6 +566,44 @@ export function createBrowserHostEntry(
     }
     return runtimeBrowserStatus(readiness, browserRuntime, controlLeases);
   }
+  async function openPanelTransport(
+    request: BrowserPanelTransportRequest,
+    dataDir: string,
+  ) {
+    const readiness = await administration(dataDir).inspect({
+      hostId: request.hostId,
+      profileId: request.profileId,
+    });
+    if (readiness.state !== "healthy" || readiness.hostId === null) {
+      throw new Error(readiness.message);
+    }
+    const gatewayKey = `${request.hostId}\u0000${request.profileId}\u0000${request.panelId}`;
+    let gateway = panelGateways.get(gatewayKey);
+    if (gateway === undefined) {
+      gateway = createPanelGateway({
+        capabilities: panelCapabilities,
+        hostId: request.hostId,
+        profileId: request.profileId,
+      });
+      panelGateways.set(gatewayKey, gateway);
+    }
+    const issued = panelCapabilities.issue({
+      ownerSessionId: request.ownerSessionId,
+      panelId: request.panelId,
+      hostId: request.hostId,
+      profileId: request.profileId,
+    });
+    return {
+      gatewayPort: gateway.choosePort(),
+      bindHost: gateway.declaredBindHost(),
+      capabilityId: issued.capabilityId,
+      secret: issued.secret,
+      expiresAt: new Date(issued.expiresAt).toISOString(),
+      rotatesAt: new Date(
+        issued.issuedAt + panelCapabilities.rotationMs,
+      ).toISOString(),
+    };
+  }
   function retainWorker(context: {
     experimental_retainWorker(): { dispose(): Promise<void> };
   }) {
@@ -776,6 +822,10 @@ export function createBrowserHostEntry(
         retainWorker(context);
         return setPanelVisibility(request, context.experimental_paths.dataDir);
       },
+      panelTransport: (request, context) => {
+        retainWorker(context);
+        return openPanelTransport(request, context.experimental_paths.dataDir);
+      },
       activityOutbox: async ({ limit }, context) => {
         retainWorker(context);
         return outbox(context.experimental_paths.dataDir).claim({
@@ -894,6 +944,9 @@ export function createBrowserHostEntry(
     dispose: async () => {
       try {
         controlLeases.dispose();
+        for (const gateway of panelGateways.values()) gateway.close();
+        panelGateways.clear();
+        panelCapabilities.dispose();
         await disposeRuntime();
       } finally {
         await workerLease?.dispose();
