@@ -16,6 +16,7 @@ import {
   type BrowserActivityRecord,
 } from "./contracts.js";
 import { BROWSER_AUTHORIZATION_MIGRATIONS } from "./authorization.js";
+import { GRANT_REQUEST_MIGRATION } from "./grant-requests.js";
 
 export { browserActivityEventFromOutboxItem as activityEventFromOutboxItem } from "./contracts.js";
 
@@ -107,13 +108,69 @@ ALTER TABLE browser_activity_records ADD COLUMN grant_scope TEXT;
 ALTER TABLE browser_activity_records ADD COLUMN grant_elevations TEXT;
 `;
 
+const activityGrantRequestMetadataMigration = `
+ALTER TABLE browser_activity_records ADD COLUMN request_id TEXT;
+`;
+
 export const BROWSER_DATABASE_MIGRATIONS = [
   ...legacyDatabaseMigrations,
   activityRecordsMigration,
   activityTombstonesMigration,
   ...BROWSER_AUTHORIZATION_MIGRATIONS,
+  GRANT_REQUEST_MIGRATION,
   activityGrantMetadataMigration,
+  activityGrantRequestMetadataMigration,
 ] as const;
+
+const skippedCompatibilityMigration = "SELECT 1";
+
+function tableExists(database: Database.Database, tableName: string): boolean {
+  return (
+    database
+      .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")
+      .get(tableName) !== undefined
+  );
+}
+
+function activityGrantMetadataExists(database: Database.Database): boolean {
+  if (!tableExists(database, "browser_activity_records")) return false;
+  const columns = new Set(
+    database
+      .prepare("PRAGMA table_info(browser_activity_records)")
+      .all()
+      .map((column) => (column as { name: string }).name),
+  );
+  return ["grant_id", "grant_scope", "grant_elevations"].every((column) =>
+    columns.has(column),
+  );
+}
+
+function activityGrantCompatibilityMigration(
+  database: Database.Database,
+): string {
+  const requestTableExists = tableExists(
+    database,
+    "browser_grant_request_events",
+  );
+  const grantMetadataExists = activityGrantMetadataExists(database);
+  if (grantMetadataExists && !requestTableExists) {
+    return GRANT_REQUEST_MIGRATION;
+  }
+  if (grantMetadataExists && requestTableExists) {
+    return skippedCompatibilityMigration;
+  }
+  return activityGrantMetadataMigration;
+}
+
+export function createBrowserDatabaseMigrationPlan(
+  database: Database.Database,
+): string[] {
+  return [
+    ...BROWSER_DATABASE_MIGRATIONS.slice(0, 12),
+    activityGrantCompatibilityMigration(database),
+    ...BROWSER_DATABASE_MIGRATIONS.slice(13),
+  ];
+}
 
 const activityRowSchema = z
   .object({
@@ -126,6 +183,7 @@ const activityRowSchema = z
     grant_id: browserProfileGrantIdSchema.nullable(),
     grant_scope: browserOriginScopeSchema.nullable(),
     grant_elevations: z.string().nullable(),
+    request_id: z.string().min(1).nullable(),
     destination_origin: z.string().min(1).nullable(),
     occurred_at: z.string().datetime(),
     kind: z.enum([
@@ -211,6 +269,7 @@ function activityRecordFromRow(activityRow: unknown): BrowserActivityRecord {
     grantId: parsed.grant_id,
     grantScope: parsed.grant_scope,
     grantElevations,
+    ...(parsed.request_id === null ? {} : { requestId: parsed.request_id }),
     destinationOrigin: parsed.destination_origin,
     occurredAt: parsed.occurred_at,
     kind: parsed.kind,
@@ -232,6 +291,7 @@ function sameActivityEvent(
     record.projectId === event.projectId &&
     record.hostId === event.hostId &&
     record.profileId === event.profileId &&
+    (record.requestId ?? null) === (event.requestId ?? null) &&
     (record.grantId ?? null) === (event.grantId ?? null) &&
     (record.grantScope ?? null) === (event.grantScope ?? null) &&
     JSON.stringify(record.grantElevations ?? null) ===
@@ -254,6 +314,7 @@ function activityEventValues(event: BrowserActivityEvent) {
     event.projectId,
     event.hostId,
     event.profileId,
+    event.requestId ?? null,
     event.grantId ?? null,
     event.grantScope ?? null,
     event.grantElevations === undefined || event.grantElevations === null
@@ -391,7 +452,7 @@ function findActivityRecord(
   const activityRow = database
     .prepare(
       `SELECT id, event_id, actor, project_id, host_id, profile_id,
-              grant_id, grant_scope, grant_elevations, destination_origin,
+              request_id, grant_id, grant_scope, grant_elevations, destination_origin,
               occurred_at, kind, action, outcome,
               interrupted, interruption_reason, duration_ms
        FROM browser_activity_records
@@ -422,10 +483,10 @@ function insertActivityEvent(
     .prepare(
       `INSERT INTO browser_activity_records
         (event_id, actor, project_id, host_id, profile_id,
-         grant_id, grant_scope, grant_elevations, destination_origin,
+         request_id, grant_id, grant_scope, grant_elevations, destination_origin,
          occurred_at, kind, action, outcome, interrupted,
          interruption_reason, duration_ms)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(...activityEventValues(event));
   return browserActivityRecordSchema.parse({
@@ -510,7 +571,7 @@ function selectActivityRecords(
   const rows = database
     .prepare(
       `SELECT id, event_id, actor, project_id, host_id, profile_id,
-              grant_id, grant_scope, grant_elevations, destination_origin,
+              request_id, grant_id, grant_scope, grant_elevations, destination_origin,
               occurred_at, kind, action, outcome,
               interrupted, interruption_reason, duration_ms
        FROM browser_activity_records

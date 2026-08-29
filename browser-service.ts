@@ -1,8 +1,12 @@
-import type { BbPluginApi, PluginAgentToolContext } from "@get-bb/plugin-sdk";
+import type {
+  BbPluginApi,
+  PluginAgentToolContext,
+  PluginCliContext,
+} from "@get-bb/plugin-sdk";
 import type Database from "better-sqlite3";
 import { z } from "zod";
 import {
-  BROWSER_DATABASE_MIGRATIONS,
+  createBrowserDatabaseMigrationPlan,
   createActivityRecordStore,
   createActivityRecordProducers,
   activityEventFromOutboxItem,
@@ -12,8 +16,14 @@ import {
 import {
   createProfileGrantStore,
   type BrowserAuthorizationDecision,
+  type BrowserAuthorizationSuccess,
 } from "./authorization.js";
+import type { GrantRequestEvent } from "./grant-requests.js";
 import {
+  browserGrantRequestDecisionRequestSchema,
+  browserGrantRequestDecisionResponseSchema,
+  browserGrantRequestQuerySchema,
+  browserGrantRequestsSchema,
   browserProfileIdSchema,
   browserProfileGrantSchema,
   browserProfileGrantsSchema,
@@ -55,6 +65,10 @@ import {
   type BrowserStatusInput,
   type BrowserScriptResponse,
   type BrowserActivityGrantMetadata,
+  type BrowserGrantRequest,
+  type BrowserGrantRequestDecisionRequest,
+  type BrowserGrantRequestDecisionResponse,
+  type BrowserGrantRequestQuery,
   type BrowserProfileGrant,
   type BrowserProfileGrantCreateRequest,
   type BrowserProfileGrantQuery,
@@ -89,6 +103,49 @@ type AgentScriptCall = {
   profileId: string;
   activity: AgentActivityInput;
 };
+
+const GRANT_REQUEST_ACTIVITY_ACTIONS = {
+  requested: "grant-request-created",
+  approved: "grant-request-approved",
+  denied: "grant-request-denied",
+  expired: "grant-request-expired",
+  consumed: "grant-request-consumed",
+  revoked: "grant-request-revoked",
+} satisfies Record<GrantRequestEvent["eventType"], string>;
+
+function grantRequestActivityOutcome(event: GrantRequestEvent) {
+  if (event.eventType === "requested") return "pending";
+  if (event.eventType !== "approved") return event.eventType;
+  if (event.request.decision === "retry") return "retry-approved";
+  if (event.request.decision === "one-hour") return "one-hour-approved";
+  return "persisted";
+}
+
+function grantRequestActivityActor(event: GrantRequestEvent) {
+  return event.actor;
+}
+
+function grantRequestActivityElevations(event: GrantRequestEvent) {
+  const { request } = event;
+  return {
+    wholeWeb: false,
+    fileTransfer: request.requestedElevations.fileTransfer,
+    invalidCertificateOrigins: request.requestedElevations.invalidCertificate
+      ? [request.origin]
+      : [],
+    persistentElevations: request.decision === "persist",
+  };
+}
+
+function grantRequestActivityMetadata(event: GrantRequestEvent) {
+  const { request } = event;
+  return {
+    requestId: request.requestId,
+    grantId: event.grantId ?? event.temporaryGrant?.grantId ?? null,
+    grantScope: request.origin,
+    grantElevations: grantRequestActivityElevations(event),
+  };
+}
 
 type LinkedAbortSignal = {
   signal: AbortSignal;
@@ -366,11 +423,13 @@ export function createBrowserService(
 ) {
   const ownerAuthority = suppliedOwnerAuthority ?? Symbol("browser-owner");
   const database = bb.storage.database();
-  bb.storage.migrate(database, [...BROWSER_DATABASE_MIGRATIONS]);
+  bb.storage.migrate(database, createBrowserDatabaseMigrationPlan(database));
   const activityStore: ActivityRecordStore =
     createActivityRecordStore(database);
   const activityProducers = createActivityRecordProducers(activityStore);
-  const grantStore = createProfileGrantStore(database);
+  const grantStore = createProfileGrantStore(database, {
+    onGrantRequestEvent: (event) => recordGrantRequestActivity(event),
+  });
   const activeGrantCalls = new Map<string, Set<AbortController>>();
   let grantStateQueue: Promise<void> = Promise.resolve();
   const host = bb.hosts.experimental_client({ contract: browserHostContract });
@@ -404,6 +463,14 @@ export function createBrowserService(
     for (const controller of activeGrantCalls.get(grantId) ?? []) {
       controller.abort();
     }
+  }
+
+  function abortGrantCallsForRequestEvent(event: GrantRequestEvent) {
+    if (event.eventType !== "expired" && event.eventType !== "revoked") {
+      return;
+    }
+    const grantId = event.grantId ?? event.temporaryGrant?.grantId;
+    if (grantId !== null && grantId !== undefined) abortGrantCalls(grantId);
   }
 
   function recordAgentActivity(
@@ -592,6 +659,26 @@ export function createBrowserService(
     };
   }
 
+  function recordGrantRequestActivity(event: GrantRequestEvent) {
+    abortGrantCallsForRequestEvent(event);
+    const request = event.request;
+    activityProducers.grant({
+      eventId: newActivityEventId("grant-request"),
+      occurredAt: event.occurredAt,
+      actor: grantRequestActivityActor(event),
+      projectId: request.projectId,
+      hostId: request.hostId,
+      profileId: request.profileId,
+      destinationOrigin: null,
+      ...grantRequestActivityMetadata(event),
+      action: GRANT_REQUEST_ACTIVITY_ACTIONS[event.eventType],
+      outcome: grantRequestActivityOutcome(event),
+      interrupted: false,
+      interruptionReason: null,
+      durationMs: null,
+    });
+  }
+
   function revokeDeletedProfileGrants(
     call: AgentScriptCall,
     installationId: string,
@@ -610,7 +697,12 @@ export function createBrowserService(
   function originDeniedResponse(
     call: AgentScriptCall,
     message: string,
+    grantRequest: BrowserGrantRequest | null = null,
   ): BrowserScriptResponse {
+    const surfacedMessage =
+      grantRequest === null
+        ? message
+        : `${message} Browser Grant Request ${grantRequest.requestId} is pending. The denied script will not resume automatically; after an owner decision, explicitly retry against current page state.`;
     return {
       ok: false,
       error: {
@@ -619,7 +711,8 @@ export function createBrowserService(
         label: "Origin denied",
         hostId: call.hostId,
         profileId: call.profileId,
-        message,
+        message: surfacedMessage,
+        grantRequest,
       },
     };
   }
@@ -627,9 +720,9 @@ export function createBrowserService(
   function authorizationResult(
     call: AgentScriptCall,
     decision: BrowserAuthorizationDecision,
-  ): BrowserScriptResponse | BrowserProfileGrant {
-    if (decision.allowed) return decision.grant;
-    return originDeniedResponse(call, decision.message);
+  ): BrowserScriptResponse | BrowserAuthorizationSuccess {
+    if (decision.allowed) return decision;
+    return originDeniedResponse(call, decision.message, decision.grantRequest);
   }
 
   function subscribeToHostReconnects() {
@@ -724,7 +817,7 @@ export function createBrowserService(
 
   async function authorizeAgentScript(
     call: AgentScriptCall,
-  ): Promise<BrowserScriptResponse | BrowserProfileGrant> {
+  ): Promise<BrowserScriptResponse | BrowserAuthorizationSuccess> {
     const readiness = await hostStatus(
       call.hostId,
       call.profileId,
@@ -765,6 +858,7 @@ export function createBrowserService(
   async function runAuthorizedAgentScript(
     call: AgentScriptCall,
     grant: BrowserProfileGrant,
+    temporaryGrant?: BrowserAuthorizationSuccess["temporaryGrant"],
   ) {
     const revocationController = new AbortController();
     const linked = linkedAbortSignal([
@@ -774,7 +868,15 @@ export function createBrowserService(
     const untrack = trackGrantCall(grant.grantId, revocationController);
     try {
       const currentGrant = grantStore.inspect(grant.grantId);
-      if (currentGrant === null || currentGrant.revokedAt !== null) {
+      const currentTemporary =
+        temporaryGrant === undefined
+          ? null
+          : grantStore.inspectTemporaryGrant(temporaryGrant.grantId);
+      if (
+        (temporaryGrant === undefined &&
+          (currentGrant === null || currentGrant.revokedAt !== null)) ||
+        (temporaryGrant !== undefined && currentTemporary === null)
+      ) {
         return await runWithAgentActivity(
           call.activity,
           call.hostId,
@@ -786,16 +888,38 @@ export function createBrowserService(
             ),
         );
       }
-      return await runWithAgentActivity(
-        call.activity,
-        call.hostId,
-        linked.signal,
-        () =>
-          host.call("browserScript", agentBrowserScriptRequest(call), {
-            hostId: call.hostId,
-            signal: linked.signal,
-          }),
-      );
+      const expiryTimer =
+        temporaryGrant === undefined
+          ? null
+          : setTimeout(
+              () => {
+                void withGrantStateSerialization(() => {
+                  grantStore.expireTemporaryGrant(
+                    temporaryGrant.grantId,
+                    new Date(temporaryGrant.expiresAt),
+                  );
+                  revocationController.abort();
+                });
+              },
+              Math.max(
+                0,
+                new Date(temporaryGrant.expiresAt).getTime() - Date.now(),
+              ),
+            );
+      try {
+        return await runWithAgentActivity(
+          call.activity,
+          call.hostId,
+          linked.signal,
+          () =>
+            host.call("browserScript", agentBrowserScriptRequest(call), {
+              hostId: call.hostId,
+              signal: linked.signal,
+            }),
+        );
+      } finally {
+        if (expiryTimer !== null) clearTimeout(expiryTimer);
+      }
     } finally {
       untrack();
       linked.dispose();
@@ -804,7 +928,7 @@ export function createBrowserService(
 
   async function runAgentBrowserScriptCall(call: AgentScriptCall) {
     const authorization = await authorizeAgentScript(call);
-    if (!("grantId" in authorization)) {
+    if ("ok" in authorization) {
       return runWithAgentActivity(
         call.activity,
         call.hostId,
@@ -812,7 +936,11 @@ export function createBrowserService(
         async () => authorization,
       );
     }
-    return runAuthorizedAgentScript(call, authorization);
+    return runAuthorizedAgentScript(
+      call,
+      authorization.grant,
+      authorization.temporaryGrant,
+    );
   }
 
   async function hostStatus(
@@ -1032,6 +1160,55 @@ export function createBrowserService(
     return browserProfileGrantsSchema.parse(grantStore.list(query));
   }
 
+  async function agentGrantRequestScope(
+    context: PluginCliContext,
+  ): Promise<BrowserGrantRequestQuery> {
+    const hostId = await resolvedHostId(bb, context);
+    if (hostId === null) {
+      throw new Error(
+        "Select a workspace host before reading Browser Grant Requests.",
+      );
+    }
+    const projectId = await profileContextProjectId(bb, context);
+    const inventory = await profileInventory(
+      {
+        hostId,
+        projectId: context.projectId,
+        threadId: context.threadId,
+      },
+      context.signal,
+    );
+    return {
+      projectId,
+      hostId,
+      installationId: inventory.installationId,
+      profileId: inventory.selectedProfileId,
+    };
+  }
+
+  async function listAgentGrantRequests(context: PluginCliContext) {
+    const scope = await agentGrantRequestScope(context);
+    return browserGrantRequestsSchema.parse(grantStore.listRequests(scope));
+  }
+
+  async function inspectAgentGrantRequest(
+    context: PluginCliContext,
+    requestId: string,
+  ) {
+    const scope = await agentGrantRequestScope(context);
+    const request = grantStore.inspectRequest(requestId);
+    if (
+      request === null ||
+      request.projectId !== scope.projectId ||
+      request.hostId !== scope.hostId ||
+      request.installationId !== scope.installationId ||
+      request.profileId !== scope.profileId
+    ) {
+      return null;
+    }
+    return request;
+  }
+
   async function inspectGrant(authority: unknown, grantId: string) {
     requireOwnerSettingsAuthority(authority);
     const grant = grantStore.inspect(grantId);
@@ -1096,6 +1273,51 @@ export function createBrowserService(
       outcome: (grantResponse) => grantResponse.outcome,
       grantMetadata: () => grantActivityMetadata(existing),
     });
+    return response;
+  }
+
+  async function listGrantRequests(
+    authority: unknown,
+    query: Partial<BrowserGrantRequestQuery> = {},
+  ) {
+    requireOwnerSettingsAuthority(authority);
+    return browserGrantRequestsSchema.parse(
+      grantStore.listRequests(browserGrantRequestQuerySchema.parse(query)),
+    );
+  }
+
+  async function inspectGrantRequest(authority: unknown, requestId: string) {
+    requireOwnerSettingsAuthority(authority);
+    const request = grantStore.inspectRequest(requestId);
+    return request === null ? null : request;
+  }
+
+  async function decideGrantRequest(
+    authority: unknown,
+    request: BrowserGrantRequestDecisionRequest,
+  ): Promise<BrowserGrantRequestDecisionResponse> {
+    requireOwnerSettingsAuthority(authority);
+    const parsed = browserGrantRequestDecisionRequestSchema.parse(request);
+    return browserGrantRequestDecisionResponseSchema.parse(
+      await withGrantStateSerialization(() => grantStore.decideRequest(parsed)),
+    );
+  }
+
+  async function revokeGrantRequest(
+    authority: unknown,
+    requestId: string,
+  ): Promise<BrowserGrantRequestDecisionResponse> {
+    requireOwnerSettingsAuthority(authority);
+    const response = browserGrantRequestDecisionResponseSchema.parse(
+      await withGrantStateSerialization(() =>
+        grantStore.revokeRequest(requestId),
+      ),
+    );
+    if (response.outcome === "revoked") {
+      const grantId =
+        response.temporaryGrant?.grantId ?? response.grant?.grantId;
+      if (grantId !== undefined) abortGrantCalls(grantId);
+    }
     return response;
   }
 
@@ -1439,6 +1661,12 @@ export function createBrowserService(
     createGrant,
     inspectGrant,
     revokeGrant,
+    listGrantRequests,
+    inspectGrantRequest,
+    listAgentGrantRequests,
+    inspectAgentGrantRequest,
+    decideGrantRequest,
+    revokeGrantRequest,
     activityRecords,
     clearActivityRecords,
     createProfile,

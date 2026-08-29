@@ -126,15 +126,16 @@ describe("Browser activity host outbox", () => {
         },
       },
     ],
+    ["requestId", { requestId: "grant-request-outbox-other" }],
   ])(
     "R8-04 rejects a duplicate with conflicting %s while deduplicating identical grant metadata",
     async (_field, conflictingGrantMetadata) => {
       const rootDirectory = await mkdtemp(join(tmpdir(), "bb-browser-outbox-"));
       const filePath = join(rootDirectory, "activity-outbox.json");
-      const event = activityEvent(
-        "outbox-event-grant-metadata",
-        GRANT_METADATA,
-      );
+      const event = activityEvent("outbox-event-grant-metadata", {
+        ...GRANT_METADATA,
+        requestId: "grant-request-outbox",
+      });
 
       try {
         const outbox = createActivityOutbox({
@@ -143,7 +144,10 @@ describe("Browser activity host outbox", () => {
         });
         await outbox.enqueue(event);
         await outbox.enqueue(
-          activityEvent(event.eventId, { ...GRANT_METADATA }),
+          activityEvent(event.eventId, {
+            ...GRANT_METADATA,
+            requestId: event.requestId,
+          }),
         );
         expect(await outbox.pending()).toHaveLength(1);
 

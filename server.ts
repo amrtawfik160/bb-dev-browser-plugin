@@ -13,6 +13,7 @@ import {
   browserScriptParametersSchema,
   type BrowserActivityRecord,
   type BrowserHostChoicesInput,
+  type BrowserGrantRequest,
   type BrowserProfileBackupRequest,
   type BrowserProfile,
   type BrowserProfileImportRequest,
@@ -31,13 +32,15 @@ import {
 } from "./contracts.js";
 
 const CLI_USAGE = [
-  "Usage: bb browser <status|diagnostics|activity|activity-export|activity-clear|list|create|rename|select|backup|restore|import|setup|disable|uninstall|purge> [options]",
+  "Usage: bb browser <status|diagnostics|activity|activity-export|activity-clear|requests|request-status|list|create|rename|select|backup|restore|import|setup|disable|uninstall|purge> [options]",
   "  setup [--profile <id>] [--step <id> --confirm <text>] [--json]",
   "  purge [--profile <id>] [--confirm <text>] [--json]",
   "  disable|uninstall [--profile <id>] --confirm <text> [--json]",
   "  activity [--profile <id>] [--json]",
   `  activity-export [--profile <id>] [--json]`,
   `  activity-clear [--profile <id>] --confirm "Clear Browser activity records" [--json]`,
+  "  requests [--json]",
+  "  request-status --request <id> [--json]",
   "  list [--host <id>] [--json]",
   "  create --name <name> [--locale <locale>] [--timezone <zone>] [--host <id>] [--json]",
   "  rename --profile <id> --name <name> [--locale <locale>] [--timezone <zone>] [--host <id>] [--json]",
@@ -54,6 +57,8 @@ const BROWSER_COMMANDS = [
   "activity",
   "activity-export",
   "activity-clear",
+  "requests",
+  "request-status",
   "list",
   "create",
   "rename",
@@ -80,6 +85,7 @@ type ParsedCliArguments = {
   sourcePath?: string;
   stepId?: z.output<typeof setupStepIdSchema>;
   confirmation?: string;
+  requestId?: string;
 };
 
 type CliArgumentParseResult =
@@ -214,6 +220,7 @@ type CliOptionName =
   | "--timezone"
   | "--archive"
   | "--source"
+  | "--request"
   | "confirmation";
 type ParsedCliOption = {
   name: CliOptionName;
@@ -229,7 +236,8 @@ function cliOptionName(argument: string): CliOptionName | null {
     argument === "--locale" ||
     argument === "--timezone" ||
     argument === "--archive" ||
-    argument === "--source"
+    argument === "--source" ||
+    argument === "--request"
   ) {
     return argument;
   }
@@ -263,6 +271,7 @@ type CliParseState = {
   sourcePath?: string;
   stepId?: ParsedCliArguments["stepId"];
   confirmation?: string;
+  requestId?: string;
 };
 
 function applyCliOption(
@@ -305,6 +314,10 @@ function applyCliOption(
     parseState.sourcePath = option.optionValue;
     return null;
   }
+  if (option.name === "--request") {
+    parseState.requestId = option.optionValue;
+    return null;
+  }
   parseState.confirmation = option.optionValue;
   return null;
 }
@@ -341,6 +354,12 @@ function validateCliCommandOptions(
     parseState.confirmation !== undefined
   ) {
     return `Confirmation is not valid for ${command}.\n${CLI_USAGE}`;
+  }
+  if (command !== "request-status" && parseState.requestId !== undefined) {
+    return "--request is only valid for request inspection.\n" + CLI_USAGE;
+  }
+  if (command === "request-status" && parseState.requestId === undefined) {
+    return `request-status requires --request.\n${CLI_USAGE}`;
   }
   if (
     command === "setup" &&
@@ -460,6 +479,7 @@ function parseCliArguments(argv: string[]): CliArgumentParseResult {
       sourcePath: parseState.sourcePath,
       stepId: parseState.stepId,
       confirmation: parseState.confirmation,
+      requestId: parseState.requestId,
     },
   };
 }
@@ -542,6 +562,56 @@ async function runActivityClearCli(
   return {
     exitCode: 0,
     stdout: json ? JSON.stringify(response) : response.message,
+  };
+}
+
+async function runGrantRequestsCli(
+  browser: BrowserService,
+  json: boolean,
+  context: PluginCliContext,
+) {
+  const requests = await browser.listAgentGrantRequests(context);
+  return {
+    exitCode: 0,
+    stdout: json
+      ? JSON.stringify(requests)
+      : requests.map(cliGrantRequestText).join("\n\n"),
+  };
+}
+
+function cliGrantRequestText(request: BrowserGrantRequest) {
+  return [
+    "Browser Grant Request " + request.requestId,
+    "Status: " + request.status,
+    "Origin: " + request.origin,
+    "Requested elevations: " +
+      (request.requestedElevations.fileTransfer
+        ? "file transfer"
+        : "standard") +
+      (request.requestedElevations.invalidCertificate
+        ? ", invalid certificate"
+        : ""),
+    "Decision: " + (request.decision ?? "none"),
+    "Expires: " + request.expiresAt,
+  ].join("\n");
+}
+
+async function runGrantRequestStatusCli(
+  browser: BrowserService,
+  requestId: string,
+  json: boolean,
+  context: PluginCliContext,
+) {
+  const request = await browser.inspectAgentGrantRequest(context, requestId);
+  if (request === null) {
+    return {
+      exitCode: 1,
+      stderr: `Browser Grant Request ${requestId} was not found.`,
+    };
+  }
+  return {
+    exitCode: 0,
+    stdout: json ? JSON.stringify(request) : cliGrantRequestText(request),
   };
 }
 
@@ -867,13 +937,19 @@ async function runCli(
 ) {
   const parsed = parseCliArguments(argv);
   if ("error" in parsed) return { exitCode: 1, stderr: parsed.error };
-  const { command, json, profileId, hostId } = parsed.arguments;
+  const { command, json, profileId, hostId, requestId } = parsed.arguments;
   try {
     if (command === "status") {
       return await runStatusCli(browser, profileId, hostId, json, context);
     }
     if (command === "diagnostics") {
       return await runDiagnosticsCli(browser, profileId, hostId, json, context);
+    }
+    if (command === "requests") {
+      return await runGrantRequestsCli(browser, json, context);
+    }
+    if (command === "request-status") {
+      return await runGrantRequestStatusCli(browser, requestId!, json, context);
     }
     return await runAdministrationCli(browser, parsed.arguments, context);
   } catch (error) {
@@ -944,6 +1020,16 @@ function registerCli(bb: BbPluginApi, browser: BrowserService) {
         summary: "Clear retained Browser activity metadata",
         usage:
           'bb browser activity-clear [--profile <id>] [--host <id>] --confirm "Clear Browser activity records" [--json]',
+      },
+      {
+        name: "requests",
+        summary: "List Browser Grant Requests",
+        usage: "bb browser requests [--json]",
+      },
+      {
+        name: "request-status",
+        summary: "Inspect a Browser Grant Request",
+        usage: "bb browser request-status --request <id> [--json]",
       },
       {
         name: "list",
@@ -1055,6 +1141,14 @@ export default function plugin(bb: BbPluginApi) {
     browser_grant_inspect: (input) =>
       browser.inspectGrant(ownerAuthority, input.grantId),
     browser_grant_revoke: (input) => browser.revokeGrant(ownerAuthority, input),
+    browser_grant_requests: (input) =>
+      browser.listGrantRequests(ownerAuthority, input),
+    browser_grant_request_inspect: (input) =>
+      browser.inspectGrantRequest(ownerAuthority, input.requestId),
+    browser_grant_request_decide: (input) =>
+      browser.decideGrantRequest(ownerAuthority, input),
+    browser_grant_request_revoke: (input) =>
+      browser.revokeGrantRequest(ownerAuthority, input.requestId),
     browser_profile_create: (input) => browser.createProfile(input),
     browser_profile_rename: (input) => browser.renameProfile(input),
     browser_profile_select: (input) => browser.selectProfile(input),

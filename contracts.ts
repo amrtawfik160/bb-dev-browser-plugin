@@ -591,6 +591,143 @@ export type BrowserProfileGrant = Omit<
 };
 export const browserProfileGrantsSchema = z.array(browserProfileGrantSchema);
 
+export const browserGrantRequestIdSchema = z
+  .string()
+  .regex(/^[A-Za-z0-9][A-Za-z0-9:_-]{0,127}$/u);
+export const browserGrantRequestDecisionSchema = z.enum([
+  "deny",
+  "retry",
+  "one-hour",
+  "persist",
+]);
+export const browserGrantRequestStatusSchema = z.enum([
+  "pending",
+  "denied",
+  "approved",
+  "consumed",
+  "expired",
+  "revoked",
+]);
+
+export const browserGrantRequestElevationsSchema = z
+  .object({
+    fileTransfer: z.boolean(),
+    invalidCertificate: z.boolean(),
+  })
+  .strict();
+
+export const browserGrantRequestSchema = z
+  .object({
+    requestId: browserGrantRequestIdSchema,
+    projectId: z.string().min(1),
+    hostId: z.string().min(1),
+    installationId: z.string().min(1),
+    profileId: browserProfileIdSchema,
+    origin: browserExactOriginSchema,
+    requestedElevations: browserGrantRequestElevationsSchema,
+    status: browserGrantRequestStatusSchema,
+    decision: browserGrantRequestDecisionSchema.nullable(),
+    expiresAt: z.string().datetime(),
+    decisionAt: z.string().datetime().nullable(),
+    consumedAt: z.string().datetime().nullable(),
+    expiredAt: z.string().datetime().nullable(),
+    revokedAt: z.string().datetime().nullable(),
+  })
+  .strict();
+
+export const browserTemporaryGrantSchema = z
+  .object({
+    grantId: browserProfileGrantIdSchema,
+    requestId: browserGrantRequestIdSchema,
+    projectId: z.string().min(1),
+    hostId: z.string().min(1),
+    installationId: z.string().min(1),
+    profileId: browserProfileIdSchema,
+    originScope: browserOriginScopeSchema,
+    wholeWeb: z.literal(false),
+    fileTransfer: z.boolean(),
+    invalidCertificateOrigins: z.array(browserExactOriginSchema).max(100),
+    mode: z.enum(["retry", "one-hour"]),
+    createdAt: z.string().datetime(),
+    expiresAt: z.string().datetime(),
+    consumedAt: z.string().datetime().nullable(),
+    revokedAt: z.string().datetime().nullable(),
+  })
+  .strict();
+
+export const browserGrantRequestsSchema = z.array(browserGrantRequestSchema);
+
+export const browserGrantRequestQuerySchema = z
+  .object({
+    requestId: browserGrantRequestIdSchema.optional(),
+    projectId: z.string().min(1).optional(),
+    hostId: z.string().min(1).optional(),
+    installationId: z.string().min(1).optional(),
+    profileId: browserProfileIdSchema.optional(),
+    status: browserGrantRequestStatusSchema.optional(),
+  })
+  .strict();
+
+export const browserGrantRequestDecisionRequestSchema = z
+  .object({
+    requestId: browserGrantRequestIdSchema,
+    decision: browserGrantRequestDecisionSchema.default("retry"),
+    persistenceConfirmation: z.string().optional(),
+  })
+  .strict();
+
+const browserGrantRequestDecisionResponseShapeSchema = z
+  .object({
+    outcome: z.enum([
+      "denied",
+      "retry-approved",
+      "one-hour-approved",
+      "persisted",
+      "already-decided",
+      "expired",
+      "revoked",
+      "not-found",
+    ]),
+    request: browserGrantRequestSchema,
+    temporaryGrant: browserTemporaryGrantSchema.nullable(),
+    grant: browserProfileGrantSchema.nullable(),
+  })
+  .strict();
+
+export const browserGrantRequestDecisionResponseSchema =
+  browserGrantRequestDecisionResponseShapeSchema;
+
+export type BrowserGrantRequestDecisionResponse = z.output<
+  typeof browserGrantRequestDecisionResponseSchema
+>;
+
+export const browserGrantRequestRevokeRequestSchema = z
+  .object({ requestId: browserGrantRequestIdSchema })
+  .strict();
+
+export type BrowserGrantRequest = z.output<typeof browserGrantRequestSchema>;
+export type BrowserTemporaryGrant = z.output<
+  typeof browserTemporaryGrantSchema
+>;
+export type BrowserAuthorizationRequest = {
+  projectId: string;
+  hostId: string;
+  installationId: string;
+  profileId: string;
+  origin: string;
+  fileTransfer?: boolean;
+  invalidCertificate?: boolean;
+};
+export type BrowserGrantRequestQuery = z.output<
+  typeof browserGrantRequestQuerySchema
+>;
+export type BrowserGrantRequestDecisionRequest = z.input<
+  typeof browserGrantRequestDecisionRequestSchema
+>;
+export type BrowserGrantRequestRevokeRequest = z.output<
+  typeof browserGrantRequestRevokeRequestSchema
+>;
+
 export const browserProfileGrantCreateRequestSchema = z
   .object({
     projectId: z.string().min(1),
@@ -676,6 +813,7 @@ export const browserOriginDeniedErrorSchema = z
     hostId: z.string().min(1).nullable(),
     profileId: z.string().min(1),
     message: z.string().min(1),
+    grantRequest: browserGrantRequestSchema.nullable(),
   })
   .strict();
 
@@ -862,6 +1000,7 @@ const browserActivityMetadataShape = {
   projectId: z.string().min(1).nullable(),
   hostId: z.string().min(1),
   profileId: z.string().min(1),
+  requestId: browserGrantRequestIdSchema.nullable().optional(),
   grantId: browserProfileGrantIdSchema.optional().nullable(),
   grantScope: browserOriginScopeSchema.optional().nullable(),
   grantElevations: browserActivityGrantElevationsSchema.optional().nullable(),
@@ -882,6 +1021,7 @@ export const browserActivityEventSchema = z
 const browserStatusFields = {
   ...browserStatusTargetSchema.shape,
   capabilities: z.array(readinessCapabilitySchema).length(9),
+  grantRequest: browserGrantRequestSchema.nullable().optional(),
 };
 
 export const browserStatusSchema = z.discriminatedUnion("state", [
@@ -1097,6 +1237,7 @@ export function browserActivityEventFromOutboxItem(
     projectId: outboxItem.projectId,
     hostId: outboxItem.hostId,
     profileId: outboxItem.profileId,
+    requestId: outboxItem.requestId,
     grantId: outboxItem.grantId,
     grantScope: outboxItem.grantScope,
     grantElevations: outboxItem.grantElevations,
@@ -1267,6 +1408,22 @@ export const rpcContract = defineRpcContract({
   browser_grant_revoke: {
     input: browserProfileGrantRevokeRequestSchema,
     output: browserProfileGrantRevokeResponseSchema,
+  },
+  browser_grant_requests: {
+    input: browserGrantRequestQuerySchema,
+    output: browserGrantRequestsSchema,
+  },
+  browser_grant_request_inspect: {
+    input: z.object({ requestId: browserGrantRequestIdSchema }).strict(),
+    output: browserGrantRequestSchema.nullable(),
+  },
+  browser_grant_request_decide: {
+    input: browserGrantRequestDecisionRequestSchema,
+    output: browserGrantRequestDecisionResponseSchema,
+  },
+  browser_grant_request_revoke: {
+    input: browserGrantRequestRevokeRequestSchema,
+    output: browserGrantRequestDecisionResponseSchema,
   },
   browser_profile_create: {
     input: browserProfileCreateRequestSchema,
