@@ -93,6 +93,15 @@ import {
   browserControlLeaseStateSchema,
   browserControlLeaseStateInputSchema,
   browserFileTransferDecisionSchema,
+  browserDownloadStartResponseSchema,
+  browserDownloadAppendOutcomeSchema,
+  browserDownloadCompleteOutcomeSchema,
+  browserDownloadCancelOutcomeSchema,
+  browserDownloadListResultSchema,
+  browserDownloadLimitsSchema,
+  browserDownloadProgressResultSchema,
+  browserDownloadExportOutcomeSchema,
+  browserDownloadPurgeOutcomeSchema,
   DEFAULT_PROFILE_ID,
   setupRequiredStatus,
   type BrowserHostTarget,
@@ -1221,6 +1230,109 @@ export async function createPublicPluginHarness(options?: {
         "browser_file_transfer_authorize",
         input,
       ) as Promise<ReturnType<typeof browserFileTransferDecisionSchema.parse>>,
+    browser_download_start: (
+      input: Parameters<
+        typeof rpcContract.browser_download_start.input.parse
+      >[0],
+    ) =>
+      backend.harness.behavior.callRpc(
+        "browser_download_start",
+        input,
+      ) as Promise<ReturnType<typeof browserDownloadStartResponseSchema.parse>>,
+    browser_download_append: (
+      input: Parameters<
+        typeof rpcContract.browser_download_append.input.parse
+      >[0],
+    ) =>
+      backend.harness.behavior.callRpc(
+        "browser_download_append",
+        input,
+      ) as Promise<ReturnType<typeof browserDownloadAppendOutcomeSchema.parse>>,
+    browser_download_complete: (
+      input: Parameters<
+        typeof rpcContract.browser_download_complete.input.parse
+      >[0],
+    ) =>
+      backend.harness.behavior.callRpc(
+        "browser_download_complete",
+        input,
+      ) as Promise<
+        ReturnType<typeof browserDownloadCompleteOutcomeSchema.parse>
+      >,
+    browser_download_fail: (
+      input: Parameters<
+        typeof rpcContract.browser_download_fail.input.parse
+      >[0],
+    ) =>
+      backend.harness.behavior.callRpc(
+        "browser_download_fail",
+        input,
+      ) as Promise<ReturnType<typeof browserDownloadPurgeOutcomeSchema.parse>>,
+    browser_download_cancel: (
+      input: Parameters<
+        typeof rpcContract.browser_download_cancel.input.parse
+      >[0],
+    ) =>
+      backend.harness.behavior.callRpc(
+        "browser_download_cancel",
+        input,
+      ) as Promise<ReturnType<typeof browserDownloadCancelOutcomeSchema.parse>>,
+    browser_download_list: (
+      input: Parameters<
+        typeof rpcContract.browser_download_list.input.parse
+      >[0],
+    ) =>
+      backend.harness.behavior.callRpc(
+        "browser_download_list",
+        input,
+      ) as Promise<ReturnType<typeof browserDownloadListResultSchema.parse>>,
+    browser_download_limits: (
+      input: Parameters<
+        typeof rpcContract.browser_download_limits.input.parse
+      >[0],
+    ) =>
+      backend.harness.behavior.callRpc(
+        "browser_download_limits",
+        input,
+      ) as Promise<ReturnType<typeof browserDownloadLimitsSchema.parse>>,
+    browser_download_progress: (
+      input: Parameters<
+        typeof rpcContract.browser_download_progress.input.parse
+      >[0],
+    ) =>
+      backend.harness.behavior.callRpc(
+        "browser_download_progress",
+        input,
+      ) as Promise<
+        ReturnType<typeof browserDownloadProgressResultSchema.parse>
+      >,
+    browser_download_export_client: (
+      input: Parameters<
+        typeof rpcContract.browser_download_export_client.input.parse
+      >[0],
+    ) =>
+      backend.harness.behavior.callRpc(
+        "browser_download_export_client",
+        input,
+      ) as Promise<ReturnType<typeof browserDownloadExportOutcomeSchema.parse>>,
+    browser_download_export_workspace: (
+      input: Parameters<
+        typeof rpcContract.browser_download_export_workspace.input.parse
+      >[0],
+    ) =>
+      backend.harness.behavior.callRpc(
+        "browser_download_export_workspace",
+        input,
+      ) as Promise<ReturnType<typeof browserDownloadExportOutcomeSchema.parse>>,
+    browser_download_purge: (
+      input: Parameters<
+        typeof rpcContract.browser_download_purge.input.parse
+      >[0],
+    ) =>
+      backend.harness.behavior.callRpc(
+        "browser_download_purge",
+        input,
+      ) as Promise<ReturnType<typeof browserDownloadPurgeOutcomeSchema.parse>>,
   };
 
   function renderSettings() {

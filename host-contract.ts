@@ -60,6 +60,26 @@ import {
   browserTransferProgressResultSchema,
   browserControlLeaseStateInputSchema,
   browserControlLeaseStateSchema,
+  browserDownloadStartInputSchema,
+  browserDownloadStartResponseSchema,
+  browserDownloadAppendInputSchema,
+  browserDownloadAppendOutcomeSchema,
+  browserDownloadCompleteInputSchema,
+  browserDownloadCompleteOutcomeSchema,
+  browserDownloadFailInputSchema,
+  browserDownloadCancelInputSchema,
+  browserDownloadCancelOutcomeSchema,
+  browserDownloadListInputSchema,
+  browserDownloadListResultSchema,
+  browserDownloadLimitsInputSchema,
+  browserDownloadLimitsSchema,
+  browserDownloadTargetInputSchema,
+  browserDownloadProgressResultSchema,
+  browserDownloadExportClientInputSchema,
+  browserDownloadExportWorkspaceInputSchema,
+  browserDownloadExportOutcomeSchema,
+  browserDownloadPurgeInputSchema,
+  browserDownloadPurgeOutcomeSchema,
 } from "./contracts.js";
 
 export const browserHostContract = defineRpcContract({
@@ -222,5 +242,49 @@ export const browserHostContract = defineRpcContract({
   controlLeaseState: {
     input: browserControlLeaseStateInputSchema,
     output: browserControlLeaseStateSchema,
+  },
+  downloadStart: {
+    input: browserDownloadStartInputSchema,
+    output: browserDownloadStartResponseSchema,
+  },
+  downloadAppend: {
+    input: browserDownloadAppendInputSchema,
+    output: browserDownloadAppendOutcomeSchema,
+  },
+  downloadComplete: {
+    input: browserDownloadCompleteInputSchema,
+    output: browserDownloadCompleteOutcomeSchema,
+  },
+  downloadFail: {
+    input: browserDownloadFailInputSchema,
+    output: browserDownloadPurgeOutcomeSchema,
+  },
+  downloadCancel: {
+    input: browserDownloadCancelInputSchema,
+    output: browserDownloadCancelOutcomeSchema,
+  },
+  downloadList: {
+    input: browserDownloadListInputSchema,
+    output: browserDownloadListResultSchema,
+  },
+  downloadLimits: {
+    input: browserDownloadLimitsInputSchema,
+    output: browserDownloadLimitsSchema,
+  },
+  downloadProgress: {
+    input: browserDownloadTargetInputSchema,
+    output: browserDownloadProgressResultSchema,
+  },
+  downloadExportClient: {
+    input: browserDownloadExportClientInputSchema,
+    output: browserDownloadExportOutcomeSchema,
+  },
+  downloadExportWorkspace: {
+    input: browserDownloadExportWorkspaceInputSchema,
+    output: browserDownloadExportOutcomeSchema,
+  },
+  downloadPurge: {
+    input: browserDownloadPurgeInputSchema,
+    output: browserDownloadPurgeOutcomeSchema,
   },
 });

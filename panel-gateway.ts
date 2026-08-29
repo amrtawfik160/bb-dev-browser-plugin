@@ -10,6 +10,7 @@ import {
   browserClipboardCopyMessageSchema,
   browserClipboardPasteMessageSchema,
   browserTransferCancelMessageSchema,
+  browserDownloadCancelMessageSchema,
   browserPanelRedeemMessageSchema,
   type BrowserPanelRedeemMessage,
 } from "./contracts.js";
@@ -39,7 +40,8 @@ export type PanelGatewayMessage =
   | { kind: "context_action"; actionId: string }
   | { kind: "clipboard_copy"; copyId: string }
   | { kind: "clipboard_paste"; pasteId: string; bytes: number }
-  | { kind: "transfer_cancel"; transferId: string };
+  | { kind: "transfer_cancel"; transferId: string }
+  | { kind: "download_cancel"; downloadId: string };
 
 export type PanelGatewayValidationResult =
   | { outcome: "accepted"; message: PanelGatewayMessage }
@@ -486,6 +488,30 @@ export function createPanelGateway(options: PanelGatewayOptions) {
         message: {
           kind: "transfer_cancel",
           transferId: cancelResult.data.transferId,
+        },
+      };
+    }
+    if (envelope.type === "download_cancel") {
+      const result = browserDownloadCancelMessageSchema.safeParse(parsed);
+      if (!result.success) {
+        return {
+          outcome: "rejected",
+          reason: "malformed",
+          message: "Panel gateway download cancel failed shape validation.",
+        };
+      }
+      if (!admitChromeAction(clock.now())) {
+        return {
+          outcome: "rejected",
+          reason: "rate-limited",
+          message: `Panel gateway download cancel exceeded the ${inputMaxPerSecond}-per-second rate limit.`,
+        };
+      }
+      return {
+        outcome: "accepted",
+        message: {
+          kind: "download_cancel",
+          downloadId: result.data.downloadId,
         },
       };
     }

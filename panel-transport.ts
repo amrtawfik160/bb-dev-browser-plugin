@@ -130,6 +130,19 @@ export type PanelTransportServerOptions = {
    * handling and gated to the controller.
    */
   onTransferCancel?: (transferId: string) => Promise<void>;
+  /**
+   * Host Downloads (issue #20). Called when the owner cancels a quarantined
+   * download through the panel so the host removes it. Exports go through the
+   * server RPC (which resolves BB environments), matching how other panel
+   * actions reach the host.
+   */
+  onDownloadCancel?: (downloadId: string) => Promise<void>;
+  /**
+   * Subscribe the panel to live Host Downloads quarantine state. When set, the
+   * transport pushes the current quarantine listing whenever the host updates
+   * it so the panel observes progress, state, limits, and expiry.
+   */
+  subscribeDownloads?: (onUpdate: (update: unknown) => void) => () => void;
 };
 
 export type PanelTransportServer = {
@@ -170,6 +183,9 @@ export function createPanelTransportServer(
   const onDisconnect = options.onDisconnect;
   const clipboardExchange = options.clipboardExchange;
   const onTransferCancel = options.onTransferCancel;
+  const onDownloadCancel = options.onDownloadCancel;
+  const subscribeDownloads = options.subscribeDownloads;
+  let unsubscribeDownloads: (() => void) | undefined;
   let server: WebSocketServer | undefined;
   let httpServer: Server | undefined;
   let boundPort: number | undefined;
@@ -266,6 +282,8 @@ export function createPanelTransportServer(
     connection = undefined;
     authorized = false;
     pendingContextQueryId = null;
+    unsubscribeDownloads?.();
+    unsubscribeDownloads = undefined;
     // Start the fail-closed timer so an open dialog is auto-resolved if the
     // controller does not reclaim within the bounded window.
     startFailClosedTimer();
@@ -294,6 +312,20 @@ export function createPanelTransportServer(
         openDialogs.set(event.dialogId, event);
         if (connection !== undefined && authorized)
           pushDialog(connection, event);
+      });
+    }
+    if (subscribeDownloads !== undefined) {
+      unsubscribeDownloads?.();
+      // Push the live Host Downloads quarantine state (progress, state,
+      // limits, expiry, errors) to the panel as it changes (issue #20).
+      unsubscribeDownloads = subscribeDownloads((update) => {
+        if (
+          connection !== undefined &&
+          authorized &&
+          connection.readyState === connection.OPEN
+        ) {
+          sendJson(connection, { type: "downloads_update", update });
+        }
       });
     }
   }
@@ -414,6 +446,21 @@ export function createPanelTransportServer(
           sendJson(socket, {
             type: "transfer_cancel_ack",
             transferId: message.transferId,
+          }),
+        )
+        .catch(() => undefined);
+      return;
+    }
+    if (message.kind === "download_cancel") {
+      // Owner cancels a quarantined download through the panel; route to the
+      // host so the quarantine file is removed.
+      if (!canInput() || onDownloadCancel === undefined) return;
+      void onDownloadCancel(message.downloadId)
+        .then(() =>
+          sendJson(socket, {
+            type: "download_ack",
+            downloadId: message.downloadId,
+            action: "cancelled",
           }),
         )
         .catch(() => undefined);

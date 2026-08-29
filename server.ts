@@ -1190,6 +1190,9 @@ async function runCli(
   if (argv[0] === "transfer") {
     return await runTransferCli(bb, browser, argv.slice(1), context);
   }
+  if (argv[0] === "downloads") {
+    return await runDownloadsCli(bb, browser, argv.slice(1), context);
+  }
   const parsed = parseCliArguments(argv);
   if ("error" in parsed) return { exitCode: 1, stderr: parsed.error };
   const { command, json, profileId, hostId, requestId } = parsed.arguments;
@@ -1449,6 +1452,286 @@ async function runTransferCli(
       exitCode: response.outcome === "staged" ? 0 : 1,
       stdout: cliJsonOrText(json, response, text),
     };
+  } catch (error) {
+    if (error instanceof Error) return { exitCode: 1, stderr: error.message };
+    throw error;
+  }
+}
+
+const DOWNLOADS_CLI_USAGE = [
+  "Usage: bb browser downloads <list|progress|cancel|export-client|export-workspace|limits|purge> [options]",
+  "  list:               [--profile <id>] [--host <id>] [--json]",
+  "  progress:           --download-id <id> [--profile <id>] [--host <id>] [--json]",
+  "  cancel:             --download-id <id> [--profile <id>] [--host <id>] [--json]",
+  "  export-client:     --download-id <id> [--actor owner|agent] [--profile <id>] [--host <id>] [--json]",
+  "  export-workspace:  --download-id <id> --environment <id> --path <relative-path> [--overwrite] [--actor owner|agent] [--profile <id>] [--host <id>] [--json]",
+  "  limits:            [--max-file-bytes <n>] [--max-profile-bytes <n>] [--expiry-ms <n>] [--profile <id>] [--host <id>] [--json]",
+  "  purge:             [--profile <id>] [--host <id>] [--json]",
+].join("\n");
+
+function readDownloadsOption(argv: string[], index: number, name: string) {
+  if (index + 1 >= argv.length) {
+    return { error: `${name} requires a value.\n${DOWNLOADS_CLI_USAGE}` };
+  }
+  return { value: argv[index + 1]!, nextIndex: index + 2 };
+}
+
+async function runDownloadsCli(
+  bb: BbPluginApi,
+  browser: BrowserService,
+  argv: string[],
+  context: PluginCliContext,
+) {
+  const action = argv[0];
+  if (action === undefined) {
+    return { exitCode: 1, stderr: DOWNLOADS_CLI_USAGE };
+  }
+  let downloadId: string | undefined;
+  let environmentId: string | undefined;
+  let relativePath: string | undefined;
+  let actor: "owner" | "agent" | undefined;
+  let profileId: string | undefined;
+  let hostId: string | undefined;
+  let overwrite = false;
+  let maxFileBytes: number | undefined;
+  let maxProfileBytes: number | undefined;
+  let expiryMs: number | undefined;
+  let json = false;
+  for (let index = 1; index < argv.length; index += 1) {
+    const argument = argv[index]!;
+    if (argument === "--json") {
+      json = true;
+      continue;
+    }
+    if (argument === "--overwrite") {
+      overwrite = true;
+      continue;
+    }
+    if (argument === "--download-id") {
+      const option = readDownloadsOption(argv, index, "--download-id");
+      if ("error" in option) return { exitCode: 1, stderr: option.error };
+      downloadId = option.value;
+      index = option.nextIndex;
+      continue;
+    }
+    if (argument === "--environment") {
+      const option = readDownloadsOption(argv, index, "--environment");
+      if ("error" in option) return { exitCode: 1, stderr: option.error };
+      environmentId = option.value;
+      index = option.nextIndex;
+      continue;
+    }
+    if (argument === "--path") {
+      const option = readDownloadsOption(argv, index, "--path");
+      if ("error" in option) return { exitCode: 1, stderr: option.error };
+      relativePath = option.value;
+      index = option.nextIndex;
+      continue;
+    }
+    if (argument === "--actor") {
+      const option = readDownloadsOption(argv, index, "--actor");
+      if ("error" in option) return { exitCode: 1, stderr: option.error };
+      actor = option.value as "owner" | "agent";
+      index = option.nextIndex;
+      continue;
+    }
+    if (argument === "--profile") {
+      const option = readDownloadsOption(argv, index, "--profile");
+      if ("error" in option) return { exitCode: 1, stderr: option.error };
+      profileId = option.value;
+      index = option.nextIndex;
+      continue;
+    }
+    if (argument === "--host") {
+      const option = readDownloadsOption(argv, index, "--host");
+      if ("error" in option) return { exitCode: 1, stderr: option.error };
+      hostId = option.value;
+      index = option.nextIndex;
+      continue;
+    }
+    if (argument === "--max-file-bytes") {
+      const option = readDownloadsOption(argv, index, "--max-file-bytes");
+      if ("error" in option) return { exitCode: 1, stderr: option.error };
+      maxFileBytes = Number(option.value);
+      index = option.nextIndex;
+      continue;
+    }
+    if (argument === "--max-profile-bytes") {
+      const option = readDownloadsOption(argv, index, "--max-profile-bytes");
+      if ("error" in option) return { exitCode: 1, stderr: option.error };
+      maxProfileBytes = Number(option.value);
+      index = option.nextIndex;
+      continue;
+    }
+    if (argument === "--expiry-ms") {
+      const option = readDownloadsOption(argv, index, "--expiry-ms");
+      if ("error" in option) return { exitCode: 1, stderr: option.error };
+      expiryMs = Number(option.value);
+      index = option.nextIndex;
+      continue;
+    }
+    return {
+      exitCode: 1,
+      stderr: `Unknown option: ${argument}.\n${DOWNLOADS_CLI_USAGE}`,
+    };
+  }
+  try {
+    const target = await browser.resolveTarget(context, profileId, hostId);
+    if (action === "list") {
+      const result = await browser.downloadList(
+        { hostId: target.hostId, profileId: target.profileId },
+        context.signal,
+      );
+      const text =
+        result.downloads.length === 0
+          ? "No quarantined downloads."
+          : result.downloads
+              .map(
+                (d) =>
+                  `${d.downloadId}: ${d.phase} ${d.safeName} (${d.sizeBytes} bytes, expires ${d.expiresAt})`,
+              )
+              .join("\n");
+      return { exitCode: 0, stdout: cliJsonOrText(json, result, text) };
+    }
+    if (action === "progress") {
+      if (downloadId === undefined) {
+        return {
+          exitCode: 1,
+          stderr: `progress requires --download-id.\n${DOWNLOADS_CLI_USAGE}`,
+        };
+      }
+      const result = await browser.downloadProgress(
+        downloadId,
+        target.hostId,
+        context.signal,
+      );
+      const text =
+        result === null
+          ? `Download ${downloadId}: not found.`
+          : `Download ${result.downloadId}: ${result.phase} (${result.bytesDownloaded}${result.totalBytes === null ? "" : `/${result.totalBytes}`} bytes).`;
+      return { exitCode: 0, stdout: cliJsonOrText(json, result ?? {}, text) };
+    }
+    if (action === "cancel") {
+      if (downloadId === undefined) {
+        return {
+          exitCode: 1,
+          stderr: `cancel requires --download-id.\n${DOWNLOADS_CLI_USAGE}`,
+        };
+      }
+      const outcome = await browser.downloadCancel(
+        { hostId: target.hostId, downloadId },
+        context.signal,
+      );
+      return {
+        exitCode: outcome.outcome === "cancelled" ? 0 : 1,
+        stdout: cliJsonOrText(
+          json,
+          outcome,
+          `Download ${downloadId}: ${outcome.outcome}.`,
+        ),
+      };
+    }
+    if (action === "export-client") {
+      if (downloadId === undefined) {
+        return {
+          exitCode: 1,
+          stderr: `export-client requires --download-id.\n${DOWNLOADS_CLI_USAGE}`,
+        };
+      }
+      const outcome = await browser.downloadExportClient(
+        {
+          hostId: target.hostId,
+          downloadId,
+          profileId: target.profileId,
+          ...(actor === undefined ? {} : { actor }),
+        },
+        context.signal,
+      );
+      const text =
+        outcome.outcome === "exported"
+          ? `Download ${outcome.downloadId}: exported to client (${outcome.sizeBytes} bytes).`
+          : `Download ${outcome.downloadId}: rejected (${outcome.reason}).`;
+      return {
+        exitCode: outcome.outcome === "exported" ? 0 : 1,
+        stdout: cliJsonOrText(json, outcome, text),
+      };
+    }
+    if (action === "export-workspace") {
+      if (downloadId === undefined) {
+        return {
+          exitCode: 1,
+          stderr: `export-workspace requires --download-id.\n${DOWNLOADS_CLI_USAGE}`,
+        };
+      }
+      if (environmentId === undefined || relativePath === undefined) {
+        return {
+          exitCode: 1,
+          stderr: `export-workspace requires --environment and --path.\n${DOWNLOADS_CLI_USAGE}`,
+        };
+      }
+      const environment = await bb.sdk.environments.get({
+        environmentId,
+        signal: context.signal,
+      });
+      if (environment.path === null) {
+        return {
+          exitCode: 1,
+          stderr: `Environment ${environmentId} has no workspace path.`,
+        };
+      }
+      const outcome = await browser.downloadExportWorkspace(
+        {
+          hostId: target.hostId,
+          downloadId,
+          profileId: target.profileId,
+          environmentRoot: environment.path,
+          relativePath,
+          overwriteConfirmed: overwrite || undefined,
+          ...(actor === undefined ? {} : { actor }),
+        },
+        context.signal,
+      );
+      const text =
+        outcome.outcome === "exported"
+          ? `Download ${outcome.downloadId}: exported to workspace (${outcome.sizeBytes} bytes).`
+          : `Download ${outcome.downloadId}: rejected (${outcome.reason}).`;
+      return {
+        exitCode: outcome.outcome === "exported" ? 0 : 1,
+        stdout: cliJsonOrText(json, outcome, text),
+      };
+    }
+    if (action === "limits") {
+      const limits = await browser.downloadLimits(
+        {
+          hostId: target.hostId,
+          profileId: target.profileId,
+          ...(maxFileBytes === undefined ? {} : { maxFileBytes }),
+          ...(maxProfileBytes === undefined ? {} : { maxProfileBytes }),
+          ...(expiryMs === undefined ? {} : { expiryMs }),
+        },
+        context.signal,
+      );
+      const text = `Limits: max file ${limits.maxFileBytes} bytes, max profile ${limits.maxProfileBytes} bytes, expiry ${limits.expiryMs} ms.`;
+      return { exitCode: 0, stdout: cliJsonOrText(json, limits, text) };
+    }
+    if (action === "purge") {
+      const outcome = await browser.downloadPurge(
+        {
+          hostId: target.hostId,
+          ...(target.profileId ? { profileId: target.profileId } : {}),
+        },
+        context.signal,
+      );
+      return {
+        exitCode: 0,
+        stdout: cliJsonOrText(
+          json,
+          outcome,
+          `Purged ${outcome.removed} download${outcome.removed === 1 ? "" : "s"}.`,
+        ),
+      };
+    }
+    return { exitCode: 1, stderr: DOWNLOADS_CLI_USAGE };
   } catch (error) {
     if (error instanceof Error) return { exitCode: 1, stderr: error.message };
     throw error;
@@ -1730,6 +2013,20 @@ export default function plugin(bb: BbPluginApi) {
       browser.controlLeaseState(input.hostId, input.profileId),
     browser_file_transfer_authorize: (input) =>
       browser.fileTransferAuthorization(input),
+    browser_download_start: (input) => browser.downloadStart(input),
+    browser_download_append: (input) => browser.downloadAppend(input),
+    browser_download_complete: (input) => browser.downloadComplete(input),
+    browser_download_fail: (input) => browser.downloadFail(input),
+    browser_download_cancel: (input) => browser.downloadCancel(input),
+    browser_download_list: (input) => browser.downloadList(input),
+    browser_download_limits: (input) => browser.downloadLimits(input),
+    browser_download_progress: (input) =>
+      browser.downloadProgress(input.downloadId, input.hostId),
+    browser_download_export_client: (input) =>
+      browser.downloadExportClient(input),
+    browser_download_export_workspace: (input) =>
+      browser.downloadExportWorkspace(input),
+    browser_download_purge: (input) => browser.downloadPurge(input),
     browser_host_choices: (input: BrowserHostChoicesInput) =>
       browser.hostChoices(input),
   });

@@ -20,6 +20,8 @@ import {
   BROWSER_PANEL_STREAM_DISCLOSURE,
   type BrowserContextAction,
   type BrowserDialogEvent,
+  type BrowserDownloadListingEntry,
+  type BrowserDownloadLimits,
   type BrowserHostChoice,
   type BrowserHostChoicesInput,
   type BrowserDiagnostics,
@@ -235,6 +237,99 @@ function PanelGrantRequestNotices({
   );
 }
 
+/**
+ * Host Downloads quarantine surface (issue #20). Surfaces progress,
+ * quarantine state, limits, expiry, and cancellation from privacy-safe
+ * metadata only — never file contents, full URLs, page data, or clipboard
+ * data. Exports go through the server RPC; cancellation is low-latency over
+ * the panel transport.
+ */
+function PanelDownloadsSurface({
+  downloads,
+  limits,
+  isController,
+  onCancel,
+}: {
+  downloads: (BrowserDownloadListingEntry & { error?: string | null })[];
+  limits: BrowserDownloadLimits | null;
+  isController: boolean;
+  onCancel: (downloadId: string) => void;
+}) {
+  return (
+    <section
+      aria-label="Browser Host Downloads quarantine"
+      className="mt-4 text-left"
+    >
+      <h3 className="text-sm font-medium">Host Downloads</h3>
+      <p className="mt-1 text-xs text-muted-foreground">
+        Downloads are quarantined on the workspace host and never opened or
+        exported automatically. Export is an explicit owner decision.
+      </p>
+      {limits === null ? null : (
+        <p className="mt-1 text-xs text-muted-foreground">
+          Limits: {Math.round(limits.maxFileBytes / (1024 * 1024))} MiB/file ·{" "}
+          {Math.round(limits.maxProfileBytes / (1024 * 1024 * 1024))}{" "}
+          GiB/profile · expires after{" "}
+          {Math.round(limits.expiryMs / (24 * 60 * 60_000))} days.
+        </p>
+      )}
+      {downloads.length === 0 ? (
+        <p className="mt-2 text-xs text-muted-foreground">
+          No quarantined downloads.
+        </p>
+      ) : (
+        <ul className="mt-2 space-y-2">
+          {downloads.map((download) => (
+            <li
+              key={download.downloadId}
+              className="rounded border p-2 text-xs"
+            >
+              <div className="flex flex-wrap items-baseline justify-between gap-2">
+                <strong className="break-all">{download.safeName}</strong>
+                <span aria-label="Download quarantine state">
+                  {download.phase}
+                </span>
+              </div>
+              <div className="mt-1 text-muted-foreground">
+                {download.sizeBytes}
+                {download.totalBytes === null
+                  ? " bytes"
+                  : `/${download.totalBytes} bytes`}{" "}
+                · expires {new Date(download.expiresAt).toLocaleString()}
+                {download.contentType === null
+                  ? ""
+                  : ` · ${download.contentType}`}
+              </div>
+              {download.error === null ||
+              download.error === undefined ? null : (
+                <p role="alert" className="mt-1 text-red-600">
+                  {download.error}
+                </p>
+              )}
+              <div className="mt-2 flex gap-2">
+                {download.phase === "downloading" && isController ? (
+                  <button
+                    type="button"
+                    className="rounded border px-2 py-1"
+                    onClick={() => onCancel(download.downloadId)}
+                  >
+                    Cancel download
+                  </button>
+                ) : null}
+                {download.phase === "quarantined" ? (
+                  <span className="text-muted-foreground">
+                    Export from the Downloads drawer (client or workspace).
+                  </span>
+                ) : null}
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+  );
+}
+
 function PanelStreamSurface({
   status,
   panelId,
@@ -273,6 +368,15 @@ function PanelStreamSurface({
     actions: BrowserContextAction[];
   } | null>(null);
   const [isController, setIsController] = useState(false);
+  // Host Downloads quarantine state (issue #20): progress, quarantine state,
+  // limits, expiry, export, cancellation, and errors surfaced from the host.
+  const [downloads, setDownloads] = useState<
+    (BrowserDownloadListingEntry & { error?: string | null })[]
+  >([]);
+  const [downloadsLimits, setDownloadsLimits] =
+    useState<BrowserDownloadLimits | null>(null);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
+  void downloadError;
   // The deterministic test environment has no real BB Connect tunnel; opening a
   // WebSocket there would attempt a real network call. The stream is exercised
   // against the provisioned host through the real-browser integration suite.
@@ -444,6 +548,36 @@ function PanelStreamSurface({
           }
           return;
         }
+        if (message.type === "downloads_update") {
+          // The host pushed the live Host Downloads quarantine listing. Only
+          // metadata (id, safe name, size, state, limits, expiry, errors) is
+          // carried — never file contents or full URLs (issue #20).
+          const payload = message as {
+            update?: {
+              downloads?: BrowserDownloadListingEntry[];
+              limits?: BrowserDownloadLimits;
+            } | null;
+          };
+          const update = payload.update ?? {};
+          if (Array.isArray(update.downloads)) {
+            setDownloads(update.downloads);
+          }
+          if (update.limits !== undefined) {
+            setDownloadsLimits(update.limits);
+          }
+          return;
+        }
+        if (message.type === "download_ack") {
+          const payload = message as {
+            downloadId?: string;
+            action?: string;
+          };
+          // Clear a transient cancellation error on acknowledgement.
+          if (payload.action === "cancelled") {
+            setDownloadError(null);
+          }
+          return;
+        }
         if (message.type === "control") {
           // The host pushed the live shared control state and tab strip; derive
           // this panel's own role from the panel list so the surface updates
@@ -557,6 +691,16 @@ function PanelStreamSurface({
     setContextMenu(null);
   }
 
+  /**
+   * Cancel a quarantined download through the low-latency panel transport
+   * (issue #20). Exports go through the server RPC because they resolve BB
+   * environments; cancellation is controller-gated like transfer cancellation.
+   */
+  function cancelDownload(downloadId: string) {
+    if (!isController) return;
+    sendStream({ type: "download_cancel", downloadId });
+  }
+
   if (capability?.outcome === "issued") {
     return (
       <section
@@ -610,6 +754,12 @@ function PanelStreamSurface({
             onClose={() => setContextMenu(null)}
           />
         )}
+        <PanelDownloadsSurface
+          downloads={downloads}
+          limits={downloadsLimits}
+          isController={isController}
+          onCancel={cancelDownload}
+        />
       </section>
     );
   }
