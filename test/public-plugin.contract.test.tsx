@@ -148,6 +148,11 @@ function publicRuntime(
     stop: async () => undefined,
     execute,
     navigate,
+    history: async (target, direction) => ({
+      address: { kind: "address", url: "about:blank" },
+      location: { direction, tabId: target.tabId ?? "public-tab" },
+      tabId: target.tabId ?? "public-tab",
+    }),
     status: async (target) => ({
       state: "running",
       hostId: target.hostId,
@@ -212,7 +217,15 @@ describe("Browser public plugin contract", () => {
     const status = browserStatusSchema.parse(JSON.parse(cli.stdout));
     expect(status.state).toBe("healthy");
     expect(status.capabilities).toHaveLength(9);
-    expect(browser.sharedPortDeclarations).toEqual([]);
+    // A healthy Browser Panel declares its dynamic loopback gateway port to
+    // BB Connect for owner-session-gated tunneling; raw listeners stay
+    // loopback-only and the panel never opens the gateway directly.
+    expect(browser.sharedPortDeclarations).toHaveLength(1);
+    expect(browser.sharedPortDeclarations[0]?.hostId).toBe("host-browser-test");
+    expect(browser.sharedPortDeclarations[0]?.ports).toHaveLength(1);
+    expect(browser.sharedPortDeclarations[0]?.ports[0]).toBeGreaterThanOrEqual(
+      49152,
+    );
     await browser.dispose();
   });
 
@@ -382,6 +395,44 @@ describe("Browser public plugin contract", () => {
       await panel.panel.findByText("http://p-project.localhost:4173/account"),
     ).toBeTruthy();
     await browser.dispose();
+  });
+
+  it("routes back, forward, and reload from the Browser Panel to the authenticated transport", async () => {
+    const browser = await createPublicPluginHarness({
+      status: healthyStatus,
+      navigationResponse: {
+        address: {
+          kind: "address",
+          url: "http://p-project.localhost:4173/account",
+        },
+        location: { url: "http://p-project.localhost:4173/account" },
+        tabId: "shared-tab-1",
+      },
+    });
+    try {
+      const panel = await browser.openExistingThreadPanel();
+      for (const [label] of [
+        ["Go back", "back"],
+        ["Go forward", "forward"],
+        ["Reload page", "reload"],
+      ] as const) {
+        const button = await panel.panel.findByRole("button", { name: label });
+        fireEvent.click(button);
+      }
+      await waitFor(() => expect(browser.historyRequests).toHaveLength(3));
+      expect(browser.historyRequests[0]).toMatchObject({
+        hostId: "host-browser-test",
+        profileId: DEFAULT_PROFILE_ID,
+        projectId: "project-browser-test",
+        direction: "back",
+      });
+      expect(browser.historyRequests[1]).toMatchObject({
+        direction: "forward",
+      });
+      expect(browser.historyRequests[2]).toMatchObject({ direction: "reload" });
+    } finally {
+      await browser.dispose();
+    }
   });
 
   it("opens one full-bleed Setup required panel per profile on an existing thread", async () => {
@@ -4256,6 +4307,160 @@ describe("Browser public plugin contract", () => {
     fireEvent.change(hostPicker, { target: { value: "host-b" } });
     await panel.panel.findByRole("combobox", { name: "Browser Profile" });
     await browser.dispose();
+  });
+
+  it("requires BB Connect enrollment to mint a Panel Capability and declares the loopback gateway port", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: { ...preparedSnapshot, connect: { enrolled: true } },
+    });
+    try {
+      const response = await browser.runBrowserPanelCapability({
+        hostId: "host-browser-test",
+        profileId: DEFAULT_PROFILE_ID,
+        panelId: "panel-capability-1",
+      });
+      if (response.outcome !== "issued") {
+        throw new Error("expected an issued Panel Capability");
+      }
+      expect(response.secret).not.toContain(response.capabilityId);
+      expect(response.secret.length).toBeGreaterThan(0);
+      expect(response.gatewayPort).toBeGreaterThanOrEqual(49152);
+      expect(response.gatewayPort).toBeLessThanOrEqual(65535);
+      expect(response.tunnel).toEqual({
+        label: "ci-gate",
+        baseDomain: "ci.getbb.app",
+      });
+      // The dynamic loopback gateway port is declared to BB Connect for
+      // owner-session-gated tunneling; raw listeners stay loopback-only.
+      expect(browser.sharedPortDeclarations).toEqual([
+        { hostId: "host-browser-test", ports: [response.gatewayPort] },
+      ]);
+      // The capability is redeemed in the first WebSocket message, never a URL.
+      expect(JSON.stringify(response)).not.toContain("ws://");
+      expect(JSON.stringify(response)).not.toContain("127.0.0.1");
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("refuses a Panel Capability without BB Connect enrollment even on a locally displayed client", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: { ...preparedSnapshot, connect: { enrolled: false } },
+    });
+    try {
+      const response = await browser.runBrowserPanelCapability({
+        hostId: "host-browser-test",
+        profileId: DEFAULT_PROFILE_ID,
+        panelId: "panel-capability-2",
+      });
+      expect(response.outcome).toBe("unavailable");
+      if (response.outcome === "unavailable") {
+        expect(response.reason).toBe("bb-connect-required");
+        expect(response.message).toMatch(/BB Connect/i);
+      }
+      expect(browser.sharedPortDeclarations).toEqual([]);
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("refuses a Panel Capability on a setup-required host without exposing transport secrets", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: {
+        ...preparedSnapshot,
+        browser: null,
+        dedicatedUser: { state: "missing" as const },
+        protectedStorage: { state: "partial" as const },
+      },
+    });
+    try {
+      const response = await browser.runBrowserPanelCapability({
+        hostId: "host-browser-test",
+        profileId: DEFAULT_PROFILE_ID,
+        panelId: "panel-capability-3",
+      });
+      expect(response.outcome).toBe("unavailable");
+      if (response.outcome === "unavailable") {
+        expect(response.reason).toBe("setup-required");
+      }
+      expect(browser.sharedPortDeclarations).toEqual([]);
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("binds the Panel Capability to the owner session derived from the BB app context, not a hardcoded literal", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+    });
+    try {
+      const panel = await browser.openExistingThreadPanel();
+      await panel.panel.findByRole("region", {
+        name: "Browser Automation Mode stream",
+      });
+      await waitFor(() =>
+        expect(browser.panelCapabilityRequests.length).toBeGreaterThan(0),
+      );
+      const request = browser.panelCapabilityRequests[0]!;
+      // The owner session is derived from the BB app context (the test harness
+      // renders the panel with a null context), never the legacy literal.
+      expect(request.ownerSessionId).not.toBe("owner-session-panel");
+      expect(request.ownerSessionId).toMatch(/^bb-owner-session:/);
+      // The panel surface never exposes transport secrets.
+      expect(panel.panel.container.innerHTML).not.toContain("ws://");
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("renders the Automation Mode stream surface in the healthy Browser Panel without exposing transport secrets", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+    });
+    try {
+      const panel = await browser.openExistingThreadPanel();
+      const streamSection = await panel.panel.findByRole("region", {
+        name: "Browser Automation Mode stream",
+      });
+      expect(streamSection.textContent).toContain("5 and 15");
+      expect(streamSection.textContent).toContain("1920");
+      const modeIndicator = panel.panel.getByRole("img", {
+        name: "Browser mode indicator",
+      });
+      expect(modeIndicator.textContent).toContain("Automation Mode");
+      // The rendered panel surface never exposes transport secrets.
+      expect(panel.panel.container.innerHTML).not.toContain("ws://");
+      const serialized = JSON.stringify(panel.panel.container.innerHTML);
+      expect(serialized).not.toContain("ci-gate");
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("renders the Safe Login elsewhere panel state without exposing transport secrets", async () => {
+    const browser = await createPublicPluginHarness({
+      status: browserStatusSchema.parse({
+        ...healthyStatus,
+        state: "safe-login-elsewhere",
+        code: "safe_login_elsewhere",
+        label: "Safe Login elsewhere",
+        message:
+          "This Browser Profile is in owner-only Safe Login Mode on another panel.",
+      }),
+    });
+    try {
+      const panel = await browser.openExistingThreadPanel();
+      await panel.panel.findByRole("status", {
+        name: "Safe Login elsewhere",
+      });
+      const status = browserStatusSchema.parse(
+        JSON.parse((await browser.runStatusCli()).stdout),
+      );
+      expect(status.state).toBe("safe-login-elsewhere");
+      expect(status.code).toBe("safe_login_elsewhere");
+    } finally {
+      await browser.dispose();
+    }
   });
 
   it("keeps public UI and CLI profile operations isolated across simulated hosts", async () => {

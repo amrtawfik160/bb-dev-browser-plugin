@@ -1,11 +1,12 @@
 import {
   useCallback,
   useEffect,
+  useRef,
   useState,
   type FormEvent,
   type ReactNode,
 } from "react";
-import { definePluginApp, useRpc } from "@get-bb/plugin-sdk/app";
+import { definePluginApp, useBbContext, useRpc } from "@get-bb/plugin-sdk/app";
 import type {
   PluginNewThreadPanelProps,
   PluginThreadPanelProps,
@@ -22,6 +23,7 @@ import {
   type BrowserActivityExport,
   type BrowserActivityRecord,
   type BrowserGrantRequest,
+  type BrowserPanelCapabilityResponse,
   type BrowserProfile,
   type BrowserProfileGrant,
   type BrowserProfileInventory,
@@ -33,6 +35,11 @@ import {
   type BrowserStatusInput,
   type rpcContract,
 } from "./contracts.js";
+import { ownerSessionIdFromContext } from "./panel-owner-session.js";
+import {
+  createAutomationStreamAdapter,
+  type PanelStreamAdapter,
+} from "./panel-stream.js";
 
 const panelParams = { profileId: DEFAULT_PROFILE_ID } as const;
 const GRANT_REQUEST_REFRESH_INTERVAL_MS = 1_000;
@@ -202,6 +209,267 @@ function PanelGrantRequestNotices({
           </li>
         ))}
       </ul>
+    </section>
+  );
+}
+
+function PanelStreamSurface({
+  status,
+  panelId,
+}: {
+  status: BrowserStatus;
+  panelId: string;
+}) {
+  const rpc = useRpc<typeof rpcContract>();
+  const bbContext = useBbContext();
+  const [capability, setCapability] = useState<
+    BrowserPanelCapabilityResponse | undefined
+  >();
+  const [streamState, setStreamState] = useState<
+    "connecting" | "streaming" | "reconnecting" | "offline"
+  >("connecting");
+  const [streamError, setStreamError] = useState<string | null>(null);
+  const ownerSessionId = ownerSessionIdFromContext(bbContext);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const streamRef = useRef<PanelStreamAdapter | null>(null);
+  // The deterministic test environment has no real BB Connect tunnel; opening a
+  // WebSocket there would attempt a real network call. The stream is exercised
+  // against the provisioned host through the real-browser integration suite.
+  const isTestEnvironment =
+    typeof import.meta !== "undefined" &&
+    typeof (import.meta as { env?: { MODE?: string } }).env === "object" &&
+    (import.meta as { env?: { MODE?: string } }).env?.MODE === "test";
+
+  useEffect(() => {
+    if (status.state !== "healthy" || status.hostId === null) {
+      setCapability(undefined);
+      setStreamState("offline");
+      return;
+    }
+    let disposed = false;
+    setStreamState("connecting");
+    setStreamError(null);
+    void rpc
+      .call("browser_panel_capability", {
+        hostId: status.hostId,
+        profileId: status.profileId,
+        panelId,
+        ownerSessionId,
+      })
+      .then((response) => {
+        if (disposed) return;
+        if (response.outcome === "unavailable") {
+          setStreamState("offline");
+          setStreamError(response.message);
+          return;
+        }
+        setCapability(response);
+        // The capability is redeemed in the first WebSocket message rather than
+        // placed in a URL. The panel never opens the loopback gateway directly;
+        // BB Connect's owner-session gate carries the opaque single-use secret.
+        setStreamState("streaming");
+      })
+      .catch((error: unknown) => {
+        if (disposed) return;
+        setStreamState("offline");
+        setStreamError(
+          error instanceof Error ? error.message : "Browser transport failed.",
+        );
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [
+    rpc,
+    status.state,
+    status.hostId,
+    status.profileId,
+    panelId,
+    ownerSessionId,
+  ]);
+
+  // Drive the authenticated stream: open a WebSocket through the BB Connect
+  // tunnel, redeem the capability in the first message, render frames on the
+  // canvas, and reconnect with bounded backoff on disconnect. Input freezes
+  // immediately on disconnect; the same panel has a 10-second reclaim window.
+  useEffect(() => {
+    if (capability?.outcome !== "issued" || isTestEnvironment) return;
+    let disposed = false;
+    let socket: WebSocket | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    const stream = createAutomationStreamAdapter();
+    streamRef.current = stream;
+    stream.start();
+
+    function clearReconnect() {
+      if (reconnectTimer !== null) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+    }
+
+    function drawFrame(frame: { mimeType: string; data: string }) {
+      const canvas = canvasRef.current;
+      if (canvas === null) return;
+      const image = new Image();
+      image.addEventListener("load", () => {
+        const context = canvas.getContext("2d");
+        if (context === null) return;
+        context.clearRect(0, 0, canvas.width, canvas.height);
+        context.drawImage(image, 0, 0, canvas.width, canvas.height);
+      });
+      image.src = `data:${frame.mimeType};base64,${frame.data}`;
+    }
+
+    function scheduleReconnect() {
+      if (disposed) return;
+      const delay = stream.beginReconnect();
+      if (delay === 0) {
+        setStreamState("offline");
+        return;
+      }
+      setStreamState("reconnecting");
+      clearReconnect();
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        if (!disposed) connect();
+      }, delay);
+    }
+
+    function connect() {
+      if (disposed) return;
+      const issued = capability;
+      if (issued?.outcome !== "issued") return;
+      // The tunnel URL is constructed from the BB Connect identity the host
+      // declared; it is never rendered into the DOM or exposed to agents.
+      const url = `wss://${issued.tunnel.label}.${issued.tunnel.baseDomain}`;
+      try {
+        socket = new WebSocket(url);
+      } catch {
+        if (!disposed) scheduleReconnect();
+        return;
+      }
+      socket.binaryType = "arraybuffer";
+      socket.addEventListener("open", () => {
+        if (disposed || socket === null) return;
+        socket.send(
+          JSON.stringify({
+            type: "redeem",
+            capabilityId: issued.capabilityId,
+            secret: issued.secret,
+            ownerSessionId,
+            panelId,
+          }),
+        );
+      });
+      socket.addEventListener("message", (event) => {
+        if (disposed) return;
+        if (typeof event.data !== "string") return;
+        let message: {
+          type?: string;
+          sequence?: number;
+          mimeType?: string;
+          data?: string;
+        };
+        try {
+          message = JSON.parse(event.data);
+        } catch {
+          return;
+        }
+        if (message.type === "ready") {
+          if (stream.state === "reconnecting") stream.reconnectSucceeded();
+          setStreamState("streaming");
+          return;
+        }
+        if (message.type === "frame" && message.data !== undefined) {
+          drawFrame({
+            mimeType: message.mimeType ?? "image/png",
+            data: message.data,
+          });
+          return;
+        }
+        if (message.type === "error") {
+          socket?.close();
+        }
+      });
+      socket.addEventListener("close", () => {
+        socket = null;
+        if (disposed) return;
+        // Input freezes immediately on disconnect; reconnect uses bounded
+        // backoff driven by the stream adapter.
+        stream.freezeInput();
+        scheduleReconnect();
+      });
+      socket.addEventListener("error", () => {
+        if (disposed || socket === null) return;
+        socket.close();
+      });
+    }
+
+    connect();
+
+    return () => {
+      disposed = true;
+      clearReconnect();
+      stream.release();
+      streamRef.current = null;
+      if (socket !== null) {
+        socket.close();
+        socket = null;
+      }
+    };
+  }, [capability, ownerSessionId, panelId, isTestEnvironment]);
+
+  // Render the stream surface whenever the panel is authorized to stream. The
+  // region always carries the Automation Mode policy text so spectators see the
+  // viewport bounds and FPS window regardless of the live connection state.
+  if (capability?.outcome === "issued") {
+    return (
+      <section
+        aria-label="Browser Automation Mode stream"
+        className="mt-5 text-left"
+      >
+        <p className="text-sm">
+          Automation Mode is streaming the shared Browser viewport.
+        </p>
+        <p className="mt-2 text-xs text-muted-foreground">
+          Frames adapt between 5 and 15 per second up to 1920×1080. Input is
+          owner-gated and freezes immediately on disconnect.
+        </p>
+        <canvas
+          ref={canvasRef}
+          aria-label="Browser stream surface"
+          role="img"
+          width={1920}
+          height={1080}
+          className="mt-3 h-64 w-full rounded border bg-muted"
+        />
+        <p className="mt-2 text-xs text-muted-foreground" aria-live="polite">
+          {streamState === "streaming"
+            ? "Stream live."
+            : streamState === "reconnecting"
+              ? "Reconnecting the Browser stream with bounded backoff…"
+              : streamState === "connecting"
+                ? "Opening the authenticated Browser transport…"
+                : "The Browser stream is offline."}
+        </p>
+      </section>
+    );
+  }
+  return (
+    <section aria-label="Browser transport status" className="mt-5 text-left">
+      <p className="text-sm">
+        {streamState === "connecting"
+          ? "Opening the authenticated Browser transport…"
+          : streamState === "reconnecting"
+            ? "Reconnecting the Browser stream with bounded backoff…"
+            : "The Browser stream is offline."}
+      </p>
+      {streamError === null ? null : (
+        <p role="alert" className="mt-2 text-xs text-muted-foreground">
+          {streamError}
+        </p>
+      )}
     </section>
   );
 }
@@ -383,13 +651,17 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
 
   function navigate(event: FormEvent) {
     event.preventDefault();
+    navigateTo(navigationInput);
+  }
+
+  function navigateTo(input: string) {
     const hostId = status?.hostId;
     const profileId = status?.profileId;
     if (
       hostId === null ||
       hostId === undefined ||
       profileId === undefined ||
-      navigationInput.trim() === ""
+      input.trim() === ""
     ) {
       return;
     }
@@ -399,8 +671,30 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
         ...request,
         hostId,
         profileId,
-        input: navigationInput,
+        input,
         rawLocalhost,
+      })
+      .then((response) => {
+        setNavigationLocation(response.address.url);
+      })
+      .catch((error: unknown) =>
+        setProfileError(administrationErrorMessage(error)),
+      );
+  }
+
+  function navigateHistory(direction: "back" | "forward" | "reload") {
+    const hostId = status?.hostId;
+    const profileId = status?.profileId;
+    if (hostId === null || hostId === undefined || profileId === undefined) {
+      return;
+    }
+    setProfileError(null);
+    void rpc
+      .call("browser_history", {
+        ...request,
+        hostId,
+        profileId,
+        direction,
       })
       .then((response) => {
         setNavigationLocation(response.address.url);
@@ -427,7 +721,40 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
       )}
       {status.state !== "healthy" ? null : (
         <form className="mt-5 text-left" onSubmit={navigate}>
-          <label className="block text-sm" htmlFor="browser-address">
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              aria-label="Go back"
+              className="rounded border px-2 py-1 text-sm"
+              onClick={() => navigateHistory("back")}
+            >
+              ←
+            </button>
+            <button
+              type="button"
+              aria-label="Go forward"
+              className="rounded border px-2 py-1 text-sm"
+              onClick={() => navigateHistory("forward")}
+            >
+              →
+            </button>
+            <button
+              type="button"
+              aria-label="Reload page"
+              className="rounded border px-2 py-1 text-sm"
+              onClick={() => navigateHistory("reload")}
+            >
+              ⟳
+            </button>
+            <span
+              role="img"
+              aria-label="Browser mode indicator"
+              className="ml-auto text-xs text-muted-foreground"
+            >
+              Automation Mode
+            </span>
+          </div>
+          <label className="mt-2 block text-sm" htmlFor="browser-address">
             Address or search
           </label>
           <div className="mt-2 flex gap-2">
@@ -457,6 +784,9 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
           )}
         </form>
       )}
+      {status.state === "healthy" ? (
+        <PanelStreamSurface status={status} panelId={panelId} />
+      ) : null}
       <PanelGrantRequestNotices requests={grantRequests} />
       {profileError === null ? null : <p role="alert">{profileError}</p>}
     </ReadinessView>

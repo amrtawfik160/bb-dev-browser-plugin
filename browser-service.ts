@@ -82,7 +82,10 @@ import {
   type BrowserProfileGrantRevokeRequest,
   type BrowserProfileGrantRevokeResponse,
   type BrowserPanelNavigationInput,
+  type BrowserPanelHistoryInput,
   type BrowserPanelVisibilityRequest,
+  type BrowserPanelCapabilityRequest,
+  type BrowserPanelCapabilityResponse,
   type BrowserNavigationResponse,
 } from "./contracts.js";
 import { browserHostContract } from "./host-contract.js";
@@ -2296,6 +2299,30 @@ export function createBrowserService(
     );
   }
 
+  async function history(
+    request: BrowserPanelHistoryInput,
+    signal?: AbortSignal,
+  ): Promise<BrowserNavigationResponse> {
+    const identity = panelIdentity(request);
+    const hostId = await resolvedHostId(bb, identity);
+    if (hostId === null || hostId !== request.hostId) {
+      throw new Error("The selected workspace host is unavailable.");
+    }
+    const projectId = await profileContextProjectId(bb, identity);
+    await requireConnectedHost(hostId, signal);
+    return host.call(
+      "history",
+      {
+        hostId,
+        profileId: request.profileId,
+        projectId,
+        direction: request.direction,
+        ...(request.tabId === undefined ? {} : { tabId: request.tabId }),
+      },
+      { hostId, signal },
+    );
+  }
+
   async function panelVisibility(
     request: BrowserPanelVisibilityRequest,
     signal?: AbortSignal,
@@ -2307,13 +2334,94 @@ export function createBrowserService(
     });
   }
 
+  /**
+   * Mint a single-use Panel Capability that bootstraps an authenticated stream
+   * connection. BB Connect enrollment is required even for a locally
+   * displayed client; the host never exposes the loopback gateway directly.
+   * The capability binds to owner session, panel instance, host, and profile,
+   * is redeemed in the first WebSocket message rather than a URL, rotates every
+   * five minutes, and is revoked on panel close or profile switch. The
+   * response never exposes transport secrets beyond the opaque single-use
+   * secret and the dynamic loopback gateway port the server declares to BB
+   * Connect for owner-session-gated tunneling.
+   */
+  async function panelCapability(
+    request: BrowserPanelCapabilityRequest,
+    signal?: AbortSignal,
+  ): Promise<BrowserPanelCapabilityResponse> {
+    const identity = panelIdentity({
+      surface: "thread",
+      threadId: "panel-capability",
+      hostId: request.hostId,
+      profileId: request.profileId,
+    });
+    const hostId = await resolvedHostId(bb, identity);
+    if (hostId === null || hostId !== request.hostId) {
+      return {
+        outcome: "unavailable",
+        reason: "host-offline",
+        message: "The selected workspace host is unavailable.",
+      };
+    }
+    const status = await host.call(
+      "status",
+      { hostId, profileId: request.profileId },
+      { hostId, signal },
+    );
+    const connectCapability = status.capabilities.find(
+      (capability) => capability.id === "bb-connect",
+    );
+    if (
+      connectCapability === undefined ||
+      connectCapability.status !== "ready"
+    ) {
+      return {
+        outcome: "unavailable",
+        reason: "bb-connect-required",
+        message:
+          "Enroll this host in BB Connect before opening the Browser Panel.",
+      };
+    }
+    if (status.state !== "healthy") {
+      return {
+        outcome: "unavailable",
+        reason:
+          status.state === "host-offline" ? "host-offline" : "setup-required",
+        message: status.message,
+      };
+    }
+    const transport = await host.call(
+      "panelTransport",
+      {
+        hostId,
+        profileId: request.profileId,
+        panelId: request.panelId,
+        ownerSessionId: request.ownerSessionId,
+      },
+      { hostId, signal },
+    );
+    const tunnel = await bb.hosts.ensureSharedPortTunnel(hostId);
+    bb.hosts.declareSharedPorts(hostId, [transport.gatewayPort]);
+    return {
+      outcome: "issued",
+      capabilityId: transport.capabilityId,
+      secret: transport.secret,
+      gatewayPort: transport.gatewayPort,
+      tunnel: { label: tunnel.label, baseDomain: tunnel.baseDomain },
+      expiresAt: transport.expiresAt,
+      rotatesAt: transport.rotatesAt,
+    };
+  }
+
   subscribeToHostConnections();
   subscribeToProjectDeletion();
 
   return {
     browserScript,
     navigate,
+    history,
     panelVisibility,
+    panelCapability,
     grants,
     createGrant,
     inspectGrant,

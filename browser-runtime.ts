@@ -18,6 +18,7 @@ import { profileStoragePaths } from "./profile-storage.js";
 import type { ProfileStoragePaths } from "./profile-storage.js";
 import {
   activeBrowserTabScript,
+  browserHistoryScript,
   browserNavigationScript,
   projectLoopbackAddress,
   resolveBrowserAddress,
@@ -948,6 +949,30 @@ function activeTabId(activeTabOutput: unknown) {
   return active.id;
 }
 
+/**
+ * Extract the page URL from a history-navigation script's JSON output. The
+ * script prints `{ tabId, url }`; the location response is that JSON string.
+ * Falls back to `about:blank` when the URL is missing or malformed.
+ */
+function safeHistoryUrl(locationOutput: unknown) {
+  if (typeof locationOutput !== "string") return "about:blank";
+  try {
+    const parsed = JSON.parse(locationOutput) as unknown;
+    if (
+      typeof parsed === "object" &&
+      parsed !== null &&
+      "url" in parsed &&
+      typeof (parsed as { url?: unknown }).url === "string"
+    ) {
+      const url = (parsed as { url: string }).url;
+      if (url.length > 0) return url;
+    }
+  } catch {
+    // Fall through to the about:blank default for malformed output.
+  }
+  return "about:blank";
+}
+
 function screenshotLimitError() {
   return new BrowserScriptExecutionError(
     "result_too_large",
@@ -1623,6 +1648,51 @@ ${codeForTarget}`;
         );
         activeTabs.set(key, tabId);
         noteActivity(key, held);
+        return { address, location, tabId };
+      } finally {
+        operationSignal.dispose();
+      }
+    },
+    async history(
+      target: BrowserRuntimeTarget,
+      direction: "back" | "forward" | "reload",
+      operationOptions: BrowserOperationOptions = {},
+    ) {
+      const held = await heldInstance(target);
+      const key = runtimeKey(target);
+      const operationSignal = linkedOperationSignal(operationOptions);
+      let tabId = target.tabId ?? activeTabs.get(key);
+      try {
+        if (tabId === undefined) {
+          const discovered = await options.launchBoundary.execute(
+            executionRequest(
+              held,
+              target.profileId,
+              activeBrowserTabScript(),
+              30_000,
+              operationSignal.signal,
+            ),
+          );
+          tabId = activeTabId(discovered);
+        }
+        const location = await options.launchBoundary.execute(
+          executionRequest(
+            held,
+            target.profileId,
+            browserHistoryScript(direction, tabId),
+            30_000,
+            operationSignal.signal,
+          ),
+        );
+        activeTabs.set(key, tabId);
+        noteActivity(key, held);
+        const address = {
+          kind: "address" as const,
+          url:
+            typeof location === "string" && location.trim().length > 0
+              ? safeHistoryUrl(location)
+              : "about:blank",
+        };
         return { address, location, tabId };
       } finally {
         operationSignal.dispose();
