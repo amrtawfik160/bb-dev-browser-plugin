@@ -13,6 +13,7 @@ import { compileFunction } from "node:vm";
 import { describe, expect, it, vi } from "vitest";
 import {
   BrowserInstanceError,
+  BrowserOriginScopeDeniedError,
   createBrowserInstanceRuntime,
   selectBrowserExecutable,
   validateBrowserLaunchPolicy,
@@ -1264,4 +1265,149 @@ describe("Browser Instance runtime", () => {
       await fixture.dispose();
     }
   });
+});
+
+describe("Browser Instance runtime Origin Scope enforcement", () => {
+  it("issue #14 injects the enforcement preamble only when an origin scope is set", async () => {
+    const fixture = await runtimeFixture();
+    try {
+      await fixture.runtime.start(fixture.target);
+      await fixture.runtime.execute(fixture.target, "return page.url()", 5_000);
+      const unenforcedCode = fixture.processFixture.executions[0]!.code;
+      expect(unenforcedCode).not.toContain("__bbOriginPermitted");
+      expect(unenforcedCode).toContain("return page.url()");
+
+      await fixture.runtime.execute(
+        fixture.target,
+        "return page.url()",
+        5_000,
+        {
+          originScope: "https://app.example.test",
+        },
+      );
+      const enforcedCode = fixture.processFixture.executions[1]!.code;
+      expect(enforcedCode).toContain("__bbOriginPermitted");
+      expect(enforcedCode).toContain('"kind":"exact"');
+      expect(enforcedCode).toContain('"https://app.example.test"');
+      expect(enforcedCode).toContain("return page.url()");
+      expect(enforcedCode.indexOf("__bbOriginPermitted")).toBeLessThan(
+        enforcedCode.indexOf("return page.url()"),
+      );
+    } finally {
+      await fixture.dispose();
+    }
+  });
+
+  it("issue #14 AC4 carries per-origin invalid-certificate flags into the enforcement preamble", async () => {
+    const fixture = await runtimeFixture();
+    try {
+      await fixture.runtime.start(fixture.target);
+      const grantedOrigin = "https://app.example.test:8443";
+      await fixture.runtime.execute(
+        fixture.target,
+        "return page.url()",
+        5_000,
+        {
+          originScope: grantedOrigin,
+          invalidCertificateOrigins: [grantedOrigin],
+        },
+      );
+      const enforcedCode = fixture.processFixture.executions[0]!.code;
+      expect(enforcedCode).toContain("__bbOriginRequiresCertificateBypass");
+      expect(enforcedCode).toContain(JSON.stringify([grantedOrigin]));
+      expect(enforcedCode).toContain("context.request.fetch");
+      expect(enforcedCode).toContain("ignoreHTTPSErrors: true");
+      expect(enforcedCode).toContain("route.fulfill");
+      expect(enforcedCode.indexOf("return page.url()")).toBeGreaterThan(
+        enforcedCode.indexOf("__bbEnforceOriginScope"),
+      );
+    } finally {
+      await fixture.dispose();
+    }
+  });
+
+  it("issue #14 surfaces a real-browser denial marker as a typed BrowserOriginScopeDeniedError", async () => {
+    const rootDirectory = await mkdtemp(join(tmpdir(), "origin-scope-denial-"));
+    const browserExecutable = join(rootDirectory, "chrome");
+    await writeFile(browserExecutable, "fixture");
+    await chmod(browserExecutable, 0o755);
+    const deniedOrigin = "https://evil.example.test";
+    const boundary: BrowserLaunchBoundary = {
+      runAsUser: "bb-browser",
+      effectiveUserId: 1001,
+      effectiveGroupId: 1001,
+      async launch(request, onSpawn) {
+        const pid = 4300;
+        await onSpawn?.({
+          pid,
+          startedAtTicks: `fixture-${pid}`,
+          commandHash: `fixture-command-${pid}`,
+        });
+        return {
+          pid,
+          automationEndpoint: "http://127.0.0.1:14300",
+          exited: new Promise<void>(() => {}),
+          async stop() {},
+        };
+      },
+      async recover() {
+        return null;
+      },
+      async processIdentity(pid) {
+        return {
+          pid,
+          startedAtTicks: `fixture-${pid}`,
+          commandHash: `fixture-command-${pid}`,
+        };
+      },
+      async execute(request) {
+        const markerMatch =
+          /const __bbDenialMarker = ("(?:[^"\\]|\\.)*")/u.exec(request.code);
+        if (markerMatch === null) return { output: "no marker" };
+        const marker = JSON.parse(markerMatch[1]!);
+        return {
+          output: JSON.stringify({
+            __bbOriginDenied: marker,
+            origin: deniedOrigin,
+          }),
+        };
+      },
+      async configuredSearchUrl({ text }) {
+        return `https://search.fixture.test/?q=${encodeURIComponent(text)}`;
+      },
+    };
+    const runtime = createBrowserInstanceRuntime({
+      rootDirectory,
+      installationId: "installation-origin-scope",
+      chromeStablePaths: [browserExecutable],
+      playwrightChromiumPath: join(rootDirectory, "fallback-chromium"),
+      launchBoundary: boundary,
+    });
+    try {
+      await runtime.start(fixtureTarget());
+      await expect(
+        runtime.execute(fixtureTarget(), "return page.url()", 5_000, {
+          originScope: "https://app.example.test",
+        }),
+      ).rejects.toBeInstanceOf(BrowserOriginScopeDeniedError);
+      await expect(
+        runtime.execute(fixtureTarget(), "return page.url()", 5_000, {
+          originScope: "https://app.example.test",
+        }),
+      ).rejects.toMatchObject({ origin: deniedOrigin });
+    } finally {
+      await runtime.dispose();
+      await rm(rootDirectory, { recursive: true, force: true });
+    }
+  });
+
+  function fixtureTarget() {
+    return {
+      hostId: "host-origin-scope",
+      profileId: "profile-origin-scope",
+      locale: "en-GB",
+      timezone: "Europe/London",
+      projectId: "project-origin-scope",
+    };
+  }
 });

@@ -10,7 +10,10 @@ import {
 } from "../contracts.js";
 import { createBrowserHostEntry } from "../host.js";
 import { createFileBrowserProfileStore } from "../profile-storage.js";
-import { createBrowserInstanceRuntime } from "../browser-runtime.js";
+import {
+  BrowserOriginScopeDeniedError,
+  createBrowserInstanceRuntime,
+} from "../browser-runtime.js";
 
 const HOST_ID = "host-runtime";
 
@@ -476,4 +479,182 @@ describe("Browser host runtime boundary", () => {
       await rm(rootDirectory, { recursive: true, force: true });
     }
   });
+});
+
+it("issue #14 returns a typed origin_denied result when the runtime blocks a real-browser navigation", async () => {
+  const rootDirectory = await mkdtemp(join(tmpdir(), "host-origin-scope-"));
+  const profiles = createFileBrowserProfileStore({
+    rootDirectory,
+    installationId: "installation-origin-scope",
+  });
+  await profiles.initialize(HOST_ID);
+  const deniedOrigin = "https://evil.example.test";
+  const runtime = {
+    start: async () => {
+      throw new Error("not used");
+    },
+    stop: async () => {},
+    execute: async (
+      _target: unknown,
+      _code: string,
+      _timeoutMs: number,
+      options: { originScope?: string } | undefined,
+    ) => {
+      if (options?.originScope !== undefined) {
+        throw new BrowserOriginScopeDeniedError(deniedOrigin);
+      }
+      return "fixture-output";
+    },
+    navigate: async () => {
+      throw new Error("not used");
+    },
+    status: async ({
+      hostId,
+      profileId,
+    }: {
+      hostId: string;
+      profileId: string;
+    }) => ({
+      state: "sleeping" as const,
+      hostId,
+      profileId,
+    }),
+    pinPanel: async () => {
+      throw new Error("not used");
+    },
+    unpinPanel: async () => {},
+    hostDisconnected: () => {},
+    hostReconnected: async () => {},
+    dispose: async () => {},
+  };
+  const readiness = {
+    inspect: healthyStatus,
+    diagnostics: () => {
+      throw new Error("diagnostics not used");
+    },
+  };
+  const host = experimental_createHostEntryHarness(
+    createBrowserHostEntry(readiness, profiles, undefined, runtime),
+    {
+      experimental_paths: {
+        dataDir: rootDirectory,
+        tempDir: join(rootDirectory, "tmp"),
+      },
+    },
+  );
+  try {
+    const response = await host.experimental_call("browserScript", {
+      purpose: "Reach a permitted page that escapes its grant",
+      code: "return page.url();",
+      hostId: HOST_ID,
+      projectId: "project-origin-scope",
+      threadId: "thread-origin-scope",
+      activityEventId: "origin-scope-event-1",
+      activityOccurredAt: "2026-08-28T00:00:00.000Z",
+      profileId: DEFAULT_PROFILE_ID,
+      timeoutMs: 5_000,
+      originScope: "https://app.example.test",
+    });
+    expect(response).toEqual({
+      ok: false,
+      error: {
+        state: "origin-denied",
+        code: "origin_denied",
+        label: "Origin denied",
+        hostId: HOST_ID,
+        profileId: DEFAULT_PROFILE_ID,
+        message: expect.stringContaining(deniedOrigin),
+        origin: deniedOrigin,
+        grantRequest: null,
+      },
+    });
+  } finally {
+    await host.experimental_dispose();
+    await rm(rootDirectory, { recursive: true, force: true });
+  }
+});
+
+it("issue #14 AC4 forwards per-origin invalid-certificate flags from the script request to the runtime", async () => {
+  const rootDirectory = await mkdtemp(join(tmpdir(), "host-cert-bypass-"));
+  const profiles = createFileBrowserProfileStore({
+    rootDirectory,
+    installationId: "installation-cert-bypass",
+  });
+  await profiles.initialize(HOST_ID);
+  let forwardedOrigins: readonly string[] | undefined;
+  const runtime = {
+    start: async () => {
+      throw new Error("not used");
+    },
+    stop: async () => {},
+    execute: async (
+      _target: unknown,
+      _code: string,
+      _timeoutMs: number,
+      options:
+        | {
+            originScope?: string;
+            invalidCertificateOrigins?: readonly string[];
+          }
+        | undefined,
+    ) => {
+      forwardedOrigins = options?.invalidCertificateOrigins;
+      return "fixture-output";
+    },
+    navigate: async () => {
+      throw new Error("not used");
+    },
+    status: async ({
+      hostId,
+      profileId,
+    }: {
+      hostId: string;
+      profileId: string;
+    }) => ({
+      state: "sleeping" as const,
+      hostId,
+      profileId,
+    }),
+    pinPanel: async () => {
+      throw new Error("not used");
+    },
+    unpinPanel: async () => {},
+    hostDisconnected: () => {},
+    hostReconnected: async () => {},
+    dispose: async () => {},
+  };
+  const readiness = {
+    inspect: healthyStatus,
+    diagnostics: () => {
+      throw new Error("diagnostics not used");
+    },
+  };
+  const host = experimental_createHostEntryHarness(
+    createBrowserHostEntry(readiness, profiles, undefined, runtime),
+    {
+      experimental_paths: {
+        dataDir: rootDirectory,
+        tempDir: join(rootDirectory, "tmp"),
+      },
+    },
+  );
+  try {
+    await host.experimental_call("browserScript", {
+      purpose: "Load a granted invalid-certificate origin",
+      code: "return page.url();",
+      hostId: HOST_ID,
+      projectId: "project-cert-bypass",
+      threadId: "thread-cert-bypass",
+      activityEventId: "cert-bypass-event-1",
+      activityOccurredAt: "2026-08-28T00:00:00.000Z",
+      profileId: DEFAULT_PROFILE_ID,
+      timeoutMs: 5_000,
+      originScope: "https://app.example.test:8443",
+      invalidCertificateOrigins: ["https://app.example.test:8443"],
+    });
+    expect(forwardedOrigins).toEqual(["https://app.example.test:8443"]);
+  } finally {
+    await host.experimental_dispose();
+    await rm(rootDirectory, { recursive: true, force: true });
+  }
 });

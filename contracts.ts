@@ -924,6 +924,12 @@ export const browserOriginDeniedErrorSchema = z
     hostId: z.string().min(1).nullable(),
     profileId: z.string().min(1),
     message: z.string().min(1),
+    /**
+     * The exact web origin that was denied. The server sets it for both the
+     * declared-origin denial and the real-browser navigation denial so the
+     * owner-facing Grant Request carries the precise origin the agent reached.
+     */
+    origin: browserExactOriginSchema.nullable(),
     grantRequest: browserGrantRequestSchema.nullable(),
   })
   .strict();
@@ -1735,6 +1741,24 @@ export const browserScriptRequestSchema = browserScriptParametersSchema
     activityEventId: browserActivityEventIdSchema,
     activityOccurredAt: z.string().datetime(),
     profileId: z.string().min(1),
+    /**
+     * The resolved Profile Grant Origin Scope the host must enforce during
+     * real browser navigation. The server resolves it from the active grant
+     * so top-level navigations, redirects, popups, and relevant frame
+     * navigations are checked before commit using the same normalized policy
+     * as the grant store. Omitting it disables enforcement (owner browsing).
+     */
+    originScope: browserOriginScopeSchema.optional(),
+    /**
+     * The per-origin invalid-certificate opt-ins resolved from the active
+     * grant. The host carries them into the enforcement preamble so navigation
+     * to a granted origin can load despite a bad TLS certificate, using the
+     * same normalized policy the grant store approved.
+     */
+    invalidCertificateOrigins: z
+      .array(browserExactOriginSchema)
+      .max(100)
+      .optional(),
   })
   .strict();
 

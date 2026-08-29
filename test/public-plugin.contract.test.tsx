@@ -22,6 +22,7 @@ import {
   browserSetupResponseSchema,
   browserPurgePlanSchema,
   browserPurgeResponseSchema,
+  browserOriginDeniedErrorSchema,
   browserScriptFailureSchema,
   BROWSER_SCRIPT_RESULT_LIMIT_BYTES,
   browserStatusSchema,
@@ -49,6 +50,7 @@ import type {
   BrowserProfileBackupResult,
   BrowserProfileRecovery,
 } from "../profile-recovery.js";
+import type { BrowserScriptResponse } from "../contracts.js";
 
 const preparedSnapshot: HostProbeSnapshot = {
   operatingSystem: {
@@ -624,6 +626,90 @@ describe("Browser public plugin contract", () => {
         .error.code,
     ).toBe("origin_denied");
     await browser.dispose();
+  });
+
+  it("issue #14 enriches a real-browser navigation denial with a non-blocking Grant Request for the escaped origin", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+      browserScriptResponse: {
+        ok: false,
+        error: {
+          state: "origin-denied",
+          code: "origin_denied",
+          label: "Origin denied",
+          hostId: "host-browser-test",
+          profileId: DEFAULT_PROFILE_ID,
+          message:
+            "Browser navigation to https://evil.example.test was denied by the active Profile Grant.",
+          origin: "https://evil.example.test",
+          grantRequest: null,
+        },
+      } as unknown as BrowserScriptResponse,
+    });
+    try {
+      await browser.createBrowserProfile({
+        hostId: "host-browser-test",
+        name: "Origin scope fixture",
+      });
+      await browser.createBrowserGrant({
+        projectId: "project-browser-test",
+        hostId: "host-browser-test",
+        profileId: DEFAULT_PROFILE_ID,
+        originScope: "https://app.example.test",
+        wholeWeb: false,
+        fileTransfer: false,
+        invalidCertificateOrigins: [],
+      });
+
+      const denied = await browser.runBrowserScriptWithProfile(undefined, {
+        purpose: "Reach a permitted page",
+        code: "await page.goto('https://evil.example.test');",
+        destinationOrigin: "https://app.example.test",
+      });
+      const failure = browserScriptFailureSchema.parse(
+        JSON.parse(denied.content[0]!.text),
+      );
+      expect(failure.error.state).toBe("origin-denied");
+      const originDenied = browserOriginDeniedErrorSchema.parse(failure.error);
+      expect(originDenied.code).toBe("origin_denied");
+      expect(originDenied.origin).toBe("https://evil.example.test");
+      const request = originDenied.grantRequest;
+      expect(request).toMatchObject({
+        projectId: "project-browser-test",
+        hostId: "host-browser-test",
+        profileId: DEFAULT_PROFILE_ID,
+        origin: "https://evil.example.test",
+        requestedElevations: { fileTransfer: false, invalidCertificate: false },
+        status: "pending",
+      });
+      expect(request).not.toBeNull();
+      expect(await browser.listBrowserGrantRequests()).toContainEqual(request);
+      // The owner-facing browsing history is not converted into agent activity.
+      const records = await browser.runBrowserActivityRecords();
+      const agentRecord = records.find(
+        (record) => record.action === "browser-script",
+      );
+      expect(agentRecord).toMatchObject({
+        actor: "agent",
+        action: "browser-script",
+        destinationOrigin: "https://app.example.test",
+        outcome: "failed",
+      });
+      // The escaped origin denial produced a Grant Request activity, not a
+      // duplicate agent browsing-history record.
+      expect(
+        records.some(
+          (record) =>
+            record.action === "grant-request-created" &&
+            record.destinationOrigin === null,
+        ),
+      ).toBe(true);
+      expect(
+        records.filter((record) => record.action === "browser-script"),
+      ).toHaveLength(1);
+    } finally {
+      await browser.dispose();
+    }
   });
 
   it("returns one exact non-blocking request across browser_script, Settings RPC, and safe CLI status", async () => {

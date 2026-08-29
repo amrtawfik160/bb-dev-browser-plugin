@@ -277,23 +277,85 @@ function grantFromRow(row: unknown): BrowserProfileGrant {
   });
 }
 
-function scopeMatchesOrigin(scope: string, origin: string) {
-  if (scope === "*") return !isRawLocalhost(origin);
-  if (!scope.includes("://*.")) return scope === origin;
+/**
+ * A normalized, framework-agnostic representation of one Origin Scope policy.
+ *
+ * The server-side Profile Grant store and the host-side real-browser
+ * enforcement both parse a stored scope into this shape once and then match
+ * candidate origins against it, so exact scheme/host/port matching, explicit
+ * subdomain patterns, Project Loopback Aliases, raw localhost fallback, and
+ * whole-web access share one policy instead of two parallel implementations.
+ */
+export type OriginScopeMatcher =
+  | { kind: "whole-web"; rawLocalhostHosts: readonly string[] }
+  | { kind: "exact"; origin: string }
+  | {
+      kind: "subdomain";
+      protocol: string;
+      baseHost: string;
+      port: string;
+    }
+  | { kind: "never" };
+
+/**
+ * Parses a normalized stored Origin Scope into a {@link OriginScopeMatcher}.
+ *
+ * Scopes are persisted through {@link browserOriginScopeSchema}, so callers may
+ * assume the input is already normalized. A subdomain scope that fails the
+ * expected shape returns a `never` matcher instead of throwing, preserving the
+ * `false` outcome the legacy matcher produced for unreachable malformed input.
+ */
+export function originScopeMatcher(scope: string): OriginScopeMatcher {
+  if (scope === "*") {
+    return { kind: "whole-web", rawLocalhostHosts: [...RAW_LOCALHOST_HOSTS] };
+  }
+  if (!scope.includes("://*.")) return { kind: "exact", origin: scope };
   const scopeParts = /^([^:]+):\/\/\*\.([^:/]+)(?::(\d+))?$/u.exec(scope);
-  if (scopeParts === null) return false;
-  const destination = new URL(origin);
-  const protocol = `${scopeParts[1]}:`;
-  const baseHost = scopeParts[2]!;
-  const scopePort = scopeParts[3] ?? "";
-  const destinationPort = destination.port;
+  if (scopeParts === null) return { kind: "never" };
+  return {
+    kind: "subdomain",
+    protocol: scopeParts[1]!,
+    baseHost: scopeParts[2]!,
+    port: scopeParts[3] ?? "",
+  };
+}
+
+/**
+ * Decides whether a candidate web origin is within one Origin Scope policy.
+ *
+ * This is the single matcher shared by the server grant store (via
+ * {@link scopeMatchesOrigin}) and the host real-browser enforcement preamble,
+ * which re-implements the same data-driven comparisons in the QuickJS sandbox.
+ * An origin that is not a valid URL is treated as out of scope rather than
+ * throwing, so the policy never lets an unparseable destination through.
+ */
+export function matcherPermitsOrigin(
+  matcher: OriginScopeMatcher,
+  origin: string,
+): boolean {
+  let destination: URL;
+  try {
+    destination = new URL(origin);
+  } catch {
+    return false;
+  }
+  const hostname = destination.hostname.toLowerCase();
+  if (matcher.kind === "whole-web") {
+    return !isRawLocalhostHostname(hostname);
+  }
+  if (matcher.kind === "never") return false;
+  if (matcher.kind === "exact") return matcher.origin === destination.origin;
   return (
-    destination.protocol === protocol &&
-    (scopePort === destinationPort ||
-      (scopePort === "" && destinationPort === "")) &&
-    destination.hostname !== baseHost &&
-    destination.hostname.endsWith(`.${baseHost}`)
+    destination.protocol === `${matcher.protocol}:` &&
+    (matcher.port === destination.port ||
+      (matcher.port === "" && destination.port === "")) &&
+    hostname !== matcher.baseHost &&
+    hostname.endsWith(`.${matcher.baseHost}`)
   );
+}
+
+export function scopeMatchesOrigin(scope: string, origin: string) {
+  return matcherPermitsOrigin(originScopeMatcher(scope), origin);
 }
 
 export function isBrowserLoopbackHostname(hostname: string) {
@@ -311,11 +373,6 @@ export function isRawLocalhostHostname(hostname: string) {
   return (
     RAW_LOCALHOST_HOSTS.has(normalized) || isBrowserLoopbackHostname(normalized)
   );
-}
-
-function isRawLocalhost(origin: string) {
-  const hostname = new URL(origin).hostname.toLowerCase();
-  return isRawLocalhostHostname(hostname);
 }
 
 function isIpv4Loopback(hostname: string) {
@@ -638,7 +695,10 @@ function permitsRequestedElevations(
   );
 }
 
-function elevationIsActive(expiresAt: string | null | undefined, now: Date) {
+export function elevationIsActive(
+  expiresAt: string | null | undefined,
+  now: Date,
+) {
   return (
     expiresAt === null || expiresAt === undefined || now < new Date(expiresAt)
   );

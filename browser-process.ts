@@ -506,9 +506,29 @@ function processAbortError(signal: AbortSignal) {
     : new Error("Browser script aborted.");
 }
 
+function stdoutContainsDenialMarker(stdout: string, marker: string) {
+  if (marker === "") return false;
+  return stdout.split("\n").some((line) => {
+    const trimmed = line.trim();
+    if (trimmed === "" || trimmed === "undefined") return false;
+    try {
+      const parsed = JSON.parse(trimmed) as unknown;
+      return (
+        typeof parsed === "object" &&
+        parsed !== null &&
+        "__bbOriginDenied" in parsed &&
+        (parsed as Record<string, unknown>).__bbOriginDenied === marker
+      );
+    } catch {
+      return false;
+    }
+  });
+}
+
 function collectOutput(
   child: ChildProcessWithoutNullStreams,
   signal?: AbortSignal,
+  denialMarker?: string,
 ) {
   return new Promise<string>((resolve, reject) => {
     const chunks: Buffer[] = [];
@@ -561,6 +581,14 @@ function collectOutput(
       if (settled) return;
       if (code === 0) {
         finish(() => resolve(Buffer.concat(chunks).toString("utf8").trimEnd()));
+        return;
+      }
+      const stdout = Buffer.concat(chunks).toString("utf8");
+      if (
+        denialMarker !== undefined &&
+        stdoutContainsDenialMarker(stdout, denialMarker)
+      ) {
+        finish(() => resolve(stdout.trimEnd()));
         return;
       }
       finish(() =>
@@ -818,6 +846,7 @@ async function executeBrowserHelper(
     const output = await collectOutput(
       devBrowserProcess,
       executionSignal.signal,
+      request.denialMarker,
     );
     if (screenshot === undefined) return output;
     const screenshotFile = await open(

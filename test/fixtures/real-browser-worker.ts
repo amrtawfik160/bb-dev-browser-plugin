@@ -9,7 +9,10 @@ import {
 import { dirname, join } from "node:path";
 import { createRequire } from "node:module";
 import { createProductionBrowserProcessBoundary } from "../../browser-process.js";
-import { createBrowserInstanceRuntime } from "../../browser-runtime.js";
+import {
+  BrowserOriginScopeDeniedError,
+  createBrowserInstanceRuntime,
+} from "../../browser-runtime.js";
 import { profileStoragePaths } from "../../profile-storage.js";
 
 function requiredEnvironment(name: string) {
@@ -63,7 +66,15 @@ async function waitForProcessExit(pid: number) {
 }
 
 const action = requiredEnvironment("BB_BROWSER_WORKER_ACTION");
-if (!new Set(["start", "crash-recover", "lifecycle", "cleanup"]).has(action)) {
+if (
+  !new Set([
+    "start",
+    "crash-recover",
+    "lifecycle",
+    "cleanup",
+    "origin-scope",
+  ]).has(action)
+) {
   throw new Error(
     "Provisioned-host fixture received an invalid worker action.",
   );
@@ -261,6 +272,95 @@ async function lifecycleAcceptance(initialPid: number) {
   };
 }
 
+async function activePageScript(gotoUrl: string) {
+  return `const __bbPages = await browser.listPages();
+if (__bbPages.length === 0) throw new Error("The Browser Profile has no open tabs");
+const __bbPage = await browser.getPage(__bbPages[0].id);
+await __bbPage.bringToFront();
+await __bbPage.goto(${JSON.stringify(gotoUrl)});
+console.log(JSON.stringify({ committedUrl: __bbPage.url() }));`;
+}
+
+async function originScopeAcceptance() {
+  const originScope = requiredEnvironment("BB_BROWSER_ORIGIN_SCOPE");
+  const attackPages = JSON.parse(
+    requiredEnvironment("BB_BROWSER_ATTACK_PAGES"),
+  ) as { kind: string; page: string }[];
+  const attacks: { kind: string; blocked: boolean; deniedOrigin?: string }[] =
+    [];
+  for (const attack of attackPages) {
+    try {
+      await runtime.execute(
+        target,
+        await activePageScript(attack.page),
+        20_000,
+        { originScope },
+      );
+      attacks.push({ kind: attack.kind, blocked: false });
+    } catch (error) {
+      if (error instanceof BrowserOriginScopeDeniedError) {
+        attacks.push({
+          kind: attack.kind,
+          blocked: true,
+          deniedOrigin: error.origin,
+        });
+        continue;
+      }
+      throw error;
+    }
+  }
+
+  let inScope: { ok: boolean };
+  try {
+    await runtime.execute(target, await activePageScript(originScope), 20_000, {
+      originScope,
+    });
+    inScope = { ok: true };
+  } catch (error) {
+    if (error instanceof BrowserOriginScopeDeniedError) {
+      inScope = { ok: false };
+    } else {
+      throw error;
+    }
+  }
+
+  const revocationController = new AbortController();
+  let revocationInterrupted = false;
+  const revocationOperation = runtime
+    .execute(
+      target,
+      "await new Promise((resolve) => setTimeout(resolve, 8000));",
+      30_000,
+      { originScope, leaseSignal: revocationController.signal },
+    )
+    .then(() => {
+      revocationInterrupted = false;
+    })
+    .catch((error: unknown) => {
+      revocationInterrupted = error instanceof Error;
+    });
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  revocationController.abort();
+  await revocationOperation;
+  const browserStillRunning =
+    (await runtime.status(target)).state === "running";
+  const ownerPageScript = `const __bbOwnerPages = await browser.listPages();
+console.log(JSON.stringify({ pages: __bbOwnerPages.length }));`;
+  const ownerPageOutput = JSON.parse(
+    String(await runtime.execute(target, ownerPageScript, 20_000)),
+  ) as { pages: number };
+
+  return {
+    attacks,
+    inScope,
+    revocation: {
+      interrupted: revocationInterrupted,
+      browserStillRunning,
+    },
+    ownerPage: { present: ownerPageOutput.pages > 0 },
+  };
+}
+
 const initialInstance = await runtime.start(target);
 let instance = initialInstance;
 let crashedPid: number | null = null;
@@ -288,6 +388,17 @@ if (action === "start") {
 } else if (action === "lifecycle") {
   lifecycle = await lifecycleAcceptance(initialInstance.pid);
 }
+let originScope:
+  | {
+      attacks: { kind: string; blocked: boolean; deniedOrigin?: string }[];
+      inScope: { ok: boolean };
+      revocation: { interrupted: boolean; browserStillRunning: boolean };
+      ownerPage: { present: boolean };
+    }
+  | undefined;
+if (action === "origin-scope") {
+  originScope = await originScopeAcceptance();
+}
 const automationHelperPid =
   action === "cleanup" || action === "lifecycle"
     ? null
@@ -299,6 +410,7 @@ const runningState = {
   scriptOutput,
   navigation,
   lifecycle,
+  originScope,
   uid: boundary.effectiveUserId,
   gid: boundary.effectiveGroupId,
   ownedProcesses: await ownedProcesses(rootDirectory),
