@@ -1298,6 +1298,34 @@ describe("Browser Instance runtime Origin Scope enforcement", () => {
     }
   });
 
+  it("issue #14 AC4 carries per-origin invalid-certificate flags into the enforcement preamble", async () => {
+    const fixture = await runtimeFixture();
+    try {
+      await fixture.runtime.start(fixture.target);
+      const grantedOrigin = "https://app.example.test:8443";
+      await fixture.runtime.execute(
+        fixture.target,
+        "return page.url()",
+        5_000,
+        {
+          originScope: grantedOrigin,
+          invalidCertificateOrigins: [grantedOrigin],
+        },
+      );
+      const enforcedCode = fixture.processFixture.executions[0]!.code;
+      expect(enforcedCode).toContain("__bbOriginRequiresCertificateBypass");
+      expect(enforcedCode).toContain(JSON.stringify([grantedOrigin]));
+      expect(enforcedCode).toContain("context.request.fetch");
+      expect(enforcedCode).toContain("ignoreHTTPSErrors: true");
+      expect(enforcedCode).toContain("route.fulfill");
+      expect(enforcedCode.indexOf("return page.url()")).toBeGreaterThan(
+        enforcedCode.indexOf("__bbEnforceOriginScope"),
+      );
+    } finally {
+      await fixture.dispose();
+    }
+  });
+
   it("issue #14 surfaces a real-browser denial marker as a typed BrowserOriginScopeDeniedError", async () => {
     const rootDirectory = await mkdtemp(join(tmpdir(), "origin-scope-denial-"));
     const browserExecutable = join(rootDirectory, "chrome");

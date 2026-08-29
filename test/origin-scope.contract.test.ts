@@ -10,6 +10,8 @@ import {
   enforcementPreambleScript,
   extractOriginDenial,
   originPermittedFunctionSource,
+  originRequiresCertificateBypass,
+  originRequiresCertificateBypassSource,
 } from "../origin-scope.js";
 
 /**
@@ -287,5 +289,194 @@ describe("enforcement preamble and denial signaling", () => {
   it("leaves an output without a denial marker unchanged", () => {
     const output = "console output\nwith no marker";
     expect(extractOriginDenial(output, "bb-denial-marker")).toBeNull();
+  });
+});
+
+describe("per-origin invalid-certificate bypass policy", () => {
+  const grantedCertOrigin = "https://app.example.test:8443";
+  const invalidCertificateOrigins = [grantedCertOrigin];
+
+  it("reports a granted invalid-certificate origin as requiring cert bypass", () => {
+    expect(
+      originRequiresCertificateBypass(
+        grantedCertOrigin,
+        invalidCertificateOrigins,
+      ),
+    ).toBe(true);
+  });
+
+  it("does not bypass an in-scope origin that lacks the invalid-certificate opt-in", () => {
+    expect(
+      originRequiresCertificateBypass("https://app.example.test:8443", []),
+    ).toBe(false);
+  });
+
+  it("treats an unparseable destination origin as not requiring cert bypass", () => {
+    expect(
+      originRequiresCertificateBypass("not-a-url", invalidCertificateOrigins),
+    ).toBe(false);
+  });
+});
+
+describe("QuickJS sandbox cert-bypass parity", () => {
+  const quickJsBypass = (() => {
+    const source = originRequiresCertificateBypassSource();
+    const factory = compileFunction(
+      `${source}\nreturn __bbOriginRequiresCertificateBypass;`,
+      [],
+      { filename: "origin-cert-bypass.js" },
+    );
+    return factory() as (origin: string, origins: readonly string[]) => boolean;
+  })();
+
+  it.each([
+    ["https://app.example.test:8443", ["https://app.example.test:8443"], true],
+    ["https://app.example.test:8443", [], false],
+    ["https://other.example.test", ["https://app.example.test:8443"], false],
+    ["not-a-url", ["https://app.example.test:8443"], false],
+  ] as const)(
+    "mirrors the TypeScript cert-bypass matcher for %s",
+    (origin, origins, expected) => {
+      expect(quickJsBypass(origin, origins)).toBe(
+        originRequiresCertificateBypass(origin, origins),
+      );
+      expect(quickJsBypass(origin, origins)).toBe(expected);
+    },
+  );
+});
+
+type RecordedRoute = {
+  fetch: { url: string; options: Record<string, unknown> } | null;
+  fulfill: { response: unknown } | null;
+  continueCount: number;
+  abortErrorCode: string | null;
+  deniedMarker: string | null;
+};
+
+async function enforcePreambleAgainst(
+  matcher: OriginScopeMatcher,
+  denialMarker: string,
+  invalidCertificateOrigins: readonly string[],
+  requestUrl: string,
+  isNavigation: boolean,
+): Promise<RecordedRoute> {
+  const recorded: RecordedRoute = {
+    fetch: null,
+    fulfill: null,
+    continueCount: 0,
+    abortErrorCode: null,
+    deniedMarker: null,
+  };
+  const mockRoute = {
+    request: () => ({
+      isNavigationRequest: () => isNavigation,
+      url: () => requestUrl,
+      method: () => "GET",
+      headers: () => [],
+      postData: () => null,
+    }),
+    continue: async () => {
+      recorded.continueCount += 1;
+    },
+    abort: async (errorCode?: string) => {
+      recorded.abortErrorCode = errorCode ?? null;
+    },
+    fulfill: async (options: { response: unknown }) => {
+      recorded.fulfill = options;
+    },
+  };
+  const mockContext = {
+    request: {
+      fetch: async (url: string, options: Record<string, unknown>) => {
+        recorded.fetch = { url, options };
+        return { __bbFetchedResponse: true };
+      },
+    },
+    route: async (
+      _pattern: string,
+      handler: (route: typeof mockRoute) => Promise<void>,
+    ) => {
+      await handler(mockRoute);
+    },
+  };
+  const mockPage = { context: () => mockContext };
+  const browserGlobal = {
+    listPages: async () => [{ id: "fixture-tab" }],
+    getPage: async () => mockPage,
+  };
+  const consoleMock = {
+    log: (message: string) => {
+      recorded.deniedMarker = message;
+    },
+  };
+  const preamble = enforcementPreambleScript(
+    matcher,
+    denialMarker,
+    invalidCertificateOrigins,
+  );
+  const factory = compileFunction(
+    `return async (browser, console) => {\n${preamble}\n};`,
+    ["browser", "console"],
+    { filename: "enforcement-preamble.js" },
+  );
+  await factory()(browserGlobal, consoleMock);
+  return recorded;
+}
+
+describe("enforcement preamble per-origin cert bypass and denial", () => {
+  const grantedOrigin = "https://app.example.test:8443";
+  const matcher: OriginScopeMatcher = {
+    kind: "exact",
+    origin: grantedOrigin,
+  };
+  const denialMarker = "bb-denial-cert";
+  const invalidCertificateOrigins = [grantedOrigin];
+
+  it("issue #14 AC4 bypasses cert errors for a granted invalid-certificate origin so it can load", async () => {
+    const recorded = await enforcePreambleAgainst(
+      matcher,
+      denialMarker,
+      invalidCertificateOrigins,
+      `${grantedOrigin}/account`,
+      true,
+    );
+    expect(recorded.fetch).not.toBeNull();
+    expect(recorded.fetch?.options.ignoreHTTPSErrors).toBe(true);
+    expect(recorded.fetch?.url).toBe(`${grantedOrigin}/account`);
+    expect(recorded.fulfill).toEqual({
+      response: { __bbFetchedResponse: true },
+    });
+    expect(recorded.continueCount).toBe(0);
+    expect(recorded.abortErrorCode).toBeNull();
+  });
+
+  it("issue #14 AC4 still blocks an ungranted out-of-scope invalid-certificate origin", async () => {
+    const recorded = await enforcePreambleAgainst(
+      matcher,
+      denialMarker,
+      invalidCertificateOrigins,
+      "https://evil.example.test/account",
+      true,
+    );
+    expect(recorded.abortErrorCode).toBe("blockedbyclient");
+    expect(recorded.fetch).toBeNull();
+    expect(recorded.fulfill).toBeNull();
+    expect(recorded.continueCount).toBe(0);
+    expect(recorded.deniedMarker).toContain(denialMarker);
+    expect(recorded.deniedMarker).toContain("https://evil.example.test");
+  });
+
+  it("continues normally for an in-scope origin that lacks the invalid-certificate opt-in", async () => {
+    const recorded = await enforcePreambleAgainst(
+      matcher,
+      denialMarker,
+      [],
+      `${grantedOrigin}/account`,
+      true,
+    );
+    expect(recorded.continueCount).toBe(1);
+    expect(recorded.fetch).toBeNull();
+    expect(recorded.fulfill).toBeNull();
+    expect(recorded.abortErrorCode).toBeNull();
   });
 });

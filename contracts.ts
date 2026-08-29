@@ -1749,6 +1749,16 @@ export const browserScriptRequestSchema = browserScriptParametersSchema
      * as the grant store. Omitting it disables enforcement (owner browsing).
      */
     originScope: browserOriginScopeSchema.optional(),
+    /**
+     * The per-origin invalid-certificate opt-ins resolved from the active
+     * grant. The host carries them into the enforcement preamble so navigation
+     * to a granted origin can load despite a bad TLS certificate, using the
+     * same normalized policy the grant store approved.
+     */
+    invalidCertificateOrigins: z
+      .array(browserExactOriginSchema)
+      .max(100)
+      .optional(),
   })
   .strict();
 

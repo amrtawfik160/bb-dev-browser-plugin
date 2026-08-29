@@ -15,6 +15,7 @@ import {
 } from "./activity-records.js";
 import {
   createProfileGrantStore,
+  elevationIsActive,
   type BrowserAuthorizationDecision,
   type BrowserAuthorizationSuccess,
 } from "./authorization.js";
@@ -189,6 +190,7 @@ class ActivitySyncTransportError extends Error {
 function agentBrowserScriptRequest(
   call: AgentScriptCall,
   originScope: string | undefined,
+  invalidCertificateOrigins: readonly string[],
 ): BrowserScriptRequest {
   return {
     purpose: call.parameters.purpose,
@@ -210,6 +212,9 @@ function agentBrowserScriptRequest(
     projectId: call.context.projectId,
     threadId: call.context.threadId,
     ...(originScope === undefined ? {} : { originScope }),
+    ...(invalidCertificateOrigins.length === 0
+      ? {}
+      : { invalidCertificateOrigins: [...invalidCertificateOrigins] }),
   };
 }
 
@@ -1102,6 +1107,12 @@ export function createBrowserService(
     ]);
     const untrack = trackGrantCall(grant.grantId, revocationController);
     const originScope = (temporaryGrant ?? grant).originScope;
+    const activeInvalidCertificateOrigins =
+      temporaryGrant === undefined
+        ? elevationIsActive(grant.invalidCertificateExpiresAt, new Date())
+          ? grant.invalidCertificateOrigins
+          : []
+        : temporaryGrant.invalidCertificateOrigins;
     try {
       const currentGrant = grantStore.inspect(grant.grantId);
       const currentTemporary =
@@ -1150,7 +1161,11 @@ export function createBrowserService(
           async () => {
             const response = await host.call(
               "browserScript",
-              agentBrowserScriptRequest(call, originScope),
+              agentBrowserScriptRequest(
+                call,
+                originScope,
+                activeInvalidCertificateOrigins,
+              ),
               { hostId: call.hostId, signal: linked.signal },
             );
             return enrichRealBrowserDenial(

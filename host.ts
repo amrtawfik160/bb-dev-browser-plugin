@@ -707,6 +707,12 @@ export function createBrowserHostEntry(
                     ...(request.originScope === undefined
                       ? {}
                       : { originScope: request.originScope }),
+                    ...(request.invalidCertificateOrigins === undefined
+                      ? {}
+                      : {
+                          invalidCertificateOrigins:
+                            request.invalidCertificateOrigins,
+                        }),
                   },
                 ),
               );

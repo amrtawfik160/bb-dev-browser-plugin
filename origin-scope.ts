@@ -95,6 +95,44 @@ function __bbIsIpv6Loopback(hostname) {
 }
 
 /**
+ * Decides whether a candidate web origin carries a per-origin invalid
+ * certificate opt-in. The grant store persists invalid-certificate approvals
+ * as normalized exact origins (`new URL(candidate).origin`), so this matches
+ * the same normalized form the route handler computes from a navigation URL.
+ * An origin that is not a valid URL is never granted a certificate bypass.
+ */
+export function originRequiresCertificateBypass(
+  origin: string,
+  invalidCertificateOrigins: readonly string[],
+): boolean {
+  let destination: URL;
+  try {
+    destination = new URL(origin);
+  } catch {
+    return false;
+  }
+  return invalidCertificateOrigins.includes(destination.origin);
+}
+
+/**
+ * Returns the source of a pure function `(origin, origins) => boolean` that
+ * mirrors {@link originRequiresCertificateBypass} for the QuickJS sandbox. It
+ * is written as a self-contained string so it can be evaluated in a Node `vm`
+ * for parity tests and embedded verbatim in the generated preamble.
+ */
+export function originRequiresCertificateBypassSource(): string {
+  return String.raw`function __bbOriginRequiresCertificateBypass(origin, origins) {
+  var url;
+  try { url = new URL(origin); } catch (error) { return false; }
+  if (!origins) return false;
+  for (var index = 0; index < origins.length; index += 1) {
+    if (origins[index] === url.origin) return true;
+  }
+  return false;
+}`;
+}
+
+/**
  * Builds the QuickJS preamble that enforces one Origin Scope during real
  * navigation. The preamble registers a context-level route that aborts any
  * navigation request whose destination origin the matcher rejects, and prints
@@ -103,16 +141,31 @@ function __bbIsIpv6Loopback(hostname) {
  * redirects, sub-document frames, and popup pages that share the context, so
  * no per-popup re-registration is needed. It must wrap the agent code so the
  * route is registered first.
+ *
+ * Per-origin invalid-certificate opt-ins use the same normalized policy: a
+ * navigation to an in-scope origin that the grant also approved for invalid
+ * certificates is fetched through the shared context request context with
+ * `ignoreHTTPSErrors` and fulfilled to the page so it loads despite a bad
+ * certificate, while every other navigation continues normally so a bad
+ * certificate still surfaces naturally. The dev-browser sandbox strips
+ * `ignoreHTTPSErrors` from `route.continue`, so the context request context is
+ * the one mechanism that honors per-origin certificate bypass for a connected
+ * browser.
  */
 export function enforcementPreambleScript(
   matcher: OriginScopeMatcher,
   denialMarker: string,
+  invalidCertificateOrigins: readonly string[] = [],
 ): string {
   const matcherJson = JSON.stringify(matcher);
   const permitted = originPermittedFunctionSource();
+  const bypass = originRequiresCertificateBypassSource();
+  const originsJson = JSON.stringify(invalidCertificateOrigins);
   return `${permitted}
+${bypass}
 const __bbMatcher = ${matcherJson};
 const __bbDenialMarker = ${JSON.stringify(denialMarker)};
+const __bbInvalidCertificateOrigins = ${originsJson};
 function __bbReportOriginDenied(origin) {
   console.log(JSON.stringify({ ${JSON.stringify(DENIAL_MARKER_PREFIX)}: __bbDenialMarker, origin }));
 }
@@ -126,12 +179,24 @@ async function __bbEnforceOriginScope(context) {
     let origin;
     try { origin = new URL(request.url()).origin; }
     catch { await route.continue(); return; }
-    if (__bbOriginPermitted(origin, __bbMatcher)) {
-      await route.continue();
+    if (!__bbOriginPermitted(origin, __bbMatcher)) {
+      __bbReportOriginDenied(origin);
+      await route.abort("blockedbyclient");
       return;
     }
-    __bbReportOriginDenied(origin);
-    await route.abort("blockedbyclient");
+    if (__bbOriginRequiresCertificateBypass(origin, __bbInvalidCertificateOrigins)) {
+      const response = await context.request.fetch(request.url(), {
+        ignoreHTTPSErrors: true,
+        method: request.method(),
+        headers: request.headers(),
+        // Let redirects re-fire the route so each hop is re-checked against scope.
+        maxRedirects: 0,
+        timeout: 30000
+      });
+      await route.fulfill({ response });
+      return;
+    }
+    await route.continue();
   });
 }
 const __bbEnforcementPages = await browser.listPages();

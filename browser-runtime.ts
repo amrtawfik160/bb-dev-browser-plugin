@@ -116,6 +116,15 @@ export type BrowserOperationOptions = {
    * navigation unrestricted (owner browsing through the panel).
    */
   originScope?: string;
+  /**
+   * The per-origin invalid-certificate opt-ins resolved from the active grant.
+   * When set alongside {@link originScope}, the enforcement preamble bypasses
+   * TLS certificate errors for navigation to these granted origins so they can
+   * load despite a bad certificate, using the same normalized policy the grant
+   * store approved. Origins within scope that lack the opt-in continue
+   * normally, so a bad certificate still surfaces naturally.
+   */
+  invalidCertificateOrigins?: readonly string[];
 };
 
 export interface BrowserLaunchBoundary {
@@ -1520,7 +1529,11 @@ export function createBrowserInstanceRuntime(
       const enforcedCode =
         matcher === undefined || denialMarker === undefined
           ? codeForTarget
-          : `${enforcementPreambleScript(matcher, denialMarker)}
+          : `${enforcementPreambleScript(
+              matcher,
+              denialMarker,
+              operationOptions.invalidCertificateOrigins ?? [],
+            )}
 ${codeForTarget}`;
       const executionCode =
         screenshot === undefined

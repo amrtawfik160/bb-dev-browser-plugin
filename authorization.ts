@@ -695,7 +695,10 @@ function permitsRequestedElevations(
   );
 }
 
-function elevationIsActive(expiresAt: string | null | undefined, now: Date) {
+export function elevationIsActive(
+  expiresAt: string | null | undefined,
+  now: Date,
+) {
   return (
     expiresAt === null || expiresAt === undefined || now < new Date(expiresAt)
   );
