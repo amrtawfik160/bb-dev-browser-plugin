@@ -243,6 +243,41 @@ describe("Browser Profile Grant public authorization contract", () => {
     }
   });
 
+  it("authorizes against the broadest grant covering an origin", async () => {
+    const { backend, store } = createStore();
+
+    try {
+      // The narrow grant is stored first, as it would be for a project that
+      // collected exact origins before the owner trusted it with the web.
+      store.create(
+        grant({
+          grantId: "grant-exact",
+          originScope: "https://app.example.test",
+        }),
+      );
+      store.create(
+        grant({ grantId: "grant-whole-web", originScope: "*", wholeWeb: true }),
+      );
+
+      const decision = store.authorize({
+        projectId: "project-a",
+        hostId: "host-a",
+        installationId: "installation-a",
+        profileId: "profile-a",
+        origin: "https://app.example.test",
+      });
+
+      expect(decision).toMatchObject({ allowed: true });
+      // The whole-web scope is what the script is enforced against, so a link
+      // leaving app.example.test is not denied by the older narrow grant.
+      expect(
+        (decision as { grant: { grantId: string; originScope: string } }).grant,
+      ).toMatchObject({ grantId: "grant-whole-web", originScope: "*" });
+    } finally {
+      await backend.harness.lifecycle.dispose();
+    }
+  });
+
   it("requires file transfer and invalid certificates to be explicitly scoped", async () => {
     const { backend, store } = createStore();
 

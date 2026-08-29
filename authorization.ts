@@ -715,13 +715,31 @@ function normalizedAuthorizationOrigin(request: BrowserAuthorizationRequest) {
   }
 }
 
+/** Broader scopes rank first, so the widest grant covering an origin wins. */
+function scopeBreadth(originScope: string) {
+  if (originScope === "*") return 0;
+  return originScope.includes("://*.") ? 1 : 2;
+}
+
+/**
+ * Every active grant that covers an origin, broadest first.
+ *
+ * More than one grant can match — a project that later takes whole-web access
+ * still has the narrow grants it collected earlier. Authorizing against
+ * whichever happened to be stored first meant an old exact-origin grant kept
+ * constraining a project that had since been trusted with the whole web, and
+ * the navigation the owner expected to work was denied.
+ */
 function grantsForOrigin(
   grants: readonly BrowserProfileGrant[],
   origin: string,
 ) {
-  return grants.filter((grant) =>
-    scopeMatchesOrigin(grant.originScope, origin),
-  );
+  return grants
+    .filter((grant) => scopeMatchesOrigin(grant.originScope, origin))
+    .sort(
+      (left, right) =>
+        scopeBreadth(left.originScope) - scopeBreadth(right.originScope),
+    );
 }
 
 function authorizeAgainstGrants(
