@@ -160,6 +160,34 @@ export function createAutomationStreamAdapter(
     });
   }
 
+  /**
+   * Begin a reconnect loop after input froze on disconnect. Transitions the
+   * stream to "reconnecting" and yields the first bounded backoff delay. The
+   * caller schedules the attempt after the delay; {@link reconnectFailed}
+   * advances the backoff and {@link reconnectSucceeded} restores streaming.
+   * Returns 0 when the stream is released and cannot reconnect.
+   */
+  function beginReconnect(): number {
+    if (state === "released") return 0;
+    if (state === "streaming") return 0;
+    state = "reconnecting";
+    reconnectAttempt = 0;
+    return nextReconnectDelayMs();
+  }
+
+  function reconnectFailed(): number {
+    if (state !== "reconnecting") return 0;
+    return nextReconnectDelayMs();
+  }
+
+  function reconnectSucceeded(): boolean {
+    if (state !== "reconnecting") return false;
+    state = "streaming";
+    reconnectAttempt = 0;
+    disconnectedAt = undefined;
+    return true;
+  }
+
   function release(): boolean {
     state = "released";
     disconnectedAt = undefined;
@@ -175,6 +203,9 @@ export function createAutomationStreamAdapter(
     reclaim,
     reclaimWindowRemainingMs,
     nextReconnectDelayMs,
+    beginReconnect,
+    reconnectFailed,
+    reconnectSucceeded,
     release,
     get viewport() {
       return viewport;

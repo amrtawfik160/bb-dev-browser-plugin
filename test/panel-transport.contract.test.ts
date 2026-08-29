@@ -1,0 +1,331 @@
+import { randomUUID } from "node:crypto";
+import { describe, expect, it } from "vitest";
+import { WebSocket } from "ws";
+import {
+  PANEL_MAX_FRAMES_PER_SECOND,
+  PANEL_MAX_VIEWPORT_HEIGHT,
+  PANEL_MAX_VIEWPORT_WIDTH,
+  PANEL_MIN_FRAMES_PER_SECOND,
+  PANEL_RECLAIM_WINDOW_MS,
+  PANEL_RECONNECT_INITIAL_BACKOFF_MS,
+} from "../contracts.js";
+import { createPanelCapabilityStore } from "../panel-capability.js";
+import { createPanelGateway } from "../panel-gateway.js";
+import {
+  createAutomationStreamAdapter,
+  frameIntervalMs,
+} from "../panel-stream.js";
+import {
+  createPanelTransportServer,
+  type ScreencastFrame,
+  type ScreencastSource,
+} from "../panel-transport.js";
+
+const hostId = "host-transport";
+const profileId = "profile-transport";
+const ownerSessionId = "owner-session-transport";
+const panelId = "panel-transport";
+
+function redeemMessage(capability: { capabilityId: string; secret: string }) {
+  return {
+    type: "redeem" as const,
+    capabilityId: capability.capabilityId,
+    secret: capability.secret,
+    ownerSessionId,
+    panelId,
+  };
+}
+
+function decode<T>(raw: string): T {
+  return JSON.parse(raw) as T;
+}
+
+/**
+ * A deterministic screencast source the transport drives. It emits a bounded
+ * burst of frames at the adapter's current frame interval, records every
+ * forwarded input payload, and stops when the abort signal fires.
+ */
+function createFakeScreencastSource(options: {
+  frameCount: number;
+}): ScreencastSource & {
+  inputs: unknown[];
+  frames: ScreencastFrame[];
+  started: boolean;
+} {
+  const inputs: unknown[] = [];
+  const frames: ScreencastFrame[] = [];
+  let stopped = false;
+  let interval: ReturnType<typeof setInterval> | undefined;
+  return {
+    inputs,
+    frames,
+    started: false,
+    async start(onFrame, signal) {
+      this.started = true;
+      await new Promise<void>((resolve) => {
+        let sequence = 1;
+        let emitted = 0;
+        const tick = () => {
+          if (stopped || signal.aborted) {
+            if (interval !== undefined) clearInterval(interval);
+            resolve();
+            return;
+          }
+          if (emitted >= options.frameCount) {
+            if (interval !== undefined) clearInterval(interval);
+            // Keep the stream open until stopped so input can still flow.
+            return;
+          }
+          emitted += 1;
+          const data = Buffer.from(`frame-${sequence}`);
+          const frame: ScreencastFrame = {
+            sequence,
+            mimeType: "image/png",
+            data,
+          };
+          frames.push(frame);
+          onFrame(frame);
+          sequence += 1;
+        };
+        interval = setInterval(tick, 1);
+        signal.addEventListener(
+          "abort",
+          () => {
+            stopped = true;
+            if (interval !== undefined) clearInterval(interval);
+            resolve();
+          },
+          { once: true },
+        );
+      });
+    },
+    input(payload) {
+      inputs.push(payload);
+    },
+    async stop() {
+      stopped = true;
+      if (interval !== undefined) clearInterval(interval);
+    },
+  };
+}
+
+async function connect(port: number) {
+  const socket = new WebSocket(`ws://127.0.0.1:${port}`);
+  await new Promise<void>((resolve, reject) => {
+    socket.once("open", resolve);
+    socket.once("error", reject);
+  });
+  return socket;
+}
+
+function send(socket: WebSocket, message: unknown) {
+  socket.send(JSON.stringify(message));
+}
+
+function onceMessage(socket: WebSocket): Promise<string> {
+  return new Promise((resolve) => {
+    const handler = (raw: string) => {
+      socket.off("message", handler);
+      resolve(raw.toString());
+    };
+    socket.on("message", handler);
+  });
+}
+
+describe("Panel transport server contract", () => {
+  it("binds a real loopback gateway port and redeems the capability in the first message", async () => {
+    const clock = { now: () => 1_000_000 };
+    const capabilities = createPanelCapabilityStore({ clock });
+    const gateway = createPanelGateway({
+      capabilities,
+      hostId,
+      profileId,
+      clock,
+    });
+    const stream = createAutomationStreamAdapter({ clock, capabilities });
+    const source = createFakeScreencastSource({ frameCount: 1 });
+    const transport = createPanelTransportServer({
+      gateway,
+      stream,
+      source,
+      clock,
+    });
+    const port = await transport.start();
+    try {
+      expect(port).toBeGreaterThan(0);
+      const socket = await connect(port);
+      const issued = capabilities.issue({
+        ownerSessionId,
+        panelId,
+        hostId,
+        profileId,
+      });
+      send(socket, {
+        type: "redeem",
+        capabilityId: issued.capabilityId,
+        secret: issued.secret,
+        ownerSessionId,
+        panelId,
+      });
+      const ready = decode<{ type: string }>(await onceMessage(socket));
+      expect(ready.type).toBe("ready");
+      socket.close();
+    } finally {
+      await transport.stop();
+    }
+  });
+
+  it("rejects a connection that does not redeem a valid capability first", async () => {
+    const clock = { now: () => 1_000_000 };
+    const capabilities = createPanelCapabilityStore({ clock });
+    const gateway = createPanelGateway({
+      capabilities,
+      hostId,
+      profileId,
+      clock,
+    });
+    const stream = createAutomationStreamAdapter({ clock, capabilities });
+    const source = createFakeScreencastSource({ frameCount: 0 });
+    const transport = createPanelTransportServer({
+      gateway,
+      stream,
+      source,
+      clock,
+    });
+    const port = await transport.start();
+    try {
+      const socket = await connect(port);
+      send(socket, { type: "ping" });
+      const message = await onceMessage(socket);
+      const error = decode<{ type: string; reason: string }>(message);
+      expect(error.type).toBe("error");
+      expect(error.reason).toBe("unauthorized");
+      await new Promise<void>((resolve) => socket.once("close", resolve));
+    } finally {
+      await transport.stop();
+    }
+  });
+
+  it("delivers frames over the WebSocket and forwards input to the screencast source", async () => {
+    const clock = { now: () => 1_000_000 };
+    const capabilities = createPanelCapabilityStore({ clock });
+    const gateway = createPanelGateway({
+      capabilities,
+      hostId,
+      profileId,
+      clock,
+    });
+    const stream = createAutomationStreamAdapter({ clock, capabilities });
+    stream.start();
+    stream.setViewport({
+      width: PANEL_MAX_VIEWPORT_WIDTH,
+      height: PANEL_MAX_VIEWPORT_HEIGHT,
+    });
+    expect(stream.viewport).toEqual({
+      width: PANEL_MAX_VIEWPORT_WIDTH,
+      height: PANEL_MAX_VIEWPORT_HEIGHT,
+    });
+    expect(stream.fps).toBeLessThanOrEqual(PANEL_MAX_FRAMES_PER_SECOND);
+    expect(stream.fps).toBeGreaterThanOrEqual(PANEL_MIN_FRAMES_PER_SECOND);
+    const source = createFakeScreencastSource({ frameCount: 3 });
+    const transport = createPanelTransportServer({
+      gateway,
+      stream,
+      source,
+      clock,
+    });
+    const port = await transport.start();
+    try {
+      const socket = await connect(port);
+      const issued = capabilities.issue({
+        ownerSessionId,
+        panelId,
+        hostId,
+        profileId,
+      });
+      send(socket, redeemMessage(issued));
+      await onceMessage(socket); // ready
+      const frameRaw = await onceMessage(socket);
+      const frame = decode<{
+        type: string;
+        sequence: number;
+        mimeType: string;
+        data: string;
+      }>(frameRaw);
+      expect(frame.type).toBe("frame");
+      expect(frame.sequence).toBe(1);
+      expect(frame.mimeType).toBe("image/png");
+      expect(Buffer.from(frame.data, "base64").toString()).toBe("frame-1");
+      // Forwarded input reaches the source after gateway validation.
+      send(socket, { type: "input", sequence: 1, payload: { kind: "click" } });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(source.inputs).toEqual([{ kind: "click" }]);
+      socket.close();
+    } finally {
+      await transport.stop();
+    }
+  });
+
+  it("freezes input on disconnect and reclaims within the 10-second window", async () => {
+    let now = 1_000_000;
+    const clock = { now: () => now };
+    const capabilities = createPanelCapabilityStore({ clock });
+    const gateway = createPanelGateway({
+      capabilities,
+      hostId,
+      profileId,
+      clock,
+    });
+    const stream = createAutomationStreamAdapter({ clock, capabilities });
+    stream.start();
+    const source = createFakeScreencastSource({ frameCount: 0 });
+    const transport = createPanelTransportServer({
+      gateway,
+      stream,
+      source,
+      clock,
+    });
+    const port = await transport.start();
+    const issued = capabilities.issue({
+      ownerSessionId,
+      panelId,
+      hostId,
+      profileId,
+    });
+    let socket: WebSocket;
+    try {
+      socket = await connect(port);
+      send(socket, redeemMessage(issued));
+      await onceMessage(socket); // ready
+      socket.close();
+      await new Promise<void>((resolve) => socket.once("close", resolve));
+      // Input freezes immediately on disconnect.
+      expect(stream.state).toBe("input-frozen");
+      expect(stream.markCapabilityDisconnected(issued.capabilityId)).toBe(true);
+      // Reclaim within the window restores the stream.
+      now += PANEL_RECLAIM_WINDOW_MS - 1;
+      expect(stream.reclaim(issued.capabilityId)).toBe(true);
+      expect(stream.state).toBe("streaming");
+    } finally {
+      await transport.stop();
+    }
+  });
+
+  it("reports a bounded reconnect delay from the stream adapter", () => {
+    const stream = createAutomationStreamAdapter();
+    stream.start();
+    stream.freezeInput();
+    const first = stream.beginReconnect();
+    expect(first).toBe(PANEL_RECONNECT_INITIAL_BACKOFF_MS);
+    expect(stream.state).toBe("reconnecting");
+    const second = stream.reconnectFailed();
+    const third = stream.reconnectFailed();
+    expect(second).toBeLessThanOrEqual(third);
+    expect(third).toBeLessThanOrEqual(8000);
+    expect(frameIntervalMs(stream.fps)).toBeGreaterThanOrEqual(
+      frameIntervalMs(PANEL_MAX_FRAMES_PER_SECOND),
+    );
+    // unique id to avoid unused import warning
+    expect(randomUUID().length).toBeGreaterThan(0);
+  });
+});

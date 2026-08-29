@@ -37,6 +37,7 @@ describe("Browser package contract", () => {
         /^react$/,
         /^typescript-eslint$/,
         /^vitest$/,
+        /^ws$/,
         /^zod$/,
       ],
     });

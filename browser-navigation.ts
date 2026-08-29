@@ -80,6 +80,24 @@ await page.goto(${JSON.stringify(address.url)});
 console.log(JSON.stringify({ tabId: ${JSON.stringify(tabId)}, url: page.url() }));`;
 }
 
+export function browserHistoryScript(
+  direction: "back" | "forward" | "reload",
+  tabId: string,
+) {
+  const action =
+    direction === "back"
+      ? "history.back()"
+      : direction === "forward"
+        ? "history.forward()"
+        : "location.reload()";
+  return `const pages = await browser.listPages();
+if (!pages.some((entry) => entry.id === ${JSON.stringify(tabId)})) throw new Error("Browser Tab is invalid or belongs to a previous runtime");
+const page = await browser.getPage(${JSON.stringify(tabId)});
+await page.bringToFront();
+await page.evaluate(() => ${action});
+console.log(JSON.stringify({ tabId: ${JSON.stringify(tabId)}, url: page.url() }));`;
+}
+
 export function activeBrowserTabScript() {
   return `const pages = await browser.listPages();
 if (pages.length === 0) throw new Error("The Browser Profile has no open tabs");

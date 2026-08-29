@@ -82,6 +82,7 @@ import {
   type BrowserProfileGrantRevokeRequest,
   type BrowserProfileGrantRevokeResponse,
   type BrowserPanelNavigationInput,
+  type BrowserPanelHistoryInput,
   type BrowserPanelVisibilityRequest,
   type BrowserPanelCapabilityRequest,
   type BrowserPanelCapabilityResponse,
@@ -2298,6 +2299,30 @@ export function createBrowserService(
     );
   }
 
+  async function history(
+    request: BrowserPanelHistoryInput,
+    signal?: AbortSignal,
+  ): Promise<BrowserNavigationResponse> {
+    const identity = panelIdentity(request);
+    const hostId = await resolvedHostId(bb, identity);
+    if (hostId === null || hostId !== request.hostId) {
+      throw new Error("The selected workspace host is unavailable.");
+    }
+    const projectId = await profileContextProjectId(bb, identity);
+    await requireConnectedHost(hostId, signal);
+    return host.call(
+      "history",
+      {
+        hostId,
+        profileId: request.profileId,
+        projectId,
+        direction: request.direction,
+        ...(request.tabId === undefined ? {} : { tabId: request.tabId }),
+      },
+      { hostId, signal },
+    );
+  }
+
   async function panelVisibility(
     request: BrowserPanelVisibilityRequest,
     signal?: AbortSignal,
@@ -2394,6 +2419,7 @@ export function createBrowserService(
   return {
     browserScript,
     navigate,
+    history,
     panelVisibility,
     panelCapability,
     grants,

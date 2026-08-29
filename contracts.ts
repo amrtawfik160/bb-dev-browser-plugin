@@ -1572,6 +1572,29 @@ export const browserNavigationRequestSchema = z
   })
   .strict();
 
+const browserHistoryFields = {
+  direction: z.enum(["back", "forward", "reload"]),
+  tabId: z.string().min(1).optional(),
+} as const;
+
+export const browserPanelHistoryRequestSchema = z.discriminatedUnion(
+  "surface",
+  [
+    threadSurfaceSchema.extend(browserHistoryFields).strict(),
+    newThreadSurfaceSchema.extend(browserHistoryFields).strict(),
+  ],
+);
+
+export const browserHistoryRequestSchema = z
+  .object({
+    hostId: z.string().min(1),
+    profileId: z.string().min(1),
+    projectId: z.string().min(1),
+    direction: z.enum(["back", "forward", "reload"]),
+    tabId: z.string().min(1).optional(),
+  })
+  .strict();
+
 export const browserPanelVisibilityRequestSchema = z
   .object({
     hostId: z.string().min(1),
@@ -1725,6 +1748,13 @@ export type BrowserPanelNavigationRequest = z.infer<
 export type BrowserPanelNavigationInput = z.input<
   typeof browserPanelNavigationRequestSchema
 >;
+export type BrowserPanelHistoryRequest = z.infer<
+  typeof browserPanelHistoryRequestSchema
+>;
+export type BrowserPanelHistoryInput = z.input<
+  typeof browserPanelHistoryRequestSchema
+>;
+export type BrowserHistoryRequest = z.infer<typeof browserHistoryRequestSchema>;
 export type BrowserNavigationRequest = z.infer<
   typeof browserNavigationRequestSchema
 >;
@@ -1739,6 +1769,10 @@ export const rpcContract = defineRpcContract({
   },
   browser_navigate: {
     input: browserPanelNavigationRequestSchema,
+    output: browserNavigationResponseSchema,
+  },
+  browser_history: {
+    input: browserPanelHistoryRequestSchema,
     output: browserNavigationResponseSchema,
   },
   browser_panel_visibility: {

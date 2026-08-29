@@ -20,6 +20,7 @@ import {
   browserScriptResponseSchema,
   browserScriptRequestSchema,
   browserNavigationRequestSchema,
+  browserHistoryRequestSchema,
   browserNavigationResponseSchema,
   browserPanelVisibilityRequestSchema,
   browserPanelTransportRequestSchema,
@@ -85,6 +86,10 @@ export const browserHostContract = defineRpcContract({
   },
   navigate: {
     input: browserNavigationRequestSchema,
+    output: browserNavigationResponseSchema,
+  },
+  history: {
+    input: browserHistoryRequestSchema,
     output: browserNavigationResponseSchema,
   },
   panelVisibility: {

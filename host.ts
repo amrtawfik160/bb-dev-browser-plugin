@@ -45,12 +45,16 @@ import {
   type BrowserScriptResponse,
   type BrowserScriptRuntimeError,
   type BrowserNavigationRequest,
+  type BrowserHistoryRequest,
   type BrowserPanelVisibilityRequest,
   type BrowserPanelTransportRequest,
   type BrowserStatus,
 } from "./contracts.js";
 import { createPanelCapabilityStore } from "./panel-capability.js";
-import { createPanelGateway } from "./panel-gateway.js";
+import { createPanelGatewayPool } from "./panel-gateway-pool.js";
+import { createPanelTransportServer } from "./panel-transport.js";
+import { createCdpScreencastSource } from "./browser-screencast.js";
+import { createAutomationStreamAdapter } from "./panel-stream.js";
 import {
   ControlLeaseError,
   createControlLeaseManager,
@@ -333,9 +337,12 @@ export function createBrowserHostEntry(
     typeof runtimeSource === "object" ? runtimeSource : undefined;
   const controlLeases = createControlLeaseManager();
   const panelCapabilities = createPanelCapabilityStore();
-  const panelGateways = new Map<
+  const panelGateways = createPanelGatewayPool({
+    capabilities: panelCapabilities,
+  });
+  const panelTransports = new Map<
     string,
-    ReturnType<typeof createPanelGateway>
+    ReturnType<typeof createPanelTransportServer>
   >();
   const hostConnectionGenerations = new Map<string, number>();
   function administration(dataDir: string) {
@@ -466,6 +473,21 @@ export function createBrowserHostEntry(
           : recoverySource;
     return retainedRecovery;
   }
+  async function resolveActiveProfile(
+    dataDir: string,
+    hostId: string,
+    profileId: string,
+  ) {
+    const inventory = await profiles(dataDir).listProfiles(hostId);
+    const profile = inventory.profiles.find(
+      (candidate) =>
+        candidate.profileId === profileId && candidate.state === "active",
+    );
+    if (profile === undefined) {
+      throw new Error("The requested Browser Profile is unavailable.");
+    }
+    return profile;
+  }
   async function navigateBrowser(
     request: BrowserNavigationRequest,
     dataDir: string,
@@ -474,15 +496,11 @@ export function createBrowserHostEntry(
     const target = { hostId: request.hostId, profileId: request.profileId };
     const readiness = await administration(dataDir).inspect(target);
     if (readiness.state !== "healthy") throw new Error(readiness.message);
-    const inventory = await profiles(dataDir).listProfiles(request.hostId);
-    const profile = inventory.profiles.find(
-      (candidate) =>
-        candidate.profileId === request.profileId &&
-        candidate.state === "active",
+    const profile = await resolveActiveProfile(
+      dataDir,
+      request.hostId,
+      request.profileId,
     );
-    if (profile === undefined) {
-      throw new Error("The requested Browser Profile is unavailable.");
-    }
     const browserRuntime = runtime(dataDir);
     if (browserRuntime === undefined) {
       throw new Error("The Workspace Browser runtime is unavailable.");
@@ -504,6 +522,43 @@ export function createBrowserHostEntry(
           timezone: profile.timezone,
         },
         request.input,
+        { signal, leaseSignal: lease.signal },
+      );
+    } finally {
+      lease.release();
+    }
+  }
+  async function historyBrowser(
+    request: BrowserHistoryRequest,
+    dataDir: string,
+    signal?: AbortSignal,
+  ) {
+    const target = { hostId: request.hostId, profileId: request.profileId };
+    const readiness = await administration(dataDir).inspect(target);
+    if (readiness.state !== "healthy") throw new Error(readiness.message);
+    const profile = await resolveActiveProfile(
+      dataDir,
+      request.hostId,
+      request.profileId,
+    );
+    const browserRuntime = runtime(dataDir);
+    if (browserRuntime === undefined) {
+      throw new Error("The Workspace Browser runtime is unavailable.");
+    }
+    const lease = await controlLeases.acquireOwner(
+      controlLeaseKey(target),
+      signal,
+    );
+    try {
+      return await browserRuntime.history(
+        {
+          ...target,
+          projectId: request.projectId,
+          ...(request.tabId === undefined ? {} : { tabId: request.tabId }),
+          locale: profile.locale,
+          timezone: profile.timezone,
+        },
+        request.direction,
         { signal, leaseSignal: lease.signal },
       );
     } finally {
@@ -577,22 +632,64 @@ export function createBrowserHostEntry(
     if (readiness.state !== "healthy" || readiness.hostId === null) {
       throw new Error(readiness.message);
     }
-    const gatewayKey = `${request.hostId}\u0000${request.profileId}\u0000${request.panelId}`;
-    let gateway = panelGateways.get(gatewayKey);
-    if (gateway === undefined) {
-      gateway = createPanelGateway({
-        capabilities: panelCapabilities,
-        hostId: request.hostId,
-        profileId: request.profileId,
-      });
-      panelGateways.set(gatewayKey, gateway);
-    }
-    const issued = panelCapabilities.issue({
+    // A remount issues a fresh single-use Panel Capability. The pool retires
+    // any prior gateway for this panel (revoking its redeemed capability) so
+    // the fresh redeem is never blocked by a stale redeemed capability.
+    const { gateway, issued } = panelGateways.openPanel({
       ownerSessionId: request.ownerSessionId,
       panelId: request.panelId,
       hostId: request.hostId,
       profileId: request.profileId,
     });
+    const browserRuntime = runtime(dataDir);
+    if (browserRuntime !== undefined) {
+      // Bind the gateway port (net.Server + WebSocket) and drive CDP screencast
+      // through the browser runtime so Automation Mode frames stream over the
+      // authenticated transport. The real-browser integration suite exercises
+      // this path against a provisioned host; the deterministic suite has no
+      // real browser and keeps the declared-port fallback below.
+      const profile = await resolveActiveProfile(
+        dataDir,
+        request.hostId,
+        request.profileId,
+      ).catch(() => undefined);
+      const target = {
+        hostId: request.hostId,
+        profileId: request.profileId,
+        locale: profile?.locale ?? "en-US",
+        timezone: profile?.timezone ?? "UTC",
+      };
+      const stream = createAutomationStreamAdapter({
+        capabilities: panelCapabilities,
+      });
+      const source = createCdpScreencastSource({
+        resolveEndpoint: async () =>
+          (await browserRuntime.start(target)).automationEndpoint,
+      });
+      const transport = createPanelTransportServer({
+        gateway,
+        stream,
+        source,
+      });
+      const port = await transport.start();
+      const transportKey = `${request.hostId}\u0000${request.profileId}\u0000${request.panelId}`;
+      const previous = panelTransports.get(transportKey);
+      if (previous !== undefined) {
+        await previous.stop().catch(() => undefined);
+        panelTransports.delete(transportKey);
+      }
+      panelTransports.set(transportKey, transport);
+      return {
+        gatewayPort: port,
+        bindHost: gateway.declaredBindHost(),
+        capabilityId: issued.capabilityId,
+        secret: issued.secret,
+        expiresAt: new Date(issued.expiresAt).toISOString(),
+        rotatesAt: new Date(
+          issued.issuedAt + panelCapabilities.rotationMs,
+        ).toISOString(),
+      };
+    }
     return {
       gatewayPort: gateway.choosePort(),
       bindHost: gateway.declaredBindHost(),
@@ -818,6 +915,14 @@ export function createBrowserHostEntry(
           context.signal,
         );
       },
+      history: async (request, context) => {
+        retainWorker(context);
+        return historyBrowser(
+          request,
+          context.experimental_paths.dataDir,
+          context.signal,
+        );
+      },
       panelVisibility: async (request, context) => {
         retainWorker(context);
         return setPanelVisibility(request, context.experimental_paths.dataDir);
@@ -944,8 +1049,11 @@ export function createBrowserHostEntry(
     dispose: async () => {
       try {
         controlLeases.dispose();
-        for (const gateway of panelGateways.values()) gateway.close();
-        panelGateways.clear();
+        for (const transport of panelTransports.values()) {
+          await transport.stop().catch(() => undefined);
+        }
+        panelTransports.clear();
+        panelGateways.dispose();
         panelCapabilities.dispose();
         await disposeRuntime();
       } finally {

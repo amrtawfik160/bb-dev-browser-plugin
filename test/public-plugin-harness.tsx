@@ -32,6 +32,7 @@ import {
   browserLifecycleRequestSchema,
   browserLifecycleResponseSchema,
   browserNavigationRequestSchema,
+  browserHistoryRequestSchema,
   browserNavigationResponseSchema,
   browserPanelVisibilityRequestSchema,
   browserPanelTransportRequestSchema,
@@ -60,8 +61,10 @@ import {
   browserProfileGrantQuerySchema,
   browserProfileGrantRevokeRequestSchema,
   type BrowserPanelNavigationInput,
+  type BrowserPanelHistoryInput,
   type BrowserPanelCapabilityResponse,
   type BrowserNavigationRequest,
+  type BrowserHistoryRequest,
   browserProfileGrantRevokeResponseSchema,
   browserProfileGrantSchema,
   browserProfileGrantsSchema,
@@ -578,6 +581,14 @@ export async function createPublicPluginHarness(options?: {
         }
         return host.experimental_call("navigate", request, { signal });
       }
+      if (method === "history") {
+        const request = browserHistoryRequestSchema.parse(input);
+        historyRequests.push(request);
+        if (options?.navigationResponse !== undefined) {
+          return options.navigationResponse;
+        }
+        return host.experimental_call("history", request, { signal });
+      }
       if (method === "activityOutbox") {
         return host.experimental_call(
           "activityOutbox",
@@ -696,6 +707,13 @@ export async function createPublicPluginHarness(options?: {
   const settingsPanels: RenderedSlot[] = [];
   let grantRequestRpcCallIndex = 0;
   const navigationRequests: BrowserNavigationRequest[] = [];
+  const historyRequests: BrowserHistoryRequest[] = [];
+  const panelCapabilityRequests: {
+    hostId: string;
+    profileId: string;
+    panelId: string;
+    ownerSessionId: string;
+  }[] = [];
 
   const rpc = {
     browser_status: (input: BrowserStatusInput) =>
@@ -705,6 +723,10 @@ export async function createPublicPluginHarness(options?: {
       ) as Promise<BrowserStatus>,
     browser_navigate: (input: BrowserPanelNavigationInput) =>
       backend.harness.behavior.callRpc("browser_navigate", input) as Promise<
+        ReturnType<typeof browserNavigationResponseSchema.parse>
+      >,
+    browser_history: (input: BrowserPanelHistoryInput) =>
+      backend.harness.behavior.callRpc("browser_history", input) as Promise<
         ReturnType<typeof browserNavigationResponseSchema.parse>
       >,
     browser_panel_visibility: (input: {
@@ -722,11 +744,13 @@ export async function createPublicPluginHarness(options?: {
       profileId: string;
       panelId: string;
       ownerSessionId: string;
-    }) =>
-      backend.harness.behavior.callRpc(
+    }) => {
+      panelCapabilityRequests.push(input);
+      return backend.harness.behavior.callRpc(
         "browser_panel_capability",
         input,
-      ) as Promise<BrowserPanelCapabilityResponse>,
+      ) as Promise<BrowserPanelCapabilityResponse>;
+    },
     browser_settings_status: (input: { profileId: string }) =>
       backend.harness.behavior.callRpc(
         "browser_settings_status",
@@ -1549,6 +1573,12 @@ export async function createPublicPluginHarness(options?: {
     },
     get navigationRequests() {
       return [...navigationRequests];
+    },
+    get historyRequests() {
+      return [...historyRequests];
+    },
+    get panelCapabilityRequests() {
+      return [...panelCapabilityRequests];
     },
     get hostConnectionRequests() {
       return [...hostConnectionRequests];

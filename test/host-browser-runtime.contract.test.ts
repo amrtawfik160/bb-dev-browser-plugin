@@ -50,6 +50,9 @@ describe("Browser host runtime boundary", () => {
       navigate: async () => {
         throw new Error("not used");
       },
+      history: async () => {
+        throw new Error("not used");
+      },
       status: async ({
         hostId,
         profileId,
@@ -272,6 +275,9 @@ describe("Browser host runtime boundary", () => {
         navigate: async () => {
           throw new Error("not used");
         },
+        history: async () => {
+          throw new Error("not used");
+        },
         status: async ({
           hostId,
           profileId,
@@ -401,6 +407,17 @@ describe("Browser host runtime boundary", () => {
         location: { url: input },
         tabId: target.tabId ?? "host-tab",
       }),
+      history: async (
+        target: { tabId?: string },
+        direction: "back" | "forward" | "reload",
+      ) => ({
+        address: {
+          kind: "address" as const,
+          url: "https://example.com/navigated",
+        },
+        location: { direction },
+        tabId: target.tabId ?? "host-tab",
+      }),
       status: async ({
         hostId,
         profileId,
@@ -508,6 +525,9 @@ it("issue #14 returns a typed origin_denied result when the runtime blocks a rea
     navigate: async () => {
       throw new Error("not used");
     },
+    history: async () => {
+      throw new Error("not used");
+    },
     status: async ({
       hostId,
       profileId,
@@ -602,6 +622,9 @@ it("issue #14 AC4 forwards per-origin invalid-certificate flags from the script 
       return "fixture-output";
     },
     navigate: async () => {
+      throw new Error("not used");
+    },
+    history: async () => {
       throw new Error("not used");
     },
     status: async ({

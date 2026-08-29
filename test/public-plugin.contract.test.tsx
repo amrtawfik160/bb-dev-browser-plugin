@@ -148,6 +148,11 @@ function publicRuntime(
     stop: async () => undefined,
     execute,
     navigate,
+    history: async (target, direction) => ({
+      address: { kind: "address", url: "about:blank" },
+      location: { direction, tabId: target.tabId ?? "public-tab" },
+      tabId: target.tabId ?? "public-tab",
+    }),
     status: async (target) => ({
       state: "running",
       hostId: target.hostId,
@@ -390,6 +395,44 @@ describe("Browser public plugin contract", () => {
       await panel.panel.findByText("http://p-project.localhost:4173/account"),
     ).toBeTruthy();
     await browser.dispose();
+  });
+
+  it("routes back, forward, and reload from the Browser Panel to the authenticated transport", async () => {
+    const browser = await createPublicPluginHarness({
+      status: healthyStatus,
+      navigationResponse: {
+        address: {
+          kind: "address",
+          url: "http://p-project.localhost:4173/account",
+        },
+        location: { url: "http://p-project.localhost:4173/account" },
+        tabId: "shared-tab-1",
+      },
+    });
+    try {
+      const panel = await browser.openExistingThreadPanel();
+      for (const [label] of [
+        ["Go back", "back"],
+        ["Go forward", "forward"],
+        ["Reload page", "reload"],
+      ] as const) {
+        const button = await panel.panel.findByRole("button", { name: label });
+        fireEvent.click(button);
+      }
+      await waitFor(() => expect(browser.historyRequests).toHaveLength(3));
+      expect(browser.historyRequests[0]).toMatchObject({
+        hostId: "host-browser-test",
+        profileId: DEFAULT_PROFILE_ID,
+        projectId: "project-browser-test",
+        direction: "back",
+      });
+      expect(browser.historyRequests[1]).toMatchObject({
+        direction: "forward",
+      });
+      expect(browser.historyRequests[2]).toMatchObject({ direction: "reload" });
+    } finally {
+      await browser.dispose();
+    }
   });
 
   it("opens one full-bleed Setup required panel per profile on an existing thread", async () => {
@@ -4341,6 +4384,30 @@ describe("Browser public plugin contract", () => {
         expect(response.reason).toBe("setup-required");
       }
       expect(browser.sharedPortDeclarations).toEqual([]);
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("binds the Panel Capability to the owner session derived from the BB app context, not a hardcoded literal", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+    });
+    try {
+      const panel = await browser.openExistingThreadPanel();
+      await panel.panel.findByRole("region", {
+        name: "Browser Automation Mode stream",
+      });
+      await waitFor(() =>
+        expect(browser.panelCapabilityRequests.length).toBeGreaterThan(0),
+      );
+      const request = browser.panelCapabilityRequests[0]!;
+      // The owner session is derived from the BB app context (the test harness
+      // renders the panel with a null context), never the legacy literal.
+      expect(request.ownerSessionId).not.toBe("owner-session-panel");
+      expect(request.ownerSessionId).toMatch(/^bb-owner-session:/);
+      // The panel surface never exposes transport secrets.
+      expect(panel.panel.container.innerHTML).not.toContain("ws://");
     } finally {
       await browser.dispose();
     }

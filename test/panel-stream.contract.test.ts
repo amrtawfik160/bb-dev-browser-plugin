@@ -121,6 +121,36 @@ describe("Automation Mode stream policy contract", () => {
     expect(reconnectBackoffMs(10)).toBe(PANEL_RECONNECT_MAX_BACKOFF_MS);
   });
 
+  it("drives a reconnect loop through the reconnecting state with bounded backoff", () => {
+    const adapter = createAutomationStreamAdapter();
+    adapter.start();
+    adapter.freezeInput();
+    // beginReconnect transitions to "reconnecting" and yields the first delay.
+    const firstDelay = adapter.beginReconnect();
+    expect(adapter.state).toBe("reconnecting");
+    expect(firstDelay).toBe(PANEL_RECONNECT_INITIAL_BACKOFF_MS);
+    // A failed attempt stays in "reconnecting" and advances the backoff.
+    const secondDelay = adapter.reconnectFailed();
+    expect(adapter.state).toBe("reconnecting");
+    expect(secondDelay).toBe(1000);
+    const thirdDelay = adapter.reconnectFailed();
+    expect(thirdDelay).toBe(2000);
+    // A successful attempt restores streaming and resets the backoff counter.
+    expect(adapter.reconnectSucceeded()).toBe(true);
+    expect(adapter.state).toBe("streaming");
+    // A fresh disconnect starts a new reconnect loop at the initial backoff.
+    adapter.freezeInput();
+    expect(adapter.beginReconnect()).toBe(PANEL_RECONNECT_INITIAL_BACKOFF_MS);
+  });
+
+  it("does not begin a reconnect loop after the stream is released", () => {
+    const adapter = createAutomationStreamAdapter();
+    adapter.start();
+    adapter.release();
+    expect(adapter.beginReconnect()).toBe(0);
+    expect(adapter.state).toBe("released");
+  });
+
   it("never streams audio or exceeds the declared viewport after release", () => {
     const adapter = createAutomationStreamAdapter();
     adapter.start();
