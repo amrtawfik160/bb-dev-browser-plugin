@@ -12,20 +12,21 @@ Where a behavior cannot yet be exercised in this environment it is stated as a
 
 ## Audience map
 
-| Document                                         | For                                                                                                                             |
-| ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------- |
-| [quickstart.md](quickstart.md)                   | Owners and agents — everyday use from both launch surfaces through recovery.                                                    |
-| [operators.md](operators.md)                     | Host operators — supported hosts, BB Connect, setup, repair, retention, purge, backups, restores, imports, quotas, diagnostics. |
-| [security.md](security.md)                       | Reviewers and security owners — trust boundaries, threat model, guarantees, and exclusions.                                     |
-| [agent-reference.md](agent-reference.md)         | Agents and agent authors — `browser_script`, the BB browser CLI, the bundled skill, typed results, contention, and retry.       |
-| [cli-reference.md](cli-reference.md)             | Everyone — the complete `bb browser` command surface with exact flags.                                                          |
-| [safe-login.md](safe-login.md)                   | Owners — owner-only Safe Login Mode for sites that reject automation.                                                           |
-| [architecture.md](architecture.md)               | Reviewers — runtime architecture, modes, transport, and ADR index.                                                              |
-| [permissions.md](permissions.md)                 | Reviewers — host, OS-user, browser, network, and data permissions.                                                              |
-| [troubleshooting.md](troubleshooting.md)         | Everyone — diagnosing states and recovery.                                                                                      |
-| [limitations.md](limitations.md)                 | Everyone — explicit version-one limitations.                                                                                    |
-| [third-party-notices.md](third-party-notices.md) | Reviewers and marketplace — exact pinned dependencies, engine, and licenses.                                                    |
-| [verification-report.md](verification-report.md) | Reviewers — every parent requirement mapped to automated evidence, planned human acceptance, or an explicit limitation.         |
+| Document                                                           | For                                                                                                                             |
+| ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------- |
+| [quickstart.md](quickstart.md)                                     | Owners and agents — everyday use from both launch surfaces through recovery.                                                    |
+| [operators.md](operators.md)                                       | Host operators — supported hosts, BB Connect, setup, repair, retention, purge, backups, restores, imports, quotas, diagnostics. |
+| [security.md](security.md)                                         | Reviewers and security owners — trust boundaries, threat model, guarantees, and exclusions.                                     |
+| [agent-reference.md](agent-reference.md)                           | Agents and agent authors — `browser_script`, the BB browser CLI, the bundled skill, typed results, contention, and retry.       |
+| [cli-reference.md](cli-reference.md)                               | Everyone — the complete `bb browser` command surface with exact flags.                                                          |
+| [safe-login.md](safe-login.md)                                     | Owners — owner-only Safe Login Mode for sites that reject automation.                                                           |
+| [third-party-login-smoke-test.md](third-party-login-smoke-test.md) | Owners — the optional, opt-in, owner-performed third-party login smoke test (issue #25, `ready-for-human`).                     |
+| [architecture.md](architecture.md)                                 | Reviewers — runtime architecture, modes, transport, and ADR index.                                                              |
+| [permissions.md](permissions.md)                                   | Reviewers — host, OS-user, browser, network, and data permissions.                                                              |
+| [troubleshooting.md](troubleshooting.md)                           | Everyone — diagnosing states and recovery.                                                                                      |
+| [limitations.md](limitations.md)                                   | Everyone — explicit version-one limitations.                                                                                    |
+| [third-party-notices.md](third-party-notices.md)                   | Reviewers and marketplace — exact pinned dependencies, engine, and licenses.                                                    |
+| [verification-report.md](verification-report.md)                   | Reviewers — every parent requirement mapped to automated evidence, planned human acceptance, or an explicit limitation.         |
 
 ## Conventions
 
