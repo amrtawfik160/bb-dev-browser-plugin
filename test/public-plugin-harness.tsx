@@ -80,6 +80,9 @@ import {
   browserHostChoicesSchema,
   browserSetupPlanSchema,
   browserSetupResponseSchema,
+  browserTransferStagingResponseSchema,
+  browserTransferOutcomeSchema,
+  browserFileTransferDecisionSchema,
   DEFAULT_PROFILE_ID,
   setupRequiredStatus,
   type BrowserHostTarget,
@@ -1097,6 +1100,35 @@ export async function createPublicPluginHarness(options?: {
         "browser_host_choices",
         input,
       ) as Promise<ReturnType<typeof browserHostChoicesSchema.parse>>,
+    browser_transfer_stage: (
+      input: Parameters<
+        typeof rpcContract.browser_transfer_stage.input.parse
+      >[0],
+    ) =>
+      backend.harness.behavior.callRpc(
+        "browser_transfer_stage",
+        input,
+      ) as Promise<
+        ReturnType<typeof browserTransferStagingResponseSchema.parse>
+      >,
+    browser_transfer_consume: (
+      input: Parameters<
+        typeof rpcContract.browser_transfer_consume.input.parse
+      >[0],
+    ) =>
+      backend.harness.behavior.callRpc(
+        "browser_transfer_consume",
+        input,
+      ) as Promise<ReturnType<typeof browserTransferOutcomeSchema.parse>>,
+    browser_file_transfer_authorize: (
+      input: Parameters<
+        typeof rpcContract.browser_file_transfer_authorize.input.parse
+      >[0],
+    ) =>
+      backend.harness.behavior.callRpc(
+        "browser_file_transfer_authorize",
+        input,
+      ) as Promise<ReturnType<typeof browserFileTransferDecisionSchema.parse>>,
   };
 
   function renderSettings() {

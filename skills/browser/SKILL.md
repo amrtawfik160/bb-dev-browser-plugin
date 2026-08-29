@@ -67,3 +67,30 @@ grantable. Project loopback aliases are project-specific. Raw
 fallback.
 
 Treat `setup_required` as final for the current call. Report that host setup is required; do not retry, provision packages, launch a browser through another path, or seek a raw browser endpoint.
+
+## Files and clipboard
+
+The browser operating-system user has no ambient repository access. An
+explicit workspace upload resolves through BB environment file APIs, must
+remain inside the environment after realpath resolution, and is copied into
+one-use Transfer Staging that is removed after use, cancellation, failure,
+expiry, worker restart, or profile lifecycle operations. Traversal, symlink
+escape, special files, changed-after-selection files, oversized files, and
+low-disk conditions all fail closed.
+
+Stage or cancel a workspace transfer from a project thread:
+
+```text
+bb browser transfer --kind workspace --source <path> --environment-root <path> [--profile <id>] [--json]
+bb browser transfer --cancel --transfer-id <id> [--profile <id>] [--json]
+```
+
+The output is privacy-safe: it shows the transfer ID, kind, size, content
+type, and outcome only. The staged path and unrelated workspace paths are
+never printed. Agent-initiated transfers additionally require the
+`file-transfer` grant and an active Control Lease; owner transfers require
+neither.
+
+Clipboard text moves only through explicit owner copy or paste actions in the
+Browser Panel; the plugin never continuously synchronizes clipboards. Outcomes
+report byte counts, never contents.

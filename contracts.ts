@@ -46,6 +46,22 @@ export const PANEL_GATEWAY_BANDWIDTH_BYTES_PER_SECOND =
 export const PANEL_RECONNECT_INITIAL_BACKOFF_MS = 500;
 export const PANEL_RECONNECT_MAX_BACKOFF_MS = 8_000;
 
+/**
+ * Transfer Staging constants (issue #19). One-use host storage brokers an
+ * explicitly selected file between a workspace or displaying client and a
+ * Workspace Browser without granting browser processes direct repository
+ * access. The defaults mirror Host Download quotas: 1 GiB per file and a
+ * bounded staging lifetime so leftover data is reaped on use, cancellation,
+ * failure, expiry, worker restart, or profile lifecycle operations.
+ */
+export const BROWSER_TRANSFER_MAX_FILE_BYTES = 1 * 1024 * 1024 * 1024;
+export const BROWSER_TRANSFER_STAGING_TTL_MS = 5 * 60_000;
+export const BROWSER_TRANSFER_LOW_DISK_MARGIN_BYTES = 16 * 1024 * 1024;
+export const BROWSER_TRANSFER_STAGING_DIR_MODE = 0o700;
+export const BROWSER_TRANSFER_STAGING_FILE_MODE = 0o600;
+/** Maximum text the explicit clipboard exchange carries per action. */
+export const BROWSER_CLIPBOARD_MAX_BYTES = 4 * 1024 * 1024;
+
 export function browserHostStorageSegment(hostId: string) {
   return encodeURIComponent(hostId).replaceAll(".", "%2E");
 }
@@ -1986,6 +2002,286 @@ export type BrowserContextActionMessage = z.infer<
 >;
 
 /**
+ * Explicit clipboard exchange (issue #19). Text clipboard moves only through
+ * an explicit owner copy or paste action; the plugin never continuously
+ * synchronizes clipboards. `copy` reads the active page selection into the
+ * controller's clipboard and `paste` writes the controller's clipboard into
+ * the page. Both are discrete controller-only actions; no ambient sync path
+ * exists. Outcomes carry privacy-safe metadata (byte counts, not contents) so
+ * the panel and CLI can report results without retaining clipboard data.
+ */
+export const browserClipboardCopyMessageSchema = z
+  .object({
+    type: z.literal("clipboard_copy"),
+    copyId: z.string().min(1).max(120),
+  })
+  .strict();
+export type BrowserClipboardCopyMessage = z.infer<
+  typeof browserClipboardCopyMessageSchema
+>;
+
+export const browserClipboardPasteMessageSchema = z
+  .object({
+    type: z.literal("clipboard_paste"),
+    pasteId: z.string().min(1).max(120),
+    bytes: z.number().int().nonnegative().max(BROWSER_CLIPBOARD_MAX_BYTES),
+  })
+  .strict();
+export type BrowserClipboardPasteMessage = z.infer<
+  typeof browserClipboardPasteMessageSchema
+>;
+
+export const browserClipboardOutcomeSchema = z.discriminatedUnion("outcome", [
+  z
+    .object({
+      outcome: z.literal("copied"),
+      copyId: z.string().min(1).max(120),
+      bytes: z.number().int().nonnegative().max(BROWSER_CLIPBOARD_MAX_BYTES),
+    })
+    .strict(),
+  z
+    .object({
+      outcome: z.literal("pasted"),
+      pasteId: z.string().min(1).max(120),
+      bytes: z.number().int().nonnegative().max(BROWSER_CLIPBOARD_MAX_BYTES),
+    })
+    .strict(),
+  z
+    .object({
+      outcome: z.literal("not-ok"),
+      id: z.string().min(1).max(120),
+      reason: z.enum([
+        "no-selection",
+        "clipboard-empty",
+        "controller-mismatch",
+        "busy",
+        "denied",
+      ]),
+    })
+    .strict(),
+]);
+export type BrowserClipboardOutcome = z.infer<
+  typeof browserClipboardOutcomeSchema
+>;
+
+/**
+ * Transfer Staging request shapes (issue #19, ADR 0011). An upload may come
+ * from the displaying client (`client`) or an explicitly selected workspace
+ * file (`workspace`). Workspace selections resolve through BB environment
+ * file APIs and must remain inside the environment after realpath resolution;
+ * the broker rejects traversal, symlink escape, special files,
+ * changed-after-selection files, oversized files, and low-disk conditions.
+ * Responses carry privacy-safe metadata and never expose the staged path or
+ * any unrelated workspace path.
+ */
+export const browserUploadKindSchema = z.enum(["client", "workspace"]);
+export type BrowserUploadKind = z.infer<typeof browserUploadKindSchema>;
+
+export const browserTransferRejectionSchema = z.enum([
+  "outside-environment",
+  "traversal",
+  "symlink-escape",
+  "special-file",
+  "not-found",
+  "changed-after-selection",
+  "oversized",
+  "quota-exceeded",
+  "low-disk",
+  "cancelled",
+]);
+export type BrowserTransferRejection = z.infer<
+  typeof browserTransferRejectionSchema
+>;
+
+export const browserTransferStagingRequestSchema = z.discriminatedUnion(
+  "kind",
+  [
+    z
+      .object({
+        kind: z.literal("client"),
+        transferId: z.string().min(1).max(120),
+        fileName: z.string().min(1).max(255),
+        contentType: z.string().min(1).max(200).optional(),
+        sizeBytes: z
+          .number()
+          .int()
+          .positive()
+          .max(BROWSER_TRANSFER_MAX_FILE_BYTES),
+      })
+      .strict(),
+    z
+      .object({
+        kind: z.literal("workspace"),
+        transferId: z.string().min(1).max(120),
+        sourcePath: z.string().min(1).max(4096),
+        environmentRoot: z.string().min(1).max(4096),
+        contentType: z.string().min(1).max(200).optional(),
+      })
+      .strict(),
+  ],
+);
+export type BrowserTransferStagingRequest = z.infer<
+  typeof browserTransferStagingRequestSchema
+>;
+
+/**
+ * Host-targeted staging input: the staging request plus the workspace host to
+ * run the broker on. The host strips `hostId` before invoking the manager.
+ */
+export const browserTransferStageInputSchema = z.discriminatedUnion("kind", [
+  browserTransferStagingRequestSchema.options[0]
+    .extend({ hostId: z.string().min(1) })
+    .strict(),
+  browserTransferStagingRequestSchema.options[1]
+    .extend({ hostId: z.string().min(1) })
+    .strict(),
+]);
+export type BrowserTransferStageInput = z.infer<
+  typeof browserTransferStageInputSchema
+>;
+
+export const browserTransferConsumeInputSchema = z
+  .object({
+    hostId: z.string().min(1),
+    transferId: z.string().min(1).max(120),
+  })
+  .strict();
+export type BrowserTransferConsumeInput = z.infer<
+  typeof browserTransferConsumeInputSchema
+>;
+
+export const browserTransferStagingResponseSchema = z.discriminatedUnion(
+  "outcome",
+  [
+    z
+      .object({
+        outcome: z.literal("staged"),
+        transferId: z.string().min(1).max(120),
+        kind: browserUploadKindSchema,
+        sizeBytes: z.number().int().nonnegative(),
+        contentType: z.string().min(1).max(200).nullable(),
+      })
+      .strict(),
+    z
+      .object({
+        outcome: z.literal("rejected"),
+        transferId: z.string().min(1).max(120),
+        reason: browserTransferRejectionSchema,
+        message: z.string().min(1).max(200),
+      })
+      .strict(),
+  ],
+);
+export type BrowserTransferStagingResponse = z.infer<
+  typeof browserTransferStagingResponseSchema
+>;
+
+export const browserTransferProgressPhaseSchema = z.enum([
+  "validating",
+  "copying",
+  "completed",
+  "cancelled",
+  "failed",
+]);
+export type BrowserTransferProgressPhase = z.infer<
+  typeof browserTransferProgressPhaseSchema
+>;
+
+export const browserTransferProgressSchema = z
+  .object({
+    transferId: z.string().min(1).max(120),
+    phase: browserTransferProgressPhaseSchema,
+    bytesCopied: z.number().int().nonnegative(),
+    totalBytes: z.number().int().nonnegative(),
+  })
+  .strict();
+export type BrowserTransferProgress = z.infer<
+  typeof browserTransferProgressSchema
+>;
+
+export const browserTransferCancelMessageSchema = z
+  .object({
+    type: z.literal("transfer_cancel"),
+    transferId: z.string().min(1).max(120),
+  })
+  .strict();
+export type BrowserTransferCancelMessage = z.infer<
+  typeof browserTransferCancelMessageSchema
+>;
+
+export const browserTransferOutcomeSchema = z.discriminatedUnion("outcome", [
+  z
+    .object({
+      outcome: z.literal("used"),
+      transferId: z.string().min(1).max(120),
+    })
+    .strict(),
+  z
+    .object({
+      outcome: z.literal("cancelled"),
+      transferId: z.string().min(1).max(120),
+    })
+    .strict(),
+  z
+    .object({
+      outcome: z.literal("expired"),
+      transferId: z.string().min(1).max(120),
+    })
+    .strict(),
+  z
+    .object({
+      outcome: z.literal("removed"),
+      transferId: z.string().min(1).max(120),
+    })
+    .strict(),
+  z
+    .object({
+      outcome: z.literal("missing"),
+      transferId: z.string().min(1).max(120),
+    })
+    .strict(),
+]);
+export type BrowserTransferOutcome = z.infer<
+  typeof browserTransferOutcomeSchema
+>;
+
+/**
+ * Agent-initiated transfer authorization (issue #19). An agent upload
+ * additionally requires the file-transfer elevated grant and an active
+ * Control Lease; owner transfers require neither because the owner already
+ * holds the browser. The decision is privacy-safe and never echoes paths.
+ */
+export const browserFileTransferAuthorizationSchema = z
+  .object({
+    actor: z.enum(["owner", "agent"]),
+    fileTransferGranted: z.boolean(),
+    leaseActive: z.boolean(),
+  })
+  .strict();
+export type BrowserFileTransferAuthorization = z.infer<
+  typeof browserFileTransferAuthorizationSchema
+>;
+
+export const browserFileTransferDecisionSchema = z.discriminatedUnion(
+  "authorized",
+  [
+    z.object({ authorized: z.literal(true) }).strict(),
+    z
+      .object({
+        authorized: z.literal(false),
+        reason: z.enum([
+          "file-transfer-grant-required",
+          "control-lease-required",
+        ]),
+      })
+      .strict(),
+  ],
+);
+export type BrowserFileTransferDecision = z.infer<
+  typeof browserFileTransferDecisionSchema
+>;
+
+/**
  * Accessible-chrome constants (issue #17). Plugin chrome targets WCAG AA,
  * honors reduced motion, and yields BB global shortcuts; the streamed webpage
  * canvas is not fully screen-reader accessible in v1 and is disclosed as such.
@@ -2190,6 +2486,18 @@ export const rpcContract = defineRpcContract({
   browser_host_choices: {
     input: browserHostChoicesInputSchema,
     output: z.array(browserHostChoiceSchema),
+  },
+  browser_transfer_stage: {
+    input: browserTransferStageInputSchema,
+    output: browserTransferStagingResponseSchema,
+  },
+  browser_transfer_consume: {
+    input: browserTransferConsumeInputSchema,
+    output: browserTransferOutcomeSchema,
+  },
+  browser_file_transfer_authorize: {
+    input: browserFileTransferAuthorizationSchema,
+    output: browserFileTransferDecisionSchema,
   },
 });
 

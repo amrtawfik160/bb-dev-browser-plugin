@@ -82,6 +82,12 @@ import {
   createSafeLoginMode,
   type SafeLoginModeManager,
 } from "./safe-login.js";
+import {
+  createTransferStagingManager,
+  type TransferStagingManager,
+  type TransferStagingFilesystem,
+} from "./transfer-staging.js";
+import { createNodeTransferStagingFilesystem } from "./transfer-staging-filesystem.js";
 
 export type HostSetupBoundary = HostReadinessBoundary;
 type HostBoundary = HostReadinessBoundary | HostAdministrationBoundary;
@@ -98,6 +104,8 @@ type BrowserRuntimeSource =
   BrowserInstanceRuntime | ((dataDir: string) => BrowserInstanceRuntime);
 type SafeLoginModeSource =
   SafeLoginModeManager | ((dataDir: string) => SafeLoginModeManager);
+type TransferStagingSource =
+  TransferStagingManager | ((dataDir: string) => TransferStagingManager);
 
 type ScriptSignalContext = { signal: AbortSignal };
 type ScriptActivityOutcome = "succeeded" | "failed" | "interrupted";
@@ -342,6 +350,7 @@ export function createBrowserHostEntry(
   recoverySource?: ProfileRecoverySource,
   runtimeSource?: BrowserRuntimeSource,
   safeLoginSource?: SafeLoginModeSource,
+  transferStagingSource?: TransferStagingSource,
 ) {
   let workerLease: { dispose(): Promise<void> } | undefined;
   let retainedBoundary: HostAdministrationBoundary | undefined;
@@ -350,6 +359,10 @@ export function createBrowserHostEntry(
   let retainedOutbox: ActivityOutbox | undefined;
   let retainedSafeLogin: SafeLoginModeManager | undefined =
     typeof safeLoginSource === "object" ? safeLoginSource : undefined;
+  let retainedTransferStaging: TransferStagingManager | undefined =
+    typeof transferStagingSource === "object"
+      ? transferStagingSource
+      : undefined;
   let retainedRuntime: BrowserInstanceRuntime | undefined =
     typeof runtimeSource === "object" ? runtimeSource : undefined;
   const controlLeases = createControlLeaseManager();
@@ -647,6 +660,21 @@ export function createBrowserHostEntry(
           ? recoverySource(dataDir)
           : recoverySource;
     return retainedRecovery;
+  }
+  function transferStaging(dataDir: string) {
+    if (retainedTransferStaging !== undefined) return retainedTransferStaging;
+    const filesystem: TransferStagingFilesystem =
+      createNodeTransferStagingFilesystem();
+    retainedTransferStaging =
+      transferStagingSource === undefined
+        ? createTransferStagingManager({
+            filesystem,
+            stagingRoot: join(dataDir, "browser-transfer-staging"),
+          })
+        : typeof transferStagingSource === "function"
+          ? transferStagingSource(dataDir)
+          : transferStagingSource;
+    return retainedTransferStaging;
   }
   async function resolveActiveProfile(
     dataDir: string,
@@ -1361,6 +1389,26 @@ export function createBrowserHostEntry(
         });
         return recovery(dataDir).importDevBrowserProfile(request);
       },
+      transferStage: async (request, context) => {
+        retainWorker(context);
+        const dataDir = context.experimental_paths.dataDir;
+        const { hostId: _hostId, ...stagingRequest } = request;
+        void _hostId;
+        return transferStaging(dataDir).stage(stagingRequest);
+      },
+      transferConsume: async (request, context) => {
+        retainWorker(context);
+        const dataDir = context.experimental_paths.dataDir;
+        const manager = transferStaging(dataDir);
+        const consume = await manager.consume(request.transferId);
+        if (consume.outcome === "used" && consume.stagedPath !== undefined) {
+          // The browser reads the staged file; removal happens immediately.
+          await manager.release(request.transferId, "used");
+          return { outcome: "used" as const, transferId: request.transferId };
+        }
+        await manager.release(request.transferId, "removed");
+        return { outcome: "missing" as const, transferId: request.transferId };
+      },
     },
     dispose: async () => {
       try {
@@ -1376,6 +1424,8 @@ export function createBrowserHostEntry(
         panelGateways.dispose();
         panelCapabilities.dispose();
         await disposeRuntime();
+        await retainedTransferStaging?.purgeAll().catch(() => undefined);
+        retainedTransferStaging = undefined;
         retainedSafeLogin?.dispose();
         retainedSafeLogin = undefined;
       } finally {

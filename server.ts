@@ -4,6 +4,7 @@ import type {
   PluginCliContext,
 } from "@get-bb/plugin-sdk";
 import type { z } from "zod";
+import { randomUUID } from "node:crypto";
 import {
   createBrowserService,
   panelIdentity,
@@ -53,6 +54,8 @@ const CLI_USAGE = [
   "  import --name <name> --source <path> [--host <id>] [--json]",
   "  archive|restore-archived --profile <id> [--host <id>] [--json]",
   "  reset|delete --profile <id> --confirm <text> [--host <id>] [--json]",
+  "  transfer --kind workspace --source <path> --environment-root <path> [--profile <id>] [--host <id>] [--json]",
+  "  transfer --cancel --transfer-id <id> [--profile <id>] [--host <id>] [--json]",
 ].join("\n");
 const PROFILE_IMPORT_COMMAND = ["imp", "ort"].join("");
 type BrowserScriptParameters = z.output<typeof browserScriptParametersSchema>;
@@ -80,6 +83,7 @@ const BROWSER_COMMANDS = [
   "disable",
   "uninstall",
   "purge",
+  "transfer",
 ] as const;
 type BrowserCommand = (typeof BROWSER_COMMANDS)[number];
 
@@ -1180,6 +1184,9 @@ async function runCli(
   argv: string[],
   context: PluginCliContext,
 ) {
+  if (argv[0] === "transfer") {
+    return await runTransferCli(browser, argv.slice(1), context);
+  }
   const parsed = parseCliArguments(argv);
   if ("error" in parsed) return { exitCode: 1, stderr: parsed.error };
   const { command, json, profileId, hostId, requestId } = parsed.arguments;
@@ -1200,6 +1207,151 @@ async function runCli(
       return await runBrowserScriptCli(browser, parsed.arguments, context);
     }
     return await runAdministrationCli(browser, parsed.arguments, context);
+  } catch (error) {
+    if (error instanceof Error) return { exitCode: 1, stderr: error.message };
+    throw error;
+  }
+}
+
+const TRANSFER_CLI_USAGE = [
+  "Usage: bb browser transfer <stage|cancel> [options]",
+  "  stage:  --kind workspace --source <path> --environment-root <path> [--profile <id>] [--host <id>] [--json]",
+  "  cancel: --cancel --transfer-id <id> [--profile <id>] [--host <id>] [--json]",
+].join("\n");
+
+function readTransferOption(argv: string[], index: number, name: string) {
+  if (index + 1 >= argv.length) {
+    return { error: `${name} requires a value.\n${TRANSFER_CLI_USAGE}` };
+  }
+  return { value: argv[index + 1]!, nextIndex: index + 1 };
+}
+
+async function runTransferCli(
+  browser: BrowserService,
+  argv: string[],
+  context: PluginCliContext,
+) {
+  let kind: string | undefined;
+  let sourcePath: string | undefined;
+  let environmentRoot: string | undefined;
+  let transferId: string | undefined;
+  let profileId: string | undefined;
+  let hostId: string | undefined;
+  let cancel = false;
+  let json = false;
+  for (let index = 0; index < argv.length; index += 1) {
+    const argument = argv[index]!;
+    if (argument === "--json") {
+      json = true;
+      continue;
+    }
+    if (argument === "--cancel") {
+      cancel = true;
+      continue;
+    }
+    if (argument === "--kind") {
+      const option = readTransferOption(argv, index, "--kind");
+      if ("error" in option) return { exitCode: 1, stderr: option.error };
+      kind = option.value;
+      index = option.nextIndex;
+      continue;
+    }
+    if (argument === "--source") {
+      const option = readTransferOption(argv, index, "--source");
+      if ("error" in option) return { exitCode: 1, stderr: option.error };
+      sourcePath = option.value;
+      index = option.nextIndex;
+      continue;
+    }
+    if (argument === "--environment-root") {
+      const option = readTransferOption(argv, index, "--environment-root");
+      if ("error" in option) return { exitCode: 1, stderr: option.error };
+      environmentRoot = option.value;
+      index = option.nextIndex;
+      continue;
+    }
+    if (argument === "--transfer-id") {
+      const option = readTransferOption(argv, index, "--transfer-id");
+      if ("error" in option) return { exitCode: 1, stderr: option.error };
+      transferId = option.value;
+      index = option.nextIndex;
+      continue;
+    }
+    if (argument === "--profile") {
+      const option = readTransferOption(argv, index, "--profile");
+      if ("error" in option) return { exitCode: 1, stderr: option.error };
+      profileId = option.value;
+      index = option.nextIndex;
+      continue;
+    }
+    if (argument === "--host") {
+      const option = readTransferOption(argv, index, "--host");
+      if ("error" in option) return { exitCode: 1, stderr: option.error };
+      hostId = option.value;
+      index = option.nextIndex;
+      continue;
+    }
+    return {
+      exitCode: 1,
+      stderr: `Unknown option: ${argument}.\n${TRANSFER_CLI_USAGE}`,
+    };
+  }
+  try {
+    const target = await browser.resolveTarget(context, profileId, hostId);
+    if (cancel) {
+      if (transferId === undefined) {
+        return {
+          exitCode: 1,
+          stderr: `transfer --cancel requires --transfer-id.\n${TRANSFER_CLI_USAGE}`,
+        };
+      }
+      const outcome = await browser.transferConsume(
+        transferId,
+        target.hostId,
+        context.signal,
+      );
+      return {
+        exitCode: 0,
+        stdout: cliJsonOrText(
+          json,
+          outcome,
+          `Transfer ${transferId}: ${outcome.outcome}.`,
+        ),
+      };
+    }
+    if (kind !== "workspace") {
+      return {
+        exitCode: 1,
+        stderr: `transfer requires --kind workspace for CLI staging.\n${TRANSFER_CLI_USAGE}`,
+      };
+    }
+    if (sourcePath === undefined || environmentRoot === undefined) {
+      return {
+        exitCode: 1,
+        stderr: `transfer staging requires --source and --environment-root.\n${TRANSFER_CLI_USAGE}`,
+      };
+    }
+    const stagedTransferId = transferId ?? `transfer-${randomUUID()}`;
+    const response = await browser.transferStage(
+      {
+        kind: "workspace",
+        transferId: stagedTransferId,
+        sourcePath,
+        environmentRoot,
+        hostId: target.hostId,
+      },
+      context.signal,
+    );
+    // Privacy-safe: report only transferId, kind, size, and content type. The
+    // staged path and any unrelated workspace paths are never printed.
+    const text =
+      response.outcome === "staged"
+        ? `Transfer ${response.transferId}: staged ${response.kind} file (${response.sizeBytes} bytes).`
+        : `Transfer ${response.transferId}: rejected (${response.reason}).`;
+    return {
+      exitCode: response.outcome === "staged" ? 0 : 1,
+      stdout: cliJsonOrText(json, response, text),
+    };
   } catch (error) {
     if (error instanceof Error) return { exitCode: 1, stderr: error.message };
     throw error;
@@ -1381,6 +1533,12 @@ function registerCli(bb: BbPluginApi, browser: BrowserService) {
         summary: "Show or apply the destructive Browser purge plan",
         usage: "bb browser purge [--confirm <text>] [--json]",
       },
+      {
+        name: "transfer",
+        summary: "Stage or cancel an explicit workspace file transfer",
+        usage:
+          "bb browser transfer --kind workspace --source <path> --environment-root <path> [--profile <id>] [--host <id>] [--json]",
+      },
     ],
     run: (argv, context) => runCli(browser, argv, context),
   });
@@ -1462,6 +1620,11 @@ export default function plugin(bb: BbPluginApi) {
     browser_profile_backup: (input) => browser.backupProfile(input),
     browser_profile_restore: (input) => browser.restoreProfile(input),
     browser_profile_import: (input) => browser.importProfile(input),
+    browser_transfer_stage: (input) => browser.transferStage(input),
+    browser_transfer_consume: (input) =>
+      browser.transferConsume(input.transferId, input.hostId),
+    browser_file_transfer_authorize: (input) =>
+      browser.fileTransferAuthorization(input),
     browser_host_choices: (input: BrowserHostChoicesInput) =>
       browser.hostChoices(input),
   });

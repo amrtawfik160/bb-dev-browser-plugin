@@ -93,9 +93,15 @@ import {
   type BrowserPanelTakeControlRequest,
   type BrowserPanelReclaimControlRequest,
   type BrowserPanelReleaseControlRequest,
+  type BrowserTransferStageInput,
+  type BrowserTransferStagingResponse,
+  type BrowserTransferOutcome,
+  type BrowserFileTransferAuthorization,
+  type BrowserFileTransferDecision,
 } from "./contracts.js";
 import { browserHostContract } from "./host-contract.js";
 import { dependencyInventory } from "./dependency-inventory.js";
+import { authorizeFileTransfer } from "./transfer-staging.js";
 
 const PROFILE_IMPORT_ACTIVITY_ACTION = ["imp", "ort"].join("");
 const OWNER_SETTINGS_AUTHORITY_ERROR =
@@ -2501,6 +2507,49 @@ export function createBrowserService(
   subscribeToHostConnections();
   subscribeToProjectDeletion();
 
+  /**
+   * Stage an explicitly selected workspace or displaying-client file through
+   * one-use Transfer Staging (issue #19). The host broker copies the file into
+   * narrow-permission staging after realpath containment checks; the response
+   * carries privacy-safe metadata and never the staged or unrelated paths.
+   */
+  async function transferStage(
+    input: BrowserTransferStageInput,
+    signal?: AbortSignal,
+  ): Promise<BrowserTransferStagingResponse> {
+    const hostId = input.hostId;
+    await requireConnectedHost(hostId, signal);
+    return host.call("transferStage", input, { hostId, signal });
+  }
+
+  /**
+   * Consume (or cancel) a staged transfer. The staged file is removed after
+   * use; the outcome is privacy-safe and never echoes paths.
+   */
+  async function transferConsume(
+    transferId: string,
+    hostId: string,
+    signal?: AbortSignal,
+  ): Promise<BrowserTransferOutcome> {
+    await requireConnectedHost(hostId, signal);
+    return host.call(
+      "transferConsume",
+      { hostId, transferId },
+      { hostId, signal },
+    );
+  }
+
+  /**
+   * Decide whether an actor may initiate a file transfer. Owner transfers
+   * always pass; agent transfers additionally require the file-transfer
+   * elevated grant and an active Control Lease. The decision is privacy-safe.
+   */
+  function fileTransferAuthorization(
+    authorization: BrowserFileTransferAuthorization,
+  ): BrowserFileTransferDecision {
+    return authorizeFileTransfer(authorization);
+  }
+
   return {
     browserScript,
     navigate,
@@ -2547,6 +2596,9 @@ export function createBrowserService(
     selectedStatus,
     status,
     selectProfile,
+    transferStage,
+    transferConsume,
+    fileTransferAuthorization,
   };
 }
 
