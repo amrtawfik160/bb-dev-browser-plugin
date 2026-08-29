@@ -48,7 +48,9 @@ import {
   type BrowserHistoryRequest,
   type BrowserPanelVisibilityRequest,
   type BrowserPanelTransportRequest,
+  type BrowserPanelControlResponse,
   type BrowserStatus,
+  type BrowserTabStrip,
 } from "./contracts.js";
 import { createPanelCapabilityStore } from "./panel-capability.js";
 import { createPanelGatewayPool } from "./panel-gateway-pool.js";
@@ -61,6 +63,8 @@ import {
   type ControlLease,
   type ControlLeaseManager,
 } from "./control-lease.js";
+import { createPanelControlState } from "./panel-control-state.js";
+import { createBrowserTabStrip } from "./browser-tabs.js";
 import {
   assertBrowserScriptResultWithinBounds,
   BrowserInstanceError,
@@ -344,6 +348,52 @@ export function createBrowserHostEntry(
     string,
     ReturnType<typeof createPanelTransportServer>
   >();
+  /**
+   * Per-profile shared Control Lease coordination (ADR 0005/0007/0012) and
+   * shared ordered Browser Tab strip. Every Browser Panel for one profile
+   * joins one control session and observes one ordered tab set and one active
+   * tab regardless of which BB thread or client opened it.
+   */
+  const panelControlSessions = new Map<
+    string,
+    ReturnType<typeof createPanelControlState>
+  >();
+  const browserTabStrips = new Map<
+    string,
+    ReturnType<typeof createBrowserTabStrip>
+  >();
+
+  function panelControlSession(target: { hostId: string; profileId: string }) {
+    const key = controlLeaseKey(target);
+    let session = panelControlSessions.get(key);
+    if (session === undefined) {
+      session = createPanelControlState({ controlLeases });
+      session.setLeaseKey(key);
+      panelControlSessions.set(key, session);
+    }
+    return session;
+  }
+
+  function browserTabStrip(target: { hostId: string; profileId: string }) {
+    const key = controlLeaseKey(target);
+    let strip = browserTabStrips.get(key);
+    if (strip === undefined) {
+      strip = createBrowserTabStrip();
+      browserTabStrips.set(key, strip);
+    }
+    return strip;
+  }
+
+  function toControlResponse(
+    target: { hostId: string; profileId: string },
+    role: "controller" | "spectator",
+  ): BrowserPanelControlResponse {
+    return {
+      role,
+      control: panelControlSession(target).state(),
+      tabs: browserTabStrip(target).snapshot() as BrowserTabStrip,
+    };
+  }
   const hostConnectionGenerations = new Map<string, number>();
   function administration(dataDir: string) {
     if (retainedBoundary !== undefined) return retainedBoundary;
@@ -360,7 +410,12 @@ export function createBrowserHostEntry(
   function profileLifecycle(dataDir: string): BrowserProfileLifecycleBoundary {
     return {
       async stopProfile(hostId, profileId) {
-        controlLeases.revoke(controlLeaseKey({ hostId, profileId }));
+        const key = controlLeaseKey({ hostId, profileId });
+        controlLeases.revoke(key);
+        // Stopping the profile releases every panel's control and invalidates
+        // the shared tab strip so stale runtime tab ids fail closed.
+        panelControlSessions.get(key)?.revoke();
+        browserTabStrips.get(key)?.resetInstance();
         try {
           await runtime(dataDir)?.stop({ hostId, profileId });
         } finally {
@@ -413,6 +468,14 @@ export function createBrowserHostEntry(
     }
     if (request.state === "disconnected") {
       controlLeases.revokeHost(request.hostId);
+      // A host disconnect freezes control for every profile on that host and
+      // invalidates runtime tab ids so agents never target a stale page.
+      for (const [key, session] of panelControlSessions) {
+        if (key.startsWith(`${request.hostId}\u0000`)) session.revoke();
+      }
+      for (const [key, strip] of browserTabStrips) {
+        if (key.startsWith(`${request.hostId}\u0000`)) strip.resetInstance();
+      }
     }
     const browserRuntime = runtime(dataDir);
     if (browserRuntime === undefined) return { ...request, applied: false };
@@ -666,10 +729,22 @@ export function createBrowserHostEntry(
         resolveEndpoint: async () =>
           (await browserRuntime.start(target)).automationEndpoint,
       });
+      const controlTarget = {
+        hostId: request.hostId,
+        profileId: request.profileId,
+      };
+      const control = panelControlSession(controlTarget);
+      // The panel joins the shared control session for its profile: the first
+      // panel becomes the controller and owns the viewport; later panels are
+      // view-only spectators. Input through the transport is gated so only the
+      // connected controller can send browser input.
+      control.connectPanel(request.panelId, request.ownerSessionId);
       const transport = createPanelTransportServer({
         gateway,
         stream,
         source,
+        canInput: () => control.canInput(request.panelId),
+        onDisconnect: () => control.disconnectPanel(request.panelId),
       });
       const port = await transport.start();
       const transportKey = `${request.hostId}\u0000${request.profileId}\u0000${request.panelId}`;
@@ -931,6 +1006,50 @@ export function createBrowserHostEntry(
         retainWorker(context);
         return openPanelTransport(request, context.experimental_paths.dataDir);
       },
+      tabs: (target, context) => {
+        retainWorker(context);
+        return browserTabStrip(target).snapshot() as BrowserTabStrip;
+      },
+      panelControl: (request, context) => {
+        retainWorker(context);
+        const target = {
+          hostId: request.hostId,
+          profileId: request.profileId,
+        };
+        const session = panelControlSession(target);
+        const role = session.connectPanel(
+          request.panelId,
+          request.ownerSessionId,
+          request.viewport,
+        );
+        return toControlResponse(target, role);
+      },
+      takeControl: async (request, context) => {
+        retainWorker(context);
+        const target = {
+          hostId: request.hostId,
+          profileId: request.profileId,
+        };
+        const session = panelControlSession(target);
+        await session.takeControl(request.panelId, request.viewport);
+        return toControlResponse(
+          target,
+          session.role(request.panelId) ?? "spectator",
+        );
+      },
+      releaseControl: (request, context) => {
+        retainWorker(context);
+        const target = {
+          hostId: request.hostId,
+          profileId: request.profileId,
+        };
+        const session = panelControlSession(target);
+        session.releaseControl(request.panelId);
+        return toControlResponse(
+          target,
+          session.role(request.panelId) ?? "spectator",
+        );
+      },
       activityOutbox: async ({ limit }, context) => {
         retainWorker(context);
         return outbox(context.experimental_paths.dataDir).claim({
@@ -1049,6 +1168,10 @@ export function createBrowserHostEntry(
     dispose: async () => {
       try {
         controlLeases.dispose();
+        for (const session of panelControlSessions.values()) session.dispose();
+        panelControlSessions.clear();
+        for (const strip of browserTabStrips.values()) strip.dispose();
+        browserTabStrips.clear();
         for (const transport of panelTransports.values()) {
           await transport.stop().catch(() => undefined);
         }

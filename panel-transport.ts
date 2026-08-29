@@ -48,6 +48,18 @@ export type PanelTransportServerOptions = {
   port?: number;
   /** Deadline slack applied to outgoing frames for stale-frame validation. */
   frameDeadlineMs?: number;
+  /**
+   * Predicate that must return true for an input message to be forwarded to
+   * the screencast source. The multi-client control session supplies this so
+   * view-only spectators cannot send browser input; only the connected
+   * controller can.
+   */
+  canInput?: () => boolean;
+  /**
+   * Called when the authenticated panel disconnects, so the control session
+   * can freeze input and start the same-panel reclaim window.
+   */
+  onDisconnect?: () => void;
 };
 
 export type PanelTransportServer = {
@@ -69,6 +81,8 @@ export function createPanelTransportServer(
   const bindHost = options.bindHost ?? PANEL_GATEWAY_BIND_HOST;
   const requestedPort = options.port ?? 0;
   const frameDeadlineMs = options.frameDeadlineMs ?? DEFAULT_FRAME_DEADLINE_MS;
+  const canInput = options.canInput ?? (() => true);
+  const onDisconnect = options.onDisconnect;
   let server: WebSocketServer | undefined;
   let httpServer: Server | undefined;
   let boundPort: number | undefined;
@@ -105,6 +119,7 @@ export function createPanelTransportServer(
     void source.stop();
     connection = undefined;
     authorized = false;
+    onDisconnect?.();
   }
 
   function startStreaming(socket: WebSocket) {
@@ -158,6 +173,9 @@ export function createPanelTransportServer(
       return;
     }
     if (message.kind === "input") {
+      // View-only spectators cannot send browser input; only the connected
+      // controller may forward input to the browser.
+      if (!canInput()) return;
       source.input(message.payload);
       return;
     }

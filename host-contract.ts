@@ -25,6 +25,12 @@ import {
   browserPanelVisibilityRequestSchema,
   browserPanelTransportRequestSchema,
   browserPanelTransportResponseSchema,
+  browserTabsRequestSchema,
+  browserTabStripSchema,
+  browserPanelControlRequestSchema,
+  browserPanelControlResponseSchema,
+  browserPanelTakeControlRequestSchema,
+  browserPanelReleaseControlRequestSchema,
   browserProfileCreateRequestSchema,
   browserProfileDeleteRequestSchema,
   browserProfileExpiryResponseSchema,
@@ -99,6 +105,22 @@ export const browserHostContract = defineRpcContract({
   panelTransport: {
     input: browserPanelTransportRequestSchema,
     output: browserPanelTransportResponseSchema,
+  },
+  tabs: {
+    input: browserTabsRequestSchema,
+    output: browserTabStripSchema,
+  },
+  panelControl: {
+    input: browserPanelControlRequestSchema,
+    output: browserPanelControlResponseSchema,
+  },
+  takeControl: {
+    input: browserPanelTakeControlRequestSchema,
+    output: browserPanelControlResponseSchema,
+  },
+  releaseControl: {
+    input: browserPanelReleaseControlRequestSchema,
+    output: browserPanelControlResponseSchema,
   },
   activityOutbox: {
     input: browserActivityOutboxRequestSchema,

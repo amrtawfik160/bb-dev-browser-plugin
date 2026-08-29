@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { projectLoopbackAddress } from "../browser-navigation.js";
 import {
   createDefaultHostSnapshotReader,
@@ -46,6 +46,25 @@ async function runWorker(environment: NodeJS.ProcessEnv) {
     };
   };
 }
+
+describe("real-host command fail-closed gate", () => {
+  it("fails closed without BB_BROWSER_HOST_DATA_DIR and never mutates the host", () => {
+    // The real-host command (the provisioned-host worker) is only spawned by
+    // the mandatory integration gate, which requires BB_BROWSER_HOST_DATA_DIR
+    // before doing anything. Without it the gate throws and never provisions
+    // or mutates the host.
+    const original = process.env.BB_BROWSER_HOST_DATA_DIR;
+    try {
+      process.env.BB_BROWSER_HOST_DATA_DIR = "";
+      expect(() => requiredEnvironment("BB_BROWSER_HOST_DATA_DIR")).toThrow(
+        /BB_BROWSER_HOST_DATA_DIR/u,
+      );
+    } finally {
+      if (original === undefined) delete process.env.BB_BROWSER_HOST_DATA_DIR;
+      else process.env.BB_BROWSER_HOST_DATA_DIR = original;
+    }
+  });
+});
 
 it.runIf(integrationEnabled)(
   "mandatory provisioned host streams Automation Mode through an authenticated loopback gateway",

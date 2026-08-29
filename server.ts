@@ -1417,6 +1417,10 @@ export default function plugin(bb: BbPluginApi) {
     browser_history: (input) => browser.history(input),
     browser_panel_visibility: (input) => browser.panelVisibility(input),
     browser_panel_capability: (input) => browser.panelCapability(input),
+    browser_tabs: (input) => browser.tabs(input),
+    browser_panel_control: (input) => browser.panelControl(input),
+    browser_panel_take_control: (input) => browser.takeControl(input),
+    browser_panel_release_control: (input) => browser.releaseControl(input),
     browser_settings_status: (input) =>
       browser.settingsStatuses(input.profileId),
     browser_diagnostics: (input) => browser.diagnostics(input),
