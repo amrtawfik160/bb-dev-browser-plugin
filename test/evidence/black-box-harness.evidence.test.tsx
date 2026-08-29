@@ -17,8 +17,8 @@ import { DEFAULT_PROFILE_ID } from "../../contracts.js";
 import { deterministicLoginFixture } from "../fixtures/safe-login-fixture.js";
 import {
   createEvidenceHarness,
+  integrationEnabled,
   realBrowserProvisioned,
-  provisionedBrowserMissingReason,
   preparedEvidenceSnapshot,
   createPublicPluginHarness,
 } from "../fixtures/evidence-helpers.js";
@@ -26,18 +26,6 @@ import {
 const HOST_ID = "host-browser-test";
 const PROJECT_ID = "project-browser-test";
 const ORIGIN = "https://app.example.test";
-
-/**
- * Version-one limitation: the real Chrome browser engine, real OS process
- * identity, and real loopback CDP listener are exercised by the mandatory
- * provisioned-host gate (`browser-auth.integration.test.ts`), which requires
- * `BB_BROWSER_REAL_INTEGRATION=1` and a healthy enrolled host. This harness
- * drives the same contracts against an in-memory engine; the real-engine
- * boundary is skipped deterministically here and proven by that gate.
- */
-const REAL_ENGINE_SKIP = provisionedBrowserMissingReason(
-  "real Chrome browser engine + OS process identity",
-);
 
 describe("issue #21 AC1 black-box harness drives the full real-plugin matrix", () => {
   it("exercises server plugin, retained host worker, transactional storage, panel protocol, CLI, browser_script, and the local authenticated fixture together", async () => {
@@ -136,18 +124,16 @@ describe("issue #21 AC1 black-box harness drives the full real-plugin matrix", (
     }
   });
 
-  it("drives the real Chrome browser engine and OS process identity only on a provisioned host", () => {
-    // The real Chrome engine, unprivileged OS process identity, and loopback
-    // CDP listener are proven by the mandatory provisioned-host gate. This
-    // harness drives the in-memory engine; the real-engine boundary is skipped
-    // here so a non-provisioned host never mutates or provisions Chrome.
-    if (!realBrowserProvisioned()) {
-      console.warn(`SKIP: ${REAL_ENGINE_SKIP}`);
-      return;
-    }
-    // When the provisioned host is available, the mandatory gate
-    // (browser-auth.integration.test.ts) provides the real-engine evidence;
-    // this file does not re-provision it.
-    expect(realBrowserProvisioned()).toBe(true);
-  });
+  it.runIf(integrationEnabled)(
+    "drives the real Chrome browser engine and OS process identity only on a provisioned host",
+    () => {
+      // The real Chrome engine, unprivileged OS process identity, and loopback
+      // CDP listener are proven by the mandatory provisioned-host gate. This
+      // harness drives the in-memory engine; the real-engine boundary is
+      // registered with `it.runIf(integrationEnabled)` so a non-provisioned
+      // host reports it as skipped (not passed) and never mutates or provisions
+      // Chrome.
+      expect(realBrowserProvisioned()).toBe(true);
+    },
+  );
 });

@@ -37,15 +37,19 @@ const SENSITIVE_COOKIE = "fixture-session=valid";
 
 describe("issue #21 AC5 sensitive-data scans across retained surfaces", () => {
   it("retains no sensitive data in Activity Records, database, durable outbox, logs, diagnostics, or manifests", async () => {
-    const evidence = await createEvidenceHarness();
-    // Record the profile storage root so manifests can be scanned directly.
+    // The manifest scan is wired to the SAME profile store the sensitive flow
+    // drives: the store (rooted at `manifestRoot`) is passed into
+    // `createEvidenceHarness`, so `createBrowserProfile` + `runBrowserScript`
+    // actually write manifests that received the flow's profile. Scanning this
+    // root therefore proves the retained manifests exclude the sensitive
+    // material, rather than scanning a separate store that was never exposed.
     const manifestRoot = await mkdtemp(join(tmpdir(), "bb-evidence-scan-"));
     const store = createFileBrowserProfileStore({
       rootDirectory: manifestRoot,
-      installationId: "installation-evidence-scan",
+      installationId: "installation-public-test",
       lifecycle: { stopProfile: async () => undefined },
     });
-    await store.initialize(HOST_ID);
+    const evidence = await createEvidenceHarness({ profileStore: store });
     try {
       await evidence.harness.createBrowserProfile({
         hostId: HOST_ID,
@@ -120,8 +124,15 @@ describe("issue #21 AC5 sensitive-data scans across retained surfaces", () => {
       expect(logLeaks, `Logs leaked: ${logLeaks.join(", ")}`).toEqual([]);
       expect(logsJson).not.toContain("super-secret-password");
 
-      // 6. Retained manifests (profile store on-disk manifests).
+      // 6. Retained manifests (profile store on-disk manifests). The scan is
+      // wired to the same store the sensitive flow drives, so the manifests
+      // below actually received the flow's profile; the scan is therefore
+      // non-vacuous (it is not an empty never-exposed store).
       const manifestFiles = await collectManifestFiles(manifestRoot);
+      expect(
+        manifestFiles.length,
+        "expected the sensitive flow to have produced retained manifests",
+      ).toBeGreaterThan(0);
       const manifestsJson = (
         await Promise.all(
           manifestFiles.map(

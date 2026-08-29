@@ -3,27 +3,32 @@
  * stop, crash, idle sleep, worker restart, plugin reload, BB restart, and lazy
  * wake.
  *
- * The in-memory/loopback boundaries run and pass against the real
- * `createBrowserInstanceRuntime` lifecycle state machine (via a fake loopback
- * launch boundary that never provisions Chrome). The crash-against-a-real-browser
- * boundary is proven by the mandatory provisioned-host gate and skipped
- * deterministically here so this environment never provisions Chrome or mutates
- * the host.
+ * The in-memory/loopback boundaries that can be genuinely exercised run and
+ * pass against the real `createBrowserInstanceRuntime` lifecycle state
+ * machine (via a fake loopback launch boundary that never provisions Chrome):
+ * graceful stop, idle sleep, panel-pin wake prevention, and host disconnect/
+ * reconnect reconciliation.
  *
- * Version-one limitation: a real OS process crash (SIGKILL of Chrome) and the
- * resulting real Restorable Session recovery are exercised only by
- * `browser-auth.integration.test.ts` under `BB_BROWSER_REAL_INTEGRATION=1` with
- * a healthy enrolled host. This file proves the same lifecycle state machine
- * (sleep, wake, crash-loop → repair-required, worker disposal/reload, lazy wake)
- * against the in-memory engine so the recovery contract holds without a real
- * browser.
+ * Version-one limitation: a real OS process crash (SIGKILL of Chrome), the
+ * resulting real Restorable Session recovery, and the worker-restart /
+ * plugin-reload / BB-restart path that observes a previously-running profile's
+ * state via a persisted runtime manifest are proven only by the mandatory
+ * provisioned-host gate (`browser-auth.integration.test.ts`) under
+ * `BB_BROWSER_REAL_INTEGRATION=1` with a healthy enrolled host. The in-memory
+ * engine has no cross-process runtime manifest that a fresh worker reads on
+ * startup, so a reloaded worker's lifecycle map is empty by construction (it
+ * cannot observe the previously-running profile's persisted state). These
+ * boundaries are therefore registered with `it.runIf(integrationEnabled)(...)`
+ * so they surface as skipped tests naming the missing capability (not passed
+ * boundaries) when the provisioned-host gate is off, rather than presenting an
+ * empty-runtime default as proof.
  */
 import { describe, expect, it } from "vitest";
 import { DEFAULT_PROFILE_ID } from "../../contracts.js";
 import {
   createInMemoryBrowserRuntime,
+  integrationEnabled,
   realBrowserProvisioned,
-  provisionedBrowserMissingReason,
 } from "../fixtures/evidence-helpers.js";
 
 const HOST_ID = "host-evidence-restorable";
@@ -34,13 +39,6 @@ const target = {
   locale: "en-GB",
   timezone: "Europe/London",
 };
-
-/**
- * Version-one limitation note for the real-process crash boundary.
- */
-const REAL_CRASH_SKIP = provisionedBrowserMissingReason(
-  "real Chrome process crash + Restorable Session recovery",
-);
 
 describe("issue #21 AC2 Restorable Session matrix", () => {
   it("graceful stop returns the instance to sleeping without losing the profile", async () => {
@@ -91,28 +89,6 @@ describe("issue #21 AC2 Restorable Session matrix", () => {
     }
   });
 
-  it("worker disposal and reload preserve lazy wake (the profile is not started until touched)", async () => {
-    // Plugin reload / BB restart = dispose the runtime and construct a fresh
-    // one over the same on-disk manifests. The profile must remain sleeping
-    // until something lazily wakes it.
-    const engine = await createInMemoryBrowserRuntime();
-    await engine.runtime.start(target);
-    await engine.runtime.dispose();
-    // Reconstruct over the same root directory and launch boundary.
-    const engine2 = await createInMemoryBrowserRuntime();
-    try {
-      // A fresh runtime sees the profile as sleeping until lazily woken.
-      // (The in-memory engine has no cross-process manifest, so the new
-      // runtime's lifecycle map is empty → sleeping, which is the lazy-wake
-      // contract: startup does not launch every stored browser.)
-      expect((await engine2.runtime.status(target)).state).toBe("sleeping");
-      const afterReload = await engine2.runtime.start(target);
-      expect(afterReload.state).toBe("running");
-    } finally {
-      await engine2.cleanup();
-    }
-  });
-
   it("host disconnect freezes work and reconnect reconciles to the same profile", async () => {
     const engine = await createInMemoryBrowserRuntime();
     try {
@@ -135,16 +111,30 @@ describe("issue #21 AC2 Restorable Session matrix", () => {
     }
   });
 
-  it("proves real Chrome process crash Restorable Session recovery only on a provisioned host", () => {
-    // The real crash → clean restart → crash-loop → repair-required contract
-    // is proven by the mandatory provisioned-host gate against a real Chrome
-    // process. This environment does not provision Chrome, so the real-process
-    // crash boundary is skipped deterministically rather than substituted with
-    // a flaky simulation.
-    if (!realBrowserProvisioned()) {
-      console.warn(`SKIP: ${REAL_CRASH_SKIP}`);
-      return;
-    }
-    expect(realBrowserProvisioned()).toBe(true);
-  });
+  // The worker-restart / plugin-reload / BB-restart path cannot be genuinely
+  // exercised against the in-memory engine: a fresh `createBrowserInstanceRuntime`
+  // over the same root has an empty in-memory lifecycle map and does not read a
+  // persisted runtime manifest on startup, so it reports "sleeping" by default
+  // regardless of the previously-running profile's state. Asserting that empty
+  // default would present an empty runtime as proof of the reload contract.
+  // The mandatory provisioned-host gate proves the real reload path (the
+  // "reload" worker action in browser-auth.integration.test.ts); this boundary
+  // stays skipped without that host.
+  it.runIf(integrationEnabled)(
+    "proves worker restart / plugin reload / BB restart observe a previously-running profile's persisted manifest only on a provisioned host",
+    () => {
+      expect(realBrowserProvisioned()).toBe(true);
+    },
+  );
+
+  // The real Chrome process crash → clean restart → crash-loop → repair-required
+  // contract is proven by the mandatory provisioned-host gate against a real
+  // Chrome process. The in-memory engine has no OS process to crash, so the
+  // real-process crash boundary is skipped deterministically here.
+  it.runIf(integrationEnabled)(
+    "proves real Chrome process crash Restorable Session recovery only on a provisioned host",
+    () => {
+      expect(realBrowserProvisioned()).toBe(true);
+    },
+  );
 });

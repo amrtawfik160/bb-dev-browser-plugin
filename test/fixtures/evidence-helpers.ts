@@ -10,9 +10,12 @@
  * the focused contract suites.
  *
  * Boundaries that require a provisioned Chrome/host this environment cannot
- * provision skip deterministically with a reason naming the missing capability
- * (see `provisionedBrowserMissingReason`). The host is never mutated and Chrome
- * is never provisioned by these helpers.
+ * provision are registered with `it.runIf(integrationEnabled)(...)` so they
+ * surface as skipped (not passed) when the provisioned-host gate is off, and
+ * fail the run at module load when `BB_BROWSER_REAL_INTEGRATION_REQUIRED=1`
+ * is set without integration enabled (the repo's "mandatory real-browser gate
+ * cannot be skipped" invariant). The host is never mutated and Chrome is never
+ * provisioned by these helpers.
  */
 
 import { mkdtemp, writeFile, chmod } from "node:fs/promises";
@@ -21,6 +24,7 @@ import { join } from "node:path";
 import { createBrowserInstanceRuntime } from "../../browser-runtime.js";
 import type { BrowserInstanceRuntime } from "../../browser-runtime.js";
 import type { HostProbeSnapshot } from "../../readiness.js";
+import type { BrowserProfileStore } from "../../profile-storage.js";
 import { DEFAULT_PROFILE_ID } from "../../contracts.js";
 import { createPublicPluginHarness } from "../public-plugin-harness";
 
@@ -28,26 +32,28 @@ export { createPublicPluginHarness };
 
 /**
  * The real provisioned-browser/host capability is present only when the
- * integration gate opts in. Everything else skips deterministically rather than
- * mutating the host or provisioning Chrome.
+ * integration gate opts in. Provisioned-host evidence tests register with
+ * `it.runIf(integrationEnabled)(...)` so a non-provisioned host reports them
+ * as skipped (not passed), keeping the version-one limitation visible to the
+ * release gate.
  */
-export function realBrowserProvisioned(): boolean {
-  return process.env.BB_BROWSER_REAL_INTEGRATION === "1";
+export const integrationEnabled =
+  process.env.BB_BROWSER_REAL_INTEGRATION === "1";
+
+const integrationRequired =
+  process.env.BB_BROWSER_REAL_INTEGRATION_REQUIRED === "1";
+
+if (integrationRequired && !integrationEnabled) {
+  throw new Error("The mandatory real-browser gate cannot be skipped.");
 }
 
 /**
- * A clear, deterministic skip reason naming the missing capability, so a
- * non-provisioned host reports an explicit version-one limitation instead of
- * masquerading as a passing boundary.
+ * The real provisioned-browser/host capability is present only when the
+ * integration gate opts in. Used by provisioned-host evidence test bodies to
+ * confirm they only run when the gate is genuinely on.
  */
-export function provisionedBrowserMissingReason(capability: string): string {
-  return [
-    `Issue #21 boundary "${capability}" requires a provisioned Chrome/host`,
-    `(BB_BROWSER_REAL_INTEGRATION=1 with a healthy enrolled host snapshot).`,
-    `This environment does not provision Chrome or mutate the host, so the`,
-    `boundary is skipped deterministically. See the version-one limitation`,
-    `note in this file for the deferred real-host evidence.`,
-  ].join(" ");
+export function realBrowserProvisioned(): boolean {
+  return integrationEnabled;
 }
 
 /**
@@ -212,6 +218,13 @@ export const preparedEvidenceSnapshot: HostProbeSnapshot = {
  */
 export async function createEvidenceHarness(options?: {
   idleSleepMs?: number;
+  /**
+   * A caller-supplied Browser Profile store wired into the public harness so
+   * evidence flows drive it directly. Used by the sensitive-data scan to scan
+   * the SAME store the sensitive flow drives (not a separate never-exposed
+   * store). When omitted the harness builds its own private store.
+   */
+  profileStore?: BrowserProfileStore;
 }) {
   const engine = await createInMemoryBrowserRuntime({
     ...(options?.idleSleepMs === undefined
@@ -221,6 +234,9 @@ export async function createEvidenceHarness(options?: {
   const harness = await createPublicPluginHarness({
     snapshot: preparedEvidenceSnapshot,
     browserRuntime: engine.runtime,
+    ...(options?.profileStore === undefined
+      ? {}
+      : { profileStore: options.profileStore }),
   });
   // Pre-warm the default profile instance so the agent browser_script path
   // (which refuses to dispatch while the retained instance reports sleeping)
