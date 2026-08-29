@@ -24,6 +24,7 @@ import {
   type BrowserActivityRecord,
   type BrowserGrantRequest,
   type BrowserPanelCapabilityResponse,
+  type BrowserPanelControlResponse,
   type BrowserProfile,
   type BrowserProfileGrant,
   type BrowserProfileInventory,
@@ -216,9 +217,15 @@ function PanelGrantRequestNotices({
 function PanelStreamSurface({
   status,
   panelId,
+  onControlState,
 }: {
   status: BrowserStatus;
   panelId: string;
+  /**
+   * Live control-state updates pushed from the host over the stream so every
+   * panel observes control transfers and tab changes without re-fetching.
+   */
+  onControlState?: (response: BrowserPanelControlResponse) => void;
 }) {
   const rpc = useRpc<typeof rpcContract>();
   const bbContext = useBbContext();
@@ -229,6 +236,10 @@ function PanelStreamSurface({
     "connecting" | "streaming" | "reconnecting" | "offline"
   >("connecting");
   const [streamError, setStreamError] = useState<string | null>(null);
+  const [controllerViewport, setControllerViewport] = useState<{
+    width: number;
+    height: number;
+  } | null>(null);
   const ownerSessionId = ownerSessionIdFromContext(bbContext);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const streamRef = useRef<PanelStreamAdapter | null>(null);
@@ -381,6 +392,31 @@ function PanelStreamSurface({
           setStreamState("streaming");
           return;
         }
+        if (message.type === "control") {
+          // The host pushed the live shared control state and tab strip; derive
+          // this panel's own role from the panel list so the surface updates
+          // without a re-fetch.
+          const payload = message as {
+            control?: BrowserPanelControlResponse["control"];
+            tabs?: BrowserPanelControlResponse["tabs"];
+          };
+          if (payload.control !== undefined && payload.tabs !== undefined) {
+            const own = payload.control.panels.find(
+              (panel) => panel.panelId === panelId,
+            );
+            onControlState?.({
+              role: own?.role ?? "spectator",
+              control: payload.control,
+              tabs: payload.tabs,
+            });
+            // The controller's viewport drives the capture size; spectators
+            // letterbox it. Size the canvas to that viewport so frames map 1:1
+            // and CSS scales/letterboxes for the panel.
+            const viewport = payload.control.controllerViewport;
+            if (viewport !== null) setControllerViewport(viewport);
+          }
+          return;
+        }
         if (message.type === "frame" && message.data !== undefined) {
           drawFrame({
             mimeType: message.mimeType ?? "image/png",
@@ -440,8 +476,8 @@ function PanelStreamSurface({
           ref={canvasRef}
           aria-label="Browser stream surface"
           role="img"
-          width={1920}
-          height={1080}
+          width={controllerViewport?.width ?? 1920}
+          height={controllerViewport?.height ?? 1080}
           className="mt-3 h-64 w-full rounded border bg-muted"
         />
         <p className="mt-2 text-xs text-muted-foreground" aria-live="polite">
@@ -474,6 +510,235 @@ function PanelStreamSurface({
   );
 }
 
+/**
+ * Shared Control Lease surface for one profile (issue #16). Every Browser Panel
+ * for one profile observes one coordinated control state: a controller and
+ * view-only spectators, the controller's logical viewport, the live
+ * agent-purpose indicator, and the shared ordered Browser Tab strip with one
+ * active tab. A spectator cannot send browser input until the owner explicitly
+ * chooses Take control; control transfer is atomic and visible to every
+ * panel.
+ */
+function PanelControlSurface({
+  status,
+  panelId,
+  control,
+  setControl,
+}: {
+  status: BrowserStatus;
+  panelId: string;
+  control: BrowserPanelControlResponse | null;
+  setControl: (response: BrowserPanelControlResponse | null) => void;
+}) {
+  const rpc = useRpc<typeof rpcContract>();
+  const bbContext = useBbContext();
+  const ownerSessionId = ownerSessionIdFromContext(bbContext);
+  const [transferPending, setTransferPending] = useState(false);
+
+  // Join the shared control session for this profile on mount and whenever the
+  // profile or panel identity changes. The first panel becomes the controller;
+  // later panels are view-only spectators. Repeated launches and reconnects
+  // never create duplicate controllers because the panel id is stable.
+  useEffect(() => {
+    if (status.state !== "healthy" || status.hostId === null) {
+      setControl(null);
+      return;
+    }
+    let disposed = false;
+    void rpc
+      .call("browser_panel_control", {
+        hostId: status.hostId,
+        profileId: status.profileId,
+        panelId,
+        ownerSessionId,
+      })
+      .then((response) => {
+        if (!disposed) setControl(response);
+      })
+      .catch(() => {
+        if (!disposed) setControl(null);
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [
+    rpc,
+    status.state,
+    status.hostId,
+    status.profileId,
+    panelId,
+    ownerSessionId,
+  ]);
+
+  async function transfer(take: boolean) {
+    if (status.hostId === null) return;
+    setTransferPending(true);
+    try {
+      const response = take
+        ? await rpc.call("browser_panel_take_control", {
+            hostId: status.hostId,
+            profileId: status.profileId,
+            panelId,
+            ownerSessionId,
+          })
+        : await rpc.call("browser_panel_release_control", {
+            hostId: status.hostId,
+            profileId: status.profileId,
+            panelId,
+          });
+      setControl(response);
+    } finally {
+      setTransferPending(false);
+    }
+  }
+
+  // A disconnected controller that reconnects stays view-only until it
+  // explicitly reclaims within its 10-second window; the reclaim RPC is the
+  // explicit action that re-grants input without silently re-granting it on
+  // reconnect.
+  async function reclaim() {
+    if (status.hostId === null) return;
+    setTransferPending(true);
+    try {
+      const response = await rpc.call("browser_panel_reclaim_control", {
+        hostId: status.hostId,
+        profileId: status.profileId,
+        panelId,
+        ownerSessionId,
+      });
+      setControl(response);
+    } finally {
+      setTransferPending(false);
+    }
+  }
+
+  if (control === null) return null;
+  const isController = control.role === "controller";
+  const ownEntry = control.control.panels.find(
+    (panel) => panel.panelId === panelId,
+  );
+  // The reclaim window is live while the deadline is in the future. The host
+  // clock drives the deadline, so compare against the observed value only to
+  // decide which explicit action to surface.
+  const canReclaim =
+    !isController &&
+    ownEntry?.reclaimUntil !== undefined &&
+    ownEntry.reclaimUntil !== null &&
+    ownEntry.reclaimUntil > Date.now();
+  const spectatorCount = control.control.panels.filter(
+    (panel) => panel.role === "spectator",
+  ).length;
+  return (
+    <section
+      aria-label="Browser Control Lease"
+      className="mt-3 rounded border border-border p-3"
+    >
+      <div className="flex flex-wrap items-center gap-2">
+        <span
+          aria-label={
+            isController ? "You control the Browser" : "You are a spectator"
+          }
+          className="rounded px-2 py-1 text-xs font-medium"
+          style={{
+            backgroundColor: isController
+              ? "var(--color-primary, #2563eb)"
+              : "transparent",
+            color: isController ? "white" : "inherit",
+            border: isController
+              ? undefined
+              : "1px solid var(--color-border, #ccc)",
+          }}
+        >
+          {isController ? "Controlling" : "View-only"}
+        </span>
+        {control.control.controllerPanelId === null ? (
+          <span className="text-xs text-muted-foreground">
+            Control is available
+          </span>
+        ) : (
+          <span className="text-xs text-muted-foreground">
+            {spectatorCount} spectator{spectatorCount === 1 ? "" : "s"}
+          </span>
+        )}
+        {control.control.agentPurpose === null ? null : (
+          <span
+            aria-label="Active agent purpose"
+            className="text-xs text-muted-foreground"
+          >
+            Agent: {control.control.agentPurpose}
+          </span>
+        )}
+        <button
+          type="button"
+          className="ml-auto rounded border px-3 py-1 text-xs"
+          disabled={transferPending}
+          onClick={() =>
+            void (isController
+              ? transfer(false)
+              : canReclaim
+                ? reclaim()
+                : transfer(true))
+          }
+        >
+          {isController
+            ? "Release control"
+            : canReclaim
+              ? "Reclaim control"
+              : "Take control"}
+        </button>
+      </div>
+      {control.control.controllerViewport === null ? null : (
+        <p className="mt-2 text-xs text-muted-foreground">
+          Shared viewport: {control.control.controllerViewport.width}×
+          {control.control.controllerViewport.height}
+          {isController
+            ? " (you drive layout)"
+            : " (spectators scale and letterbox)"}
+        </p>
+      )}
+      <BrowserTabStripView
+        tabs={control.tabs.tabs}
+        activeTabId={control.tabs.activeTabId}
+      />
+    </section>
+  );
+}
+
+function BrowserTabStripView({
+  tabs,
+  activeTabId,
+}: {
+  tabs: BrowserPanelControlResponse["tabs"]["tabs"];
+  activeTabId: string | null;
+}) {
+  if (tabs.length === 0) return null;
+  return (
+    <ul
+      aria-label="Shared Browser Tabs"
+      className="mt-3 flex flex-wrap gap-1 text-xs"
+    >
+      {tabs.map((tab) => {
+        const active = tab.tabId === activeTabId;
+        return (
+          <li
+            key={tab.tabId}
+            className="max-w-[16rem] truncate rounded border px-2 py-1"
+            style={{
+              fontWeight: active ? 600 : 400,
+              borderColor: active ? "var(--color-primary, #2563eb)" : undefined,
+            }}
+            title={tab.url}
+          >
+            {tab.origin === "popup" ? "↗ " : ""}
+            {tab.title === "" ? tab.url : tab.title}
+            {active ? " •" : ""}
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
+
 function BrowserPanel({ request }: { request: BrowserStatusInput }) {
   const rpc = useRpc<typeof rpcContract>();
   const [status, setStatus] = useState<BrowserStatus | null>(null);
@@ -490,6 +755,11 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
     null,
   );
   const [panelId] = useState(() => `browser-panel-${nextBrowserPanelId++}`);
+  // Shared control state lifted so the stream's live control broadcasts keep
+  // the control surface current without re-fetching (ADR 0012).
+  const [control, setControl] = useState<BrowserPanelControlResponse | null>(
+    null,
+  );
 
   const statusRequest: BrowserStatusInput =
     selectedHostId === undefined
@@ -785,7 +1055,19 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
         </form>
       )}
       {status.state === "healthy" ? (
-        <PanelStreamSurface status={status} panelId={panelId} />
+        <>
+          <PanelControlSurface
+            status={status}
+            panelId={panelId}
+            control={control}
+            setControl={setControl}
+          />
+          <PanelStreamSurface
+            status={status}
+            panelId={panelId}
+            onControlState={setControl}
+          />
+        </>
       ) : null}
       <PanelGrantRequestNotices requests={grantRequests} />
       {profileError === null ? null : <p role="alert">{profileError}</p>}

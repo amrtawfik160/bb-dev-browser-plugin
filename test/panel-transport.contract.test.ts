@@ -311,6 +311,70 @@ describe("Panel transport server contract", () => {
     }
   });
 
+  it("broadcasts live control state to the connected panel without re-fetch", async () => {
+    const clock = { now: () => 1_000_000 };
+    const capabilities = createPanelCapabilityStore({ clock });
+    const gateway = createPanelGateway({
+      capabilities,
+      hostId,
+      profileId,
+      clock,
+    });
+    const stream = createAutomationStreamAdapter({ clock, capabilities });
+    stream.start();
+    const source = createFakeScreencastSource({ frameCount: 0 });
+    const transport = createPanelTransportServer({
+      gateway,
+      stream,
+      source,
+      clock,
+    });
+    const port = await transport.start();
+    const issued = capabilities.issue({
+      ownerSessionId,
+      panelId,
+      hostId,
+      profileId,
+    });
+    try {
+      const socket = await connect(port);
+      send(socket, redeemMessage(issued));
+      await onceMessage(socket); // ready
+      // The host pushes a live control transfer so every panel observes it
+      // without re-fetching the control state.
+      transport.broadcastControl(
+        {
+          controllerPanelId: "panel-other",
+          controllerViewport: { width: 1280, height: 720 },
+          agentPurpose: null,
+          panels: [
+            {
+              panelId,
+              ownerSessionId,
+              role: "spectator",
+              connection: "connected",
+              viewport: { width: 1280, height: 720 },
+              reclaimUntil: null,
+            },
+          ],
+        },
+        { tabs: [], activeTabId: null },
+      );
+      const raw = await onceMessage(socket);
+      const message = decode<{
+        type: string;
+        control: { controllerPanelId: string };
+        tabs: { tabs: unknown[]; activeTabId: null };
+      }>(raw);
+      expect(message.type).toBe("control");
+      expect(message.control.controllerPanelId).toBe("panel-other");
+      expect(message.tabs.activeTabId).toBeNull();
+      socket.close();
+    } finally {
+      await transport.stop();
+    }
+  });
+
   it("reports a bounded reconnect delay from the stream adapter", () => {
     const stream = createAutomationStreamAdapter();
     stream.start();

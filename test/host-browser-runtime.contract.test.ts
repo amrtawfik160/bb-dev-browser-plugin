@@ -53,6 +53,7 @@ describe("Browser host runtime boundary", () => {
       history: async () => {
         throw new Error("not used");
       },
+      listPages: async () => [],
       status: async ({
         hostId,
         profileId,
@@ -278,6 +279,7 @@ describe("Browser host runtime boundary", () => {
         history: async () => {
           throw new Error("not used");
         },
+        listPages: async () => [],
         status: async ({
           hostId,
           profileId,
@@ -418,6 +420,7 @@ describe("Browser host runtime boundary", () => {
         location: { direction },
         tabId: target.tabId ?? "host-tab",
       }),
+      listPages: async () => [],
       status: async ({
         hostId,
         profileId,
@@ -498,6 +501,368 @@ describe("Browser host runtime boundary", () => {
   });
 });
 
+it("issue #16 feeds the shared tab strip from real browser page events and normalizes popups", async () => {
+  const rootDirectory = await mkdtemp(join(tmpdir(), "host-tab-feed-"));
+  const profiles = createFileBrowserProfileStore({
+    rootDirectory,
+    installationId: "installation-tab-feed",
+  });
+  await profiles.initialize(HOST_ID);
+  const listedPages: Array<{
+    id: string;
+    url: string;
+    title: string;
+    openerTabId: string | null;
+  }> = [];
+  const runtime = {
+    start: async () => {
+      throw new Error("not used");
+    },
+    stop: async () => {},
+    execute: async () => {
+      throw new Error("not used");
+    },
+    navigate: async (target: { tabId?: string }, input: string) => {
+      listedPages.length = 0;
+      listedPages.push(
+        { id: "page-1", url: input, title: "Page", openerTabId: null },
+        {
+          id: "popup-1",
+          url: "https://popup.test",
+          title: "Popup",
+          openerTabId: "page-1",
+        },
+      );
+      return {
+        address: { kind: "address" as const, url: input },
+        location: { url: input },
+        tabId: target.tabId ?? "page-1",
+      };
+    },
+    history: async () => {
+      throw new Error("not used");
+    },
+    listPages: async () => [...listedPages],
+    status: async ({
+      hostId,
+      profileId,
+    }: {
+      hostId: string;
+      profileId: string;
+    }) => ({
+      state: "running" as const,
+      hostId,
+      profileId,
+    }),
+    pinPanel: async () => {
+      throw new Error("not used");
+    },
+    unpinPanel: async () => {},
+    hostDisconnected: () => {},
+    hostReconnected: async () => {},
+    dispose: async () => {},
+  };
+  const readiness = {
+    inspect: healthyStatus,
+    diagnostics: () => {
+      throw new Error("diagnostics not used");
+    },
+  };
+  const host = experimental_createHostEntryHarness(
+    createBrowserHostEntry(readiness, profiles, undefined, runtime),
+    {
+      experimental_paths: {
+        dataDir: rootDirectory,
+        tempDir: join(rootDirectory, "tmp"),
+      },
+    },
+  );
+  try {
+    await host.experimental_call("navigate", {
+      hostId: HOST_ID,
+      profileId: DEFAULT_PROFILE_ID,
+      projectId: "project-tab-feed",
+      input: "https://app.example.test/home",
+      rawLocalhost: false,
+    });
+    const strip = (await host.experimental_call("tabs", {
+      hostId: HOST_ID,
+      profileId: DEFAULT_PROFILE_ID,
+    })) as {
+      tabs: Array<{
+        tabId: string;
+        url: string;
+        title: string;
+        origin: string;
+        openerTabId: string | null;
+      }>;
+      activeTabId: string | null;
+    };
+    // The shared strip is fed by the runtime page inventory: the top-level
+    // page and the normalized popup both appear, with the popup carrying its
+    // opener, and the navigated tab is active.
+    expect(strip.tabs).toHaveLength(2);
+    const popup = strip.tabs.find((tab) => tab.origin === "popup");
+    expect(popup).toMatchObject({
+      tabId: "popup-1",
+      url: "https://popup.test",
+      openerTabId: "page-1",
+    });
+    expect(strip.activeTabId).toBe("page-1");
+  } finally {
+    await host.experimental_dispose();
+    await rm(rootDirectory, { recursive: true, force: true });
+  }
+});
+
+it("issue #16 interrupts an active agent Control Lease when the owner takes control", async () => {
+  const rootDirectory = await mkdtemp(join(tmpdir(), "host-agent-contention-"));
+  const profiles = createFileBrowserProfileStore({
+    rootDirectory,
+    installationId: "installation-agent-contention",
+  });
+  await profiles.initialize(HOST_ID);
+  let executionStarted!: () => void;
+  const started = new Promise<void>((resolve) => {
+    executionStarted = resolve;
+  });
+  const runtime = {
+    start: async () => {
+      throw new Error("not used");
+    },
+    stop: async () => {},
+    execute: async (
+      _target: unknown,
+      _code: string,
+      _timeoutMs: number,
+      options: { leaseSignal?: AbortSignal } | undefined,
+    ) => {
+      await new Promise<void>((resolve) => {
+        if (options?.leaseSignal?.aborted) {
+          resolve();
+          return;
+        }
+        executionStarted();
+        options?.leaseSignal?.addEventListener("abort", () => resolve(), {
+          once: true,
+        });
+      });
+      return "agent work interrupted by owner takeover";
+    },
+    navigate: async (target: { tabId?: string }, input: string) => ({
+      address: { kind: "address" as const, url: input },
+      location: { url: input },
+      tabId: target.tabId ?? "page-1",
+    }),
+    history: async () => {
+      throw new Error("not used");
+    },
+    listPages: async () => [
+      {
+        id: "page-1",
+        url: "https://app.example.test",
+        title: "App",
+        openerTabId: null,
+      },
+    ],
+    status: async ({
+      hostId,
+      profileId,
+    }: {
+      hostId: string;
+      profileId: string;
+    }) => ({
+      state: "running" as const,
+      hostId,
+      profileId,
+    }),
+    pinPanel: async () => {
+      throw new Error("not used");
+    },
+    unpinPanel: async () => {},
+    hostDisconnected: () => {},
+    hostReconnected: async () => {},
+    dispose: async () => {},
+  };
+  const readiness = {
+    inspect: healthyStatus,
+    diagnostics: () => {
+      throw new Error("diagnostics not used");
+    },
+  };
+  const host = experimental_createHostEntryHarness(
+    createBrowserHostEntry(readiness, profiles, undefined, runtime),
+    {
+      experimental_paths: {
+        dataDir: rootDirectory,
+        tempDir: join(rootDirectory, "tmp"),
+      },
+    },
+  );
+  try {
+    // A controller panel joins the shared control session.
+    await host.experimental_call("panelControl", {
+      hostId: HOST_ID,
+      profileId: DEFAULT_PROFILE_ID,
+      panelId: "panel-owner",
+      ownerSessionId: "owner-session-contention",
+    });
+    const operation = host.experimental_call("browserScript", {
+      purpose: "Long-running agent work",
+      code: "return page.url();",
+      hostId: HOST_ID,
+      projectId: "project-contention",
+      threadId: "thread-contention",
+      activityEventId: "contention-event-1",
+      activityOccurredAt: "2026-08-28T00:00:00.000Z",
+      profileId: DEFAULT_PROFILE_ID,
+      timeoutMs: 5_000,
+    });
+    await started;
+    // The owner explicitly takes control; the agent lease is interrupted while
+    // the script is in flight so automation never races a human controller.
+    await host.experimental_call("takeControl", {
+      hostId: HOST_ID,
+      profileId: DEFAULT_PROFILE_ID,
+      panelId: "panel-owner",
+      ownerSessionId: "owner-session-contention",
+    });
+    const response = await operation;
+    expect(response).toEqual({
+      ok: true,
+      result: "agent work interrupted by owner takeover",
+    });
+    const outboxState = JSON.parse(
+      await readFile(
+        join(rootDirectory, "browser-activity-outbox.json"),
+        "utf8",
+      ),
+    );
+    const scriptEvent = outboxState.events.find(
+      (event: { action: string }) => event.action === "browser-script",
+    );
+    expect(scriptEvent).toMatchObject({
+      outcome: "succeeded",
+      interrupted: true,
+      interruptionReason: "control-lease-revoked",
+    });
+  } finally {
+    await host.experimental_dispose();
+    await rm(rootDirectory, { recursive: true, force: true });
+  }
+});
+
+it("issue #16 reflects active-tab changes from navigation across the shared strip", async () => {
+  const rootDirectory = await mkdtemp(join(tmpdir(), "host-active-tab-"));
+  const profiles = createFileBrowserProfileStore({
+    rootDirectory,
+    installationId: "installation-active-tab",
+  });
+  await profiles.initialize(HOST_ID);
+  const listedPages: Array<{
+    id: string;
+    url: string;
+    title: string;
+    openerTabId: string | null;
+  }> = [];
+  const runtime = {
+    start: async () => {
+      throw new Error("not used");
+    },
+    stop: async () => {},
+    execute: async () => {
+      throw new Error("not used");
+    },
+    navigate: async (target: { tabId?: string }, input: string) => {
+      listedPages.length = 0;
+      listedPages.push(
+        {
+          id: "page-1",
+          url: "https://app.example.test/home",
+          title: "Home",
+          openerTabId: null,
+        },
+        { id: "page-2", url: input, title: "Second", openerTabId: null },
+      );
+      return {
+        address: { kind: "address" as const, url: input },
+        location: { url: input },
+        tabId: target.tabId ?? "page-1",
+      };
+    },
+    history: async () => {
+      throw new Error("not used");
+    },
+    listPages: async () => [...listedPages],
+    status: async ({
+      hostId,
+      profileId,
+    }: {
+      hostId: string;
+      profileId: string;
+    }) => ({
+      state: "running" as const,
+      hostId,
+      profileId,
+    }),
+    pinPanel: async () => {
+      throw new Error("not used");
+    },
+    unpinPanel: async () => {},
+    hostDisconnected: () => {},
+    hostReconnected: async () => {},
+    dispose: async () => {},
+  };
+  const readiness = {
+    inspect: healthyStatus,
+    diagnostics: () => {
+      throw new Error("diagnostics not used");
+    },
+  };
+  const host = experimental_createHostEntryHarness(
+    createBrowserHostEntry(readiness, profiles, undefined, runtime),
+    {
+      experimental_paths: {
+        dataDir: rootDirectory,
+        tempDir: join(rootDirectory, "tmp"),
+      },
+    },
+  );
+  try {
+    await host.experimental_call("navigate", {
+      hostId: HOST_ID,
+      profileId: DEFAULT_PROFILE_ID,
+      projectId: "project-active-tab",
+      input: "https://app.example.test/home",
+      rawLocalhost: false,
+    });
+    let strip = (await host.experimental_call("tabs", {
+      hostId: HOST_ID,
+      profileId: DEFAULT_PROFILE_ID,
+    })) as { tabs: Array<{ tabId: string }>; activeTabId: string | null };
+    expect(strip.activeTabId).toBe("page-1");
+    // A subsequent navigation activates a different tab; every panel observes
+    // the new active tab through the shared strip.
+    await host.experimental_call("navigate", {
+      hostId: HOST_ID,
+      profileId: DEFAULT_PROFILE_ID,
+      projectId: "project-active-tab",
+      input: "https://app.example.test/second",
+      tabId: "page-2",
+      rawLocalhost: false,
+    });
+    strip = (await host.experimental_call("tabs", {
+      hostId: HOST_ID,
+      profileId: DEFAULT_PROFILE_ID,
+    })) as { tabs: Array<{ tabId: string }>; activeTabId: string | null };
+    expect(strip.tabs.map((tab) => tab.tabId)).toEqual(["page-1", "page-2"]);
+    expect(strip.activeTabId).toBe("page-2");
+  } finally {
+    await host.experimental_dispose();
+    await rm(rootDirectory, { recursive: true, force: true });
+  }
+});
+
 it("issue #14 returns a typed origin_denied result when the runtime blocks a real-browser navigation", async () => {
   const rootDirectory = await mkdtemp(join(tmpdir(), "host-origin-scope-"));
   const profiles = createFileBrowserProfileStore({
@@ -528,6 +893,7 @@ it("issue #14 returns a typed origin_denied result when the runtime blocks a rea
     history: async () => {
       throw new Error("not used");
     },
+    listPages: async () => [],
     status: async ({
       hostId,
       profileId,
@@ -627,6 +993,7 @@ it("issue #14 AC4 forwards per-origin invalid-certificate flags from the script 
     history: async () => {
       throw new Error("not used");
     },
+    listPages: async () => [],
     status: async ({
       hostId,
       profileId,

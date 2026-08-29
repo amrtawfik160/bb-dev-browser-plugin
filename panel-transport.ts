@@ -2,7 +2,11 @@ import { WebSocketServer, type WebSocket } from "ws";
 import { createServer, type Server } from "node:http";
 import type { PanelGateway } from "./panel-gateway.js";
 import type { PanelStreamAdapter } from "./panel-stream.js";
-import { PANEL_GATEWAY_BIND_HOST } from "./contracts.js";
+import {
+  PANEL_GATEWAY_BIND_HOST,
+  type BrowserPanelControlState,
+  type BrowserTabStrip,
+} from "./contracts.js";
 
 /**
  * Automation Mode stream transport. The host binds a dynamic loopback gateway
@@ -37,6 +41,12 @@ export interface ScreencastSource {
   input(payload: ScreencastInputPayload): void;
   /** Release the underlying browser resources. Idempotent. */
   stop(): Promise<void>;
+  /**
+   * Apply the controller's logical viewport to the capture so the screencast
+   * tracks the controller viewport rather than an independent size. Optional;
+   * sources without a dynamic viewport ignore it.
+   */
+  setViewport?(viewport: { width: number; height: number }): void;
 }
 
 export type PanelTransportServerOptions = {
@@ -48,11 +58,32 @@ export type PanelTransportServerOptions = {
   port?: number;
   /** Deadline slack applied to outgoing frames for stale-frame validation. */
   frameDeadlineMs?: number;
+  /**
+   * Predicate that must return true for an input message to be forwarded to
+   * the screencast source. The multi-client control session supplies this so
+   * view-only spectators cannot send browser input; only the connected
+   * controller can.
+   */
+  canInput?: () => boolean;
+  /**
+   * Called when the authenticated panel disconnects, so the control session
+   * can freeze input and start the same-panel reclaim window.
+   */
+  onDisconnect?: () => void;
 };
 
 export type PanelTransportServer = {
   start(): Promise<number>;
   stop(): Promise<void>;
+  /**
+   * Push the live shared control state and tab strip to the connected panel so
+   * every panel observes control transfers and tab changes without re-fetching.
+   * No-op when the panel is not currently authorized.
+   */
+  broadcastControl(
+    control: BrowserPanelControlState,
+    tabs: BrowserTabStrip,
+  ): void;
   get port(): number | undefined;
   get state(): "idle" | "listening" | "closed";
 };
@@ -69,6 +100,8 @@ export function createPanelTransportServer(
   const bindHost = options.bindHost ?? PANEL_GATEWAY_BIND_HOST;
   const requestedPort = options.port ?? 0;
   const frameDeadlineMs = options.frameDeadlineMs ?? DEFAULT_FRAME_DEADLINE_MS;
+  const canInput = options.canInput ?? (() => true);
+  const onDisconnect = options.onDisconnect;
   let server: WebSocketServer | undefined;
   let httpServer: Server | undefined;
   let boundPort: number | undefined;
@@ -105,6 +138,7 @@ export function createPanelTransportServer(
     void source.stop();
     connection = undefined;
     authorized = false;
+    onDisconnect?.();
   }
 
   function startStreaming(socket: WebSocket) {
@@ -158,6 +192,9 @@ export function createPanelTransportServer(
       return;
     }
     if (message.kind === "input") {
+      // View-only spectators cannot send browser input; only the connected
+      // controller may forward input to the browser.
+      if (!canInput()) return;
       source.input(message.payload);
       return;
     }
@@ -239,9 +276,18 @@ export function createPanelTransportServer(
     gateway.close();
   }
 
+  function broadcastControl(
+    control: BrowserPanelControlState,
+    tabs: BrowserTabStrip,
+  ) {
+    if (disposed || connection === undefined || !authorized) return;
+    sendJson(connection, { type: "control", control, tabs });
+  }
+
   return {
     start,
     stop,
+    broadcastControl,
     get port() {
       return boundPort;
     },

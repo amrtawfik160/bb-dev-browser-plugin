@@ -87,6 +87,12 @@ import {
   type BrowserPanelCapabilityRequest,
   type BrowserPanelCapabilityResponse,
   type BrowserNavigationResponse,
+  type BrowserTabStrip,
+  type BrowserPanelControlRequest,
+  type BrowserPanelControlResponse,
+  type BrowserPanelTakeControlRequest,
+  type BrowserPanelReclaimControlRequest,
+  type BrowserPanelReleaseControlRequest,
 } from "./contracts.js";
 import { browserHostContract } from "./host-contract.js";
 import { dependencyInventory } from "./dependency-inventory.js";
@@ -2413,6 +2419,85 @@ export function createBrowserService(
     };
   }
 
+  /**
+   * The shared ordered Browser Tab strip for one profile. Every Browser Panel
+   * using that profile observes the same ordered tab set and one active tab;
+   * popup windows are normalized into the strip and runtime tab identifiers
+   * stay consistent for the life of the instance.
+   */
+  async function tabs(
+    target: BrowserHostTarget,
+    signal?: AbortSignal,
+  ): Promise<BrowserTabStrip> {
+    await requireConnectedHost(target.hostId, signal);
+    return host.call("tabs", target, { hostId: target.hostId, signal });
+  }
+
+  /**
+   * Join the shared Control Lease session for one panel's profile. The first
+   * panel becomes the controller and owns the logical viewport; later panels
+   * are view-only spectators that scale and letterbox that viewport. Returns
+   * the panel's role plus the shared control state and tab strip so every
+   * panel renders one coordinated view.
+   */
+  async function panelControl(
+    request: BrowserPanelControlRequest,
+    signal?: AbortSignal,
+  ): Promise<BrowserPanelControlResponse> {
+    await requireConnectedHost(request.hostId, signal);
+    return host.call("panelControl", request, {
+      hostId: request.hostId,
+      signal,
+    });
+  }
+
+  /**
+   * The owner explicitly takes control. The transfer is atomic, visible to
+   * every panel, and interrupts any active agent Control Lease while
+   * preserving the page for human use.
+   */
+  async function takeControl(
+    request: BrowserPanelTakeControlRequest,
+    signal?: AbortSignal,
+  ): Promise<BrowserPanelControlResponse> {
+    await requireConnectedHost(request.hostId, signal);
+    return host.call("takeControl", request, {
+      hostId: request.hostId,
+      signal,
+    });
+  }
+
+  /**
+   * The controller releases control and returns to spectator, making control
+   * available to other panels and agents.
+   */
+  async function releaseControl(
+    request: BrowserPanelReleaseControlRequest,
+    signal?: AbortSignal,
+  ): Promise<BrowserPanelControlResponse> {
+    await requireConnectedHost(request.hostId, signal);
+    return host.call("releaseControl", request, {
+      hostId: request.hostId,
+      signal,
+    });
+  }
+
+  /**
+   * A disconnected controller reclaims control within its 10-second window
+   * after a reconnect. Input is not re-granted automatically; the owner must
+   * reclaim explicitly so the reclaim path is observable and atomic.
+   */
+  async function reclaimControl(
+    request: BrowserPanelReclaimControlRequest,
+    signal?: AbortSignal,
+  ): Promise<BrowserPanelControlResponse> {
+    await requireConnectedHost(request.hostId, signal);
+    return host.call("reclaimControl", request, {
+      hostId: request.hostId,
+      signal,
+    });
+  }
+
   subscribeToHostConnections();
   subscribeToProjectDeletion();
 
@@ -2422,6 +2507,11 @@ export function createBrowserService(
     history,
     panelVisibility,
     panelCapability,
+    tabs,
+    panelControl,
+    takeControl,
+    releaseControl,
+    reclaimControl,
     grants,
     createGrant,
     inspectGrant,

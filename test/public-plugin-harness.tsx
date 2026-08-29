@@ -36,10 +36,13 @@ import {
   browserNavigationResponseSchema,
   browserPanelVisibilityRequestSchema,
   browserPanelTransportRequestSchema,
+  browserPanelControlRequestSchema,
+  browserPanelReleaseControlRequestSchema,
   browserPurgeRequestSchema,
   browserScriptRequestSchema,
   browserSetupRequestSchema,
   browserHostTargetSchema,
+  browserTabStripSchema,
   browserHostConnectionRequestSchema,
   browserPurgePlanSchema,
   browserPurgeResponseSchema,
@@ -63,6 +66,7 @@ import {
   type BrowserPanelNavigationInput,
   type BrowserPanelHistoryInput,
   type BrowserPanelCapabilityResponse,
+  type BrowserPanelControlResponse,
   type BrowserNavigationRequest,
   type BrowserHistoryRequest,
   browserProfileGrantRevokeResponseSchema,
@@ -503,6 +507,31 @@ export async function createPublicPluginHarness(options?: {
           { signal },
         );
       }
+      if (method === "tabs") {
+        return host.experimental_call(
+          "tabs",
+          browserHostTargetSchema.parse(input),
+          { signal },
+        );
+      }
+      if (
+        method === "panelControl" ||
+        method === "takeControl" ||
+        method === "reclaimControl"
+      ) {
+        return host.experimental_call(
+          method,
+          browserPanelControlRequestSchema.parse(input),
+          { signal },
+        );
+      }
+      if (method === "releaseControl") {
+        return host.experimental_call(
+          "releaseControl",
+          browserPanelReleaseControlRequestSchema.parse(input),
+          { signal },
+        );
+      }
       if (method === "diagnostics") {
         return host.experimental_call(
           "diagnostics",
@@ -751,6 +780,52 @@ export async function createPublicPluginHarness(options?: {
         input,
       ) as Promise<BrowserPanelCapabilityResponse>;
     },
+    browser_tabs: (input: { hostId: string; profileId: string }) =>
+      backend.harness.behavior.callRpc("browser_tabs", input) as Promise<
+        ReturnType<typeof browserTabStripSchema.parse>
+      >,
+    browser_panel_control: (input: {
+      hostId: string;
+      profileId: string;
+      panelId: string;
+      ownerSessionId: string;
+      viewport?: { width: number; height: number };
+    }) =>
+      backend.harness.behavior.callRpc(
+        "browser_panel_control",
+        input,
+      ) as Promise<BrowserPanelControlResponse>,
+    browser_panel_take_control: (input: {
+      hostId: string;
+      profileId: string;
+      panelId: string;
+      ownerSessionId: string;
+      viewport?: { width: number; height: number };
+    }) =>
+      backend.harness.behavior.callRpc(
+        "browser_panel_take_control",
+        input,
+      ) as Promise<BrowserPanelControlResponse>,
+    browser_panel_release_control: (input: {
+      hostId: string;
+      profileId: string;
+      panelId: string;
+    }) =>
+      backend.harness.behavior.callRpc(
+        "browser_panel_release_control",
+        input,
+      ) as Promise<BrowserPanelControlResponse>,
+    browser_panel_reclaim_control: (input: {
+      hostId: string;
+      profileId: string;
+      panelId: string;
+      ownerSessionId: string;
+      viewport?: { width: number; height: number };
+    }) =>
+      backend.harness.behavior.callRpc(
+        "browser_panel_reclaim_control",
+        input,
+      ) as Promise<BrowserPanelControlResponse>,
     browser_settings_status: (input: { profileId: string }) =>
       backend.harness.behavior.callRpc(
         "browser_settings_status",
@@ -1343,6 +1418,48 @@ export async function createPublicPluginHarness(options?: {
     });
   }
 
+  function runBrowserPanelControl(input: {
+    hostId: string;
+    profileId: string;
+    panelId: string;
+    ownerSessionId: string;
+    viewport?: { width: number; height: number };
+  }) {
+    return rpc.browser_panel_control(input);
+  }
+
+  function runBrowserTakeControl(input: {
+    hostId: string;
+    profileId: string;
+    panelId: string;
+    ownerSessionId: string;
+    viewport?: { width: number; height: number };
+  }) {
+    return rpc.browser_panel_take_control(input);
+  }
+
+  function runBrowserReleaseControl(input: {
+    hostId: string;
+    profileId: string;
+    panelId: string;
+  }) {
+    return rpc.browser_panel_release_control(input);
+  }
+
+  function runBrowserReclaimControl(input: {
+    hostId: string;
+    profileId: string;
+    panelId: string;
+    ownerSessionId: string;
+    viewport?: { width: number; height: number };
+  }) {
+    return rpc.browser_panel_reclaim_control(input);
+  }
+
+  function runBrowserTabs(hostId: string, profileId = DEFAULT_PROFILE_ID) {
+    return rpc.browser_tabs({ hostId, profileId });
+  }
+
   function runBrowserStatus(input: BrowserStatusInput) {
     return rpc.browser_status(input);
   }
@@ -1637,6 +1754,11 @@ export async function createPublicPluginHarness(options?: {
     revokeBrowserGrantRequest,
     runBrowserHostChoices,
     runBrowserPanelCapability,
+    runBrowserPanelControl,
+    runBrowserTakeControl,
+    runBrowserReleaseControl,
+    runBrowserReclaimControl,
+    runBrowserTabs,
     runBrowserScript,
     runBrowserScriptWithProfile,
     privilegedExecutor: options?.privilegedExecutor ?? null,

@@ -153,6 +153,7 @@ function publicRuntime(
       location: { direction, tabId: target.tabId ?? "public-tab" },
       tabId: target.tabId ?? "public-tab",
     }),
+    listPages: async () => [],
     status: async (target) => ({
       state: "running",
       hostId: target.hostId,

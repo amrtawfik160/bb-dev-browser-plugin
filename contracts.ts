@@ -1734,6 +1734,145 @@ export type BrowserPanelTransportResponse = z.infer<
   typeof browserPanelTransportResponseSchema
 >;
 
+/**
+ * Shared Browser Tab strip for one profile (ADR 0005). Tabs, one active tab,
+ * and one Browser Instance belong to a Browser Profile rather than a BB
+ * thread, so every Browser Panel using that profile observes the same ordered
+ * tab set. Popups are normalized into the strip; runtime-only tab identifiers
+ * stay consistent for the life of the instance and are invalidated on
+ * restart.
+ */
+export const browserTabSchema = z
+  .object({
+    tabId: z.string().min(1),
+    url: z.string().min(1),
+    title: z.string(),
+    origin: z.enum(["page", "popup"]),
+    openerTabId: z.string().min(1).nullable(),
+  })
+  .strict();
+
+export const browserTabStripSchema = z
+  .object({
+    tabs: z.array(browserTabSchema),
+    activeTabId: z.string().min(1).nullable(),
+  })
+  .strict();
+
+export type BrowserTab = z.infer<typeof browserTabSchema>;
+export type BrowserTabStrip = z.infer<typeof browserTabStripSchema>;
+
+/**
+ * Shared Control Lease state across every Browser Panel using one profile
+ * (ADR 0005/0007/0012). Exactly one panel is the controller at a time and owns
+ * the logical viewport that drives page layout; the rest are view-only
+ * spectators that scale and letterbox that viewport. A second client starts
+ * view-only and cannot send browser input until the owner explicitly chooses
+ * Take control. Transfer is atomic and visible to every panel; the live
+ * agent-purpose indicator is shown while an agent holds the lease.
+ */
+export const browserPanelClientSchema = z
+  .object({
+    panelId: z.string().min(1),
+    ownerSessionId: z.string().min(1),
+    role: z.enum(["controller", "spectator"]),
+    connection: z.enum(["connected", "disconnected"]),
+    viewport: z.object({
+      width: z.number().int().positive(),
+      height: z.number().int().positive(),
+    }),
+    /**
+     * Deadline (clock ms) until which this panel may reclaim control after a
+     * disconnect, or null when it has no reclaim window. A spectator with an
+     * unexpired deadline must reclaim explicitly to regain input.
+     */
+    reclaimUntil: z.number().int().nullable(),
+  })
+  .strict();
+
+export const browserPanelControlStateSchema = z
+  .object({
+    controllerPanelId: z.string().min(1).nullable(),
+    controllerViewport: z
+      .object({
+        width: z.number().int().positive(),
+        height: z.number().int().positive(),
+      })
+      .nullable(),
+    agentPurpose: z.string().nullable(),
+    panels: z.array(browserPanelClientSchema),
+  })
+  .strict();
+
+export type BrowserPanelClient = z.infer<typeof browserPanelClientSchema>;
+export type BrowserPanelControlState = z.infer<
+  typeof browserPanelControlStateSchema
+>;
+
+/** Request the shared tab strip for a profile. */
+export const browserTabsRequestSchema = browserHostTargetSchema;
+
+/** Request the shared control state for one panel's profile. */
+export const browserPanelControlRequestSchema = z
+  .object({
+    hostId: z.string().min(1),
+    profileId: z.string().min(1),
+    panelId: z.string().min(1),
+    ownerSessionId: z.string().min(1),
+    viewport: z
+      .object({
+        width: z.number().int().positive(),
+        height: z.number().int().positive(),
+      })
+      .optional(),
+  })
+  .strict();
+
+export const browserPanelControlResponseSchema = z
+  .object({
+    role: z.enum(["controller", "spectator"]),
+    control: browserPanelControlStateSchema,
+    tabs: browserTabStripSchema,
+  })
+  .strict();
+
+export type BrowserPanelControlRequest = z.infer<
+  typeof browserPanelControlRequestSchema
+>;
+export type BrowserPanelControlResponse = z.infer<
+  typeof browserPanelControlResponseSchema
+>;
+
+/** The controller explicitly transfers control to another panel. */
+export const browserPanelTakeControlRequestSchema =
+  browserPanelControlRequestSchema;
+export type BrowserPanelTakeControlRequest = z.infer<
+  typeof browserPanelTakeControlRequestSchema
+>;
+
+/**
+ * A disconnected controller reclaims control within its reclaim window. The
+ * same panel must call this explicitly after a reconnect; input is not
+ * re-granted automatically.
+ */
+export const browserPanelReclaimControlRequestSchema =
+  browserPanelControlRequestSchema;
+export type BrowserPanelReclaimControlRequest = z.infer<
+  typeof browserPanelReclaimControlRequestSchema
+>;
+
+/** The controller releases control and returns to spectator. */
+export const browserPanelReleaseControlRequestSchema = z
+  .object({
+    hostId: z.string().min(1),
+    profileId: z.string().min(1),
+    panelId: z.string().min(1),
+  })
+  .strict();
+export type BrowserPanelReleaseControlRequest = z.infer<
+  typeof browserPanelReleaseControlRequestSchema
+>;
+
 export const browserNavigationResponseSchema = z
   .object({
     address: z.object({ kind: z.literal("address"), url: z.string().url() }),
@@ -1782,6 +1921,26 @@ export const rpcContract = defineRpcContract({
   browser_panel_capability: {
     input: browserPanelCapabilityRequestSchema,
     output: browserPanelCapabilityResponseSchema,
+  },
+  browser_tabs: {
+    input: browserTabsRequestSchema,
+    output: browserTabStripSchema,
+  },
+  browser_panel_control: {
+    input: browserPanelControlRequestSchema,
+    output: browserPanelControlResponseSchema,
+  },
+  browser_panel_take_control: {
+    input: browserPanelTakeControlRequestSchema,
+    output: browserPanelControlResponseSchema,
+  },
+  browser_panel_reclaim_control: {
+    input: browserPanelReclaimControlRequestSchema,
+    output: browserPanelControlResponseSchema,
+  },
+  browser_panel_release_control: {
+    input: browserPanelReleaseControlRequestSchema,
+    output: browserPanelControlResponseSchema,
   },
   browser_settings_status: {
     input: z.object({ profileId: z.string().min(1) }).strict(),
