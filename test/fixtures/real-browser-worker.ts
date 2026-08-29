@@ -19,6 +19,7 @@ import { createPanelGateway } from "../../panel-gateway.js";
 import { createAutomationStreamAdapter } from "../../panel-stream.js";
 import { createCdpScreencastSource } from "../../browser-screencast.js";
 import { createPanelTransportServer } from "../../panel-transport.js";
+import { createSafeLoginMode } from "../../safe-login.js";
 import { WebSocket } from "ws";
 import {
   PANEL_MAX_VIEWPORT_HEIGHT,
@@ -86,6 +87,7 @@ if (
     "origin-scope",
     "panel-transport",
     "dialogs",
+    "safe-login",
   ]).has(action)
 ) {
   throw new Error(
@@ -694,6 +696,135 @@ if (action === "dialogs") {
     performedAction,
   };
 }
+let safeLogin:
+  | {
+      entered: boolean;
+      warned: boolean;
+      agentsInterrupted: number;
+      initiatorOnlyPixels: boolean;
+      elsewhereOpaque: boolean;
+      agentDenied: boolean;
+      authenticatedThroughFixture: boolean;
+      extended: boolean;
+      doneReturnedToAutomation: boolean;
+      reconciledToAutomation: boolean;
+      activityMetadataOnly: boolean;
+    }
+  | undefined;
+if (action === "safe-login") {
+  // Exercise the owner-only Safe Login Mode policy against the real running
+  // browser. The real-host command fails closed without BB_BROWSER_HOST_DATA_DIR:
+  // this gate throws before any relaunch or host mutation when the directory is
+  // absent, so a non-provisioned host is never mutated by this worker action.
+  // The real Xvfb/x11vnc/noVNC display plumbing is provisioned separately and is
+  // out of scope for this deterministic policy slice; the relaunch effects here
+  // are stubs that record the relaunch/return-to-automation transitions so the
+  // isolation, expiry, extension, and reconciliation policy is proven against
+  // the live fixture address without depending on the display helpers.
+  const dataDirectory = requiredEnvironment("BB_BROWSER_HOST_DATA_DIR");
+  if (!dataDirectory) {
+    throw new Error("The Safe Login worker requires BB_BROWSER_HOST_DATA_DIR.");
+  }
+  const safeLoginMode = createSafeLoginMode({
+    clock: { now: () => Date.now() },
+    leaseMs: 10_000,
+    expiryWarningMs: 3_000,
+    maxExtensionMs: 5_000,
+    maxTotalMs: 15_000,
+  });
+  const relaunchCalls: {
+    relaunchWithoutAutomation: string[];
+    returnToAutomation: string[];
+  } = {
+    relaunchWithoutAutomation: [],
+    returnToAutomation: [],
+  };
+  const relaunch = {
+    relaunchWithoutAutomation: async () => {
+      relaunchCalls.relaunchWithoutAutomation.push(target.profileId);
+    },
+    returnToAutomation: async () => {
+      relaunchCalls.returnToAutomation.push(target.profileId);
+    },
+  };
+  const interruption = {
+    interruptAgents: async () => ({ active: true, interrupted: 1 }),
+  };
+  const initiatorBinding = {
+    ownerSessionId: "owner-session-safe-login",
+    panelId: "safe-login-panel",
+    hostId: target.hostId,
+    profileId: target.profileId,
+  };
+  const spectatorBinding = {
+    ownerSessionId: "owner-session-spectator",
+    panelId: "spectator-panel",
+    hostId: target.hostId,
+    profileId: target.profileId,
+  };
+  const entered = await safeLoginMode.enter({
+    binding: initiatorBinding,
+    relaunch,
+    interruption,
+  });
+  const initiatorOnlyPixels =
+    safeLoginMode.canStreamPixels(initiatorBinding) &&
+    !safeLoginMode.canStreamPixels(spectatorBinding);
+  const elsewhereOpaque =
+    safeLoginMode.statusFor(target, spectatorBinding) ===
+    "safe-login-elsewhere";
+  let agentDenied = false;
+  try {
+    safeLoginMode.assertAgentAllowed(target);
+  } catch {
+    agentDenied = true;
+  }
+  // While in Safe Login the owner signs in through the deterministic login
+  // fixture: drive the same sign-in script the auth gate uses, against the
+  // live fixture address, so the policy is proven against a real login rather
+  // than bare relaunch stubs. The automation here stands in for the owner's
+  // manual sign-in; the policy machine above is the unit under test.
+  const loginOutput = JSON.parse(
+    String(await runtime.execute(target, signInScript, 20_000)),
+  ) as { accountHeading?: string; popupHeading?: string };
+  const authenticatedThroughFixture =
+    loginOutput.accountHeading === "Signed in" &&
+    loginOutput.popupHeading === "Authenticated popup";
+  const extended = safeLoginMode.extend(target, entered.sessionId, 5_000);
+  await safeLoginMode.done(target, entered.sessionId);
+  const doneReturnedToAutomation =
+    safeLoginMode.mode(target) === "automation" &&
+    relaunchCalls.returnToAutomation.length === 1;
+  const reconciled = await safeLoginMode.reconcile({
+    target,
+    transition: "entering",
+    startedAt: Date.now(),
+  });
+  const reconciledToAutomation = reconciled.resolved === "automation";
+  // Activity metadata was never plumbed through this worker (no store), so the
+  // policy recorded nothing locally; confirm the machine holds no sensitive
+  // payload by checking it exposes only structural state.
+  const activityMetadataOnly =
+    JSON.stringify({
+      mode: safeLoginMode.mode(target),
+      initiator: safeLoginMode.initiatingBinding(target),
+      session: safeLoginMode.session(target),
+    }).search(/password|credential|pixel|screenshot|cookie/i) === -1;
+  safeLoginMode.dispose();
+  safeLogin = {
+    entered: entered.agentsWereActive,
+    warned: entered.warning.transientStateLoss.length > 0,
+    agentsInterrupted: entered.interruptedAgents,
+    initiatorOnlyPixels,
+    elsewhereOpaque,
+    agentDenied,
+    authenticatedThroughFixture,
+    extended: extended.extendedByMs === 5_000,
+    doneReturnedToAutomation,
+    reconciledToAutomation,
+    activityMetadataOnly,
+  };
+}
 const automationHelperPid =
   action === "cleanup" || action === "lifecycle"
     ? null
@@ -708,6 +839,7 @@ const runningState = {
   originScope,
   panelTransport,
   dialogs,
+  safeLogin,
   uid: boundary.effectiveUserId,
   gid: boundary.effectiveGroupId,
   ownedProcesses: await ownedProcesses(rootDirectory),

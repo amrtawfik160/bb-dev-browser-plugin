@@ -77,6 +77,11 @@ import {
 } from "./browser-runtime.js";
 import { createProductionBrowserProcessBoundary } from "./browser-process.js";
 import { PINNED_BROWSER_RUNTIME } from "./dependency-inventory.js";
+import {
+  SafeLoginAgentDeniedError,
+  createSafeLoginMode,
+  type SafeLoginModeManager,
+} from "./safe-login.js";
 
 export type HostSetupBoundary = HostReadinessBoundary;
 type HostBoundary = HostReadinessBoundary | HostAdministrationBoundary;
@@ -91,6 +96,8 @@ type ProfileRecoverySource =
   BrowserProfileRecovery | ((dataDir: string) => BrowserProfileRecovery);
 type BrowserRuntimeSource =
   BrowserInstanceRuntime | ((dataDir: string) => BrowserInstanceRuntime);
+type SafeLoginModeSource =
+  SafeLoginModeManager | ((dataDir: string) => SafeLoginModeManager);
 
 type ScriptSignalContext = { signal: AbortSignal };
 type ScriptActivityOutcome = "succeeded" | "failed" | "interrupted";
@@ -119,6 +126,7 @@ const scriptRuntimeErrorLabels: Record<
   tab_invalid: "Browser Tab invalid",
   sandbox_violation: "Browser sandbox violation",
   script_failed: "Browser script failed",
+  safe_login_denied: "Safe Login active",
 };
 
 function scriptRuntimeFailure(
@@ -333,12 +341,15 @@ export function createBrowserHostEntry(
   profileSource?: ProfileStoreSource,
   recoverySource?: ProfileRecoverySource,
   runtimeSource?: BrowserRuntimeSource,
+  safeLoginSource?: SafeLoginModeSource,
 ) {
   let workerLease: { dispose(): Promise<void> } | undefined;
   let retainedBoundary: HostAdministrationBoundary | undefined;
   let retainedProfiles: BrowserProfileStore | undefined;
   let retainedRecovery: BrowserProfileRecovery | undefined;
   let retainedOutbox: ActivityOutbox | undefined;
+  let retainedSafeLogin: SafeLoginModeManager | undefined =
+    typeof safeLoginSource === "object" ? safeLoginSource : undefined;
   let retainedRuntime: BrowserInstanceRuntime | undefined =
     typeof runtimeSource === "object" ? runtimeSource : undefined;
   const controlLeases = createControlLeaseManager();
@@ -488,6 +499,39 @@ export function createBrowserHostEntry(
         ? runtimeSource(dataDir)
         : runtimeSource;
     return retainedRuntime;
+  }
+  /**
+   * The owner-only Safe Login policy owns the per-profile mode. The host is
+   * the only place that can relaunch a profile without a dev-browser or
+   * automation attachment, so it holds the authoritative machine and denies
+   * browser_script (and therefore the CLI, which relays through it) while a
+   * profile is in Safe Login Mode. Tests inject a pre-activated machine.
+   */
+  function safeLogin(dataDir: string) {
+    if (retainedSafeLogin !== undefined) return retainedSafeLogin;
+    retainedSafeLogin =
+      safeLoginSource === undefined
+        ? createSafeLoginMode()
+        : typeof safeLoginSource === "function"
+          ? safeLoginSource(dataDir)
+          : safeLoginSource;
+    return retainedSafeLogin;
+  }
+  function safeLoginDeniedResponse(
+    request: BrowserScriptRequest,
+    denial: SafeLoginAgentDeniedError,
+  ): BrowserScriptResponse {
+    return {
+      ok: false,
+      error: {
+        state: "runtime-error",
+        code: "safe_login_denied",
+        label: scriptRuntimeErrorLabels.safe_login_denied,
+        hostId: request.hostId,
+        profileId: request.profileId,
+        message: denial.message,
+      },
+    };
   }
   async function disposeRuntime() {
     controlLeases.revokeAll();
@@ -984,6 +1028,19 @@ export function createBrowserHostEntry(
         let response: BrowserScriptResponse | undefined;
         let leaseRevokedAfterCompletion = false;
         try {
+          // Deny browser_script while the profile is in owner-only Safe Login
+          // Mode before touching the runtime. Both the agent tool and the CLI
+          // relay through this handler, so this is the single denial point for
+          // DOM, screenshot, and control access during Safe Login.
+          try {
+            safeLogin(dataDir).assertAgentAllowed(target);
+          } catch (error) {
+            if (error instanceof SafeLoginAgentDeniedError) {
+              response = safeLoginDeniedResponse(request, error);
+              return response;
+            }
+            throw error;
+          }
           const readiness = await administration(dataDir).inspect(target);
           if (readiness.state !== "healthy") {
             response = { ok: false as const, error: readiness };
@@ -1319,6 +1376,8 @@ export function createBrowserHostEntry(
         panelGateways.dispose();
         panelCapabilities.dispose();
         await disposeRuntime();
+        retainedSafeLogin?.dispose();
+        retainedSafeLogin = undefined;
       } finally {
         await workerLease?.dispose();
       }

@@ -2252,6 +2252,7 @@ export const browserScriptRuntimeErrorSchema = z
       "tab_invalid",
       "sandbox_violation",
       "script_failed",
+      "safe_login_denied",
     ]),
     label: z.string().trim().min(1).max(80),
     hostId: z.string().min(1),

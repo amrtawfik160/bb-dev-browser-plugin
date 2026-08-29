@@ -46,6 +46,7 @@ import {
   isBbGlobalShortcut,
 } from "./panel-chrome.js";
 import { ownerSessionIdFromContext } from "./panel-owner-session.js";
+import { SAFE_LOGIN_LIMITATIONS_NOTICE } from "./safe-login-notice.js";
 import {
   createAutomationStreamAdapter,
   type PanelStreamAdapter,
@@ -110,6 +111,17 @@ function ReadinessView({
         {children}
       </section>
     </main>
+  );
+}
+
+function SafeLoginLimitationsNotice() {
+  return (
+    <p
+      aria-label="Safe Login limitations"
+      className="mt-3 text-left text-xs text-muted-foreground"
+    >
+      {SAFE_LOGIN_LIMITATIONS_NOTICE}
+    </p>
   );
 }
 
@@ -1128,6 +1140,9 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
       {profiles === null || status.hostId === null ? null : (
         <PanelProfilePicker inventory={profiles} onChange={selectProfile} />
       )}
+      {status.state === "safe-login-elsewhere" ? (
+        <SafeLoginLimitationsNotice />
+      ) : null}
       {status.state !== "healthy" ? null : (
         <form className="mt-5 text-left" onSubmit={navigate}>
           <div className="flex items-center gap-2">

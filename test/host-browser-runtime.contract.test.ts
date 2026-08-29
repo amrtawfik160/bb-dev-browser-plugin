@@ -14,6 +14,10 @@ import {
   BrowserOriginScopeDeniedError,
   createBrowserInstanceRuntime,
 } from "../browser-runtime.js";
+import {
+  createSafeLoginMode,
+  type SafeLoginRelaunchEffects,
+} from "../safe-login.js";
 
 const HOST_ID = "host-runtime";
 
@@ -1045,6 +1049,152 @@ it("issue #14 AC4 forwards per-origin invalid-certificate flags from the script 
     expect(forwardedOrigins).toEqual(["https://app.example.test:8443"]);
   } finally {
     await host.experimental_dispose();
+    await rm(rootDirectory, { recursive: true, force: true });
+  }
+});
+
+function safeLoginExecuteRuntime() {
+  return {
+    start: async () => {
+      throw new Error("not used");
+    },
+    stop: async () => {},
+    execute: async () => "fixture-output",
+    navigate: async () => {
+      throw new Error("not used");
+    },
+    history: async () => {
+      throw new Error("not used");
+    },
+    listPages: async () => [],
+    status: async ({
+      hostId,
+      profileId,
+    }: {
+      hostId: string;
+      profileId: string;
+    }) => ({
+      state: "running" as const,
+      hostId,
+      profileId,
+    }),
+    pinPanel: async () => {
+      throw new Error("not used");
+    },
+    unpinPanel: async () => {},
+    hostDisconnected: () => {},
+    hostReconnected: async () => {},
+    dispose: async () => {},
+  };
+}
+
+function deterministicSafeLoginRelaunch(): {
+  effects: SafeLoginRelaunchEffects;
+} {
+  return {
+    effects: {
+      relaunchWithoutAutomation: async () => {},
+      returnToAutomation: async () => {},
+    },
+  };
+}
+
+it("issue #18 denies browser_script DOM, screenshot, and control access while the profile is in Safe Login Mode", async () => {
+  const rootDirectory = await mkdtemp(join(tmpdir(), "host-safe-login-deny-"));
+  const profiles = createFileBrowserProfileStore({
+    rootDirectory,
+    installationId: "installation-safe-login-deny",
+  });
+  await profiles.initialize(HOST_ID);
+  const safeLoginMode = createSafeLoginMode();
+  const readiness = {
+    inspect: healthyStatus,
+    diagnostics: () => {
+      throw new Error("diagnostics not used");
+    },
+  };
+  const host = experimental_createHostEntryHarness(
+    createBrowserHostEntry(
+      readiness,
+      profiles,
+      undefined,
+      safeLoginExecuteRuntime(),
+      safeLoginMode,
+    ),
+    {
+      experimental_paths: {
+        dataDir: rootDirectory,
+        tempDir: join(rootDirectory, "tmp"),
+      },
+    },
+  );
+  const baseScriptRequest = {
+    purpose: "Inspect the fixture",
+    code: "return page.url();",
+    hostId: HOST_ID,
+    projectId: "project-safe-login-deny",
+    threadId: "thread-safe-login-deny",
+    activityOccurredAt: "2026-08-28T00:00:00.000Z",
+    profileId: DEFAULT_PROFILE_ID,
+    timeoutMs: 5_000,
+  };
+  let eventSequence = 0;
+  function scriptRequest() {
+    eventSequence += 1;
+    return {
+      ...baseScriptRequest,
+      activityEventId: `safe-login-deny-event-${eventSequence}`,
+    };
+  }
+  try {
+    // While Automation Mode is active the script runs normally.
+    await expect(
+      host.experimental_call("browserScript", scriptRequest()),
+    ).resolves.toEqual({ ok: true, result: "fixture-output" });
+
+    // Entering owner-only Safe Login Mode denies every browser_script path
+    // (DOM, screenshot, and control) before the runtime is touched.
+    await safeLoginMode.enter({
+      binding: {
+        ownerSessionId: "owner-session-deny",
+        panelId: "deny-panel",
+        hostId: HOST_ID,
+        profileId: DEFAULT_PROFILE_ID,
+      },
+      relaunch: deterministicSafeLoginRelaunch().effects,
+      interruption: {
+        interruptAgents: async () => ({ active: false, interrupted: 0 }),
+      },
+    });
+    const denied = await host.experimental_call(
+      "browserScript",
+      scriptRequest(),
+    );
+    expect(denied).toEqual({
+      ok: false,
+      error: {
+        state: "runtime-error",
+        code: "safe_login_denied",
+        label: "Safe Login active",
+        hostId: HOST_ID,
+        profileId: DEFAULT_PROFILE_ID,
+        message:
+          "Browser automation is denied while this Browser Profile is in owner-only Safe Login Mode.",
+      },
+    });
+
+    // After the owner ends Safe Login, agents can run scripts again.
+    await safeLoginMode.done(
+      { hostId: HOST_ID, profileId: DEFAULT_PROFILE_ID },
+      safeLoginMode.session({ hostId: HOST_ID, profileId: DEFAULT_PROFILE_ID })!
+        .sessionId,
+    );
+    await expect(
+      host.experimental_call("browserScript", scriptRequest()),
+    ).resolves.toEqual({ ok: true, result: "fixture-output" });
+  } finally {
+    await host.experimental_dispose();
+    safeLoginMode.dispose();
     await rm(rootDirectory, { recursive: true, force: true });
   }
 });
