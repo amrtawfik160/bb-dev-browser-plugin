@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type FormEvent, type ReactNode } from "react";
 import { definePluginApp, useRpc } from "@get-bb/plugin-sdk/app";
 import type {
   PluginNewThreadPanelProps,
@@ -7,7 +7,11 @@ import type {
 import {
   DEFAULT_PROFILE_ID,
   STOP_BROWSER_CONFIRMATION,
+  type BrowserHostChoice,
+  type BrowserHostChoicesInput,
   type BrowserDiagnostics,
+  type BrowserProfile,
+  type BrowserProfileInventory,
   type BrowserPurgePlan,
   type BrowserSetupPlan,
   type BrowserStatus,
@@ -36,7 +40,13 @@ function ReadinessChecklist({ status }: { status: BrowserStatus }) {
   );
 }
 
-function ReadinessView({ status }: { status: BrowserStatus }) {
+function ReadinessView({
+  status,
+  children,
+}: {
+  status: BrowserStatus;
+  children?: ReactNode;
+}) {
   return (
     <main className="flex h-full min-h-0 items-center justify-center bg-background p-6">
       <section
@@ -52,18 +62,176 @@ function ReadinessView({ status }: { status: BrowserStatus }) {
           {status.profileId}
         </p>
         <ReadinessChecklist status={status} />
+        {children}
       </section>
     </main>
+  );
+}
+
+function hostChoicesRequest(
+  request: BrowserStatusInput,
+): BrowserHostChoicesInput {
+  return request.surface === "thread"
+    ? { surface: "thread", threadId: request.threadId }
+    : { surface: "new-thread", projectId: request.projectId };
+}
+
+function PanelHostPicker({
+  choices,
+  onChange,
+}: {
+  choices: readonly BrowserHostChoice[];
+  onChange: (hostId: string) => void;
+}) {
+  const [hostId, setHostId] = useState("");
+  return (
+    <div className="mt-5 text-left">
+      <label className="block text-sm" htmlFor="browser-workspace-host">
+        Workspace host
+      </label>
+      <select
+        id="browser-workspace-host"
+        aria-label="Workspace host"
+        className="mt-2 w-full rounded border px-3 py-2 text-sm"
+        value={hostId}
+        onChange={(event) => {
+          setHostId(event.target.value);
+          onChange(event.target.value);
+        }}
+      >
+        <option value="" disabled>
+          Select a host
+        </option>
+        {choices.map((choice) => (
+          <option key={choice.hostId} value={choice.hostId}>
+            {choice.name}
+          </option>
+        ))}
+      </select>
+    </div>
+  );
+}
+
+function PanelProfilePicker({
+  inventory,
+  onChange,
+}: {
+  inventory: BrowserProfileInventory;
+  onChange: (profileId: string) => void;
+}) {
+  return (
+    <div className="mt-5 text-left">
+      <label className="block text-sm" htmlFor="browser-profile-selection">
+        Browser Profile
+      </label>
+      <select
+        id="browser-profile-selection"
+        aria-label="Browser Profile"
+        className="mt-2 w-full rounded border px-3 py-2 text-sm"
+        value={inventory.selectedProfileId}
+        onChange={(event) => onChange(event.target.value)}
+      >
+        {inventory.profiles.map((profile) => (
+          <option key={profile.profileId} value={profile.profileId}>
+            {profile.name}
+          </option>
+        ))}
+      </select>
+      <p className="mt-2 text-xs text-muted-foreground">
+        Locale: {inventory.profiles.find((profile) => profile.selected)?.locale}
+        {" · "}
+        Timezone:{" "}
+        {inventory.profiles.find((profile) => profile.selected)?.timezone}
+      </p>
+    </div>
   );
 }
 
 function BrowserPanel({ request }: { request: BrowserStatusInput }) {
   const rpc = useRpc<typeof rpcContract>();
   const [status, setStatus] = useState<BrowserStatus | null>(null);
+  const [selectedHostId, setSelectedHostId] = useState(request.hostId);
+  const [hostChoices, setHostChoices] = useState<BrowserHostChoice[]>([]);
+  const [profiles, setProfiles] = useState<BrowserProfileInventory | null>(
+    null,
+  );
+  const [profileError, setProfileError] = useState<string | null>(null);
+
+  const statusRequest: BrowserStatusInput =
+    selectedHostId === undefined
+      ? { ...request, profileSelection: "selected" }
+      : {
+          ...request,
+          hostId: selectedHostId,
+          profileSelection: "selected",
+        };
+
+  function profileContext() {
+    return request.surface === "thread"
+      ? { threadId: request.threadId }
+      : { projectId: request.projectId };
+  }
 
   useEffect(() => {
-    void rpc.call("browser_status", request).then(setStatus);
-  }, [request, rpc]);
+    setStatus(null);
+    void rpc.call("browser_status", statusRequest).then(setStatus);
+  }, [request, selectedHostId, rpc]);
+
+  useEffect(() => {
+    if (status?.hostId !== null || status === null) {
+      setHostChoices([]);
+      return;
+    }
+    void rpc
+      .call("browser_host_choices", hostChoicesRequest(request))
+      .then(setHostChoices)
+      .catch((error: unknown) =>
+        setProfileError(administrationErrorMessage(error)),
+      );
+  }, [request, rpc, status]);
+
+  useEffect(() => {
+    const hostId = status?.hostId;
+    if (
+      hostId === undefined ||
+      hostId === null ||
+      status?.state === "host-offline"
+    ) {
+      setProfiles(null);
+      return;
+    }
+    void rpc
+      .call("browser_profiles", { hostId, ...profileContext() })
+      .then(setProfiles)
+      .catch((error: unknown) =>
+        setProfileError(administrationErrorMessage(error)),
+      );
+  }, [rpc, status]);
+
+  function selectProfile(profileId: string) {
+    const hostId = status?.hostId;
+    if (hostId === null || hostId === undefined) return;
+    setProfileError(null);
+    void rpc
+      .call("browser_profile_select", {
+        hostId,
+        profileId,
+        ...profileContext(),
+      })
+      .then((inventory) => {
+        setProfiles(inventory);
+        return rpc.call("browser_status", {
+          ...request,
+          hostId,
+          profileId,
+          profileSelection: "selected",
+        });
+      })
+      .then(setStatus)
+      .catch((error: unknown) =>
+        setProfileError(administrationErrorMessage(error)),
+      );
+  }
 
   if (status === null) {
     return (
@@ -72,7 +240,17 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
       </div>
     );
   }
-  return <ReadinessView status={status} />;
+  return (
+    <ReadinessView status={status}>
+      {status.hostId === null && hostChoices.length > 0 ? (
+        <PanelHostPicker choices={hostChoices} onChange={setSelectedHostId} />
+      ) : null}
+      {profiles === null || status.hostId === null ? null : (
+        <PanelProfilePicker inventory={profiles} onChange={selectProfile} />
+      )}
+      {profileError === null ? null : <p role="alert">{profileError}</p>}
+    </ReadinessView>
+  );
 }
 
 function administrationErrorMessage(error: unknown) {
@@ -91,6 +269,402 @@ function purgeTargetLocation(target: BrowserPurgePlan["targets"][number]) {
   if ("path" in target) return target.path;
   if ("scope" in target) return target.scope;
   return target.username;
+}
+
+function browserClientLocale() {
+  return Intl.DateTimeFormat().resolvedOptions().locale || "en-US";
+}
+
+function browserClientTimezone() {
+  return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+}
+
+function ProfileRow({
+  profile,
+  renameName,
+  locale,
+  timezone,
+  pendingAction,
+  onRenameNameChange,
+  onLocaleChange,
+  onTimezoneChange,
+  onRename,
+  onSelect,
+}: {
+  profile: BrowserProfile;
+  renameName: string;
+  locale: string;
+  timezone: string;
+  pendingAction: string | null;
+  onRenameNameChange: (name: string) => void;
+  onLocaleChange: (locale: string) => void;
+  onTimezoneChange: (timezone: string) => void;
+  onRename: () => void;
+  onSelect: () => void;
+}) {
+  return (
+    <div className="rounded border p-3">
+      <div className="flex flex-wrap items-baseline justify-between gap-2">
+        <strong>{profile.name}</strong>
+        {profile.selected ? <span>Selected</span> : null}
+      </div>
+      <p className="mt-1 text-xs text-muted-foreground">
+        {profile.profileId} · Locale: {profile.locale} · Timezone:{" "}
+        {profile.timezone}
+      </p>
+      <div className="mt-3 flex flex-wrap items-end gap-2">
+        <label className="min-w-48 grow text-sm">
+          Rename {profile.name}
+          <input
+            aria-label={"Rename Browser Profile " + profile.name}
+            className="mt-1 block w-full rounded border px-3 py-2 text-sm"
+            value={renameName}
+            onChange={(event) => onRenameNameChange(event.target.value)}
+          />
+        </label>
+        <label className="min-w-32 text-sm">
+          Locale
+          <input
+            aria-label={"Locale for Browser Profile " + profile.name}
+            className="mt-1 block w-full rounded border px-3 py-2 text-sm"
+            value={locale}
+            onChange={(event) => onLocaleChange(event.target.value)}
+          />
+        </label>
+        <label className="min-w-32 text-sm">
+          Timezone
+          <input
+            aria-label={"Timezone for Browser Profile " + profile.name}
+            className="mt-1 block w-full rounded border px-3 py-2 text-sm"
+            value={timezone}
+            onChange={(event) => onTimezoneChange(event.target.value)}
+          />
+        </label>
+        <button
+          type="button"
+          className="rounded border px-3 py-2 text-sm"
+          disabled={pendingAction !== null || renameName.trim().length === 0}
+          onClick={onRename}
+        >
+          Rename {profile.name}
+        </button>
+        <button
+          type="button"
+          className="rounded border px-3 py-2 text-sm"
+          disabled={pendingAction !== null}
+          onClick={onRename}
+        >
+          Save settings {profile.name}
+        </button>
+        {profile.selected ? null : (
+          <button
+            type="button"
+            className="rounded border px-3 py-2 text-sm"
+            disabled={pendingAction !== null}
+            onClick={onSelect}
+          >
+            Select {profile.name}
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+type ProfileSettingsDraft = { locale: string; timezone: string };
+
+function ProfileInventoryView({
+  inventory,
+  renameNames,
+  profileSettings,
+  pendingAction,
+  onRenameNameChange,
+  onLocaleChange,
+  onTimezoneChange,
+  onRename,
+  onSelect,
+}: {
+  inventory: BrowserProfileInventory;
+  renameNames: Record<string, string>;
+  profileSettings: Record<string, ProfileSettingsDraft>;
+  pendingAction: string | null;
+  onRenameNameChange: (profileId: string, name: string) => void;
+  onLocaleChange: (profile: BrowserProfile, locale: string) => void;
+  onTimezoneChange: (profile: BrowserProfile, timezone: string) => void;
+  onRename: (profile: BrowserProfile) => void;
+  onSelect: (profile: BrowserProfile) => void;
+}) {
+  return (
+    <>
+      <p className="mt-3 text-sm">Selected: {inventory.selectedProfileId}</p>
+      {inventory.profiles.length === 0 ? (
+        <p className="mt-1 text-xs text-muted-foreground">
+          Default Browser Profile: <code>{inventory.selectedProfileId}</code>
+        </p>
+      ) : null}
+      <div className="mt-3 space-y-3">
+        {inventory.profiles.map((profile) => (
+          <ProfileRow
+            key={profile.profileId}
+            profile={profile}
+            renameName={renameNames[profile.profileId] ?? profile.name}
+            locale={
+              profileSettings[profile.profileId]?.locale ?? profile.locale
+            }
+            timezone={
+              profileSettings[profile.profileId]?.timezone ?? profile.timezone
+            }
+            pendingAction={pendingAction}
+            onRenameNameChange={(name) =>
+              onRenameNameChange(profile.profileId, name)
+            }
+            onLocaleChange={(locale) => onLocaleChange(profile, locale)}
+            onTimezoneChange={(timezone) => onTimezoneChange(profile, timezone)}
+            onRename={() => onRename(profile)}
+            onSelect={() => onSelect(profile)}
+          />
+        ))}
+      </div>
+    </>
+  );
+}
+
+function ProfileCreateForm({
+  name,
+  locale,
+  timezone,
+  pending,
+  onNameChange,
+  onLocaleChange,
+  onTimezoneChange,
+  onSubmit,
+}: {
+  name: string;
+  locale: string;
+  timezone: string;
+  pending: boolean;
+  onNameChange: (name: string) => void;
+  onLocaleChange: (locale: string) => void;
+  onTimezoneChange: (timezone: string) => void;
+  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+}) {
+  return (
+    <form className="mt-5 space-y-2" onSubmit={onSubmit}>
+      <h5 className="font-medium">Create a Browser Profile</h5>
+      <label className="block text-sm">
+        New Browser Profile name
+        <input
+          aria-label="New Browser Profile name"
+          className="mt-1 block w-full rounded border px-3 py-2 text-sm"
+          value={name}
+          onChange={(event) => onNameChange(event.target.value)}
+        />
+      </label>
+      <label className="block text-sm">
+        Locale
+        <input
+          aria-label="New Browser Profile locale"
+          className="mt-1 block w-full rounded border px-3 py-2 text-sm"
+          value={locale}
+          onChange={(event) => onLocaleChange(event.target.value)}
+        />
+      </label>
+      <label className="block text-sm">
+        Timezone
+        <input
+          aria-label="New Browser Profile timezone"
+          className="mt-1 block w-full rounded border px-3 py-2 text-sm"
+          value={timezone}
+          onChange={(event) => onTimezoneChange(event.target.value)}
+        />
+      </label>
+      <button
+        type="submit"
+        className="rounded border px-3 py-2 text-sm"
+        disabled={pending || name.trim().length === 0}
+      >
+        Create Browser Profile
+      </button>
+    </form>
+  );
+}
+
+function ProfileControls({
+  hostId,
+  available,
+}: {
+  hostId: string;
+  available: boolean;
+}) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [inventory, setInventory] = useState<BrowserProfileInventory | null>(
+    null,
+  );
+  const [newName, setNewName] = useState("");
+  const [newLocale, setNewLocale] = useState(browserClientLocale);
+  const [newTimezone, setNewTimezone] = useState(browserClientTimezone);
+  const [renameNames, setRenameNames] = useState<Record<string, string>>({});
+  const [profileSettings, setProfileSettings] = useState<
+    Record<string, ProfileSettingsDraft>
+  >({});
+  const [pendingAction, setPendingAction] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  function refreshProfiles() {
+    return rpc.call("browser_profiles", { hostId }).then((nextInventory) => {
+      setInventory(nextInventory);
+      return nextInventory;
+    });
+  }
+
+  useEffect(() => {
+    if (!available) {
+      setInventory(null);
+      return;
+    }
+    void rpc
+      .call("browser_profiles", { hostId })
+      .then(setInventory)
+      .catch((requestError: unknown) =>
+        setError(administrationErrorMessage(requestError)),
+      );
+  }, [available, hostId, rpc]);
+
+  function createProfile(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setPendingAction("create");
+    setError(null);
+    void rpc
+      .call("browser_profile_create", {
+        hostId,
+        name: newName,
+        locale: newLocale,
+        timezone: newTimezone,
+      })
+      .then(() => refreshProfiles())
+      .then(() => setNewName(""))
+      .catch((requestError: unknown) =>
+        setError(administrationErrorMessage(requestError)),
+      )
+      .finally(() => setPendingAction(null));
+  }
+
+  function saveProfile(profile: BrowserProfile) {
+    setPendingAction(profile.profileId);
+    setError(null);
+    const settings = profileSettings[profile.profileId] ?? {
+      locale: profile.locale,
+      timezone: profile.timezone,
+    };
+    void rpc
+      .call("browser_profile_rename", {
+        hostId,
+        profileId: profile.profileId,
+        name: renameNames[profile.profileId] ?? profile.name,
+        ...settings,
+      })
+      .then(() => refreshProfiles())
+      .then((nextInventory) => {
+        const savedProfile = nextInventory.profiles.find(
+          (candidate) => candidate.profileId === profile.profileId,
+        );
+        if (savedProfile === undefined) return;
+        setRenameNames((current) => ({
+          ...current,
+          [profile.profileId]: savedProfile.name,
+        }));
+      })
+      .catch((requestError: unknown) =>
+        setError(administrationErrorMessage(requestError)),
+      )
+      .finally(() => setPendingAction(null));
+  }
+
+  function selectProfile(profile: BrowserProfile) {
+    setPendingAction(profile.profileId);
+    setError(null);
+    void rpc
+      .call("browser_profile_select", {
+        hostId,
+        profileId: profile.profileId,
+      })
+      .then(setInventory)
+      .catch((requestError: unknown) =>
+        setError(administrationErrorMessage(requestError)),
+      )
+      .finally(() => setPendingAction(null));
+  }
+
+  function changeRenameName(profileId: string, name: string) {
+    setRenameNames((current) => ({ ...current, [profileId]: name }));
+  }
+
+  function changeLocale(profile: BrowserProfile, locale: string) {
+    setProfileSettings((current) => ({
+      ...current,
+      [profile.profileId]: {
+        locale,
+        timezone: current[profile.profileId]?.timezone ?? profile.timezone,
+      },
+    }));
+  }
+
+  function changeTimezone(profile: BrowserProfile, timezone: string) {
+    setProfileSettings((current) => ({
+      ...current,
+      [profile.profileId]: {
+        locale: current[profile.profileId]?.locale ?? profile.locale,
+        timezone,
+      },
+    }));
+  }
+
+  return (
+    <section
+      aria-label={"Browser Profiles for host " + hostId}
+      className="mt-6 border-t pt-5 text-left"
+    >
+      <h4 className="font-semibold">Browser Profiles</h4>
+      <p className="mt-2 text-sm text-muted-foreground">
+        Profiles stay on this workspace host. Authenticated browser data never
+        enters BB server storage.
+      </p>
+      {!available ? (
+        <p className="mt-3 text-sm">
+          Profiles are unavailable while this host is offline.
+        </p>
+      ) : inventory === null ? (
+        <p role="status" className="mt-3 text-sm">
+          Loading Browser Profiles…
+        </p>
+      ) : (
+        <>
+          <ProfileInventoryView
+            inventory={inventory}
+            renameNames={renameNames}
+            profileSettings={profileSettings}
+            pendingAction={pendingAction}
+            onRenameNameChange={changeRenameName}
+            onLocaleChange={changeLocale}
+            onTimezoneChange={changeTimezone}
+            onRename={saveProfile}
+            onSelect={selectProfile}
+          />
+          <ProfileCreateForm
+            name={newName}
+            locale={newLocale}
+            timezone={newTimezone}
+            pending={pendingAction !== null}
+            onNameChange={setNewName}
+            onLocaleChange={setNewLocale}
+            onTimezoneChange={setNewTimezone}
+            onSubmit={createProfile}
+          />
+        </>
+      )}
+      <AdministrationFeedback message={null} error={error} />
+    </section>
+  );
 }
 
 type BrowserAdministrationTarget = {
@@ -466,6 +1040,12 @@ function BrowserSettings() {
           <h3 className="font-semibold">{status.label}</h3>
           <p className="text-sm text-muted-foreground">{status.message}</p>
           <ReadinessChecklist status={status} />
+          {status.hostId === null ? null : (
+            <ProfileControls
+              hostId={status.hostId}
+              available={status.state !== "host-offline"}
+            />
+          )}
           <HostAdministrationControls status={status} />
           <button
             type="button"

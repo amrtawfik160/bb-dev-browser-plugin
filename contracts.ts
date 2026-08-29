@@ -2,6 +2,9 @@ import { defineRpcContract } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 
 export const DEFAULT_PROFILE_ID = "bb-personal";
+export const PROFILE_MANIFEST_VERSION = 1 as const;
+export const PROFILE_DEFAULT_LOCALE = "en-US";
+export const PROFILE_DEFAULT_TIMEZONE = "UTC";
 export const SETUP_REQUIRED_MESSAGE =
   "Browser host setup has not been completed.";
 export const BROWSER_STORAGE_ROOT = "/var/lib/bb-browser";
@@ -228,6 +231,159 @@ export type BrowserPurgePlan = z.infer<typeof browserPurgePlanSchema>;
 export type BrowserPurgeRequest = z.infer<typeof browserPurgeRequestSchema>;
 export type BrowserPurgeResponse = z.infer<typeof browserPurgeResponseSchema>;
 
+export const browserProfileIdSchema = z
+  .string()
+  .regex(/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/u);
+export const browserProfileNameSchema = z.string().trim().min(1).max(80);
+export const browserProfileLocaleSchema = z.string().trim().min(2).max(64);
+export const browserProfileTimezoneSchema = z.string().trim().min(1).max(128);
+
+export const browserProfileStartupSchema = z
+  .object({
+    initialTabUrl: z.literal("about:blank"),
+    suppressWelcome: z.literal(true),
+    chromeArguments: z.tuple([
+      z.literal("--no-first-run"),
+      z.literal("--no-default-browser-check"),
+    ]),
+  })
+  .strict();
+
+export const browserProfileStorageSchema = z
+  .object({
+    owner: z.literal("bb-browser"),
+    directoryMode: z.literal("0700"),
+    manifestMode: z.literal("0600"),
+  })
+  .strict();
+
+export const browserProfileManifestSchema = z
+  .object({
+    version: z.literal(PROFILE_MANIFEST_VERSION),
+    profileId: browserProfileIdSchema,
+    name: browserProfileNameSchema,
+    hostId: z.string().min(1),
+    installationId: z.string().min(1),
+    locale: browserProfileLocaleSchema,
+    timezone: browserProfileTimezoneSchema,
+    createdAt: z.string().datetime(),
+    updatedAt: z.string().datetime(),
+    state: z.literal("active"),
+    startup: browserProfileStartupSchema,
+    storage: browserProfileStorageSchema,
+  })
+  .strict();
+
+export const browserProfileSchema = browserProfileManifestSchema
+  .extend({ selected: z.boolean() })
+  .strict();
+
+export const browserProfileHostTargetSchema = z
+  .object({ hostId: z.string().min(1) })
+  .strict();
+
+export const browserProfileCreateRequestSchema = z
+  .object({
+    hostId: z.string().min(1),
+    name: browserProfileNameSchema,
+    locale: browserProfileLocaleSchema.optional(),
+    timezone: browserProfileTimezoneSchema.optional(),
+  })
+  .strict();
+
+export const browserProfileRenameRequestSchema = z
+  .object({
+    hostId: z.string().min(1),
+    profileId: browserProfileIdSchema,
+    name: browserProfileNameSchema,
+    locale: browserProfileLocaleSchema.optional(),
+    timezone: browserProfileTimezoneSchema.optional(),
+  })
+  .strict();
+
+export const browserProfileSelectRequestSchema = z
+  .object({
+    hostId: z.string().min(1),
+    profileId: browserProfileIdSchema,
+  })
+  .strict();
+
+const browserProfileContextSchema = z
+  .object({
+    projectId: z.string().min(1).nullable().optional(),
+    threadId: z.string().min(1).optional(),
+  })
+  .strict();
+
+export const browserProfileQuerySchema = browserProfileHostTargetSchema
+  .extend(browserProfileContextSchema.shape)
+  .strict();
+
+export const browserProfileSelectionRequestSchema =
+  browserProfileSelectRequestSchema
+    .extend(browserProfileContextSchema.shape)
+    .strict();
+
+export const browserProfileInventorySchema = z
+  .object({
+    hostId: z.string().min(1),
+    installationId: z.string().min(1),
+    selectedProfileId: browserProfileIdSchema,
+    profiles: z.array(browserProfileSchema),
+  })
+  .strict();
+
+export const browserHostChoiceSchema = z
+  .object({
+    hostId: z.string().min(1),
+    name: z.string().min(1),
+  })
+  .strict();
+
+export const browserHostChoicesInputSchema = z.discriminatedUnion("surface", [
+  z
+    .object({
+      surface: z.literal("thread"),
+      threadId: z.string().min(1),
+    })
+    .strict(),
+  z
+    .object({
+      surface: z.literal("new-thread"),
+      projectId: z.string().min(1).nullable(),
+    })
+    .strict(),
+]);
+export const browserHostChoicesSchema = z.array(browserHostChoiceSchema);
+
+export type BrowserProfileManifest = z.infer<
+  typeof browserProfileManifestSchema
+>;
+export type BrowserProfile = z.infer<typeof browserProfileSchema>;
+export type BrowserProfileHostTarget = z.infer<
+  typeof browserProfileHostTargetSchema
+>;
+export type BrowserProfileCreateRequest = z.infer<
+  typeof browserProfileCreateRequestSchema
+>;
+export type BrowserProfileRenameRequest = z.infer<
+  typeof browserProfileRenameRequestSchema
+>;
+export type BrowserProfileSelectRequest = z.infer<
+  typeof browserProfileSelectRequestSchema
+>;
+export type BrowserProfileQuery = z.infer<typeof browserProfileQuerySchema>;
+export type BrowserProfileSelectionRequest = z.infer<
+  typeof browserProfileSelectionRequestSchema
+>;
+export type BrowserProfileInventory = z.infer<
+  typeof browserProfileInventorySchema
+>;
+export type BrowserHostChoice = z.infer<typeof browserHostChoiceSchema>;
+export type BrowserHostChoicesInput = z.infer<
+  typeof browserHostChoicesInputSchema
+>;
+
 export const readinessCapabilityIdSchema = z.enum([
   "operating-system",
   "architecture",
@@ -450,11 +606,28 @@ export function hostProbeFailedStatus(
   };
 }
 
+export function browserProfileUnavailableStatus(
+  target: BrowserStatusTarget,
+): BrowserStatus {
+  return {
+    ...target,
+    state: "repair-required",
+    code: "repair_required",
+    label: "Repair required",
+    message: "The requested Browser Profile is not available on this host.",
+    capabilities: unavailableCapabilities(
+      "Select a profile listed for this workspace host.",
+    ),
+  };
+}
+
 const threadSurfaceSchema = z
   .object({
     surface: z.literal("thread"),
     threadId: z.string().min(1),
     profileId: z.string().min(1),
+    hostId: z.string().min(1).optional(),
+    profileSelection: z.literal("selected").optional(),
   })
   .strict();
 
@@ -463,6 +636,8 @@ const newThreadSurfaceSchema = z
     surface: z.literal("new-thread"),
     projectId: z.string().min(1).nullable(),
     profileId: z.string().min(1),
+    hostId: z.string().min(1).optional(),
+    profileSelection: z.literal("selected").optional(),
   })
   .strict();
 
@@ -513,6 +688,26 @@ export const rpcContract = defineRpcContract({
   browser_purge: {
     input: browserPurgeRequestSchema,
     output: browserPurgeResponseSchema,
+  },
+  browser_profiles: {
+    input: browserProfileQuerySchema,
+    output: browserProfileInventorySchema,
+  },
+  browser_profile_create: {
+    input: browserProfileCreateRequestSchema,
+    output: browserProfileSchema,
+  },
+  browser_profile_rename: {
+    input: browserProfileRenameRequestSchema,
+    output: browserProfileSchema,
+  },
+  browser_profile_select: {
+    input: browserProfileSelectionRequestSchema,
+    output: browserProfileInventorySchema,
+  },
+  browser_host_choices: {
+    input: browserHostChoicesInputSchema,
+    output: z.array(browserHostChoiceSchema),
   },
 });
 

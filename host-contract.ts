@@ -12,6 +12,12 @@ import {
   browserSetupResponseSchema,
   browserScriptFailureSchema,
   browserScriptRequestSchema,
+  browserProfileCreateRequestSchema,
+  browserProfileHostTargetSchema,
+  browserProfileInventorySchema,
+  browserProfileRenameRequestSchema,
+  browserProfileSchema,
+  browserProfileSelectRequestSchema,
   browserStatusSchema,
 } from "./contracts.js";
 
@@ -51,5 +57,21 @@ export const browserHostContract = defineRpcContract({
   browserScript: {
     input: browserScriptRequestSchema,
     output: browserScriptFailureSchema,
+  },
+  listProfiles: {
+    input: browserProfileHostTargetSchema,
+    output: browserProfileInventorySchema,
+  },
+  createProfile: {
+    input: browserProfileCreateRequestSchema,
+    output: browserProfileSchema,
+  },
+  renameProfile: {
+    input: browserProfileRenameRequestSchema,
+    output: browserProfileSchema,
+  },
+  selectProfile: {
+    input: browserProfileSelectRequestSchema,
+    output: browserProfileInventorySchema,
   },
 });

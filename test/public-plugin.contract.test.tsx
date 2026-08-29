@@ -1,5 +1,8 @@
 // @vitest-environment jsdom
 import { fireEvent } from "@testing-library/react";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   browserActivityRecordsSchema,
@@ -11,12 +14,18 @@ import {
   browserPurgeResponseSchema,
   browserScriptFailureSchema,
   browserStatusSchema,
+  browserProfileSchema,
+  browserProfileInventorySchema,
   DEFAULT_PROFILE_ID,
   setupRequiredStatus,
   type BrowserStatus,
 } from "../contracts.js";
 import { createPublicPluginHarness } from "./public-plugin-harness.js";
 import { createSimulatedPrivilegedExecutor } from "../host-operations.js";
+import {
+  createFileBrowserProfileStore,
+  profileStoragePaths,
+} from "../profile-storage.js";
 import type { HostProbeSnapshot } from "../readiness.js";
 
 const preparedSnapshot: HostProbeSnapshot = {
@@ -296,6 +305,22 @@ describe("Browser public plugin contract", () => {
     await browser.dispose();
   });
 
+  it("returns a typed host-offline tool failure before selecting a profile", async () => {
+    const browser = await createPublicPluginHarness({
+      hostConnection: "disconnected",
+    });
+
+    const toolReply = await browser.runBrowserScriptWithProfile();
+    const failure = browserScriptFailureSchema.parse(
+      JSON.parse(toolReply.content[0]!.text),
+    );
+
+    expect(failure.error.state).toBe("host-offline");
+    expect(failure.error.profileId).toBe(DEFAULT_PROFILE_ID);
+    expect(browser.setupInspectionTargets).toEqual([]);
+    await browser.dispose();
+  });
+
   it("selects the static browser_script tool and bundled Browser skill", async () => {
     const browser = await createPublicPluginHarness();
 
@@ -306,6 +331,516 @@ describe("Browser public plugin contract", () => {
     ]);
     expect(capabilities.skills).toEqual(["browser"]);
     await browser.dispose();
+  });
+
+  it("manages a host-local profile through public RPC and the Browser CLI", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+    });
+
+    const initial = await browser.runBrowserProfiles();
+    const created = await browser.createBrowserProfile({
+      hostId: "host-browser-test",
+      name: "Work",
+      locale: "fr-FR",
+      timezone: "Europe/Paris",
+    });
+    await browser.renameBrowserProfile({
+      hostId: "host-browser-test",
+      profileId: created.profileId,
+      name: "Work laptop",
+    });
+    const selected = await browser.selectBrowserProfile({
+      hostId: "host-browser-test",
+      profileId: created.profileId,
+    });
+    const cli = await browser.runBrowserCli(["list", "--json"]);
+
+    expect(initial.selectedProfileId).toBe(DEFAULT_PROFILE_ID);
+    expect(selected.selectedProfileId).toBe(created.profileId);
+    expect(JSON.parse(cli.stdout)).toMatchObject({
+      selectedProfileId: created.profileId,
+    });
+    expect(cli.stdout).toContain("Work laptop");
+
+    const cliCreated = browserProfileSchema.parse(
+      JSON.parse(
+        (
+          await browser.runBrowserCli([
+            "create",
+            "--name",
+            "CLI profile",
+            "--locale",
+            "en-GB",
+            "--timezone",
+            "Europe/London",
+            "--json",
+          ])
+        ).stdout,
+      ),
+    );
+    const cliRenamed = browserProfileSchema.parse(
+      JSON.parse(
+        (
+          await browser.runBrowserCli([
+            "rename",
+            "--profile",
+            cliCreated.profileId,
+            "--name",
+            "CLI renamed",
+            "--locale",
+            "en-US",
+            "--timezone",
+            "UTC",
+            "--json",
+          ])
+        ).stdout,
+      ),
+    );
+    expect(cliRenamed).toMatchObject({
+      name: "CLI renamed",
+      locale: "en-US",
+      timezone: "UTC",
+    });
+    const cliSelected = browserProfileInventorySchema.parse(
+      JSON.parse(
+        (
+          await browser.runBrowserCli([
+            "select",
+            "--profile",
+            cliRenamed.profileId,
+            "--json",
+          ])
+        ).stdout,
+      ),
+    );
+    expect(cliSelected.selectedProfileId).toBe(cliRenamed.profileId);
+    await browser.dispose();
+  });
+
+  it("resolves browser_script to the selected profile while honoring an explicit profile", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+    });
+    const created = await browser.createBrowserProfile({
+      hostId: "host-browser-test",
+      name: "Work",
+    });
+    await browser.selectBrowserProfile({
+      hostId: "host-browser-test",
+      profileId: created.profileId,
+    });
+
+    const selectedScript = browserScriptFailureSchema.parse(
+      JSON.parse(
+        (await browser.runBrowserScriptWithProfile()).content[0]!.text,
+      ),
+    );
+    const explicitScript = browserScriptFailureSchema.parse(
+      JSON.parse(
+        (await browser.runBrowserScriptWithProfile(DEFAULT_PROFILE_ID))
+          .content[0]!.text,
+      ),
+    );
+    const missing = browserScriptFailureSchema.parse(
+      JSON.parse(
+        (await browser.runBrowserScriptWithProfile("missing-profile"))
+          .content[0]!.text,
+      ),
+    );
+
+    expect(selectedScript.error.profileId).toBe(created.profileId);
+    expect(explicitScript.error.profileId).toBe(DEFAULT_PROFILE_ID);
+    expect(missing.error.message).toContain("not available on this host");
+    await browser.dispose();
+  });
+
+  it("R5-03 keeps selected Browser Profiles separate for each project on one host", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+    });
+    const projectAProfile = await browser.createBrowserProfile({
+      hostId: "host-browser-test",
+      name: "Project A",
+    });
+    const projectBProfile = await browser.createBrowserProfile({
+      hostId: "host-browser-test",
+      name: "Project B",
+    });
+
+    await browser.selectBrowserProfile(
+      {
+        hostId: "host-browser-test",
+        profileId: projectAProfile.profileId,
+      },
+      { projectId: "project-a" },
+    );
+    await browser.selectBrowserProfile(
+      {
+        hostId: "host-browser-test",
+        profileId: projectBProfile.profileId,
+      },
+      { projectId: "project-b" },
+    );
+
+    const projectAStatus = await browser.runBrowserStatus({
+      surface: "new-thread",
+      projectId: "project-a",
+      hostId: "host-browser-test",
+      profileId: DEFAULT_PROFILE_ID,
+      profileSelection: "selected",
+    });
+    const projectBStatus = await browser.runBrowserStatus({
+      surface: "new-thread",
+      projectId: "project-b",
+      hostId: "host-browser-test",
+      profileId: DEFAULT_PROFILE_ID,
+      profileSelection: "selected",
+    });
+    const projectAInventory = await browser.runBrowserProfiles(
+      "host-browser-test",
+      { projectId: "project-a" },
+    );
+    const projectBInventory = await browser.runBrowserProfiles(
+      "host-browser-test",
+      { projectId: "project-b" },
+    );
+
+    expect(projectAStatus.profileId).toBe(projectAProfile.profileId);
+    expect(projectBStatus.profileId).toBe(projectBProfile.profileId);
+    expect(projectAInventory.selectedProfileId).toBe(projectAProfile.profileId);
+    expect(projectBInventory.selectedProfileId).toBe(projectBProfile.profileId);
+    await browser.dispose();
+  });
+
+  it("R5-03 reports a stale selected Browser Profile like browser_script", async () => {
+    const rootDirectory = await mkdtemp(join(tmpdir(), "bb-browser-public-"));
+    const profileStore = createFileBrowserProfileStore({
+      rootDirectory,
+      installationId: "installation-public-test",
+    });
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+      profileStore,
+    });
+
+    try {
+      const selectedProfile = await browser.createBrowserProfile({
+        hostId: "host-browser-test",
+        name: "Stale selection",
+      });
+      await browser.selectBrowserProfile({
+        hostId: "host-browser-test",
+        profileId: selectedProfile.profileId,
+      });
+      await rm(
+        profileStoragePaths({
+          rootDirectory,
+          installationId: "installation-public-test",
+          hostId: "host-browser-test",
+          profileId: selectedProfile.profileId,
+        }).profileDirectory,
+        { recursive: true, force: true },
+      );
+
+      const status = await browser.runBrowserStatus({
+        surface: "new-thread",
+        projectId: "project-browser-test",
+        hostId: "host-browser-test",
+        profileId: DEFAULT_PROFILE_ID,
+        profileSelection: "selected",
+      });
+      const scriptFailure = browserScriptFailureSchema.parse(
+        JSON.parse(
+          (await browser.runBrowserScriptWithProfile()).content[0]!.text,
+        ),
+      );
+
+      expect(status).toMatchObject({
+        state: "repair-required",
+        code: "repair_required",
+        profileId: selectedProfile.profileId,
+      });
+      expect(scriptFailure.error).toEqual(status);
+    } finally {
+      await browser.dispose();
+      await rm(rootDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("R5-04 returns a typed unavailable status before probing an explicit missing profile", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+    });
+
+    const status = await browser.runBrowserStatus({
+      surface: "new-thread",
+      projectId: "project-browser-test",
+      hostId: "host-browser-test",
+      profileId: "profile-missing",
+    });
+
+    expect(status.state).toBe("repair-required");
+    expect(status.message).toContain("not available on this host");
+    expect(browser.setupInspectionTargets).toEqual([]);
+    await browser.dispose();
+  });
+
+  it("R5-05 retains metadata-only activity for successful and failed profile lifecycle", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+    });
+    const created = await browser.createBrowserProfile({
+      hostId: "host-browser-test",
+      name: "Audited profile",
+    });
+    await browser.renameBrowserProfile({
+      hostId: "host-browser-test",
+      profileId: created.profileId,
+      name: "Audited renamed",
+    });
+    await browser.selectBrowserProfile({
+      hostId: "host-browser-test",
+      profileId: created.profileId,
+    });
+    const failed = await browser.runBrowserCli([
+      "rename",
+      "--profile",
+      "profile-missing",
+      "--name",
+      "Should not exist",
+      "--json",
+    ]);
+
+    const profileActivity = browserActivityRecordsSchema.parse(
+      JSON.parse(
+        (
+          await browser.runBrowserCli([
+            "activity",
+            "--profile",
+            created.profileId,
+            "--json",
+          ])
+        ).stdout,
+      ),
+    );
+    const failedActivity = browserActivityRecordsSchema.parse(
+      JSON.parse(
+        (
+          await browser.runBrowserCli([
+            "activity",
+            "--profile",
+            "profile-missing",
+            "--json",
+          ])
+        ).stdout,
+      ),
+    );
+
+    expect(failed.exitCode).toBe(1);
+    expect(
+      profileActivity.map(({ kind, action, outcome }) => ({
+        kind,
+        action,
+        outcome,
+      })),
+    ).toEqual([
+      { kind: "lifecycle", action: "create", outcome: "succeeded" },
+      { kind: "lifecycle", action: "rename", outcome: "succeeded" },
+      { kind: "lifecycle", action: "select", outcome: "succeeded" },
+    ]);
+    expect(
+      failedActivity.map(({ kind, action, outcome }) => ({
+        kind,
+        action,
+        outcome,
+      })),
+    ).toEqual([{ kind: "lifecycle", action: "rename", outcome: "failed" }]);
+    expect(JSON.stringify(profileActivity)).not.toMatch(
+      /Audited profile|Audited renamed|Should not exist/,
+    );
+    await browser.dispose();
+  });
+
+  it("offers deterministic host choices when a new-thread project has multiple repository hosts", async () => {
+    const browser = await createPublicPluginHarness({
+      hostIds: ["host-a", "host-b"],
+      projectHostIds: ["host-a", "host-b"],
+    });
+
+    const choices = await browser.runBrowserHostChoices({
+      surface: "new-thread",
+      projectId: "project-browser-test",
+    });
+    const ambiguous = await browser.runBrowserStatus({
+      surface: "new-thread",
+      projectId: "project-browser-test",
+      profileId: DEFAULT_PROFILE_ID,
+    });
+    const selected = await browser.runBrowserStatus({
+      surface: "new-thread",
+      projectId: "project-browser-test",
+      profileId: DEFAULT_PROFILE_ID,
+      hostId: "host-b",
+      profileSelection: "selected",
+    });
+
+    expect(choices.map((choice) => choice.hostId)).toEqual([
+      "host-a",
+      "host-b",
+    ]);
+    expect(ambiguous.hostId).toBeNull();
+    expect(selected.hostId).toBe("host-b");
+    await browser.dispose();
+  });
+
+  it("exposes profile creation, rename, and selection controls in Settings", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+    });
+    const settings = browser.renderSettings();
+
+    await settings.findByText("Browser Profiles");
+    await settings.findByText(DEFAULT_PROFILE_ID);
+    const name = await settings.findByRole("textbox", {
+      name: "New Browser Profile name",
+    });
+    fireEvent.change(name, { target: { value: "Settings profile" } });
+    fireEvent.click(
+      settings.getByRole("button", { name: "Create Browser Profile" }),
+    );
+    await settings.findByText("Settings profile");
+
+    const rename = settings.getByRole("textbox", {
+      name: "Rename Browser Profile Settings profile",
+    });
+    fireEvent.change(rename, { target: { value: "Settings renamed" } });
+    fireEvent.click(
+      settings.getByRole("button", { name: "Rename Settings profile" }),
+    );
+    await settings.findByText("Settings renamed");
+
+    fireEvent.change(
+      settings.getByRole("textbox", {
+        name: "Locale for Browser Profile Settings renamed",
+      }),
+      { target: { value: "de-DE" } },
+    );
+    fireEvent.change(
+      settings.getByRole("textbox", {
+        name: "Timezone for Browser Profile Settings renamed",
+      }),
+      { target: { value: "Europe/Berlin" } },
+    );
+    fireEvent.click(
+      settings.getByRole("button", { name: "Save settings Settings renamed" }),
+    );
+    await settings.findByText(/Locale: de-DE/);
+
+    fireEvent.click(
+      settings.getByRole("button", { name: "Select Settings renamed" }),
+    );
+    await settings.findByText(/Selected: profile-/);
+    await browser.dispose();
+  });
+
+  it("lets a panel choose a host-local Browser Profile", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+    });
+    const created = await browser.createBrowserProfile({
+      hostId: "host-browser-test",
+      name: "Panel profile",
+    });
+    const panel = await browser.openExistingThreadPanel();
+    const picker = await panel.panel.findByRole("combobox", {
+      name: "Browser Profile",
+    });
+
+    fireEvent.change(picker, { target: { value: created.profileId } });
+    await panel.panel.findByText(created.profileId, { selector: "p" });
+    expect(browser.setupInspectionTargets.at(-1)).toEqual({
+      hostId: "host-browser-test",
+      profileId: created.profileId,
+    });
+    await browser.dispose();
+  });
+
+  it("shows the host picker in an ambiguous New thread panel", async () => {
+    const browser = await createPublicPluginHarness({
+      hostIds: ["host-a", "host-b"],
+      projectHostIds: ["host-a", "host-b"],
+    });
+    const panel = await browser.openNewThreadPanel();
+    const hostPicker = await panel.panel.findByRole("combobox", {
+      name: "Workspace host",
+    });
+
+    fireEvent.change(hostPicker, { target: { value: "host-b" } });
+    await panel.panel.findByRole("combobox", { name: "Browser Profile" });
+    await browser.dispose();
+  });
+
+  it("keeps public UI and CLI profile operations isolated across simulated hosts", async () => {
+    const rootDirectory = await mkdtemp(join(tmpdir(), "bb-browser-public-"));
+    const profileStore = createFileBrowserProfileStore({
+      rootDirectory,
+      installationId: "installation-public-test",
+    });
+    const hostA = await createPublicPluginHarness({
+      hostId: "host-a",
+      profileStore,
+      snapshot: preparedSnapshot,
+    });
+    const hostB = await createPublicPluginHarness({
+      hostId: "host-b",
+      profileStore,
+      snapshot: preparedSnapshot,
+    });
+
+    try {
+      const settings = hostA.renderSettings();
+      const name = await settings.findByRole("textbox", {
+        name: "New Browser Profile name",
+      });
+      fireEvent.change(name, { target: { value: "Only host A" } });
+      fireEvent.click(
+        settings.getByRole("button", { name: "Create Browser Profile" }),
+      );
+      await settings.findByText("Only host A");
+
+      const profilesA = await hostA.runBrowserProfiles();
+      const hostAProfile = profilesA.profiles.find(
+        (profile) => profile.name === "Only host A",
+      );
+      expect(hostAProfile).toBeDefined();
+
+      const profilesB = browserProfileInventorySchema.parse(
+        JSON.parse((await hostB.runBrowserCli(["list", "--json"])).stdout),
+      );
+      expect(profilesB.profiles.map((profile) => profile.name)).toEqual([]);
+
+      const selectedA = browserProfileInventorySchema.parse(
+        JSON.parse(
+          (
+            await hostA.runBrowserCli([
+              "select",
+              "--profile",
+              hostAProfile!.profileId,
+              "--json",
+            ])
+          ).stdout,
+        ),
+      );
+      expect(selectedA.selectedProfileId).toBe(hostAProfile!.profileId);
+      expect((await hostB.runBrowserProfiles()).selectedProfileId).toBe(
+        DEFAULT_PROFILE_ID,
+      );
+    } finally {
+      await hostA.dispose();
+      await hostB.dispose();
+      await rm(rootDirectory, { recursive: true, force: true });
+    }
   });
 
   it("prints setup and purge plans before CLI consent and gates each mutation", async () => {
@@ -385,6 +920,60 @@ describe("Browser public plugin contract", () => {
       executor.successfulOperations.map((operation) => operation.kind),
     ).toContain("stop-owned-processes");
     await browser.dispose();
+  });
+
+  it("R5-01 initializes the default profile only after confirmed setup completes", async () => {
+    const executor = createSimulatedPrivilegedExecutor();
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+      privilegedExecutor: executor,
+    });
+
+    expect((await browser.runBrowserProfiles()).profiles).toEqual([]);
+    const setupSteps = [
+      ["dedicated-user", "Create bb-browser"],
+      ["system-packages", "Install Browser packages"],
+      ["protected-storage", "Configure protected Browser storage"],
+    ] as const;
+    for (const [stepId, confirmation] of setupSteps) {
+      const reply = await browser.runBrowserCli([
+        "setup",
+        "--step",
+        stepId,
+        "--confirm",
+        confirmation,
+        "--json",
+      ]);
+      expect(reply.exitCode).toBe(0);
+    }
+
+    const inventory = await browser.runBrowserProfiles();
+    expect(inventory.profiles.map((profile) => profile.profileId)).toEqual([
+      DEFAULT_PROFILE_ID,
+    ]);
+    expect(executor.successfulOperations).toHaveLength(3);
+    await browser.dispose();
+  });
+
+  it("R5-01 keeps pre-setup selected status reads free of profile storage writes", async () => {
+    const rootDirectory = await mkdtemp(join(tmpdir(), "bb-browser-public-"));
+    const profileStore = createFileBrowserProfileStore({
+      rootDirectory,
+      installationId: "installation-public-test",
+    });
+    const browser = await createPublicPluginHarness({ profileStore });
+
+    try {
+      const status = browserStatusSchema.parse(
+        JSON.parse((await browser.runStatusCli()).stdout),
+      );
+
+      expect(status.state).toBe("setup-required");
+      expect(await readdir(rootDirectory)).toEqual([]);
+    } finally {
+      await browser.dispose();
+      await rm(rootDirectory, { recursive: true, force: true });
+    }
   });
 
   it("R4-SETUP-PLAN-DETAILS exposes storage owner and permissions everywhere", async () => {

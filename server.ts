@@ -12,9 +12,11 @@ import {
 import {
   browserScriptParametersSchema,
   type BrowserActivityRecord,
+  type BrowserHostChoicesInput,
+  type BrowserProfile,
+  type BrowserProfileInventory,
   rpcContract,
   setupStepIdSchema,
-  DEFAULT_PROFILE_ID,
   type BrowserScriptFailure,
   type BrowserPurgePlan,
   type BrowserPurgeResponse,
@@ -24,17 +26,25 @@ import {
 } from "./contracts.js";
 
 const CLI_USAGE = [
-  "Usage: bb browser <status|diagnostics|activity|setup|disable|uninstall|purge> [options]",
+  "Usage: bb browser <status|diagnostics|activity|list|create|rename|select|setup|disable|uninstall|purge> [options]",
   "  setup [--profile <id>] [--step <id> --confirm <text>] [--json]",
   "  purge [--profile <id>] [--confirm <text>] [--json]",
   "  disable|uninstall [--profile <id>] --confirm <text> [--json]",
   "  activity [--profile <id>] [--json]",
+  "  list [--host <id>] [--json]",
+  "  create --name <name> [--locale <locale>] [--timezone <zone>] [--host <id>] [--json]",
+  "  rename --profile <id> --name <name> [--locale <locale>] [--timezone <zone>] [--host <id>] [--json]",
+  "  select --profile <id> [--host <id>] [--json]",
 ].join("\n");
 type BrowserScriptParameters = z.output<typeof browserScriptParametersSchema>;
 const BROWSER_COMMANDS = [
   "status",
   "diagnostics",
   "activity",
+  "list",
+  "create",
+  "rename",
+  "select",
   "setup",
   "disable",
   "uninstall",
@@ -45,7 +55,11 @@ type BrowserCommand = (typeof BROWSER_COMMANDS)[number];
 type ParsedCliArguments = {
   command: BrowserCommand;
   json: boolean;
-  profileId: string;
+  profileId?: string;
+  hostId?: string;
+  name?: string;
+  locale?: string;
+  timezone?: string;
   stepId?: z.output<typeof setupStepIdSchema>;
   confirmation?: string;
 };
@@ -122,6 +136,22 @@ function cliActivityText(records: readonly BrowserActivityRecord[]) {
     .join("\n");
 }
 
+function cliProfileText(profile: BrowserProfile) {
+  return `${profile.name} (${profile.profileId})\nLocale: ${profile.locale}\nTimezone: ${profile.timezone}`;
+}
+
+function cliProfilesText(inventory: BrowserProfileInventory) {
+  const profiles = inventory.profiles.map((profile) => {
+    const marker = profile.selected ? "*" : "-";
+    return `${marker} ${cliProfileText(profile).replaceAll("\n", " — ")}`;
+  });
+  return [
+    `Browser Profiles for ${inventory.hostId}`,
+    `Selected: ${inventory.selectedProfileId}`,
+    ...profiles,
+  ].join("\n");
+}
+
 function cliJsonOrText<T>(json: boolean, payload: T, textValue: string) {
   return json ? JSON.stringify(payload) : textValue;
 }
@@ -149,7 +179,14 @@ function requiredOptionValue(
   return { optionValue, nextIndex: index + 1 };
 }
 
-type CliOptionName = "--profile" | "--step" | "confirmation";
+type CliOptionName =
+  | "--profile"
+  | "--step"
+  | "--host"
+  | "--name"
+  | "--locale"
+  | "--timezone"
+  | "confirmation";
 type ParsedCliOption = {
   name: CliOptionName;
   optionValue: string;
@@ -158,6 +195,14 @@ type ParsedCliOption = {
 
 function cliOptionName(argument: string): CliOptionName | null {
   if (argument === "--profile" || argument === "--step") return argument;
+  if (
+    argument === "--host" ||
+    argument === "--name" ||
+    argument === "--locale" ||
+    argument === "--timezone"
+  ) {
+    return argument;
+  }
   if (argument === "--confirm" || argument === "--confirmation") {
     return "confirmation";
   }
@@ -179,7 +224,11 @@ function readCliOption(
 type CliParseState = {
   positional: string[];
   json: boolean;
-  profileId: string;
+  profileId?: string;
+  hostId?: string;
+  name?: string;
+  locale?: string;
+  timezone?: string;
   stepId?: ParsedCliArguments["stepId"];
   confirmation?: string;
 };
@@ -198,6 +247,22 @@ function applyCliOption(
       return `Unknown setup step: ${option.optionValue}.\n${CLI_USAGE}`;
     }
     parseState.stepId = parsedStep.data;
+    return null;
+  }
+  if (option.name === "--host") {
+    parseState.hostId = option.optionValue;
+    return null;
+  }
+  if (option.name === "--name") {
+    parseState.name = option.optionValue;
+    return null;
+  }
+  if (option.name === "--locale") {
+    parseState.locale = option.optionValue;
+    return null;
+  }
+  if (option.name === "--timezone") {
+    parseState.timezone = option.optionValue;
     return null;
   }
   parseState.confirmation = option.optionValue;
@@ -226,7 +291,7 @@ function validateCliCommandOptions(
     return `--step is only valid for setup.\n${CLI_USAGE}`;
   }
   if (
-    ["status", "diagnostics", "activity"].includes(command) &&
+    ["status", "diagnostics", "activity", "list"].includes(command) &&
     parseState.confirmation !== undefined
   ) {
     return `Confirmation is not valid for ${command}.\n${CLI_USAGE}`;
@@ -244,6 +309,36 @@ function validateCliCommandOptions(
   ) {
     return `${command} requires --confirm.\n${CLI_USAGE}`;
   }
+  if (
+    !["create", "rename"].includes(command) &&
+    parseState.name !== undefined
+  ) {
+    return `--name is only valid for create or rename.\n${CLI_USAGE}`;
+  }
+  if (
+    !["create", "rename"].includes(command) &&
+    parseState.locale !== undefined
+  ) {
+    return `--locale is only valid for create or rename.\n${CLI_USAGE}`;
+  }
+  if (
+    !["create", "rename"].includes(command) &&
+    parseState.timezone !== undefined
+  ) {
+    return `--timezone is only valid for create or rename.\n${CLI_USAGE}`;
+  }
+  if (command === "create" && parseState.name === undefined) {
+    return `create requires --name.\n${CLI_USAGE}`;
+  }
+  if (command === "rename" && parseState.name === undefined) {
+    return `rename requires --name.\n${CLI_USAGE}`;
+  }
+  if (command === "rename" && parseState.profileId === undefined) {
+    return `rename requires --profile.\n${CLI_USAGE}`;
+  }
+  if (command === "select" && parseState.profileId === undefined) {
+    return `select requires --profile.\n${CLI_USAGE}`;
+  }
   return null;
 }
 
@@ -251,7 +346,6 @@ function parseCliArguments(argv: string[]): CliArgumentParseResult {
   const parseState: CliParseState = {
     positional: [],
     json: false,
-    profileId: DEFAULT_PROFILE_ID,
   };
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index]!;
@@ -281,6 +375,10 @@ function parseCliArguments(argv: string[]): CliArgumentParseResult {
       command,
       json: parseState.json,
       profileId: parseState.profileId,
+      hostId: parseState.hostId,
+      name: parseState.name,
+      locale: parseState.locale,
+      timezone: parseState.timezone,
       stepId: parseState.stepId,
       confirmation: parseState.confirmation,
     },
@@ -289,11 +387,15 @@ function parseCliArguments(argv: string[]): CliArgumentParseResult {
 
 async function runStatusCli(
   browser: BrowserService,
-  profileId: string,
+  profileId: string | undefined,
+  hostId: string | undefined,
   json: boolean,
   context: PluginCliContext,
 ) {
-  const status = await browser.status(context, profileId, context.signal);
+  const status =
+    profileId === undefined
+      ? await browser.selectedStatus(context, context.signal, hostId)
+      : await browser.status(context, profileId, context.signal, hostId);
   return {
     exitCode: 0,
     stdout: cliJsonOrText(json, status, cliStatusText(status)),
@@ -302,11 +404,15 @@ async function runStatusCli(
 
 async function runDiagnosticsCli(
   browser: BrowserService,
-  profileId: string,
+  profileId: string | undefined,
+  hostId: string | undefined,
   json: boolean,
   context: PluginCliContext,
 ) {
-  const status = await browser.status(context, profileId, context.signal);
+  const status =
+    profileId === undefined
+      ? await browser.selectedStatus(context, context.signal, hostId)
+      : await browser.status(context, profileId, context.signal, hostId);
   if (status.hostId === null) return { exitCode: 1, stderr: status.message };
   const diagnostics = await browser.diagnostics(status, context.signal);
   const stdout = json
@@ -412,12 +518,140 @@ async function runLifecycleCli(
   };
 }
 
+async function profileTarget(
+  browser: BrowserService,
+  cliArguments: ParsedCliArguments,
+  context: PluginCliContext,
+) {
+  return browser.resolveTarget(
+    context,
+    cliArguments.profileId,
+    cliArguments.hostId,
+  );
+}
+
+async function runProfileListCli(
+  browser: BrowserService,
+  cliArguments: ParsedCliArguments,
+  context: PluginCliContext,
+) {
+  const target = await profileTarget(browser, cliArguments, context);
+  const inventory = await browser.profiles(
+    {
+      hostId: target.hostId,
+      projectId: context.projectId,
+      threadId: context.threadId,
+    },
+    context.signal,
+  );
+  return {
+    exitCode: 0,
+    stdout: cliJsonOrText(
+      cliArguments.json,
+      inventory,
+      cliProfilesText(inventory),
+    ),
+  };
+}
+
+async function runProfileCreateCli(
+  browser: BrowserService,
+  cliArguments: ParsedCliArguments,
+  context: PluginCliContext,
+) {
+  const target = await profileTarget(browser, cliArguments, context);
+  const profile = await browser.createProfile(
+    {
+      hostId: target.hostId,
+      name: cliArguments.name!,
+      ...(cliArguments.locale === undefined
+        ? {}
+        : { locale: cliArguments.locale }),
+      ...(cliArguments.timezone === undefined
+        ? {}
+        : { timezone: cliArguments.timezone }),
+    },
+    context.signal,
+  );
+  return {
+    exitCode: 0,
+    stdout: cliJsonOrText(cliArguments.json, profile, cliProfileText(profile)),
+  };
+}
+
+async function runProfileRenameCli(
+  browser: BrowserService,
+  cliArguments: ParsedCliArguments,
+  context: PluginCliContext,
+) {
+  const target = await profileTarget(browser, cliArguments, context);
+  const profile = await browser.renameProfile(
+    {
+      hostId: target.hostId,
+      profileId: cliArguments.profileId!,
+      name: cliArguments.name!,
+      ...(cliArguments.locale === undefined
+        ? {}
+        : { locale: cliArguments.locale }),
+      ...(cliArguments.timezone === undefined
+        ? {}
+        : { timezone: cliArguments.timezone }),
+    },
+    context.signal,
+  );
+  return {
+    exitCode: 0,
+    stdout: cliJsonOrText(cliArguments.json, profile, cliProfileText(profile)),
+  };
+}
+
+async function runProfileSelectCli(
+  browser: BrowserService,
+  cliArguments: ParsedCliArguments,
+  context: PluginCliContext,
+) {
+  const target = await profileTarget(browser, cliArguments, context);
+  const inventory = await browser.selectProfile(
+    {
+      hostId: target.hostId,
+      profileId: cliArguments.profileId!,
+      projectId: context.projectId,
+      threadId: context.threadId,
+    },
+    context.signal,
+  );
+  return {
+    exitCode: 0,
+    stdout: cliJsonOrText(
+      cliArguments.json,
+      inventory,
+      cliProfilesText(inventory),
+    ),
+  };
+}
+
 async function runAdministrationCli(
   browser: BrowserService,
   cliArguments: ParsedCliArguments,
   context: PluginCliContext,
 ) {
-  const target = await browser.resolveTarget(context, cliArguments.profileId);
+  if (cliArguments.command === "list") {
+    return runProfileListCli(browser, cliArguments, context);
+  }
+  if (cliArguments.command === "create") {
+    return runProfileCreateCli(browser, cliArguments, context);
+  }
+  if (cliArguments.command === "rename") {
+    return runProfileRenameCli(browser, cliArguments, context);
+  }
+  if (cliArguments.command === "select") {
+    return runProfileSelectCli(browser, cliArguments, context);
+  }
+  const target = await browser.resolveTarget(
+    context,
+    cliArguments.profileId,
+    cliArguments.hostId,
+  );
   if (cliArguments.command === "activity") {
     return runActivityCli(browser, target, cliArguments.json);
   }
@@ -437,13 +671,13 @@ async function runCli(
 ) {
   const parsed = parseCliArguments(argv);
   if ("error" in parsed) return { exitCode: 1, stderr: parsed.error };
-  const { command, json, profileId } = parsed.arguments;
+  const { command, json, profileId, hostId } = parsed.arguments;
   try {
     if (command === "status") {
-      return await runStatusCli(browser, profileId, json, context);
+      return await runStatusCli(browser, profileId, hostId, json, context);
     }
     if (command === "diagnostics") {
-      return await runDiagnosticsCli(browser, profileId, json, context);
+      return await runDiagnosticsCli(browser, profileId, hostId, json, context);
     }
     return await runAdministrationCli(browser, parsed.arguments, context);
   } catch (error) {
@@ -475,17 +709,39 @@ function registerCli(bb: BbPluginApi, browser: BrowserService) {
       {
         name: "status",
         summary: "Report Browser host readiness",
-        usage: "bb browser status [--json]",
+        usage: "bb browser status [--profile <id>] [--host <id>] [--json]",
       },
       {
         name: "diagnostics",
         summary: "Generate redacted Browser host diagnostics",
-        usage: "bb browser diagnostics [--json]",
+        usage: "bb browser diagnostics [--profile <id>] [--host <id>] [--json]",
       },
       {
         name: "activity",
         summary: "List retained Browser activity records",
-        usage: "bb browser activity [--json]",
+        usage: "bb browser activity [--profile <id>] [--host <id>] [--json]",
+      },
+      {
+        name: "list",
+        summary: "List host-local Browser Profiles",
+        usage: "bb browser list [--host <id>] [--json]",
+      },
+      {
+        name: "create",
+        summary: "Create a host-local Browser Profile",
+        usage:
+          "bb browser create --name <name> [--locale <locale>] [--timezone <zone>] [--host <id>] [--json]",
+      },
+      {
+        name: "rename",
+        summary: "Rename a host-local Browser Profile",
+        usage:
+          "bb browser rename --profile <id> --name <name> [--locale <locale>] [--timezone <zone>] [--host <id>] [--json]",
+      },
+      {
+        name: "select",
+        summary: "Select a host-local Browser Profile",
+        usage: "bb browser select --profile <id> [--host <id>] [--json]",
       },
       {
         name: "setup",
@@ -535,7 +791,9 @@ export default function plugin(bb: BbPluginApi) {
   const browser = createBrowserService(bb);
   bb.rpc.register(rpcContract, {
     browser_status: (input) =>
-      browser.status(panelIdentity(input), input.profileId),
+      input.profileSelection === "selected"
+        ? browser.selectedStatus(panelIdentity(input))
+        : browser.status(panelIdentity(input), input.profileId),
     browser_settings_status: (input) =>
       browser.settingsStatuses(input.profileId),
     browser_diagnostics: (input) => browser.diagnostics(input),
@@ -546,6 +804,12 @@ export default function plugin(bb: BbPluginApi) {
     browser_uninstall: (input) => browser.lifecycle("uninstall", input),
     browser_purge_plan: (input) => browser.purgePlan(input),
     browser_purge: (input) => browser.purge(input),
+    browser_profiles: (input) => browser.profiles(input),
+    browser_profile_create: (input) => browser.createProfile(input),
+    browser_profile_rename: (input) => browser.renameProfile(input),
+    browser_profile_select: (input) => browser.selectProfile(input),
+    browser_host_choices: (input: BrowserHostChoicesInput) =>
+      browser.hostChoices(input),
   });
   registerCli(bb, browser);
   registerAgentTool(bb, browser);

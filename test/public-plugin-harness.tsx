@@ -5,6 +5,9 @@ import type {
   PluginSettingsSectionProps,
   PluginThreadPanelProps,
 } from "@get-bb/plugin-sdk";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   createFakePluginHost,
   makeThreadResponse,
@@ -26,12 +29,20 @@ import {
   browserHostTargetSchema,
   browserPurgePlanSchema,
   browserPurgeResponseSchema,
+  browserProfileCreateRequestSchema,
+  browserProfileHostTargetSchema,
+  browserProfileInventorySchema,
+  browserProfileRenameRequestSchema,
+  browserProfileSchema,
+  browserProfileSelectRequestSchema,
+  browserHostChoicesSchema,
   browserSetupPlanSchema,
   browserSetupResponseSchema,
   DEFAULT_PROFILE_ID,
   setupRequiredStatus,
   type BrowserHostTarget,
   type BrowserStatus,
+  type BrowserHostChoicesInput,
   type BrowserStatusInput,
   type rpcContract,
 } from "../contracts.js";
@@ -41,6 +52,10 @@ import {
   type HostAdministrationStateStore,
   type PrivilegedExecutor,
 } from "../host-operations.js";
+import {
+  createFileBrowserProfileStore,
+  type BrowserProfileStore,
+} from "../profile-storage.js";
 import {
   createHostReadinessBoundary,
   type HostProbeSnapshot,
@@ -64,7 +79,7 @@ type OpenedPanel = {
   panel: RenderedSlot;
 };
 
-function projectFixture() {
+function projectFixture(hostIds: readonly string[] = [HOST_ID]) {
   return {
     id: PROJECT_ID,
     name: "Browser contract project",
@@ -72,26 +87,24 @@ function projectFixture() {
     gitRemoteUrl: null,
     createdAt: 1,
     updatedAt: 1,
-    sources: [
-      {
-        id: "source-browser-test",
-        projectId: PROJECT_ID,
-        hostId: HOST_ID,
-        path: "/workspace/browser-contract",
-        type: "local_path" as const,
-        isDefault: true,
-        createdAt: 1,
-        updatedAt: 1,
-      },
-    ],
+    sources: hostIds.map((hostId, index) => ({
+      id: `source-browser-test-${hostId}`,
+      projectId: PROJECT_ID,
+      hostId,
+      path: `/workspace/browser-contract-${index}`,
+      type: "local_path" as const,
+      isDefault: hostIds.length === 1 && index === 0,
+      createdAt: 1,
+      updatedAt: 1,
+    })),
   };
 }
 
-function environmentFixture() {
+function environmentFixture(hostId = HOST_ID) {
   return {
     id: ENVIRONMENT_ID,
     projectId: PROJECT_ID,
-    hostId: HOST_ID,
+    hostId,
     name: "Browser contract environment",
     path: "/workspace/browser-contract",
     status: "ready" as const,
@@ -108,10 +121,13 @@ function environmentFixture() {
   };
 }
 
-function hostFixture(status: "connected" | "disconnected" = "connected") {
+function hostFixture(
+  hostId = HOST_ID,
+  status: "connected" | "disconnected" = "connected",
+) {
   return {
-    id: HOST_ID,
-    name: "Browser contract host",
+    id: hostId,
+    name: `Browser contract host ${hostId}`,
     type: "persistent" as const,
     status,
     maxPermissionMode: "full" as const,
@@ -127,29 +143,45 @@ function panelKey(actionId: string, params: unknown) {
 }
 
 export async function createPublicPluginHarness(options?: {
+  hostId?: string;
   status?: BrowserStatus;
   hostConnection?: "connected" | "disconnected";
+  hostIds?: readonly string[];
+  projectHostIds?: readonly string[];
   probeFailure?: boolean;
   snapshot?: HostProbeSnapshot;
   privilegedExecutor?: PrivilegedExecutor;
   administrationStateStore?: HostAdministrationStateStore;
+  profileStore?: BrowserProfileStore;
 }) {
+  const configuredHostId = options?.hostId ?? HOST_ID;
+  const configuredProjectHostIds = options?.projectHostIds ?? [
+    configuredHostId,
+  ];
   const setupInspectionTargets: BrowserHostTarget[] = [];
   const expectedStatus =
     options?.status ??
     setupRequiredStatus({
-      hostId: HOST_ID,
+      hostId: configuredHostId,
       profileId: DEFAULT_PROFILE_ID,
     });
   const fixtureBoundary: HostSetupBoundary =
     options?.snapshot === undefined
       ? {
-          inspect: () => expectedStatus,
+          inspect: (target) => ({
+            ...expectedStatus,
+            hostId: target.hostId,
+            profileId: target.profileId,
+          }),
           diagnostics: (target) => ({
             hostId: target.hostId,
             profileId: target.profileId,
             generatedAt: "2026-08-27T00:00:00.000Z",
-            readiness: expectedStatus,
+            readiness: {
+              ...expectedStatus,
+              hostId: target.hostId,
+              profileId: target.profileId,
+            },
             dependencies: [],
             processes: [],
             resourceUse: {
@@ -187,8 +219,18 @@ export async function createPublicPluginHarness(options?: {
           executor: options.privilegedExecutor,
           stateStore: options.administrationStateStore,
         });
+  const profileStorageRoot =
+    options?.profileStore === undefined
+      ? await mkdtemp(join(tmpdir(), "bb-browser-plugin-"))
+      : null;
+  const profileStore =
+    options?.profileStore ??
+    createFileBrowserProfileStore({
+      rootDirectory: profileStorageRoot!,
+      installationId: "installation-public-test",
+    });
   const host = experimental_createHostEntryHarness(
-    createBrowserHostEntry(hostBoundary),
+    createBrowserHostEntry(hostBoundary, profileStore),
   );
   const backend = createFakePluginHost({
     pluginId: "browser",
@@ -202,10 +244,18 @@ export async function createPublicPluginHarness(options?: {
             environmentId: ENVIRONMENT_ID,
           }),
       },
-      environments: { get: async () => environmentFixture() },
-      projects: { get: async () => projectFixture() },
+      environments: {
+        get: async () =>
+          environmentFixture(configuredProjectHostIds[0] ?? configuredHostId),
+      },
       hosts: {
-        list: async () => [hostFixture(options?.hostConnection)],
+        list: async () =>
+          (options?.hostIds ?? [configuredHostId]).map((hostId) =>
+            hostFixture(hostId, options?.hostConnection),
+          ),
+      },
+      projects: {
+        get: async () => projectFixture(configuredProjectHostIds),
       },
     },
     experimental_callHostRpc: ({ method, input, signal }) => {
@@ -264,6 +314,34 @@ export async function createPublicPluginHarness(options?: {
         return host.experimental_call(
           "browserScript",
           browserScriptRequestSchema.parse(input),
+          { signal },
+        );
+      }
+      if (method === "listProfiles") {
+        return host.experimental_call(
+          "listProfiles",
+          browserProfileHostTargetSchema.parse(input),
+          { signal },
+        );
+      }
+      if (method === "createProfile") {
+        return host.experimental_call(
+          "createProfile",
+          browserProfileCreateRequestSchema.parse(input),
+          { signal },
+        );
+      }
+      if (method === "renameProfile") {
+        return host.experimental_call(
+          "renameProfile",
+          browserProfileRenameRequestSchema.parse(input),
+          { signal },
+        );
+      }
+      if (method === "selectProfile") {
+        return host.experimental_call(
+          "selectProfile",
+          browserProfileSelectRequestSchema.parse(input),
           { signal },
         );
       }
@@ -340,6 +418,50 @@ export async function createPublicPluginHarness(options?: {
       backend.harness.behavior.callRpc("browser_purge", input) as Promise<
         ReturnType<typeof browserPurgeResponseSchema.parse>
       >,
+    browser_profiles: (input: {
+      hostId: string;
+      projectId?: string | null;
+      threadId?: string;
+    }) =>
+      backend.harness.behavior.callRpc("browser_profiles", input) as Promise<
+        ReturnType<typeof browserProfileInventorySchema.parse>
+      >,
+    browser_profile_create: (input: {
+      hostId: string;
+      name: string;
+      locale?: string;
+      timezone?: string;
+    }) =>
+      backend.harness.behavior.callRpc(
+        "browser_profile_create",
+        input,
+      ) as Promise<ReturnType<typeof browserProfileSchema.parse>>,
+    browser_profile_rename: (input: {
+      hostId: string;
+      profileId: string;
+      name: string;
+      locale?: string;
+      timezone?: string;
+    }) =>
+      backend.harness.behavior.callRpc(
+        "browser_profile_rename",
+        input,
+      ) as Promise<ReturnType<typeof browserProfileSchema.parse>>,
+    browser_profile_select: (input: {
+      hostId: string;
+      profileId: string;
+      projectId?: string | null;
+      threadId?: string;
+    }) =>
+      backend.harness.behavior.callRpc(
+        "browser_profile_select",
+        input,
+      ) as Promise<ReturnType<typeof browserProfileInventorySchema.parse>>,
+    browser_host_choices: (input: BrowserHostChoicesInput) =>
+      backend.harness.behavior.callRpc(
+        "browser_host_choices",
+        input,
+      ) as Promise<ReturnType<typeof browserHostChoicesSchema.parse>>,
   };
 
   function renderSettings() {
@@ -442,9 +564,48 @@ export async function createPublicPluginHarness(options?: {
 
   function runBrowserActivityRecords() {
     return rpc.browser_activity_records({
-      hostId: HOST_ID,
+      hostId: configuredHostId,
       profileId: DEFAULT_PROFILE_ID,
     });
+  }
+
+  function runBrowserProfiles(
+    hostId = configuredHostId,
+    context?: { projectId?: string | null; threadId?: string },
+  ) {
+    return rpc.browser_profiles({ hostId, ...context });
+  }
+
+  function createBrowserProfile(input: {
+    hostId: string;
+    name: string;
+    locale?: string;
+    timezone?: string;
+  }) {
+    return rpc.browser_profile_create(input);
+  }
+
+  function renameBrowserProfile(input: {
+    hostId: string;
+    profileId: string;
+    name: string;
+    locale?: string;
+    timezone?: string;
+  }) {
+    return rpc.browser_profile_rename(input);
+  }
+
+  function selectBrowserProfile(
+    input: { hostId: string; profileId: string },
+    context?: { projectId?: string | null; threadId?: string },
+  ) {
+    const selectionContext =
+      context === undefined ? { projectId: PROJECT_ID } : context;
+    return rpc.browser_profile_select({ ...input, ...selectionContext });
+  }
+
+  function runBrowserHostChoices(input: BrowserHostChoicesInput) {
+    return rpc.browser_host_choices(input);
   }
 
   function runBrowserStatus(input: BrowserStatusInput) {
@@ -471,6 +632,22 @@ export async function createPublicPluginHarness(options?: {
     return { content: [reply.content[0]], isError: true };
   }
 
+  async function runBrowserScriptWithProfile(profileId?: string) {
+    const reply = await backend.harness.behavior.callAgentTool(
+      "browser_script",
+      {
+        purpose: "Verify profile resolution",
+        code: "return page.url();",
+        ...(profileId === undefined ? {} : { profileId }),
+      },
+      { threadId: THREAD_ID, projectId: PROJECT_ID },
+    );
+    if (typeof reply === "string" || reply.content[0]?.type !== "text") {
+      throw new Error("browser_script did not return text output");
+    }
+    return { content: [reply.content[0]], isError: reply.isError === true };
+  }
+
   function resolveAgentCapabilities() {
     return backend.harness.behavior.resolveAgentConfiguration({
       thread: {
@@ -492,7 +669,10 @@ export async function createPublicPluginHarness(options?: {
         workspaceProvisionType: "unmanaged",
         branchName: "main",
       },
-      host: { id: HOST_ID, name: "Browser contract host" },
+      host: {
+        id: configuredHostId,
+        name: `Browser contract host ${configuredHostId}`,
+      },
       provider: {
         id: "codex",
         model: "test-model",
@@ -503,11 +683,22 @@ export async function createPublicPluginHarness(options?: {
   }
 
   async function dispose() {
-    for (const panel of threadPanels.values()) panel.lifecycle.unmount();
-    for (const panel of newThreadPanels.values()) panel.lifecycle.unmount();
-    for (const panel of settingsPanels) panel.lifecycle.unmount();
-    await backend.harness.lifecycle.dispose();
-    await host.experimental_dispose();
+    try {
+      for (const panel of threadPanels.values()) panel.lifecycle.unmount();
+      for (const panel of newThreadPanels.values()) panel.lifecycle.unmount();
+      for (const panel of settingsPanels) panel.lifecycle.unmount();
+      await backend.harness.lifecycle.dispose();
+      await host.experimental_dispose();
+    } finally {
+      if (profileStorageRoot !== null) {
+        await rm(profileStorageRoot, {
+          recursive: true,
+          force: true,
+          maxRetries: 10,
+          retryDelay: 20,
+        });
+      }
+    }
   }
 
   return {
@@ -528,7 +719,13 @@ export async function createPublicPluginHarness(options?: {
     runDiagnosticsCli,
     runBrowserCli,
     runBrowserActivityRecords,
+    runBrowserProfiles,
+    createBrowserProfile,
+    renameBrowserProfile,
+    selectBrowserProfile,
+    runBrowserHostChoices,
     runBrowserScript,
+    runBrowserScriptWithProfile,
     privilegedExecutor: options?.privilegedExecutor ?? null,
     resolveAgentCapabilities,
     dispose,
