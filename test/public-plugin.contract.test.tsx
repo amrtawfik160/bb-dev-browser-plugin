@@ -51,6 +51,7 @@ import type {
   BrowserProfileRecovery,
 } from "../profile-recovery.js";
 import type { BrowserScriptResponse } from "../contracts.js";
+import { createSafeLoginMode } from "../safe-login.js";
 
 const preparedSnapshot: HostProbeSnapshot = {
   operatingSystem: {
@@ -206,6 +207,33 @@ describe("Browser public plugin contract", () => {
       }
     },
   );
+  it("issue #18 states Safe Login limitations on the panel for hardware-bound passkeys, DRM, corporate device policy, and site-specific anti-automation behavior", async () => {
+    const browser = await createPublicPluginHarness({
+      status: browserStatusSchema.parse({
+        ...healthyStatus,
+        state: "safe-login-elsewhere",
+        code: "safe_login_elsewhere",
+        label: "Safe Login elsewhere",
+        message: "Another panel is signing in through owner-only Safe Login.",
+      }),
+    });
+    try {
+      const panel = await browser.openExistingThreadPanel();
+      await panel.panel.findByRole("status", {
+        name: "Safe Login elsewhere",
+      });
+      const notice = await panel.panel.findByLabelText(
+        "Safe Login limitations",
+      );
+      expect(notice.textContent).toMatch(/passkey/i);
+      expect(notice.textContent).toMatch(/DRM/i);
+      expect(notice.textContent).toMatch(/corporate/i);
+      expect(notice.textContent).toMatch(/anti-automation/i);
+    } finally {
+      await browser.dispose();
+    }
+  });
+
   it("reports a healthy supported host through the panel and CLI", async () => {
     const browser = await createPublicPluginHarness({
       snapshot: preparedSnapshot,
@@ -2091,6 +2119,74 @@ describe("Browser public plugin contract", () => {
       expect(JSON.parse(cli.stdout)).toBe("hello from Browser");
     } finally {
       await browser.dispose();
+    }
+  });
+
+  it("issue #18 denies the browser script CLI DOM, screenshot, and control access while Safe Login is active", async () => {
+    const safeLoginMode = createSafeLoginMode();
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+      safeLoginMode,
+    });
+    try {
+      await grantDefaultProfileOrigin(browser, "https://example.com");
+      await safeLoginMode.enter({
+        binding: {
+          ownerSessionId: "owner-session-safe-login",
+          panelId: "safe-login-panel",
+          hostId: "host-browser-test",
+          profileId: DEFAULT_PROFILE_ID,
+        },
+        relaunch: {
+          relaunchWithoutAutomation: async () => {},
+          returnToAutomation: async () => {},
+        },
+        interruption: {
+          interruptAgents: async () => ({ active: false, interrupted: 0 }),
+        },
+      });
+
+      // The CLI relays through the same host browser_script handler as the
+      // agent tool, so the owner-only Safe Login denial closes both paths.
+      const cli = await browser.runBrowserCli([
+        "script",
+        "--purpose",
+        "Read the fixture heading",
+        "--code",
+        "return page.url();",
+        "--origin",
+        "https://example.com",
+        "--json",
+      ]);
+      expect(cli).toMatchObject({ exitCode: 1 });
+      const response = JSON.parse(cli.stdout) as BrowserScriptResponse;
+      expect(response).toEqual({
+        ok: false,
+        error: {
+          state: "runtime-error",
+          code: "safe_login_denied",
+          label: "Safe Login active",
+          hostId: "host-browser-test",
+          profileId: DEFAULT_PROFILE_ID,
+          message:
+            "Browser automation is denied while this Browser Profile is in owner-only Safe Login Mode.",
+        },
+      });
+
+      // The agent tool is denied through the same handler too.
+      const tool = await browser.runBrowserScriptWithProfile(undefined, {
+        purpose: "Read the fixture heading",
+        code: "return page.url();",
+        destinationOrigin: "https://example.com",
+      });
+      expect(tool.isError).toBe(true);
+      expect(tool.content[0]).toMatchObject({
+        type: "text",
+        text: expect.stringContaining("Safe Login Mode"),
+      });
+    } finally {
+      await browser.dispose();
+      safeLoginMode.dispose();
     }
   });
 

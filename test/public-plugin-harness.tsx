@@ -231,6 +231,7 @@ export async function createPublicPluginHarness(options?: {
   hostConnection?: HostConnectionStatus;
   browserScriptResponse?: BrowserScriptResponse;
   browserRuntime?: BrowserInstanceRuntime;
+  safeLoginMode?: import("../safe-login.js").SafeLoginModeManager;
   browserScriptDelayMs?: number;
   browserScriptStarted?: () => void;
   navigationResponse?: {
@@ -404,6 +405,7 @@ export async function createPublicPluginHarness(options?: {
       profileStore,
       profileRecovery,
       options?.browserRuntime,
+      options?.safeLoginMode,
     ),
     {
       experimental_paths: {

@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { createServer, type Server } from "node:http";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
@@ -41,12 +42,61 @@ async function runWorker(environment: NodeJS.ProcessEnv) {
       initiatorOnlyPixels: boolean;
       elsewhereOpaque: boolean;
       agentDenied: boolean;
+      authenticatedThroughFixture: boolean;
       extended: boolean;
       doneReturnedToAutomation: boolean;
       reconciledToAutomation: boolean;
       activityMetadataOnly: boolean;
     };
   };
+}
+
+function authenticationFixture() {
+  return createServer((request, response) => {
+    const signedIn = request.headers.cookie?.includes("fixture-session=valid");
+    if (request.method === "POST" && request.url === "/sign-in") {
+      response.writeHead(303, {
+        location: "/account",
+        "set-cookie": "fixture-session=valid; Path=/; SameSite=Lax",
+      });
+      response.end();
+      return;
+    }
+    response.setHeader("content-type", "text/html; charset=utf-8");
+    if (request.url === "/account" && signedIn) {
+      response.end(
+        "<h1>Signed in</h1><button id=\"popup\" onclick=\"open('/popup', 'fixture-popup')\">Popup</button>",
+      );
+      return;
+    }
+    if (request.url === "/popup" && signedIn) {
+      response.end("<h1>Authenticated popup</h1>");
+      return;
+    }
+    response.end(
+      '<form method="post" action="/sign-in"><input name="user"><button>Sign in</button></form>',
+    );
+  });
+}
+
+function listen(server: Server) {
+  return new Promise<number>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      if (address === null || typeof address === "string") {
+        reject(new Error("The local authentication fixture did not bind TCP."));
+        return;
+      }
+      resolve(address.port);
+    });
+  });
+}
+
+function close(server: Server) {
+  return new Promise<void>((resolve, reject) => {
+    server.close((error) => (error === undefined ? resolve() : reject(error)));
+  });
 }
 
 describe("real-host Safe Login command fail-closed gate", () => {
@@ -89,9 +139,14 @@ it.runIf(integrationEnabled)(
       createHostReadinessBoundary(snapshotReader).inspect(target),
     ).resolves.toMatchObject({ state: "healthy" });
 
+    // Safe Login drives the same deterministic login fixture the auth gate
+    // uses: spin up the local authentication server and point the worker at it
+    // so the owner signs in through the fixture rather than bare stubs.
+    const fixtureServer = authenticationFixture();
+    const fixturePort = await listen(fixtureServer);
     const fixtureAddress = projectLoopbackAddress(
       projectId,
-      "http://localhost:0/account",
+      `http://localhost:${fixturePort}/account`,
     );
     const workerEnvironment = {
       BB_BROWSER_REAL_ROOT: rootDirectory,
@@ -114,6 +169,7 @@ it.runIf(integrationEnabled)(
       expect(safeLogin.initiatorOnlyPixels).toBe(true);
       expect(safeLogin.elsewhereOpaque).toBe(true);
       expect(safeLogin.agentDenied).toBe(true);
+      expect(safeLogin.authenticatedThroughFixture).toBe(true);
       expect(safeLogin.extended).toBe(true);
       expect(safeLogin.doneReturnedToAutomation).toBe(true);
       expect(safeLogin.reconciledToAutomation).toBe(true);
@@ -127,6 +183,7 @@ it.runIf(integrationEnabled)(
           BB_BROWSER_WORKER_ACTION: "cleanup",
         });
       }
+      await close(fixtureServer);
     }
   },
   240_000,

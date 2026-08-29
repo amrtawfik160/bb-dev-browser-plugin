@@ -11,6 +11,7 @@ import {
   SAFE_LOGIN_MAX_TOTAL_MS,
   SafeLoginAgentDeniedError,
   SafeLoginModeError,
+  createInMemorySafeLoginIntentStore,
   createSafeLoginMode,
   safeLoginActivitySink,
   type SafeLoginActivitySink,
@@ -19,6 +20,10 @@ import {
   type SafeLoginProfileTarget,
   type SafeLoginRelaunchEffects,
 } from "../safe-login.js";
+import {
+  deterministicLoginFixture,
+  type DeterministicLoginRelaunch,
+} from "./fixtures/safe-login-fixture.js";
 
 const HOST_ID = "host-safe-login";
 const PROFILE_ID = "profile-safe-login";
@@ -27,43 +32,28 @@ const TARGET: SafeLoginProfileTarget = {
   profileId: PROFILE_ID,
 };
 
+/**
+ * The deterministic login fixture is the policy-level analog of the real
+ * authentication fixture. The helpers below delegate to it so every Safe Login
+ * test drives enter/exit/reconcile through the fixture instead of bare stubs,
+ * and `loginFixture.authenticate()` stands in for the owner signing in.
+ */
+const loginFixture = deterministicLoginFixture({
+  hostId: HOST_ID,
+  profileId: PROFILE_ID,
+});
+
 function binding(
   panelId: string,
   overrides: Partial<SafeLoginPanelBinding> = {},
 ): SafeLoginPanelBinding {
-  return {
-    ownerSessionId: `owner-session-${panelId}`,
-    panelId,
-    hostId: HOST_ID,
-    profileId: PROFILE_ID,
-    ...overrides,
-  };
+  return loginFixture.binding(panelId, overrides);
 }
 
-type CapturedRelaunch = {
-  calls: {
-    relaunchWithoutAutomation: string[];
-    returnToAutomation: string[];
-  };
-  effects: SafeLoginRelaunchEffects;
-};
+type CapturedRelaunch = DeterministicLoginRelaunch;
 
 function deterministicRelaunch(): CapturedRelaunch {
-  const calls = {
-    relaunchWithoutAutomation: [] as string[],
-    returnToAutomation: [] as string[],
-  };
-  return {
-    calls,
-    effects: {
-      relaunchWithoutAutomation: async (target) => {
-        calls.relaunchWithoutAutomation.push(target.profileId);
-      },
-      returnToAutomation: async (target) => {
-        calls.returnToAutomation.push(target.profileId);
-      },
-    },
-  };
+  return loginFixture.recordingRelaunch();
 }
 
 type CapturedInterruption = { active: boolean; interrupted: number };
@@ -73,9 +63,7 @@ function interruptionEffect(captured: CapturedInterruption): {
     target: SafeLoginProfileTarget,
   ) => Promise<CapturedInterruption>;
 } {
-  return {
-    interruptAgents: async () => captured,
-  };
+  return loginFixture.interruption(captured);
 }
 
 function capturingSink(): SafeLoginActivitySink & {
@@ -127,6 +115,38 @@ describe("Safe Login Mode policy", () => {
       expect(mode.initiatingBinding(TARGET)).toMatchObject({
         panelId: "initiator",
       });
+    } finally {
+      mode.dispose();
+    }
+  });
+
+  it("drives Safe Login through the deterministic login fixture: the owner authenticates, enters, signs in, and returns to Automation Mode", async () => {
+    const fixture = deterministicLoginFixture({
+      hostId: HOST_ID,
+      profileId: PROFILE_ID,
+    });
+    const mode = createSafeLoginMode({ clock: { now: () => Date.now() } });
+    try {
+      expect(fixture.authenticated).toBe(false);
+      const entered = await mode.enter({
+        binding: fixture.initiator,
+        relaunch: fixture.relaunch,
+        interruption: fixture.interruption({ active: true, interrupted: 1 }),
+      });
+      expect(entered.agentsWereActive).toBe(true);
+      // While in Safe Login the owner signs in through the fixture; the policy
+      // denies agents for the duration of the login.
+      const login = fixture.authenticate();
+      expect(login.signedIn).toBe(true);
+      expect(fixture.authenticated).toBe(true);
+      expect(mode.isAgentDenied(TARGET)).toBe(true);
+      expect(fixture.relaunchCalls.relaunchWithoutAutomation).toEqual([
+        PROFILE_ID,
+      ]);
+      // Done returns the profile to Automation Mode without copying credentials.
+      await mode.done(TARGET, entered.sessionId);
+      expect(mode.mode(TARGET)).toBe("automation");
+      expect(fixture.relaunchCalls.returnToAutomation).toEqual([PROFILE_ID]);
     } finally {
       mode.dispose();
     }
@@ -270,6 +290,43 @@ describe("Safe Login Mode policy", () => {
     }
   });
 
+  it("expires without leaking relaunch effects, matching Done and panel-close exits", async () => {
+    const mode = createSafeLoginMode({
+      clock: { now: () => Date.now() },
+      leaseMs: 10_000,
+      expiryWarningMs: 3_000,
+    });
+    const relaunch = deterministicRelaunch();
+    try {
+      const result = await mode.enter({
+        binding: binding("initiator"),
+        relaunch: relaunch.effects,
+        interruption: interruptionEffect({ active: false, interrupted: 0 }),
+      });
+      // Before expiry the relaunch effects are retained for the live session.
+      expect(mode.relaunchEffectsHeld()).toBe(1);
+      await vi.advanceTimersByTimeAsync(10_000);
+      // Expiry runs the exit transition and, like Done and panel-close, must
+      // release the session's relaunch effects so they do not leak until
+      // dispose().
+      expect(mode.mode(TARGET)).toBe("automation");
+      expect(mode.relaunchEffectsHeld()).toBe(0);
+      expect(relaunch.calls.returnToAutomation).toEqual([PROFILE_ID]);
+      // The expired session is fully gone: re-entering is independent.
+      await mode.enter({
+        binding: binding("initiator"),
+        relaunch: deterministicRelaunch().effects,
+        interruption: interruptionEffect({ active: false, interrupted: 0 }),
+      });
+      expect(mode.relaunchEffectsHeld()).toBe(1);
+      await mode.done(TARGET, mode.session(TARGET)!.sessionId);
+      expect(mode.relaunchEffectsHeld()).toBe(0);
+      expect(result.sessionId).toBeDefined();
+    } finally {
+      mode.dispose();
+    }
+  });
+
   it("reconciles interrupted enter/exit transitions to a safe explicit Automation Mode state after reconnect or worker restart", async () => {
     const mode = createSafeLoginMode({ clock: { now: () => Date.now() } });
     try {
@@ -319,6 +376,80 @@ describe("Safe Login Mode policy", () => {
       expect(mode.persistedIntent(TARGET)).toBeNull();
     } finally {
       mode.dispose();
+    }
+  });
+
+  it("persists intent durably so a fresh Safe Login policy reconciles after a worker restart", async () => {
+    const clock = { now: () => Date.now() };
+    const completedStore = createInMemorySafeLoginIntentStore();
+    const completed = createSafeLoginMode({
+      clock,
+      intentStore: completedStore,
+    });
+    try {
+      // A completed enter clears the durable intent: nothing to reconcile.
+      await completed.enter({
+        binding: binding("initiator"),
+        relaunch: deterministicRelaunch().effects,
+        interruption: interruptionEffect({ active: false, interrupted: 0 }),
+      });
+      expect(completed.persistedIntent(TARGET)).toBeNull();
+      expect(completedStore.load(TARGET)).toBeNull();
+    } finally {
+      completed.dispose();
+    }
+
+    // Simulate an interrupted exit: the worker persisted the "exiting"
+    // intent through the in-flight Done below, then crashed before
+    // returnToAutomation completed. The hanging relaunch stands in for a
+    // process that died mid-transition; the durable store retains the intent
+    // across the restart.
+    const restartingStore = createInMemorySafeLoginIntentStore();
+    const crashing = createSafeLoginMode({
+      clock,
+      intentStore: restartingStore,
+    });
+    let exitReachedReturn = false;
+    const hanging: SafeLoginRelaunchEffects = {
+      relaunchWithoutAutomation: async () => {},
+      returnToAutomation: async () => {
+        exitReachedReturn = true;
+        await new Promise<void>(() => {});
+      },
+    };
+    const entered = await crashing.enter({
+      binding: binding("initiator"),
+      relaunch: hanging,
+      interruption: interruptionEffect({ active: false, interrupted: 0 }),
+    });
+    // Fire Done; it persists the "exiting" intent then awaits the hanging
+    // returnToAutomation. Do not await: the transition never completes.
+    void crashing.done(TARGET, entered.sessionId);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(exitReachedReturn).toBe(true);
+    expect(restartingStore.load(TARGET)?.transition).toBe("exiting");
+    crashing.dispose();
+
+    // A fresh policy with the same durable store reloads the persisted intent
+    // and reconciles it to a safe explicit Automation Mode state.
+    const restarted = createSafeLoginMode({
+      clock,
+      intentStore: restartingStore,
+    });
+    try {
+      const reloaded = restarted.persistedIntent(TARGET);
+      expect(reloaded?.transition).toBe("exiting");
+      const relaunch = deterministicRelaunch();
+      const reconciled = await restarted.reconcile(reloaded!, relaunch.effects);
+      expect(reconciled.resolved).toBe("automation");
+      expect(restarted.mode(TARGET)).toBe("automation");
+      expect(relaunch.calls.returnToAutomation).toEqual([PROFILE_ID]);
+      // Reconciliation clears the durable intent: a second restart reconciles
+      // to idle rather than replaying the same transition forever.
+      expect(restarted.persistedIntent(TARGET)).toBeNull();
+      expect(restartingStore.load(TARGET)).toBeNull();
+    } finally {
+      restarted.dispose();
     }
   });
 

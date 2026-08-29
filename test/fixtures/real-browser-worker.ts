@@ -704,6 +704,7 @@ let safeLogin:
       initiatorOnlyPixels: boolean;
       elsewhereOpaque: boolean;
       agentDenied: boolean;
+      authenticatedThroughFixture: boolean;
       extended: boolean;
       doneReturnedToAutomation: boolean;
       reconciledToAutomation: boolean;
@@ -778,6 +779,17 @@ if (action === "safe-login") {
   } catch {
     agentDenied = true;
   }
+  // While in Safe Login the owner signs in through the deterministic login
+  // fixture: drive the same sign-in script the auth gate uses, against the
+  // live fixture address, so the policy is proven against a real login rather
+  // than bare relaunch stubs. The automation here stands in for the owner's
+  // manual sign-in; the policy machine above is the unit under test.
+  const loginOutput = JSON.parse(
+    String(await runtime.execute(target, signInScript, 20_000)),
+  ) as { accountHeading?: string; popupHeading?: string };
+  const authenticatedThroughFixture =
+    loginOutput.accountHeading === "Signed in" &&
+    loginOutput.popupHeading === "Authenticated popup";
   const extended = safeLoginMode.extend(target, entered.sessionId, 5_000);
   await safeLoginMode.done(target, entered.sessionId);
   const doneReturnedToAutomation =
@@ -806,6 +818,7 @@ if (action === "safe-login") {
     initiatorOnlyPixels,
     elsewhereOpaque,
     agentDenied,
+    authenticatedThroughFixture,
     extended: extended.extendedByMs === 5_000,
     doneReturnedToAutomation,
     reconciledToAutomation,

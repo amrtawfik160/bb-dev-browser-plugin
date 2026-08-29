@@ -6,6 +6,15 @@ import {
   type ActivityProducerInput,
 } from "./activity-records.js";
 import type { BrowserActivityEvent } from "./contracts.js";
+import {
+  SAFE_LOGIN_LIMITATIONS_NOTICE,
+  SAFE_LOGIN_TRANSIENT_STATE_WARNING,
+} from "./safe-login-notice.js";
+
+export {
+  SAFE_LOGIN_LIMITATIONS_NOTICE,
+  SAFE_LOGIN_TRANSIENT_STATE_WARNING,
+} from "./safe-login-notice.js";
 
 /**
  * Safe Login Mode: a renewable, time-bounded owner-only browser mode for
@@ -36,10 +45,6 @@ export const SAFE_LOGIN_MAX_EXTENSION_MS = SAFE_LOGIN_LEASE_MS;
 /** A bounded total ceiling so a lease can never exceed 30 minutes. */
 export const SAFE_LOGIN_MAX_TOTAL_MS = SAFE_LOGIN_LEASE_MS * 2;
 export const SAFE_LOGIN_EXPIRY_WARNING_MS = 60_000;
-export const SAFE_LOGIN_TRANSIENT_STATE_WARNING =
-  "Entering Safe Login will restart this Browser Profile. Unsaved form input, transient tab state, and in-flight agent work will be lost; saved logins and tabs are preserved.";
-export const SAFE_LOGIN_LIMITATIONS_NOTICE =
-  "Safe Login improves compatibility with sites that reject automation, but hardware-bound passkeys, DRM content, corporate device policies, and site-specific anti-automation behavior may still prevent a login.";
 
 export type SafeLoginModeState = "automation" | "safe-login";
 export type SafeLoginTransition = "idle" | "entering" | "exiting";
@@ -104,6 +109,13 @@ export type SafeLoginOptions = {
    * wiring passes the `mode` producer from createActivityRecordProducers.
    */
   activity?: SafeLoginActivitySink;
+  /**
+   * Durable storage for the transition intent. When omitted the policy uses a
+   * process-local in-memory store, which does not survive a worker restart;
+   * real wiring passes a file-backed store so reconciliation can reload an
+   * intent written before the previous process stopped.
+   */
+  intentStore?: SafeLoginIntentStore;
 };
 
 export type SafeLoginWarning = {
@@ -146,6 +158,41 @@ export type SafeLoginPersistedIntent = {
   transition: "entering" | "exiting";
   startedAt: number;
 };
+
+/**
+ * Durable storage for the transition intent a worker persists before
+ * relaunching a profile for Safe Login. After a reconnect or worker restart a
+ * fresh policy loads the most recent intent and reconciles it to a safe
+ * explicit state instead of a half-applied mode. Implementations must survive
+ * the process stopping: an in-memory store is suitable only for tests that
+ * share one store across two policy instances.
+ */
+export type SafeLoginIntentStore = {
+  load(target: SafeLoginProfileTarget): SafeLoginPersistedIntent | null;
+  save(intent: SafeLoginPersistedIntent): void;
+  clear(target: SafeLoginProfileTarget): void;
+};
+
+/**
+ * A process-local intent store. It is the default and keeps the pure state
+ * machine testable without a filesystem, but it does NOT survive a worker
+ * restart: real wiring passes a file-backed store so reconciliation can reload
+ * an intent written before the previous process stopped.
+ */
+export function createInMemorySafeLoginIntentStore(): SafeLoginIntentStore {
+  const intents = new Map<string, SafeLoginPersistedIntent>();
+  return {
+    load(target) {
+      return intents.get(profileKey(target)) ?? null;
+    },
+    save(intent) {
+      intents.set(profileKey(intent.target), intent);
+    },
+    clear(target) {
+      intents.delete(profileKey(target));
+    },
+  };
+}
 
 export class SafeLoginModeError extends Error {
   constructor(
@@ -228,6 +275,8 @@ export function createSafeLoginMode(options: SafeLoginOptions = {}) {
   const expiryWarningMs =
     options.expiryWarningMs ?? SAFE_LOGIN_EXPIRY_WARNING_MS;
   const activity = options.activity;
+  const intentStore =
+    options.intentStore ?? createInMemorySafeLoginIntentStore();
   const profiles = new Map<string, ProfileState>();
   const expiryListeners = new Set<(warning: SafeLoginExpiryWarning) => void>();
   let disposed = false;
@@ -240,12 +289,29 @@ export function createSafeLoginMode(options: SafeLoginOptions = {}) {
         target,
         mode: "automation",
         transition: "idle",
-        intent: null,
+        // After a reconnect or worker restart a fresh policy loads whatever
+        // intent the previous process persisted so reconcile() can resolve an
+        // interrupted transition to a safe explicit state.
+        intent: intentStore.load(target),
         session: null,
       };
       profiles.set(key, state);
     }
     return state;
+  }
+
+  /**
+   * Set the per-profile transition intent and mirror it to the durable store
+   * so a worker restart can reload it. Passing null clears both the in-memory
+   * intent and the durable copy once the transition resolves.
+   */
+  function setIntent(
+    state: ProfileState,
+    intent: SafeLoginPersistedIntent | null,
+  ) {
+    state.intent = intent;
+    if (intent === null) intentStore.clear(state.target);
+    else intentStore.save(intent);
   }
 
   function record(
@@ -326,11 +392,11 @@ export function createSafeLoginMode(options: SafeLoginOptions = {}) {
   ) {
     const exitingSession = state.session;
     state.transition = "exiting";
-    state.intent = {
+    setIntent(state, {
       target: state.target,
       transition: "exiting",
       startedAt: clock.now(),
-    };
+    });
     if (exitingSession !== null) clearTimers(exitingSession);
     let outcome = "succeeded";
     let exitInterrupted = interrupted;
@@ -349,7 +415,7 @@ export function createSafeLoginMode(options: SafeLoginOptions = {}) {
       // owner must re-enter; agents stay denied only while a session exists.
     }
     state.session = null;
-    state.intent = null;
+    setIntent(state, null);
     state.transition = "idle";
     state.mode = "automation";
     record(state.target, {
@@ -368,18 +434,43 @@ export function createSafeLoginMode(options: SafeLoginOptions = {}) {
     }
   }
 
+  /**
+   * The single owner of relaunch-effect release for every exit path. It deletes
+   * the session's relaunch effects before running the exit transition so the
+   * effects can never leak past the end of a session, whether the session ends
+   * through Done, the final initiating panel closing, or lease expiry.
+   */
+  async function exitSession(
+    state: ProfileState,
+    session: ActiveSession,
+    relaunch: SafeLoginRelaunchEffects,
+    action: "safe-login-exited" | "safe-login-expired",
+    interrupted: boolean,
+    interruptionReason: string | null,
+  ) {
+    relaunchBySession.delete(session.sessionId);
+    await runExit(
+      state,
+      relaunch,
+      action,
+      interrupted,
+      interruptionReason,
+      session.startedAt,
+    );
+  }
+
   async function expire(state: ProfileState, sessionId: SafeLoginSessionId) {
     const session = state.session;
     if (session === null || session.sessionId !== sessionId) return;
     const relaunch = await consumeRelaunch(state);
     if (relaunch === null) return;
-    await runExit(
+    await exitSession(
       state,
+      session,
       relaunch,
       "safe-login-expired",
       false,
       null,
-      session.startedAt,
     );
   }
 
@@ -428,11 +519,11 @@ export function createSafeLoginMode(options: SafeLoginOptions = {}) {
     }
     const startedAt = clock.now();
     state.transition = "entering";
-    state.intent = {
+    setIntent(state, {
       target,
       transition: "entering",
       startedAt,
-    };
+    });
     let outcome = "succeeded";
     let interruptionReason: string | null = null;
     let interruption: { active: boolean; interrupted: number } | undefined;
@@ -451,7 +542,7 @@ export function createSafeLoginMode(options: SafeLoginOptions = {}) {
           ? error.message
           : "The Safe Login enter transition failed.";
       state.transition = "idle";
-      state.intent = null;
+      setIntent(state, null);
       state.mode = "automation";
       record(target, {
         eventId: newActivityEventId("safe-login"),
@@ -483,7 +574,7 @@ export function createSafeLoginMode(options: SafeLoginOptions = {}) {
     state.session = session;
     relaunchBySession.set(sessionId, request.relaunch);
     state.transition = "idle";
-    state.intent = null;
+    setIntent(state, null);
     state.mode = "safe-login";
     scheduleExpiry(state, session);
     record(target, {
@@ -590,18 +681,19 @@ export function createSafeLoginMode(options: SafeLoginOptions = {}) {
         "Only the initiating panel can end Safe Login.",
       );
     }
-    const relaunch = (await consumeRelaunch(state)) ?? null;
-    relaunchBySession.delete(session.sessionId);
-    await runExit(
-      state,
-      relaunch ?? {
+    const relaunch =
+      (await consumeRelaunch(state)) ??
+      ({
         returnToAutomation: async () => {},
         relaunchWithoutAutomation: async () => {},
-      },
+      } satisfies SafeLoginRelaunchEffects);
+    await exitSession(
+      state,
+      session,
+      relaunch,
       "safe-login-exited",
       false,
       null,
-      session.startedAt,
     );
   }
 
@@ -615,18 +707,19 @@ export function createSafeLoginMode(options: SafeLoginOptions = {}) {
     if (!session.initiatingPanels.has(key)) return;
     session.initiatingPanels.delete(key);
     if (session.initiatingPanels.size > 0) return;
-    const relaunch = relaunchBySession.get(session.sessionId) ?? null;
-    relaunchBySession.delete(session.sessionId);
-    await runExit(
-      state,
-      relaunch ?? {
+    const relaunch =
+      relaunchBySession.get(session.sessionId) ??
+      ({
         returnToAutomation: async () => {},
         relaunchWithoutAutomation: async () => {},
-      },
+      } satisfies SafeLoginRelaunchEffects);
+    await exitSession(
+      state,
+      session,
+      relaunch,
       "safe-login-exited",
       false,
       null,
-      session.startedAt,
     );
   }
 
@@ -756,7 +849,7 @@ export function createSafeLoginMode(options: SafeLoginOptions = {}) {
     }
     state.session = null;
     state.transition = "idle";
-    state.intent = null;
+    setIntent(state, null);
     state.mode = "automation";
     let interruptionReason =
       intent.transition === "entering"
@@ -811,6 +904,13 @@ export function createSafeLoginMode(options: SafeLoginOptions = {}) {
     onExpiryWarning,
     persistedIntent,
     reconcile,
+    /**
+     * Diagnostic for the no-leak invariant: the number of sessions still
+     * retaining relaunch effects. Every exit path (Done, final panel close, and
+     * expiry) releases its effects, so this is 0 whenever no live Safe Login
+     * session holds the profile.
+     */
+    relaunchEffectsHeld: () => relaunchBySession.size,
     dispose,
     get leaseMs() {
       return leaseMs;
