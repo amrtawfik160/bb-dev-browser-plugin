@@ -14,6 +14,7 @@ import {
   CLEAR_ACTIVITY_CONFIRMATION,
   DEFAULT_PROFILE_ID,
   PERSIST_BROWSER_ELEVATED_ACCESS_CONFIRMATION,
+  RESET_PROFILE_CONFIRMATION,
   STOP_BROWSER_CONFIRMATION,
   type BrowserHostChoice,
   type BrowserHostChoicesInput,
@@ -24,6 +25,7 @@ import {
   type BrowserProfile,
   type BrowserProfileGrant,
   type BrowserProfileInventory,
+  type BrowserProfileLifecycleResponse,
   type BrowserProfileRecoveryResponse,
   type BrowserPurgePlan,
   type BrowserSetupPlan,
@@ -387,6 +389,7 @@ function ProfileRow({
   onTimezoneChange,
   onRename,
   onSelect,
+  onLifecycleComplete,
 }: {
   profile: BrowserProfile;
   renameName: string;
@@ -398,6 +401,7 @@ function ProfileRow({
   onTimezoneChange: (timezone: string) => void;
   onRename: () => void;
   onSelect: () => void;
+  onLifecycleComplete: () => void;
 }) {
   return (
     <div className="rounded border p-3">
@@ -453,7 +457,7 @@ function ProfileRow({
         >
           Save settings {profile.name}
         </button>
-        {profile.selected ? null : (
+        {profile.selected || profile.state === "archived" ? null : (
           <button
             type="button"
             className="rounded border px-3 py-2 text-sm"
@@ -464,7 +468,192 @@ function ProfileRow({
           </button>
         )}
       </div>
+      <ProfileDestructiveControls
+        profile={profile}
+        onComplete={onLifecycleComplete}
+      />
     </div>
+  );
+}
+
+function ProfileLifecycleConsequences({
+  profile,
+}: {
+  profile: BrowserProfile;
+}) {
+  return (
+    <>
+      <p className="text-sm text-muted-foreground">
+        Archive stops this profile, removes all agent authority immediately, and
+        keeps browser state recoverable for 30 days. Reset permanently loses
+        credentials. Permanent deletion cannot be undone.
+      </p>
+      {profile.state === "archived" ? (
+        <p className="mt-2 text-sm">Recoverable until {profile.expiresAt}</p>
+      ) : null}
+    </>
+  );
+}
+
+function ProfileLifecycleConfirmation({
+  profile,
+  confirmation,
+  onChange,
+}: {
+  profile: BrowserProfile;
+  confirmation: string;
+  onChange: (confirmation: string) => void;
+}) {
+  return (
+    <>
+      <label className="mt-2 block text-sm">
+        Lifecycle confirmation
+        <input
+          aria-label={`Lifecycle confirmation ${profile.name}`}
+          className="mt-1 block w-full rounded border px-3 py-2 text-sm"
+          value={confirmation}
+          onChange={(event) => onChange(event.target.value)}
+        />
+      </label>
+      <p className="mt-1 text-xs text-muted-foreground">
+        Reset: <code>{RESET_PROFILE_CONFIRMATION}</code>. Delete: type the exact
+        profile name shown above.
+      </p>
+    </>
+  );
+}
+
+function ProfileLifecycleAction({
+  label,
+  disabled,
+  onClick,
+}: {
+  label: string;
+  disabled: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      className="rounded border px-3 py-2 text-sm"
+      disabled={disabled}
+      onClick={onClick}
+    >
+      {label}
+    </button>
+  );
+}
+
+type ProfileLifecycleActions = {
+  archiveOrRestore: () => void;
+  reset: () => void;
+  delete: () => void;
+};
+
+function ProfileLifecycleActions({
+  profile,
+  confirmation,
+  pending,
+  actions,
+}: {
+  profile: BrowserProfile;
+  confirmation: string;
+  pending: boolean;
+  actions: ProfileLifecycleActions;
+}) {
+  const active = profile.state === "active";
+  return (
+    <div className="mt-3 flex flex-wrap gap-2">
+      <ProfileLifecycleAction
+        label={`${active ? "Archive" : "Restore"} ${profile.name}`}
+        disabled={pending}
+        onClick={actions.archiveOrRestore}
+      />
+      {active ? (
+        <ProfileLifecycleAction
+          label={`Reset ${profile.name}`}
+          disabled={pending || confirmation !== RESET_PROFILE_CONFIRMATION}
+          onClick={actions.reset}
+        />
+      ) : null}
+      <ProfileLifecycleAction
+        label={`Permanently delete ${profile.name}`}
+        disabled={pending || profile.selected || confirmation !== profile.name}
+        onClick={actions.delete}
+      />
+    </div>
+  );
+}
+
+function ProfileDestructiveControls({
+  profile,
+  onComplete,
+}: {
+  profile: BrowserProfile;
+  onComplete: () => void;
+}) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [confirmation, setConfirmation] = useState("");
+  const [pending, setPending] = useState<string | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const target = { hostId: profile.hostId, profileId: profile.profileId };
+
+  function runLifecycle(
+    action: string,
+    operation: () => Promise<BrowserProfileLifecycleResponse>,
+  ) {
+    setPending(action);
+    setMessage(`${action} in progress…`);
+    setError(null);
+    void operation()
+      .then((response) => {
+        setMessage(`${response.message} ${response.progress.message}`);
+        setConfirmation("");
+        onComplete();
+      })
+      .catch((requestError: unknown) => {
+        setMessage(null);
+        setError(administrationErrorMessage(requestError));
+      })
+      .finally(() => setPending(null));
+  }
+
+  const actions = {
+    archiveOrRestore: () =>
+      runLifecycle(profile.state === "active" ? "Archive" : "Restore", () =>
+        profile.state === "active"
+          ? rpc.call("browser_profile_archive", target)
+          : rpc.call("browser_profile_restore_archived", target),
+      ),
+    reset: () =>
+      runLifecycle("Reset", () =>
+        rpc.call("browser_profile_reset", { ...target, confirmation }),
+      ),
+    delete: () =>
+      runLifecycle("Delete", () =>
+        rpc.call("browser_profile_delete", { ...target, confirmation }),
+      ),
+  };
+  return (
+    <section
+      className="mt-4 border-t pt-3"
+      aria-label={`Lifecycle ${profile.name}`}
+    >
+      <ProfileLifecycleConsequences profile={profile} />
+      <ProfileLifecycleConfirmation
+        profile={profile}
+        confirmation={confirmation}
+        onChange={setConfirmation}
+      />
+      <ProfileLifecycleActions
+        profile={profile}
+        confirmation={confirmation}
+        pending={pending !== null}
+        actions={actions}
+      />
+      <AdministrationFeedback message={message} error={error} />
+    </section>
   );
 }
 
@@ -480,6 +669,7 @@ function ProfileInventoryView({
   onTimezoneChange,
   onRename,
   onSelect,
+  onLifecycleComplete,
 }: {
   inventory: BrowserProfileInventory;
   renameNames: Record<string, string>;
@@ -490,6 +680,7 @@ function ProfileInventoryView({
   onTimezoneChange: (profile: BrowserProfile, timezone: string) => void;
   onRename: (profile: BrowserProfile) => void;
   onSelect: (profile: BrowserProfile) => void;
+  onLifecycleComplete: () => void;
 }) {
   return (
     <>
@@ -519,6 +710,7 @@ function ProfileInventoryView({
             onTimezoneChange={(timezone) => onTimezoneChange(profile, timezone)}
             onRename={() => onRename(profile)}
             onSelect={() => onSelect(profile)}
+            onLifecycleComplete={onLifecycleComplete}
           />
         ))}
       </div>
@@ -755,6 +947,7 @@ function ProfileControls({
             onTimezoneChange={changeTimezone}
             onRename={saveProfile}
             onSelect={selectProfile}
+            onLifecycleComplete={() => void refreshProfiles()}
           />
           <ProfileCreateForm
             name={newName}

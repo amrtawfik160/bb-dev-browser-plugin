@@ -1,4 +1,6 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { join } from "node:path";
 import { z } from "zod";
 import {
@@ -105,6 +107,15 @@ export type PrivilegedOperation =
       confirmation: string;
     }
   | {
+      kind: "stop-profile-processes";
+      owner: typeof BROWSER_USER;
+      hostId: string;
+      installationId: string;
+      profileId: string;
+      profilePath: string;
+      confirmation: "Authenticated owner profile lifecycle";
+    }
+  | {
       kind: "stop-owned-processes";
       owner: typeof BROWSER_USER;
       hostId: string;
@@ -197,6 +208,72 @@ export function createUnavailablePrivilegedExecutor(): PrivilegedExecutor {
   };
 }
 
+type ExecuteFile = (
+  file: string,
+  arguments_: readonly string[],
+) => Promise<void>;
+
+const executeFile: ExecuteFile = async (file, arguments_) => {
+  await promisify(execFile)(file, [...arguments_]);
+};
+
+async function stopMatchingProcesses(
+  run: ExecuteFile,
+  arguments_: readonly string[],
+) {
+  try {
+    await run("/usr/bin/pkill", arguments_);
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === 1) return;
+    throw error;
+  }
+}
+
+function escapedProcessPattern(literal: string) {
+  return literal.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+}
+
+function profileStopArguments(
+  operation: Extract<PrivilegedOperation, { kind: "stop-profile-processes" }>,
+) {
+  return [
+    "--signal",
+    "TERM",
+    "--uid",
+    operation.owner,
+    "--full",
+    escapedProcessPattern(operation.profilePath),
+  ];
+}
+
+function ownedProcessStopArguments() {
+  return ["--signal", "TERM", "--uid", BROWSER_USER, "--full", ".*"];
+}
+
+async function executeProductionOperation(
+  run: ExecuteFile,
+  operation: PrivilegedOperation,
+) {
+  if (operation.kind === "stop-profile-processes") {
+    return stopMatchingProcesses(run, profileStopArguments(operation));
+  }
+  if (operation.kind === "stop-owned-processes") {
+    return stopMatchingProcesses(run, ownedProcessStopArguments());
+  }
+  throw new Error(
+    `Production Browser privileged execution is not configured for ${operation.kind}.`,
+  );
+}
+
+export function createProductionPrivilegedExecutor(options?: {
+  executeFile?: ExecuteFile;
+}): PrivilegedExecutor {
+  const run = options?.executeFile ?? executeFile;
+  return {
+    execute: (operation) => executeProductionOperation(run, operation),
+  };
+}
+
 export type SetupProgressState = "pending" | "completed" | "failed";
 export type PurgeTargetId =
   "stop-owned-processes" | "browser-data" | "configuration" | "dedicated-user";
@@ -207,6 +284,7 @@ export interface HostAdministrationState {
     { state: SetupProgressState; failure: string | null }
   >;
   processesStopped: boolean;
+  stoppedProfileIds: string[];
   purge: Record<
     PurgeTargetId,
     { state: SetupProgressState; failure: string | null }
@@ -230,6 +308,7 @@ const persistedStateSchema = z
       })
       .strict(),
     processesStopped: z.boolean(),
+    stoppedProfileIds: z.array(z.string().min(1)).default([]),
     purge: z
       .object({
         "stop-owned-processes": progressRecordSchema,
@@ -260,6 +339,7 @@ export function emptyHostAdministrationState(): HostAdministrationState {
       "protected-storage": emptyProgressRecord(),
     },
     processesStopped: false,
+    stoppedProfileIds: [],
     purge: {
       "stop-owned-processes": emptyProgressRecord(),
       "browser-data": emptyProgressRecord(),
@@ -277,6 +357,7 @@ function cloneState(state: HostAdministrationState): HostAdministrationState {
       "protected-storage": { ...state.setup["protected-storage"] },
     },
     processesStopped: state.processesStopped,
+    stoppedProfileIds: [...state.stoppedProfileIds],
     purge: {
       "stop-owned-processes": { ...state.purge["stop-owned-processes"] },
       "browser-data": { ...state.purge["browser-data"] },
@@ -640,6 +721,29 @@ function stopOwnedProcessesOperation(
   };
 }
 
+function stopProfileProcessesOperation(
+  target: BrowserHostTarget,
+  installationId: string,
+): PrivilegedOperation {
+  const installationPaths = browserInstallationPaths(
+    installationId,
+    target.hostId,
+  );
+  return {
+    kind: "stop-profile-processes",
+    owner: BROWSER_USER,
+    hostId: target.hostId,
+    installationId,
+    profileId: target.profileId,
+    profilePath: join(
+      installationPaths.hostStoragePath,
+      "profiles",
+      target.profileId,
+    ),
+    confirmation: "Authenticated owner profile lifecycle",
+  };
+}
+
 function removeBrowserDataOperation(
   target: BrowserHostTarget,
   installationId: string,
@@ -719,6 +823,8 @@ function purgeResponse(
 }
 
 export interface HostAdministrationBoundary extends HostReadinessBoundary {
+  stopProfile(target: BrowserHostTarget): Promise<void>;
+  isProfileStopped(target: BrowserHostTarget): Promise<boolean>;
   setupPlan(
     target: BrowserHostTarget,
   ): BrowserSetupPlan | Promise<BrowserSetupPlan>;
@@ -1183,6 +1289,28 @@ async function readPurgePlan(
   );
 }
 
+async function stopProfileProcesses(
+  target: BrowserHostTarget,
+  runtime: HostAdministrationRuntime,
+) {
+  const state = await readState(runtime.stateStore, target.hostId);
+  await runtime.executor.execute(
+    stopProfileProcessesOperation(target, runtime.installationId),
+  );
+  if (!state.stoppedProfileIds.includes(target.profileId)) {
+    state.stoppedProfileIds.push(target.profileId);
+  }
+  await writeState(runtime.stateStore, target.hostId, state);
+}
+
+async function profileProcessesAreStopped(
+  target: BrowserHostTarget,
+  runtime: HostAdministrationRuntime,
+) {
+  const state = await readState(runtime.stateStore, target.hostId);
+  return state.stoppedProfileIds.includes(target.profileId);
+}
+
 export function createHostAdministrationBoundary(
   options: HostAdministrationOptions,
 ): HostAdministrationBoundary {
@@ -1190,6 +1318,11 @@ export function createHostAdministrationBoundary(
   return {
     inspect: (target) => runtime.readiness.inspect(target),
     diagnostics: (target) => runtime.readiness.diagnostics(target),
+    stopProfile: (target) =>
+      withHostMutationLock(runtime, target.hostId, () =>
+        stopProfileProcesses(target, runtime),
+      ),
+    isProfileStopped: (target) => profileProcessesAreStopped(target, runtime),
     setupPlan: (target) => readSetupPlan(target, runtime),
     setup: (request) =>
       withHostMutationLock(runtime, request.hostId, () =>

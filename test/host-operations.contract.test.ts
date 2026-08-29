@@ -23,6 +23,7 @@ import {
   createFileHostAdministrationStateStore,
   createHostAdministrationBoundary,
   createMemoryHostAdministrationStateStore,
+  createProductionPrivilegedExecutor,
   createSimulatedPrivilegedExecutor,
   type BrowserRuntimePolicy,
   type HostAdministrationBoundary,
@@ -334,6 +335,89 @@ describe("Browser host administration contract", () => {
         (operation) => operation.kind,
       ),
     ).toEqual(["stop-owned-processes"]);
+  });
+
+  it("R10-01 stops and recovers Browser Instances independently of installation lifecycle", async () => {
+    const { boundary, executor } = administrationFixture();
+    const secondProfile = { ...target, profileId: "profile-second" };
+
+    await boundary.stopProfile(target);
+    await boundary.stopProfile(secondProfile);
+
+    expect(executor.successfulOperations).toMatchObject([
+      { kind: "stop-profile-processes", profileId: target.profileId },
+      { kind: "stop-profile-processes", profileId: secondProfile.profileId },
+    ]);
+    await expect(boundary.isProfileStopped(target)).resolves.toBe(true);
+    await expect(boundary.isProfileStopped(secondProfile)).resolves.toBe(true);
+
+    const disabled = await boundary.disable({
+      ...target,
+      confirmation: STOP_BROWSER_CONFIRMATION,
+    });
+    expect(disabled.outcome).toBe("stopped");
+    expect(executor.successfulOperations.at(-1)).toMatchObject({
+      kind: "stop-owned-processes",
+    });
+  });
+
+  it("R10-02 production lifecycle execution invokes the privileged process boundary and fails closed", async () => {
+    const commands: { file: string; arguments: readonly string[] }[] = [];
+    const executor = createProductionPrivilegedExecutor({
+      executeFile: async (file, arguments_) => {
+        commands.push({ file, arguments: arguments_ });
+      },
+    });
+
+    await executor.execute({
+      kind: "stop-profile-processes",
+      owner: BROWSER_USER,
+      hostId: target.hostId,
+      installationId,
+      profileId: target.profileId,
+      profilePath: `${BROWSER_STORAGE_ROOT}/installations/${installationId}/hosts/${encodeURIComponent(target.hostId)}/profiles/${target.profileId}`,
+      confirmation: "Authenticated owner profile lifecycle",
+    });
+
+    expect(commands).toEqual([
+      {
+        file: "/usr/bin/pkill",
+        arguments: [
+          "--signal",
+          "TERM",
+          "--uid",
+          BROWSER_USER,
+          "--full",
+          `${BROWSER_STORAGE_ROOT}/installations/${installationId}/hosts/${encodeURIComponent(target.hostId)}/profiles/${target.profileId}`,
+        ],
+      },
+    ]);
+    await expect(
+      executor.execute({
+        kind: "remove-browser-data",
+        path: "/var/lib/bb-browser/example",
+        installationId,
+        hostId: target.hostId,
+        confirmation: "confirmed",
+      }),
+    ).rejects.toThrow("not configured for remove-browser-data");
+
+    const noMatchingProcess = createProductionPrivilegedExecutor({
+      executeFile: async () => {
+        throw Object.assign(new Error("no process matched"), { code: 1 });
+      },
+    });
+    await expect(
+      noMatchingProcess.execute({
+        kind: "stop-profile-processes",
+        owner: BROWSER_USER,
+        hostId: target.hostId,
+        installationId,
+        profileId: target.profileId,
+        profilePath: `${BROWSER_STORAGE_ROOT}/installations/${installationId}/hosts/${encodeURIComponent(target.hostId)}/profiles/${target.profileId}`,
+        confirmation: "Authenticated owner profile lifecycle",
+      }),
+    ).resolves.toBeUndefined();
   });
 
   it("purges only the installation-scoped targets after typed confirmation", async () => {

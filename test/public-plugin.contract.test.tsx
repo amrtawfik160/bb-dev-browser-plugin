@@ -29,6 +29,7 @@ import {
   browserProfileRecoveryResponseSchema,
   DEFAULT_PROFILE_ID,
   PERSIST_BROWSER_ELEVATED_ACCESS_CONFIRMATION,
+  RESET_PROFILE_CONFIRMATION,
   setupRequiredStatus,
   type BrowserGrantRequest,
   type BrowserStatus,
@@ -1957,6 +1958,536 @@ describe("Browser public plugin contract", () => {
     }
   });
 
+  it("removes persistent and temporary authority before archive stop and never restores it", async () => {
+    const rootDirectory = await mkdtemp(
+      join(tmpdir(), "bb-browser-public-lifecycle-"),
+    );
+    const stopStarted = deferred<void>();
+    const releaseStop = deferred<void>();
+    const profileStore = createFileBrowserProfileStore({
+      rootDirectory,
+      installationId: "installation-public-test",
+      lifecycle: {
+        stopProfile: async () => {
+          stopStarted.resolve();
+          await releaseStop.promise;
+        },
+      },
+    });
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+      profileStore,
+    });
+    try {
+      const profile = await browser.createBrowserProfile({
+        hostId: "host-browser-test",
+        name: "Authority target",
+      });
+      const persistent = await browser.createBrowserGrant({
+        projectId: "project-browser-test",
+        hostId: "host-browser-test",
+        profileId: profile.profileId,
+        originScope: "https://persistent.example.test",
+      });
+      const denied = browserScriptFailureSchema.parse(
+        JSON.parse(
+          (
+            await browser.runBrowserScriptWithProfile(profile.profileId, {
+              destinationOrigin: "https://temporary.example.test",
+            })
+          ).content[0]!.text,
+        ),
+      );
+      const requestId = denied.error.grantRequest!.requestId;
+      const approved = await browser.decideBrowserGrantRequest({
+        requestId,
+        decision: "retry",
+      });
+      expect(approved.temporaryGrant).not.toBeNull();
+
+      const archiving = browser.archiveBrowserProfile({
+        hostId: "host-browser-test",
+        profileId: profile.profileId,
+      });
+      await stopStarted.promise;
+      const concurrentArchive = browser.archiveBrowserProfile({
+        hostId: "host-browser-test",
+        profileId: profile.profileId,
+      });
+
+      expect(
+        await browser.inspectBrowserGrant(persistent.grantId),
+      ).toMatchObject({
+        revokedAt: expect.any(String),
+      });
+      expect(await browser.inspectBrowserGrantRequest(requestId)).toMatchObject(
+        {
+          status: "revoked",
+        },
+      );
+      releaseStop.resolve();
+      await expect(archiving).resolves.toMatchObject({ outcome: "archived" });
+      await expect(concurrentArchive).resolves.toMatchObject({
+        outcome: "already-archived",
+      });
+      await expect(
+        browser.restoreArchivedBrowserProfile({
+          hostId: "host-browser-test",
+          profileId: profile.profileId,
+        }),
+      ).resolves.toMatchObject({ outcome: "restored" });
+      expect(
+        await browser.inspectBrowserGrant(persistent.grantId),
+      ).toMatchObject({
+        revokedAt: expect.any(String),
+      });
+      expect(await browser.inspectBrowserGrantRequest(requestId)).toMatchObject(
+        {
+          status: "revoked",
+        },
+      );
+    } finally {
+      releaseStop.resolve();
+      await browser.dispose();
+      await rm(rootDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("R10-03 reconciles expiry authority transactionally from the durable host outbox", async () => {
+    let now = new Date("2026-08-28T00:00:00.000Z");
+    const rootDirectory = await mkdtemp(
+      join(tmpdir(), "bb-browser-expiry-authority-"),
+    );
+    const profileStore = createFileBrowserProfileStore({
+      rootDirectory,
+      installationId: "installation-public-test",
+      clock: () => now,
+      lifecycle: { stopProfile: async () => undefined },
+    });
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+      profileStore,
+    });
+    try {
+      const profile = await browser.createBrowserProfile({
+        hostId: "host-browser-test",
+        name: "Expiry authority",
+      });
+      const grant = await browser.createBrowserGrant({
+        projectId: "project-browser-test",
+        hostId: "host-browser-test",
+        profileId: profile.profileId,
+        originScope: "https://expiry.example.test",
+      });
+      const denied = browserScriptFailureSchema.parse(
+        JSON.parse(
+          (
+            await browser.runBrowserScriptWithProfile(profile.profileId, {
+              destinationOrigin: "https://temporary-expiry.example.test",
+            })
+          ).content[0]!.text,
+        ),
+      );
+      const requestId = denied.error.grantRequest!.requestId;
+      await browser.decideBrowserGrantRequest({
+        requestId,
+        decision: "retry",
+      });
+
+      await profileStore.archiveProfile({
+        hostId: "host-browser-test",
+        profileId: profile.profileId,
+      });
+      now = new Date("2026-09-27T00:00:00.001Z");
+      await browser.runBrowserProfiles();
+      await browser.runBrowserActivityRecords(profile.profileId);
+
+      expect(await browser.inspectBrowserGrant(grant.grantId)).toMatchObject({
+        revokedAt: expect.any(String),
+      });
+      expect(await browser.inspectBrowserGrantRequest(requestId)).toMatchObject(
+        {
+          status: "revoked",
+        },
+      );
+      expect(
+        (await browser.runBrowserActivityRecords(profile.profileId)).map(
+          ({ action }) => action,
+        ),
+      ).toEqual(expect.arrayContaining(["archive-expired", "profile-deleted"]));
+    } finally {
+      await browser.dispose();
+      await rm(rootDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("R10-03 missing-profile delete idempotently clears all linked authority", async () => {
+    const rootDirectory = await mkdtemp(
+      join(tmpdir(), "bb-browser-missing-delete-authority-"),
+    );
+    const profileStore = createFileBrowserProfileStore({
+      rootDirectory,
+      installationId: "installation-public-test",
+      lifecycle: { stopProfile: async () => undefined },
+    });
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+      profileStore,
+    });
+    try {
+      const profile = await browser.createBrowserProfile({
+        hostId: "host-browser-test",
+        name: "Missing authority",
+      });
+      const grant = await browser.createBrowserGrant({
+        projectId: "project-browser-test",
+        hostId: "host-browser-test",
+        profileId: profile.profileId,
+        originScope: "https://missing.example.test",
+      });
+      const denied = browserScriptFailureSchema.parse(
+        JSON.parse(
+          (
+            await browser.runBrowserScriptWithProfile(profile.profileId, {
+              destinationOrigin: "https://missing-request.example.test",
+            })
+          ).content[0]!.text,
+        ),
+      );
+      const requestId = denied.error.grantRequest!.requestId;
+      await profileStore.deleteProfile({
+        hostId: "host-browser-test",
+        profileId: profile.profileId,
+        confirmation: profile.name,
+        defaultProfileId: DEFAULT_PROFILE_ID,
+      });
+
+      await expect(
+        browser.deleteBrowserProfile({
+          hostId: "host-browser-test",
+          profileId: profile.profileId,
+          confirmation: profile.name,
+        }),
+      ).resolves.toMatchObject({ outcome: "already-deleted" });
+      expect(await browser.inspectBrowserGrant(grant.grantId)).toMatchObject({
+        revokedAt: expect.any(String),
+      });
+      expect(await browser.inspectBrowserGrantRequest(requestId)).toMatchObject(
+        {
+          status: "revoked",
+        },
+      );
+    } finally {
+      await browser.dispose();
+      await rm(rootDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("R10-05 lifecycle epoch rejects stale grant commits and agent use after archive wins", async () => {
+    const rootDirectory = await mkdtemp(
+      join(tmpdir(), "bb-browser-lifecycle-epoch-"),
+    );
+    const profileStore = createFileBrowserProfileStore({
+      rootDirectory,
+      installationId: "installation-public-test",
+      lifecycle: { stopProfile: async () => undefined },
+    });
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+      profileStore,
+      deferProfileInventory: true,
+    });
+    try {
+      const profile = await browser.createBrowserProfile({
+        hostId: "host-browser-test",
+        name: "Epoch target",
+      });
+      const staleGrant = browser.createBrowserGrant({
+        projectId: "project-browser-test",
+        hostId: "host-browser-test",
+        profileId: profile.profileId,
+        originScope: "https://stale-epoch.example.test",
+      });
+      await browser.profileInventoryStarted;
+      await browser.archiveBrowserProfile({
+        hostId: "host-browser-test",
+        profileId: profile.profileId,
+      });
+      browser.releaseProfileInventory();
+
+      await expect(staleGrant).rejects.toThrow("lifecycle changed");
+      const agent = browserScriptFailureSchema.parse(
+        JSON.parse(
+          (
+            await browser.runBrowserScriptWithProfile(profile.profileId, {
+              destinationOrigin: "https://stale-epoch.example.test",
+            })
+          ).content[0]!.text,
+        ),
+      );
+      expect(agent.error).toMatchObject({ profileId: profile.profileId });
+    } finally {
+      browser.releaseProfileInventory();
+      await browser.dispose();
+      await rm(rootDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("R10-05 a deferred grant-request approval cannot restore authority after archive revocation", async () => {
+    const rootDirectory = await mkdtemp(
+      join(tmpdir(), "bb-browser-approval-epoch-"),
+    );
+    const profileStore = createFileBrowserProfileStore({
+      rootDirectory,
+      installationId: "installation-public-test",
+      lifecycle: { stopProfile: async () => undefined },
+    });
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+      profileStore,
+      deferProfileInventory: true,
+      deferProfileInventoryAfterCalls: 1,
+    });
+    try {
+      const profile = await browser.createBrowserProfile({
+        hostId: "host-browser-test",
+        name: "Approval epoch",
+      });
+      const denied = browserScriptFailureSchema.parse(
+        JSON.parse(
+          (
+            await browser.runBrowserScriptWithProfile(profile.profileId, {
+              destinationOrigin: "https://approval-epoch.example.test",
+            })
+          ).content[0]!.text,
+        ),
+      );
+      const requestId = denied.error.grantRequest!.requestId;
+      const approval = browser.decideBrowserGrantRequest({
+        requestId,
+        decision: "retry",
+      });
+      await browser.profileInventoryStarted;
+      const archive = browser.archiveBrowserProfile({
+        hostId: "host-browser-test",
+        profileId: profile.profileId,
+      });
+      await expect(archive).resolves.toMatchObject({ outcome: "archived" });
+      browser.releaseProfileInventory();
+
+      await expect(approval).rejects.toThrow("lifecycle changed");
+      expect(await browser.inspectBrowserGrantRequest(requestId)).toMatchObject(
+        {
+          status: "revoked",
+        },
+      );
+    } finally {
+      browser.releaseProfileInventory();
+      await browser.dispose();
+      await rm(rootDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("R10-05 stale agent authorization fails closed when archive wins its inventory barrier", async () => {
+    const rootDirectory = await mkdtemp(
+      join(tmpdir(), "bb-browser-agent-epoch-"),
+    );
+    const profileStore = createFileBrowserProfileStore({
+      rootDirectory,
+      installationId: "installation-public-test",
+      lifecycle: { stopProfile: async () => undefined },
+    });
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+      profileStore,
+      deferProfileInventory: true,
+      deferProfileInventoryAfterCalls: 1,
+    });
+    try {
+      const profile = await browser.createBrowserProfile({
+        hostId: "host-browser-test",
+        name: "Agent epoch",
+      });
+      await browser.createBrowserGrant({
+        projectId: "project-browser-test",
+        hostId: "host-browser-test",
+        profileId: profile.profileId,
+        originScope: "https://agent-epoch.example.test",
+      });
+      const agent = browser.runBrowserScriptWithProfile(profile.profileId, {
+        destinationOrigin: "https://agent-epoch.example.test",
+      });
+      await browser.profileInventoryStarted;
+      await browser.archiveBrowserProfile({
+        hostId: "host-browser-test",
+        profileId: profile.profileId,
+      });
+      browser.releaseProfileInventory();
+
+      const denied = browserScriptFailureSchema.parse(
+        JSON.parse((await agent).content[0]!.text),
+      );
+      expect(denied.error).toMatchObject({
+        code: "repair_required",
+        message: "The requested Browser Profile is not available on this host.",
+      });
+    } finally {
+      browser.releaseProfileInventory();
+      await browser.dispose();
+      await rm(rootDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("R10-08 a stale concurrent selection cannot make a deleted profile current", async () => {
+    const rootDirectory = await mkdtemp(
+      join(tmpdir(), "bb-browser-delete-selection-"),
+    );
+    const profileStore = createFileBrowserProfileStore({
+      rootDirectory,
+      installationId: "installation-public-test",
+      lifecycle: { stopProfile: async () => undefined },
+    });
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+      profileStore,
+      deferProfileSelection: true,
+    });
+    try {
+      const profile = await browser.createBrowserProfile({
+        hostId: "host-browser-test",
+        name: "Selection race",
+      });
+      const selection = browser.selectBrowserProfile(
+        { hostId: "host-browser-test", profileId: profile.profileId },
+        {},
+      );
+      await browser.profileSelectionStarted;
+      await browser.deleteBrowserProfile({
+        hostId: "host-browser-test",
+        profileId: profile.profileId,
+        confirmation: profile.name,
+      });
+      browser.releaseProfileSelection();
+
+      await expect(selection).rejects.toThrow("lifecycle changed");
+      await expect(browser.runBrowserProfiles()).resolves.toMatchObject({
+        selectedProfileId: DEFAULT_PROFILE_ID,
+      });
+    } finally {
+      browser.releaseProfileSelection();
+      await browser.dispose();
+      await rm(rootDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("protects the Settings default, confirms credential loss, and fails closed for CLI mutations", async () => {
+    const rootDirectory = await mkdtemp(
+      join(tmpdir(), "bb-browser-public-lifecycle-"),
+    );
+    const profileStore = createFileBrowserProfileStore({
+      rootDirectory,
+      installationId: "installation-public-test",
+      lifecycle: { stopProfile: async () => undefined },
+    });
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+      profileStore,
+    });
+    try {
+      const profile = await browser.createBrowserProfile({
+        hostId: "host-browser-test",
+        name: "Delete target",
+      });
+      await browser.selectBrowserProfile(
+        { hostId: "host-browser-test", profileId: profile.profileId },
+        {},
+      );
+      const priorGrant = await browser.createBrowserGrant({
+        projectId: "project-browser-test",
+        hostId: "host-browser-test",
+        profileId: profile.profileId,
+        originScope: "https://reset-authority.example.test",
+      });
+      await expect(
+        browser.deleteBrowserProfile({
+          hostId: "host-browser-test",
+          profileId: profile.profileId,
+          confirmation: profile.name,
+        }),
+      ).rejects.toThrow("Select another default");
+      await expect(
+        browser.resetBrowserProfile({
+          hostId: "host-browser-test",
+          profileId: profile.profileId,
+          confirmation: "reset",
+        }),
+      ).rejects.toThrow("credential loss");
+      const reset = await browser.resetBrowserProfile({
+        hostId: "host-browser-test",
+        profileId: profile.profileId,
+        confirmation: RESET_PROFILE_CONFIRMATION,
+      });
+      expect(reset).toMatchObject({ outcome: "reset" });
+      if (!("profile" in reset)) throw new Error("Expected reset profile.");
+      expect(reset.profile.profileId).not.toBe(profile.profileId);
+      expect(
+        await browser.inspectBrowserGrant(priorGrant.grantId),
+      ).toMatchObject({ revokedAt: expect.any(String) });
+      await expect(
+        browser.listBrowserGrants({ profileId: reset.profile.profileId }),
+      ).resolves.toEqual([]);
+      await expect(browser.runBrowserProfiles()).resolves.toMatchObject({
+        selectedProfileId: reset.profile.profileId,
+      });
+
+      const cli = await browser.runBrowserCli([
+        "archive",
+        "--profile",
+        profile.profileId,
+      ]);
+      expect(cli).toMatchObject({ exitCode: 1 });
+      expect(cli.stderr).toContain("authenticated owner Settings");
+      expect(cli.stdout).toContain("Progress: not started");
+      expect(cli.stdout).toContain("State: archived");
+
+      await browser.selectBrowserProfile(
+        { hostId: "host-browser-test", profileId: DEFAULT_PROFILE_ID },
+        {},
+      );
+      await expect(
+        browser.deleteBrowserProfile({
+          hostId: "host-browser-test",
+          profileId: profile.profileId,
+          confirmation: profile.name,
+        }),
+      ).resolves.toMatchObject({ outcome: "deleted" });
+      await expect(
+        browser.deleteBrowserProfile({
+          hostId: "host-browser-test",
+          profileId: profile.profileId,
+          confirmation: profile.name,
+        }),
+      ).resolves.toMatchObject({ outcome: "already-deleted" });
+      const lifecycleRecords = (
+        await browser.runBrowserActivityRecords(profile.profileId)
+      ).filter(({ kind }) => kind === "lifecycle");
+      expect(
+        lifecycleRecords.map(({ action, outcome }) => ({ action, outcome })),
+      ).toEqual(
+        expect.arrayContaining([
+          { action: "reset", outcome: "reset" },
+          { action: "delete", outcome: "deleted" },
+        ]),
+      );
+      expect(JSON.stringify(lifecycleRecords)).not.toMatch(
+        /Delete target|Lose saved sessions|confirmation/i,
+      );
+    } finally {
+      await browser.dispose();
+      await rm(rootDirectory, { recursive: true, force: true });
+    }
+  });
+
   it("R7-06 shows an operation-specific recovery status while Settings waits for completion", async () => {
     let releaseBackup!: (result: BrowserProfileBackupResult) => void;
     const backupResult = new Promise<BrowserProfileBackupResult>((resolve) => {
@@ -2912,6 +3443,58 @@ describe("Browser public plugin contract", () => {
     );
     await settings.findByText(/Selected: profile-/);
     await browser.dispose();
+  });
+
+  it("shows destructive consequences, progress, recovery deadline, and final state in Settings", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+    });
+    await browser.createBrowserProfile({
+      hostId: "host-browser-test",
+      name: "Lifecycle UI target",
+    });
+    const settings = browser.renderSettings();
+    try {
+      expect(
+        await settings.findAllByText(/removes all agent authority immediately/),
+      ).toHaveLength(2);
+      fireEvent.click(
+        await settings.findByRole("button", {
+          name: "Archive Lifecycle UI target",
+        }),
+      );
+      await settings.findByText(/Archive in progress/);
+      await settings.findByText(/Recoverable until \d{4}-/);
+      fireEvent.click(
+        await settings.findByRole("button", {
+          name: "Restore Lifecycle UI target",
+        }),
+      );
+      await settings.findByText(/Restore in progress/);
+      await settings.findByRole("button", {
+        name: "Reset Lifecycle UI target",
+      });
+
+      const confirmation = settings.getByLabelText(
+        "Lifecycle confirmation Lifecycle UI target",
+      );
+      fireEvent.change(confirmation, {
+        target: { value: RESET_PROFILE_CONFIRMATION },
+      });
+      fireEvent.click(
+        settings.getByRole("button", { name: "Reset Lifecycle UI target" }),
+      );
+      await settings.findByText(/Browser Profile Lifecycle UI target is reset/);
+      await waitFor(() =>
+        expect(
+          settings.getAllByRole("region", {
+            name: "Lifecycle Lifecycle UI target",
+          }),
+        ).toHaveLength(2),
+      );
+    } finally {
+      await browser.dispose();
+    }
   });
 
   it("lets a panel choose a host-local Browser Profile", async () => {

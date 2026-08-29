@@ -37,15 +37,19 @@ import {
   browserPurgePlanSchema,
   browserPurgeResponseSchema,
   browserProfileCreateRequestSchema,
+  browserProfileDeleteRequestSchema,
   browserProfileBackupRequestSchema,
   browserProfileHostTargetSchema,
   browserProfileImportRequestSchema,
   browserProfileInventorySchema,
+  browserProfileLifecycleResponseSchema,
   browserProfileRenameRequestSchema,
+  browserProfileResetRequestSchema,
   browserProfileRecoveryResponseSchema,
   browserProfileRestoreRequestSchema,
   browserProfileSchema,
   browserProfileSelectRequestSchema,
+  browserProfileTargetSchema,
   browserProfileGrantCreateRequestSchema,
   browserProfileGrantQuerySchema,
   browserProfileGrantRevokeRequestSchema,
@@ -212,6 +216,9 @@ export async function createPublicPluginHarness(options?: {
   profileStore?: BrowserProfileStore;
   profileRecovery?: BrowserProfileRecovery;
   deferProjectLookup?: boolean;
+  deferProfileInventory?: boolean;
+  deferProfileInventoryAfterCalls?: number;
+  deferProfileSelection?: boolean;
   deferGrantRequestRpc?: (
     requests: BrowserGrantRequest[],
     callIndex: number,
@@ -237,6 +244,36 @@ export async function createPublicPluginHarness(options?: {
     options?.deferProjectLookup === true
       ? new Promise<void>((resolve) => {
           releaseProjectLookupGate = resolve;
+        })
+      : Promise.resolve();
+  let resolveProfileInventoryStarted: (() => void) | undefined;
+  let releaseProfileInventoryGate: (() => void) | undefined;
+  const profileInventoryStarted =
+    options?.deferProfileInventory === true
+      ? new Promise<void>((resolve) => {
+          resolveProfileInventoryStarted = resolve;
+        })
+      : Promise.resolve();
+  const profileInventoryGate =
+    options?.deferProfileInventory === true
+      ? new Promise<void>((resolve) => {
+          releaseProfileInventoryGate = resolve;
+        })
+      : Promise.resolve();
+  let profileInventoryDeferred = false;
+  let profileInventoryCalls = 0;
+  let resolveProfileSelectionStarted: (() => void) | undefined;
+  let releaseProfileSelectionGate: (() => void) | undefined;
+  const profileSelectionStarted =
+    options?.deferProfileSelection === true
+      ? new Promise<void>((resolve) => {
+          resolveProfileSelectionStarted = resolve;
+        })
+      : Promise.resolve();
+  const profileSelectionGate =
+    options?.deferProfileSelection === true
+      ? new Promise<void>((resolve) => {
+          releaseProfileSelectionGate = resolve;
         })
       : Promise.resolve();
   const hostRpcFailures = new Map<string, string>();
@@ -314,6 +351,7 @@ export async function createPublicPluginHarness(options?: {
     createFileBrowserProfileStore({
       rootDirectory: profileStorageRoot!,
       installationId: "installation-public-test",
+      lifecycle: { stopProfile: async () => undefined },
     });
   const profileRecovery =
     options?.profileRecovery ??
@@ -500,11 +538,23 @@ export async function createPublicPluginHarness(options?: {
         );
       }
       if (method === "listProfiles") {
-        return host.experimental_call(
+        const inventory = await host.experimental_call(
           "listProfiles",
           browserProfileHostTargetSchema.parse(input),
           { signal },
         );
+        profileInventoryCalls += 1;
+        const deferAfterCalls = options?.deferProfileInventoryAfterCalls ?? 0;
+        if (
+          options?.deferProfileInventory === true &&
+          !profileInventoryDeferred &&
+          profileInventoryCalls > deferAfterCalls
+        ) {
+          profileInventoryDeferred = true;
+          resolveProfileInventoryStarted?.();
+          await profileInventoryGate;
+        }
+        return inventory;
       }
       if (method === "createProfile") {
         return host.experimental_call(
@@ -521,9 +571,35 @@ export async function createPublicPluginHarness(options?: {
         );
       }
       if (method === "selectProfile") {
-        return host.experimental_call(
+        const inventory = await host.experimental_call(
           "selectProfile",
           browserProfileSelectRequestSchema.parse(input),
+          { signal },
+        );
+        if (options?.deferProfileSelection === true) {
+          resolveProfileSelectionStarted?.();
+          await profileSelectionGate;
+        }
+        return inventory;
+      }
+      if (method === "archiveProfile" || method === "restoreArchivedProfile") {
+        return host.experimental_call(
+          method,
+          browserProfileTargetSchema.parse(input),
+          { signal },
+        );
+      }
+      if (method === "resetProfile") {
+        return host.experimental_call(
+          method,
+          browserProfileResetRequestSchema.parse(input),
+          { signal },
+        );
+      }
+      if (method === "deleteProfile") {
+        return host.experimental_call(
+          method,
+          browserProfileDeleteRequestSchema.parse(input),
           { signal },
         );
       }
@@ -756,6 +832,45 @@ export async function createPublicPluginHarness(options?: {
         "browser_profile_select",
         input,
       ) as Promise<ReturnType<typeof browserProfileInventorySchema.parse>>,
+    browser_profile_archive: (input: { hostId: string; profileId: string }) =>
+      backend.harness.behavior.callRpc(
+        "browser_profile_archive",
+        input,
+      ) as Promise<
+        ReturnType<typeof browserProfileLifecycleResponseSchema.parse>
+      >,
+    browser_profile_restore_archived: (input: {
+      hostId: string;
+      profileId: string;
+    }) =>
+      backend.harness.behavior.callRpc(
+        "browser_profile_restore_archived",
+        input,
+      ) as Promise<
+        ReturnType<typeof browserProfileLifecycleResponseSchema.parse>
+      >,
+    browser_profile_reset: (input: {
+      hostId: string;
+      profileId: string;
+      confirmation: string;
+    }) =>
+      backend.harness.behavior.callRpc(
+        "browser_profile_reset",
+        input,
+      ) as Promise<
+        ReturnType<typeof browserProfileLifecycleResponseSchema.parse>
+      >,
+    browser_profile_delete: (input: {
+      hostId: string;
+      profileId: string;
+      confirmation: string;
+    }) =>
+      backend.harness.behavior.callRpc(
+        "browser_profile_delete",
+        input,
+      ) as Promise<
+        ReturnType<typeof browserProfileLifecycleResponseSchema.parse>
+      >,
     browser_profile_backup: (input: {
       hostId: string;
       profileId: string;
@@ -967,6 +1082,33 @@ export async function createPublicPluginHarness(options?: {
     const selectionContext =
       context === undefined ? { projectId: PROJECT_ID } : context;
     return rpc.browser_profile_select({ ...input, ...selectionContext });
+  }
+
+  function archiveBrowserProfile(input: { hostId: string; profileId: string }) {
+    return rpc.browser_profile_archive(input);
+  }
+
+  function restoreArchivedBrowserProfile(input: {
+    hostId: string;
+    profileId: string;
+  }) {
+    return rpc.browser_profile_restore_archived(input);
+  }
+
+  function resetBrowserProfile(input: {
+    hostId: string;
+    profileId: string;
+    confirmation: string;
+  }) {
+    return rpc.browser_profile_reset(input);
+  }
+
+  function deleteBrowserProfile(input: {
+    hostId: string;
+    profileId: string;
+    confirmation: string;
+  }) {
+    return rpc.browser_profile_delete(input);
   }
 
   function backupBrowserProfile(input: {
@@ -1280,6 +1422,14 @@ export async function createPublicPluginHarness(options?: {
     releaseProjectLookup() {
       releaseProjectLookupGate?.();
     },
+    profileInventoryStarted,
+    releaseProfileInventory() {
+      releaseProfileInventoryGate?.();
+    },
+    profileSelectionStarted,
+    releaseProfileSelection() {
+      releaseProfileSelectionGate?.();
+    },
     seedHostActivityEvent,
     runStatusCli,
     runStatusCliText,
@@ -1295,6 +1445,10 @@ export async function createPublicPluginHarness(options?: {
     createBrowserProfile,
     renameBrowserProfile,
     selectBrowserProfile,
+    archiveBrowserProfile,
+    restoreArchivedBrowserProfile,
+    resetBrowserProfile,
+    deleteBrowserProfile,
     backupBrowserProfile,
     restoreBrowserProfile,
     importBrowserProfile,

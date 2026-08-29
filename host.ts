@@ -1,4 +1,5 @@
 import { experimental_defineHostEntry } from "@get-bb/plugin-sdk/host";
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import {
   createActivityOutbox,
@@ -8,6 +9,7 @@ import { browserHostContract } from "./host-contract.js";
 import {
   createBrowserUserProfileOwnershipBoundary,
   createFileBrowserProfileStore,
+  type BrowserProfileLifecycleBoundary,
   type BrowserProfileStore,
 } from "./profile-storage.js";
 import {
@@ -16,6 +18,8 @@ import {
 } from "./profile-recovery.js";
 import {
   createFileHostAdministrationStateStore,
+  createHostAdministrationBoundary,
+  createProductionPrivilegedExecutor,
   createReadOnlyHostAdministrationBoundary,
   type HostAdministrationBoundary,
 } from "./host-operations.js";
@@ -38,7 +42,11 @@ export type HostSetupBoundary = HostReadinessBoundary;
 type HostBoundary = HostReadinessBoundary | HostAdministrationBoundary;
 type HostBoundarySource = HostBoundary | ((dataDir: string) => HostBoundary);
 type ProfileStoreSource =
-  BrowserProfileStore | ((dataDir: string) => BrowserProfileStore);
+  | BrowserProfileStore
+  | ((
+      dataDir: string,
+      lifecycle: BrowserProfileLifecycleBoundary,
+    ) => BrowserProfileStore);
 type ProfileRecoverySource =
   BrowserProfileRecovery | ((dataDir: string) => BrowserProfileRecovery);
 
@@ -99,6 +107,30 @@ async function recordScriptActivity(
   );
 }
 
+async function recordExpiredProfiles(
+  outbox: ActivityOutbox,
+  hostId: string,
+  profileIds: readonly string[],
+) {
+  for (const profileId of profileIds) {
+    await outbox.enqueue({
+      eventId: `host-lifecycle-${randomUUID()}`,
+      actor: "system",
+      projectId: null,
+      hostId,
+      profileId,
+      destinationOrigin: null,
+      occurredAt: new Date().toISOString(),
+      kind: "lifecycle",
+      action: "archive-expired",
+      outcome: "deleted",
+      interrupted: false,
+      interruptionReason: null,
+      durationMs: null,
+    });
+  }
+}
+
 export function createBrowserHostEntry(
   source: HostBoundarySource,
   profileSource?: ProfileStoreSource,
@@ -121,6 +153,13 @@ export function createBrowserHostEntry(
         });
     return retainedBoundary;
   }
+  function profileLifecycle(dataDir: string): BrowserProfileLifecycleBoundary {
+    return {
+      async stopProfile(hostId, profileId) {
+        await administration(dataDir).stopProfile({ hostId, profileId });
+      },
+    };
+  }
   function profiles(dataDir: string) {
     if (retainedProfiles !== undefined) return retainedProfiles;
     retainedProfiles =
@@ -128,9 +167,10 @@ export function createBrowserHostEntry(
         ? createFileBrowserProfileStore({
             rootDirectory: join(dataDir, "browser-profiles"),
             installationId: hostInstallationId(dataDir),
+            lifecycle: profileLifecycle(dataDir),
           })
         : typeof profileSource === "function"
-          ? profileSource(dataDir)
+          ? profileSource(dataDir, profileLifecycle(dataDir))
           : profileSource;
     return retainedProfiles;
   }
@@ -143,15 +183,17 @@ export function createBrowserHostEntry(
   }
   function recovery(dataDir: string) {
     if (retainedRecovery !== undefined) return retainedRecovery;
-    const stateStore = createFileHostAdministrationStateStore(dataDir);
     retainedRecovery =
       recoverySource === undefined
         ? createFileBrowserProfileRecovery({
             rootDirectory: join(dataDir, "browser-profiles"),
             installationId: hostInstallationId(dataDir),
             state: {
-              isProfileStopped: async (hostId) =>
-                (await stateStore.read(hostId))?.processesStopped === true,
+              isProfileStopped: (hostId, profileId) =>
+                administration(dataDir).isProfileStopped({
+                  hostId,
+                  profileId,
+                }),
               isDevBrowserProfileStopped: unverifiedDevBrowserProfileIsStopped,
             },
             ownership: createBrowserUserProfileOwnershipBoundary(),
@@ -242,7 +284,9 @@ export function createBrowserHostEntry(
           );
           if (
             !inventory.profiles.some(
-              (profile) => profile.profileId === request.profileId,
+              (profile) =>
+                profile.profileId === request.profileId &&
+                profile.state === "active",
             )
           ) {
             response = {
@@ -289,11 +333,19 @@ export function createBrowserHostEntry(
           limit,
         });
       },
-      listProfiles: (target, context) => {
+      listProfiles: async (target, context) => {
         retainWorker(context);
-        return profiles(context.experimental_paths.dataDir).listProfiles(
+        const store = profiles(context.experimental_paths.dataDir);
+        const inventory = await store.listProfiles(target.hostId);
+        if (inventory.profiles.length === 0) return inventory;
+        await store.reconcileProfileLifecycle(target.hostId);
+        const expired = await store.expireArchivedProfiles(target.hostId);
+        await recordExpiredProfiles(
+          outbox(context.experimental_paths.dataDir),
           target.hostId,
+          expired.deletedProfileIds,
         );
+        return store.listProfiles(target.hostId);
       },
       createProfile: async (request, context) => {
         retainWorker(context);
@@ -315,6 +367,43 @@ export function createBrowserHostEntry(
         const dataDir = context.experimental_paths.dataDir;
         await requireReadyForProfileMutation(administration(dataDir), request);
         return profiles(dataDir).selectProfile(request);
+      },
+      archiveProfile: async (request, context) => {
+        retainWorker(context);
+        const dataDir = context.experimental_paths.dataDir;
+        await requireReadyForProfileMutation(administration(dataDir), request);
+        return profiles(dataDir).archiveProfile(request);
+      },
+      restoreArchivedProfile: async (request, context) => {
+        retainWorker(context);
+        const dataDir = context.experimental_paths.dataDir;
+        await requireReadyForProfileMutation(administration(dataDir), request);
+        return profiles(dataDir).restoreArchivedProfile(request);
+      },
+      resetProfile: async (request, context) => {
+        retainWorker(context);
+        const dataDir = context.experimental_paths.dataDir;
+        await requireReadyForProfileMutation(administration(dataDir), request);
+        return profiles(dataDir).resetProfile(request);
+      },
+      deleteProfile: async (request, context) => {
+        retainWorker(context);
+        const dataDir = context.experimental_paths.dataDir;
+        await requireReadyForProfileMutation(administration(dataDir), request);
+        return profiles(dataDir).deleteProfile(request);
+      },
+      expireArchivedProfiles: async (request, context) => {
+        retainWorker(context);
+        const dataDir = context.experimental_paths.dataDir;
+        const expired = await profiles(dataDir).expireArchivedProfiles(
+          request.hostId,
+        );
+        await recordExpiredProfiles(
+          outbox(dataDir),
+          request.hostId,
+          expired.deletedProfileIds,
+        );
+        return expired;
       },
       backupProfile: async (request, context) => {
         retainWorker(context);
@@ -344,27 +433,35 @@ export function createBrowserHostEntry(
 
 export default createBrowserHostEntry(
   (dataDir) =>
-    createReadOnlyHostAdministrationBoundary({
+    createHostAdministrationBoundary({
       readiness: createHostReadinessBoundary(
         createDefaultHostSnapshotReader(dataDir),
       ),
       installationId: hostInstallationId(dataDir),
+      executor: createProductionPrivilegedExecutor(),
       stateStore: createFileHostAdministrationStateStore(dataDir),
     }),
-  (dataDir) =>
+  (dataDir, lifecycle) =>
     createFileBrowserProfileStore({
       rootDirectory: BROWSER_STORAGE_ROOT,
       installationId: hostInstallationId(dataDir),
       ownership: createBrowserUserProfileOwnershipBoundary(),
+      lifecycle,
     }),
   (dataDir) =>
     createFileBrowserProfileRecovery({
       rootDirectory: BROWSER_STORAGE_ROOT,
       installationId: hostInstallationId(dataDir),
       state: {
-        isProfileStopped: async (hostId) =>
-          (await createFileHostAdministrationStateStore(dataDir).read(hostId))
-            ?.processesStopped === true,
+        isProfileStopped: (hostId, profileId) =>
+          createHostAdministrationBoundary({
+            readiness: createHostReadinessBoundary(
+              createDefaultHostSnapshotReader(dataDir),
+            ),
+            installationId: hostInstallationId(dataDir),
+            executor: createProductionPrivilegedExecutor(),
+            stateStore: createFileHostAdministrationStateStore(dataDir),
+          }).isProfileStopped({ hostId, profileId }),
         isDevBrowserProfileStopped: unverifiedDevBrowserProfileIsStopped,
       },
       ownership: createBrowserUserProfileOwnershipBoundary(),

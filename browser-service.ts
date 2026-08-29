@@ -30,12 +30,14 @@ import {
   browserScriptParametersSchema,
   ACTIVITY_OUTBOX_BATCH_LIMIT,
   CLEAR_ACTIVITY_CONFIRMATION,
+  RESET_PROFILE_CONFIRMATION,
   browserProfileUnavailableStatus,
   DEFAULT_PROFILE_ID,
   hostOfflineStatus,
   hostProbeFailedStatus,
   setupRequiredStatus,
   type BrowserHostTarget,
+  type BrowserActivityEvent,
   type BrowserActivityRecord,
   type BrowserActivityExport,
   type BrowserActivityClearResponse,
@@ -45,14 +47,18 @@ import {
   type BrowserLifecycleRequest,
   type BrowserProfile,
   type BrowserProfileCreateRequest,
+  type BrowserProfileDeleteRequest,
   type BrowserProfileBackupRequest,
   type BrowserProfileImportRequest,
   type BrowserProfileInventory,
+  type BrowserProfileLifecycleResponse,
   type BrowserProfileQuery,
   type BrowserProfileRenameRequest,
+  type BrowserProfileResetRequest,
   type BrowserProfileRecoveryResponse,
   type BrowserProfileRestoreRequest,
   type BrowserProfileSelectRequest,
+  type BrowserProfileTarget,
   type BrowserProfileSelectionRequest,
   type BrowserPurgePlan,
   type BrowserPurgeRequest,
@@ -211,6 +217,25 @@ type BrowserIdentity = {
   hostId?: string;
 };
 type ProfileContext = Pick<BrowserProfileQuery, "projectId" | "threadId">;
+type ProfileAuthoritySnapshot = {
+  key: string;
+  epoch: number;
+};
+
+function expiredLifecycleProfileIds(events: readonly BrowserActivityEvent[]) {
+  return [
+    ...new Set(
+      events
+        .filter(
+          (event) =>
+            event.kind === "lifecycle" &&
+            event.action === "archive-expired" &&
+            event.outcome === "deleted",
+        )
+        .map(({ profileId }) => profileId),
+    ),
+  ];
+}
 
 type ProfileHostCall = {
   createProfile: {
@@ -236,6 +261,22 @@ type ProfileHostCall = {
   importProfile: {
     request: BrowserProfileImportRequest;
     response: BrowserProfileRecoveryResponse;
+  };
+  archiveProfile: {
+    request: BrowserProfileTarget;
+    response: BrowserProfileLifecycleResponse;
+  };
+  restoreArchivedProfile: {
+    request: BrowserProfileTarget;
+    response: BrowserProfileLifecycleResponse;
+  };
+  resetProfile: {
+    request: BrowserProfileResetRequest;
+    response: BrowserProfileLifecycleResponse;
+  };
+  deleteProfile: {
+    request: BrowserProfileDeleteRequest;
+    response: BrowserProfileLifecycleResponse;
   };
 };
 
@@ -275,13 +316,18 @@ function inventoryWithSelectedProfile(
   inventory: BrowserProfileInventory,
   preferredProfileId: string | null,
 ): BrowserProfileInventory {
+  const activeProfiles = inventory.profiles.filter(
+    (profile) => profile.state === "active",
+  );
   const selectedProfileId =
     preferredProfileId !== null &&
-    inventory.profiles.some(
-      (profile) => profile.profileId === preferredProfileId,
-    )
+    activeProfiles.some((profile) => profile.profileId === preferredProfileId)
       ? preferredProfileId
-      : DEFAULT_PROFILE_ID;
+      : (activeProfiles.find(
+          ({ profileId }) => profileId === DEFAULT_PROFILE_ID,
+        )?.profileId ??
+        activeProfiles[0]?.profileId ??
+        DEFAULT_PROFILE_ID);
   return {
     ...inventory,
     selectedProfileId,
@@ -431,6 +477,8 @@ export function createBrowserService(
     onGrantRequestEvent: (event) => recordGrantRequestActivity(event),
   });
   const activeGrantCalls = new Map<string, Set<AbortController>>();
+  const profileLifecycleEpochs = new Map<string, number>();
+  const inactiveProfileKeys = new Set<string>();
   let grantStateQueue: Promise<void> = Promise.resolve();
   const host = bb.hosts.experimental_client({ contract: browserHostContract });
 
@@ -447,6 +495,58 @@ export function createBrowserService(
       () => undefined,
     );
     return next;
+  }
+
+  function profileAuthorityKey(target: {
+    hostId: string;
+    installationId: string;
+    profileId: string;
+  }) {
+    return `${target.hostId}\u0000${target.installationId}\u0000${target.profileId}`;
+  }
+
+  function profileAuthoritySnapshot(target: {
+    hostId: string;
+    installationId: string;
+    profileId: string;
+  }): ProfileAuthoritySnapshot {
+    const key = profileAuthorityKey(target);
+    return { key, epoch: profileLifecycleEpochs.get(key) ?? 0 };
+  }
+
+  function assertProfileAuthorityCurrent(snapshot: ProfileAuthoritySnapshot) {
+    if (!profileAuthorityIsCurrent(snapshot)) {
+      throw new Error(
+        "Browser Profile lifecycle changed before authority could commit.",
+      );
+    }
+  }
+
+  function profileAuthorityIsCurrent(snapshot: ProfileAuthoritySnapshot) {
+    return (
+      !inactiveProfileKeys.has(snapshot.key) &&
+      (profileLifecycleEpochs.get(snapshot.key) ?? 0) === snapshot.epoch
+    );
+  }
+
+  function markProfileAuthorityInactive(target: {
+    hostId: string;
+    installationId: string;
+    profileId: string;
+  }) {
+    const key = profileAuthorityKey(target);
+    profileLifecycleEpochs.set(key, (profileLifecycleEpochs.get(key) ?? 0) + 1);
+    inactiveProfileKeys.add(key);
+  }
+
+  function markProfileAuthorityActive(target: {
+    hostId: string;
+    installationId: string;
+    profileId: string;
+  }) {
+    const key = profileAuthorityKey(target);
+    profileLifecycleEpochs.set(key, (profileLifecycleEpochs.get(key) ?? 0) + 1);
+    inactiveProfileKeys.delete(key);
   }
 
   function trackGrantCall(grantId: string, controller: AbortController) {
@@ -552,6 +652,41 @@ export function createBrowserService(
     return [...new Set([...acknowledgedEventIds, ...acceptedEventIds])];
   }
 
+  async function ingestHostActivityBatch(
+    hostId: string,
+    batch: Awaited<ReturnType<typeof reconcileActivityBatch>>,
+    signal?: AbortSignal,
+  ) {
+    const events = batch.map(activityEventFromOutboxItem);
+    const expiredProfileIds = expiredLifecycleProfileIds(events);
+    if (expiredProfileIds.length === 0) return activityStore.ingest(events);
+    const inventory = await callActivityTransport(() =>
+      host.call("listProfiles", { hostId }, { hostId, signal }),
+    );
+    return database.transaction(() =>
+      reconcileExpiredProfileAuthority(
+        hostId,
+        inventory.installationId,
+        expiredProfileIds,
+        events,
+      ),
+    )();
+  }
+
+  function reconcileExpiredProfileAuthority(
+    hostId: string,
+    installationId: string,
+    profileIds: readonly string[],
+    events: readonly BrowserActivityEvent[],
+  ) {
+    for (const profileId of profileIds) {
+      const target = { hostId, installationId, profileId };
+      markProfileAuthorityInactive(target);
+      revokeProfileAuthority(target, "profile-deleted");
+    }
+    return activityStore.ingest(events);
+  }
+
   async function syncActivityBatch(
     hostId: string,
     acknowledgedEventIds: readonly string[],
@@ -574,8 +709,10 @@ export function createBrowserService(
       ),
     );
     if (batch.length === 0) return [];
-    const acceptedEventIds = activityStore.ingest(
-      batch.map(activityEventFromOutboxItem),
+    const acceptedEventIds = await ingestHostActivityBatch(
+      hostId,
+      batch,
+      signal,
     );
     await acknowledgeActivityBatch(hostId, acceptedEventIds, signal);
     return acceptedEventIds;
@@ -618,7 +755,11 @@ export function createBrowserService(
 
   function recordSystemGrantRevocation(
     grant: BrowserProfileGrant,
-    action: "project-deleted" | "profile-deleted",
+    action:
+      | "project-deleted"
+      | "profile-archived"
+      | "profile-reset"
+      | "profile-deleted",
   ) {
     activityProducers.grant({
       eventId: newActivityEventId("system"),
@@ -683,14 +824,28 @@ export function createBrowserService(
     call: AgentScriptCall,
     installationId: string,
   ) {
+    revokeProfileAuthority(
+      {
+        hostId: call.hostId,
+        profileId: call.profileId,
+        installationId,
+      },
+      "profile-deleted",
+    );
+  }
+
+  function revokeProfileAuthority(
+    target: BrowserProfileTarget & { installationId: string },
+    action: "profile-archived" | "profile-reset" | "profile-deleted",
+  ) {
     const revoked = grantStore.revokeProfile({
-      hostId: call.hostId,
-      installationId,
-      profileId: call.profileId,
+      hostId: target.hostId,
+      installationId: target.installationId,
+      profileId: target.profileId,
     });
     for (const grant of revoked) {
       abortGrantCalls(grant.grantId);
-      recordSystemGrantRevocation(grant, "profile-deleted");
+      recordSystemGrantRevocation(grant, action);
     }
   }
 
@@ -843,15 +998,49 @@ export function createBrowserService(
         }),
       };
     }
-    const decision: BrowserAuthorizationDecision = grantStore.authorize({
-      projectId: call.context.projectId,
+    if (profile.state !== "active") {
+      revokeProfileAuthority(
+        {
+          hostId: call.hostId,
+          profileId: call.profileId,
+          installationId: inventory.installationId,
+        },
+        "profile-archived",
+      );
+      return {
+        ok: false as const,
+        error: browserProfileUnavailableStatus({
+          hostId: call.hostId,
+          profileId: call.profileId,
+        }),
+      };
+    }
+    const target = {
       hostId: call.hostId,
       installationId: inventory.installationId,
       profileId: call.profileId,
-      origin: call.parameters.destinationOrigin ?? "",
-      fileTransfer: call.parameters.fileTransfer,
-      invalidCertificate: call.parameters.invalidCertificate,
-    });
+    };
+    const snapshot = profileAuthoritySnapshot(target);
+    const decision: BrowserAuthorizationDecision | null =
+      await withGrantStateSerialization(() => {
+        if (!profileAuthorityIsCurrent(snapshot)) return null;
+        return grantStore.authorize({
+          projectId: call.context.projectId,
+          ...target,
+          origin: call.parameters.destinationOrigin ?? "",
+          fileTransfer: call.parameters.fileTransfer,
+          invalidCertificate: call.parameters.invalidCertificate,
+        });
+      });
+    if (decision === null) {
+      return {
+        ok: false as const,
+        error: browserProfileUnavailableStatus({
+          hostId: call.hostId,
+          profileId: call.profileId,
+        }),
+      };
+    }
     return authorizationResult(call, decision);
   }
 
@@ -1034,7 +1223,10 @@ export function createBrowserService(
     }
     const inventory = await profileInventory({ hostId }, signal);
     if (
-      !inventory.profiles.some((profile) => profile.profileId === profileId)
+      !inventory.profiles.some(
+        (profile) =>
+          profile.profileId === profileId && profile.state === "active",
+      )
     ) {
       return browserProfileUnavailableStatus({ hostId, profileId });
     }
@@ -1068,10 +1260,20 @@ export function createBrowserService(
     const profileId = preferredProfileId ?? DEFAULT_PROFILE_ID;
     if (preferredProfileId !== null) {
       const inventory = await profileInventory({ ...identity, hostId }, signal);
-      if (
-        !inventory.profiles.some((profile) => profile.profileId === profileId)
-      ) {
+      const preferred = inventory.profiles.find(
+        (profile) => profile.profileId === profileId,
+      );
+      if (preferred === undefined) {
         return browserProfileUnavailableStatus({ hostId, profileId });
+      }
+      if (preferred.state === "archived") {
+        saveSelectedProfilePreference(
+          database,
+          projectId,
+          hostId,
+          inventory.selectedProfileId,
+        );
+        return hostStatus(hostId, inventory.selectedProfileId, signal);
       }
     }
     return hostStatus(hostId, profileId, signal);
@@ -1141,6 +1343,11 @@ export function createBrowserService(
         `Browser Profile ${request.profileId} is not available on host ${request.hostId}.`,
       );
     }
+    if (profile.state !== "active") {
+      throw new Error(
+        `Archived Profile ${request.profileId} must be restored before granting access.`,
+      );
+    }
     if (
       request.installationId !== undefined &&
       request.installationId !== inventory.installationId
@@ -1149,7 +1356,16 @@ export function createBrowserService(
         "The requested Browser Profile installation is no longer current.",
       );
     }
-    return { inventory, profile, projectGeneration };
+    return {
+      inventory,
+      profile,
+      projectGeneration,
+      authoritySnapshot: profileAuthoritySnapshot({
+        hostId: request.hostId,
+        installationId: inventory.installationId,
+        profileId: request.profileId,
+      }),
+    };
   }
 
   async function grants(
@@ -1221,7 +1437,8 @@ export function createBrowserService(
     signal?: AbortSignal,
   ) {
     requireOwnerSettingsAuthority(authority);
-    const { inventory, projectGeneration } = await grantTarget(request, signal);
+    const { inventory, projectGeneration, authoritySnapshot } =
+      await grantTarget(request, signal);
     const target = {
       hostId: request.hostId,
       profileId: request.profileId,
@@ -1233,6 +1450,7 @@ export function createBrowserService(
       projectId: request.projectId,
       operation: () =>
         withGrantStateSerialization(() => {
+          assertProfileAuthorityCurrent(authoritySnapshot);
           if (
             grantStore.projectGeneration(request.projectId) !==
             projectGeneration
@@ -1292,14 +1510,46 @@ export function createBrowserService(
     return request === null ? null : request;
   }
 
+  async function grantRequestAuthoritySnapshot(pending: BrowserGrantRequest) {
+    const inventory = await profileInventory({ hostId: pending.hostId });
+    const profile = inventory.profiles.find(
+      ({ profileId }) => profileId === pending.profileId,
+    );
+    if (
+      profile?.state !== "active" ||
+      inventory.installationId !== pending.installationId
+    ) {
+      throw new Error(
+        `Browser Profile ${pending.profileId} lifecycle changed before approval could commit.`,
+      );
+    }
+    return profileAuthoritySnapshot({
+      hostId: pending.hostId,
+      installationId: pending.installationId,
+      profileId: pending.profileId,
+    });
+  }
+
   async function decideGrantRequest(
     authority: unknown,
     request: BrowserGrantRequestDecisionRequest,
   ): Promise<BrowserGrantRequestDecisionResponse> {
     requireOwnerSettingsAuthority(authority);
     const parsed = browserGrantRequestDecisionRequestSchema.parse(request);
+    const pending = grantStore.inspectRequest(parsed.requestId);
+    if (parsed.decision === "deny" || pending?.status !== "pending") {
+      return browserGrantRequestDecisionResponseSchema.parse(
+        await withGrantStateSerialization(() =>
+          grantStore.decideRequest(parsed),
+        ),
+      );
+    }
+    const snapshot = await grantRequestAuthoritySnapshot(pending);
     return browserGrantRequestDecisionResponseSchema.parse(
-      await withGrantStateSerialization(() => grantStore.decideRequest(parsed)),
+      await withGrantStateSerialization(() => {
+        assertProfileAuthorityCurrent(snapshot);
+        return grantStore.decideRequest(parsed);
+      }),
     );
   }
 
@@ -1362,12 +1612,20 @@ export function createBrowserService(
           signal,
         );
         const projectId = await profileContextProjectId(bb, request);
-        saveSelectedProfilePreference(
-          database,
-          projectId,
-          request.hostId,
-          request.profileId,
-        );
+        const snapshot = profileAuthoritySnapshot({
+          hostId: request.hostId,
+          installationId: inventory.installationId,
+          profileId: request.profileId,
+        });
+        await withGrantStateSerialization(() => {
+          assertProfileAuthorityCurrent(snapshot);
+          saveSelectedProfilePreference(
+            database,
+            projectId,
+            request.hostId,
+            request.profileId,
+          );
+        });
         return inventoryWithSelectedProfile(inventory, request.profileId);
       },
     );
@@ -1407,6 +1665,249 @@ export function createBrowserService(
         response.outcome === "imported"
           ? { hostId: request.hostId, profileId: response.profileId }
           : { hostId: request.hostId, profileId: DEFAULT_PROFILE_ID },
+    );
+  }
+
+  async function lifecycleProfile(
+    request: BrowserProfileTarget,
+    signal?: AbortSignal,
+  ) {
+    const inventory = await profileInventory(
+      { hostId: request.hostId },
+      signal,
+    );
+    const profile = inventory.profiles.find(
+      ({ profileId }) => profileId === request.profileId,
+    );
+    if (profile === undefined) {
+      throw new Error(
+        `Browser Profile ${request.profileId} is not available on host ${request.hostId}.`,
+      );
+    }
+    return { inventory, profile };
+  }
+
+  function replaceProfilePreferences(
+    target: BrowserProfileTarget,
+    inventory: BrowserProfileInventory,
+  ) {
+    const fallback = inventory.profiles.find(
+      (profile) =>
+        profile.profileId !== target.profileId && profile.state === "active",
+    );
+    if (fallback === undefined) return;
+    database
+      .prepare(
+        "UPDATE browser_preferences SET profile_id = ? WHERE host_id = ? AND profile_id = ?",
+      )
+      .run(fallback.profileId, target.hostId, target.profileId);
+  }
+
+  function settingsDefaultProfileId(hostId: string) {
+    return (
+      selectedProfilePreference(database, SETTINGS_PROJECT_ID, hostId) ??
+      DEFAULT_PROFILE_ID
+    );
+  }
+
+  async function runDestructiveProfileLifecycle(
+    request: BrowserProfileTarget,
+    inventory: BrowserProfileInventory,
+    action: "profile-archived" | "profile-reset" | "profile-deleted",
+    operation: () => Promise<BrowserProfileLifecycleResponse>,
+  ) {
+    return withGrantStateSerialization(async () => {
+      const target = { ...request, installationId: inventory.installationId };
+      markProfileAuthorityInactive(target);
+      revokeProfileAuthority(target, action);
+      return operation();
+    });
+  }
+
+  async function archiveProfile(
+    authority: unknown,
+    request: BrowserProfileTarget,
+    signal?: AbortSignal,
+  ) {
+    requireOwnerSettingsAuthority(authority);
+    const { inventory } = await lifecycleProfile(request, signal);
+    return recordProfileLifecycleActivity(request, "archive", async () => {
+      const response = await runDestructiveProfileLifecycle(
+        request,
+        inventory,
+        "profile-archived",
+        () => callConnectedProfile("archiveProfile", request, signal),
+      );
+      replaceProfilePreferences(request, inventory);
+      return response;
+    });
+  }
+
+  async function restoreArchivedProfile(
+    authority: unknown,
+    request: BrowserProfileTarget,
+    signal?: AbortSignal,
+  ) {
+    requireOwnerSettingsAuthority(authority);
+    const { inventory } = await lifecycleProfile(request, signal);
+    return recordProfileLifecycleActivity(
+      request,
+      "restore-archived",
+      async () => {
+        const response = await callConnectedProfile(
+          "restoreArchivedProfile",
+          request,
+          signal,
+        );
+        await withGrantStateSerialization(() =>
+          markProfileAuthorityActive({
+            ...request,
+            installationId: inventory.installationId,
+          }),
+        );
+        return response;
+      },
+    );
+  }
+
+  async function resetProfile(
+    authority: unknown,
+    request: BrowserProfileResetRequest,
+    signal?: AbortSignal,
+  ) {
+    requireOwnerSettingsAuthority(authority);
+    if (request.confirmation !== RESET_PROFILE_CONFIRMATION) {
+      throw new Error(
+        `Type exactly "${RESET_PROFILE_CONFIRMATION}" to confirm credential loss.`,
+      );
+    }
+    const { inventory } = await lifecycleProfile(request, signal);
+    return recordProfileLifecycleActivity(request, "reset", async () => {
+      const response = await runDestructiveProfileLifecycle(
+        request,
+        inventory,
+        "profile-reset",
+        () => callConnectedProfile("resetProfile", request, signal),
+      );
+      await withGrantStateSerialization(() =>
+        preserveResetProfileIntent(request, inventory, response),
+      );
+      return response;
+    });
+  }
+
+  function preserveResetProfileIntent(
+    request: BrowserProfileTarget,
+    inventory: BrowserProfileInventory,
+    response: BrowserProfileLifecycleResponse,
+  ) {
+    if (!("profile" in response)) return;
+    database
+      .prepare(
+        "UPDATE browser_preferences SET profile_id = ? WHERE host_id = ? AND profile_id = ?",
+      )
+      .run(response.profile.profileId, request.hostId, request.profileId);
+    markProfileAuthorityActive({
+      hostId: request.hostId,
+      installationId: inventory.installationId,
+      profileId: response.profile.profileId,
+    });
+  }
+
+  function profileDeletionTarget(
+    request: BrowserProfileTarget,
+    inventory: BrowserProfileInventory,
+  ) {
+    return { ...request, installationId: inventory.installationId };
+  }
+
+  async function deleteMissingProfileAuthority(
+    request: Omit<BrowserProfileDeleteRequest, "defaultProfileId">,
+    inventory: BrowserProfileInventory,
+    signal?: AbortSignal,
+  ) {
+    return withGrantStateSerialization(async () => {
+      const target = profileDeletionTarget(request, inventory);
+      markProfileAuthorityInactive(target);
+      revokeProfileAuthority(target, "profile-deleted");
+      const response = await callConnectedProfile(
+        "deleteProfile",
+        {
+          ...request,
+          defaultProfileId: settingsDefaultProfileId(request.hostId),
+        },
+        signal,
+      );
+      replaceProfilePreferences(request, inventory);
+      return response;
+    });
+  }
+
+  function assertProfileDeleteRequest(
+    profile: BrowserProfile,
+    request: Omit<BrowserProfileDeleteRequest, "defaultProfileId">,
+  ) {
+    if (request.confirmation !== profile.name) {
+      throw new Error(`Type the exact Browser Profile name "${profile.name}".`);
+    }
+    if (settingsDefaultProfileId(request.hostId) === request.profileId) {
+      throw new Error(
+        "Select another default Browser Profile before permanent deletion.",
+      );
+    }
+  }
+
+  function deletionFallbackProfileId(request: BrowserProfileTarget) {
+    const profileId = settingsDefaultProfileId(request.hostId);
+    if (profileId === request.profileId) {
+      throw new Error(
+        "Select another default Browser Profile before permanent deletion.",
+      );
+    }
+    return profileId;
+  }
+
+  async function deleteExistingProfile(
+    request: Omit<BrowserProfileDeleteRequest, "defaultProfileId">,
+    inventory: BrowserProfileInventory,
+    signal?: AbortSignal,
+  ) {
+    return withGrantStateSerialization(async () => {
+      const defaultProfileId = deletionFallbackProfileId(request);
+      const target = profileDeletionTarget(request, inventory);
+      markProfileAuthorityInactive(target);
+      revokeProfileAuthority(target, "profile-deleted");
+      const response = await callConnectedProfile(
+        "deleteProfile",
+        { ...request, defaultProfileId },
+        signal,
+      );
+      replaceProfilePreferences(request, inventory);
+      return response;
+    });
+  }
+
+  async function deleteProfile(
+    authority: unknown,
+    request: Omit<BrowserProfileDeleteRequest, "defaultProfileId">,
+    signal?: AbortSignal,
+  ) {
+    requireOwnerSettingsAuthority(authority);
+    const inventory = await profileInventory(
+      { hostId: request.hostId },
+      signal,
+    );
+    const profile = inventory.profiles.find(
+      ({ profileId }) => profileId === request.profileId,
+    );
+    if (profile === undefined) {
+      return recordProfileLifecycleActivity(request, "delete", () =>
+        deleteMissingProfileAuthority(request, inventory, signal),
+      );
+    }
+    assertProfileDeleteRequest(profile, request);
+    return recordProfileLifecycleActivity(request, "delete", () =>
+      deleteExistingProfile(request, inventory, signal),
     );
   }
 
@@ -1516,6 +2017,20 @@ export function createBrowserService(
       operation,
       outcome: () => "succeeded",
       successTarget,
+    });
+  }
+
+  function recordProfileLifecycleActivity(
+    target: BrowserHostTarget,
+    action: string,
+    operation: () => Promise<BrowserProfileLifecycleResponse>,
+  ) {
+    return recordActivity({
+      target,
+      kind: "lifecycle",
+      action,
+      operation,
+      outcome: ({ outcome }) => outcome,
     });
   }
 
@@ -1681,6 +2196,10 @@ export function createBrowserService(
     backupProfile,
     restoreProfile,
     importProfile,
+    archiveProfile,
+    restoreArchivedProfile,
+    resetProfile,
+    deleteProfile,
     resolveTarget,
     settingsStatuses,
     setup,

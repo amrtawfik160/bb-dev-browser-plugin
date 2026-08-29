@@ -20,15 +20,23 @@ import {
   browserProfileManifestSchema,
   browserProfileNameSchema,
   DEFAULT_PROFILE_ID,
+  PROFILE_ARCHIVE_RETENTION_DAYS,
   PROFILE_DEFAULT_LOCALE,
   PROFILE_DEFAULT_TIMEZONE,
   PROFILE_MANIFEST_VERSION,
+  RESET_PROFILE_CONFIRMATION,
   type BrowserProfile,
   type BrowserProfileCreateRequest,
+  type BrowserProfileDeleteRequest,
+  type BrowserProfileExpiryResponse,
   type BrowserProfileInventory,
+  type BrowserProfileLifecycleProgress,
+  type BrowserProfileLifecycleResponse,
   type BrowserProfileManifest,
   type BrowserProfileRenameRequest,
+  type BrowserProfileResetRequest,
   type BrowserProfileSelectRequest,
+  type BrowserProfileTarget,
 } from "./contracts.js";
 
 const PROFILE_DIRECTORY_MODE = 0o700;
@@ -48,6 +56,19 @@ const legacyProfileManifestSchema = z
   })
   .strict();
 
+const profileLifecycleJournalSchema = z
+  .object({
+    operation: z.enum(["archive", "restore", "reset", "delete"]),
+    hostId: z.string().min(1),
+    profileId: browserProfileIdSchema,
+    startedAt: z.string().datetime(),
+    phase: z.enum(["planned", "stopped"]),
+    replacementProfileId: browserProfileIdSchema.optional(),
+  })
+  .strict();
+
+type ProfileLifecycleJournal = z.infer<typeof profileLifecycleJournalSchema>;
+
 export interface ProfileStoragePaths {
   hostStoragePath: string;
   profilesDirectory: string;
@@ -56,6 +77,18 @@ export interface ProfileStoragePaths {
   manifestBackupPath: string;
   selectionPath: string;
   browserDataPath: string;
+  downloadsDirectory: string;
+  runtimeManifestsDirectory: string;
+  runtimeManifestPath: string;
+  lifecycleDirectory: string;
+  lifecycleJournalPath: string;
+}
+
+export interface BrowserProfileLifecycleBoundary {
+  stopProfile(hostId: string, profileId: string): Promise<void>;
+  reportProgress?(
+    progress: BrowserProfileLifecycleProgress,
+  ): void | Promise<void>;
 }
 
 export interface BrowserProfileStore {
@@ -66,6 +99,20 @@ export interface BrowserProfileStore {
   selectProfile(
     request: BrowserProfileSelectRequest,
   ): Promise<BrowserProfileInventory>;
+  archiveProfile(
+    request: BrowserProfileTarget,
+  ): Promise<BrowserProfileLifecycleResponse>;
+  restoreArchivedProfile(
+    request: BrowserProfileTarget,
+  ): Promise<BrowserProfileLifecycleResponse>;
+  resetProfile(
+    request: BrowserProfileResetRequest,
+  ): Promise<BrowserProfileLifecycleResponse>;
+  deleteProfile(
+    request: BrowserProfileDeleteRequest,
+  ): Promise<BrowserProfileLifecycleResponse>;
+  expireArchivedProfiles(hostId: string): Promise<BrowserProfileExpiryResponse>;
+  reconcileProfileLifecycle(hostId: string): Promise<void>;
 }
 
 export interface FileBrowserProfileStoreOptions {
@@ -74,6 +121,7 @@ export interface FileBrowserProfileStoreOptions {
   clock?: () => Date;
   idFactory?: () => string;
   ownership?: ProfileStorageOwnershipBoundary;
+  lifecycle?: BrowserProfileLifecycleBoundary;
 }
 
 export interface ProfileStorageOwner {
@@ -204,7 +252,10 @@ export type BrowserProfileErrorCode =
   | "profile-unsupported-version"
   | "profile-id-conflict"
   | "profile-lock-timeout"
-  | "profile-settings-invalid";
+  | "profile-settings-invalid"
+  | "profile-confirmation-required"
+  | "profile-default-protected"
+  | "profile-archive-expired";
 
 export class BrowserProfileError extends Error {
   constructor(
@@ -247,6 +298,19 @@ function profilePaths(
     manifestBackupPath: join(profileDirectory, "manifest.json.v0.bak"),
     selectionPath: join(hostStoragePath, "selection.json"),
     browserDataPath: join(profileDirectory, "chrome-data"),
+    downloadsDirectory: join(hostStoragePath, "downloads", profileId),
+    runtimeManifestsDirectory: join(hostStoragePath, "runtime-manifests"),
+    runtimeManifestPath: join(
+      hostStoragePath,
+      "runtime-manifests",
+      `${profileId}.json`,
+    ),
+    lifecycleDirectory: join(hostStoragePath, "profile-lifecycle"),
+    lifecycleJournalPath: join(
+      hostStoragePath,
+      "profile-lifecycle",
+      `${profileId}.json`,
+    ),
   };
 }
 
@@ -375,6 +439,8 @@ function profileManifest(
     createdAt: timestamp,
     updatedAt: timestamp,
     state: "active",
+    archivedAt: null,
+    expiresAt: null,
     startup: startupConfiguration(),
     storage: {
       owner: "bb-browser",
@@ -494,6 +560,8 @@ function migratedManifest(raw: unknown): {
       version: PROFILE_MANIFEST_VERSION,
       ...settings,
       state: "active",
+      archivedAt: null,
+      expiresAt: null,
       startup: startupConfiguration(),
       storage: {
         owner: "bb-browser",
@@ -522,15 +590,71 @@ function delay(milliseconds: number) {
   return new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
 }
 
+const profileLockOwnerSchema = z
+  .object({ pid: z.number().int().positive() })
+  .strict();
+
+function isMissingFilesystemPath(error: unknown) {
+  return error instanceof Error && "code" in error && error.code === "ENOENT";
+}
+
+async function deadProfileLock(path: string) {
+  let owner: z.infer<typeof profileLockOwnerSchema>;
+  try {
+    owner = profileLockOwnerSchema.parse(
+      JSON.parse(await readFile(path, "utf8")),
+    );
+  } catch (error) {
+    if (error instanceof SyntaxError || error instanceof z.ZodError)
+      return false;
+    if (isMissingFilesystemPath(error)) return false;
+    throw error;
+  }
+  try {
+    process.kill(owner.pid, 0);
+    return false;
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ESRCH") {
+      return true;
+    }
+    if (error instanceof Error && "code" in error && error.code === "EPERM") {
+      return false;
+    }
+    throw error;
+  }
+}
+
+async function removeDeadProfileLock(path: string) {
+  if (!(await deadProfileLock(path))) return;
+  try {
+    await unlink(path);
+  } catch (error) {
+    if (!isMissingFilesystemPath(error)) throw error;
+  }
+}
+
+async function createProfileLock(path: string) {
+  const handle = await open(path, "wx", 0o600);
+  let initialized = false;
+  try {
+    await handle.writeFile(JSON.stringify({ pid: process.pid }), "utf8");
+    await handle.sync();
+    initialized = true;
+  } finally {
+    await handle.close();
+    if (!initialized) await removeTemporaryJson(path);
+  }
+}
+
 async function acquireFileLock(path: string) {
   for (let attempt = 0; attempt < 500; attempt += 1) {
     try {
-      const handle = await open(path, "wx", 0o600);
-      await handle.close();
+      await createProfileLock(path);
       return;
     } catch (error) {
       if (!(error instanceof Error) || !("code" in error)) throw error;
       if (error.code !== "EEXIST") throw error;
+      await removeDeadProfileLock(path);
       await delay(10);
     }
   }
@@ -750,6 +874,92 @@ function profileIdFromFactory(factory: ProfileIdFactory): string {
   return browserProfileIdSchema.parse(profileId);
 }
 
+function archiveExpiration(archivedAt: Date) {
+  const expiresAt = new Date(archivedAt);
+  expiresAt.setUTCDate(expiresAt.getUTCDate() + PROFILE_ARCHIVE_RETENTION_DAYS);
+  return expiresAt;
+}
+
+function completedProgress(message: string): BrowserProfileLifecycleProgress {
+  return { phase: "completed", message };
+}
+
+async function readLifecycleJournal(path: string) {
+  if (!(await pathExists(path))) return null;
+  return profileLifecycleJournalSchema.parse(
+    JSON.parse(await readFile(path, "utf8")),
+  );
+}
+
+async function removeProfileArtifacts(paths: ProfileStoragePaths) {
+  await rm(paths.profileDirectory, { recursive: true, force: true });
+  await rm(paths.downloadsDirectory, { recursive: true, force: true });
+  await rm(paths.runtimeManifestPath, { force: true });
+}
+
+function lifecycleMessage(operation: ProfileLifecycleJournal["operation"]) {
+  if (operation === "archive") return "Archiving Browser Profile storage.";
+  if (operation === "restore") return "Restoring Archived Profile storage.";
+  if (operation === "reset") return "Resetting Browser Profile storage.";
+  return "Permanently deleting Browser Profile storage.";
+}
+
+function profileNotFound(target: BrowserProfileTarget) {
+  return new BrowserProfileError(
+    "profile-not-found",
+    `Browser Profile ${target.profileId} does not exist on host ${target.hostId}.`,
+  );
+}
+
+function lifecycleProfileResponse(
+  outcome:
+    "archived" | "already-archived" | "restored" | "already-restored" | "reset",
+  profile: BrowserProfile,
+): BrowserProfileLifecycleResponse {
+  const message = `Browser Profile ${profile.name} is ${outcome.replace("already-", "already ")}.`;
+  return {
+    outcome,
+    profile,
+    progress: completedProgress("Lifecycle completed."),
+    message,
+  };
+}
+
+function lifecycleDeleteResponse(
+  profileId: string,
+  outcome: "deleted" | "already-deleted" = "already-deleted",
+): BrowserProfileLifecycleResponse {
+  const message =
+    outcome === "deleted"
+      ? `Browser Profile ${profileId} was permanently deleted.`
+      : `Browser Profile ${profileId} was already permanently deleted.`;
+  return {
+    outcome,
+    profileId,
+    progress: completedProgress("Lifecycle completed."),
+    message,
+  };
+}
+
+function assertDeleteConfirmation(
+  profile: BrowserProfile,
+  request: BrowserProfileDeleteRequest,
+) {
+  if (request.confirmation !== profile.name) {
+    throw new BrowserProfileError(
+      "profile-confirmation-required",
+      `Type the exact Browser Profile name "${profile.name}" to delete it.`,
+    );
+  }
+  const defaultProfileId = request.defaultProfileId ?? DEFAULT_PROFILE_ID;
+  if (defaultProfileId === profile.profileId) {
+    throw new BrowserProfileError(
+      "profile-default-protected",
+      "Select another default Browser Profile before permanent deletion.",
+    );
+  }
+}
+
 export function createFileBrowserProfileStore(
   options: FileBrowserProfileStoreOptions,
 ) {
@@ -761,6 +971,267 @@ export function createFileBrowserProfileStore(
       uid: process.getuid?.() ?? 0,
       gid: process.getgid?.() ?? 0,
     });
+  const lifecycle = options.lifecycle ?? {
+    async stopProfile() {
+      throw new Error("Browser Profile process control is unavailable.");
+    },
+  };
+
+  async function reportLifecycleProgress(
+    phase: BrowserProfileLifecycleProgress["phase"],
+    message: string,
+  ) {
+    await lifecycle.reportProgress?.({ phase, message });
+  }
+
+  async function persistLifecycleJournal(
+    paths: ProfileStoragePaths,
+    journal: ProfileLifecycleJournal,
+  ) {
+    await secureDirectory(paths.lifecycleDirectory, ownership);
+    await writeJson(paths.lifecycleJournalPath, journal, ownership);
+  }
+
+  async function stoppedLifecycleJournal(
+    paths: ProfileStoragePaths,
+    journal: ProfileLifecycleJournal,
+  ) {
+    await reportLifecycleProgress("stopping", "Stopping the Browser Instance.");
+    await lifecycle.stopProfile(journal.hostId, journal.profileId);
+    const stopped = { ...journal, phase: "stopped" as const };
+    await persistLifecycleJournal(paths, stopped);
+    return stopped;
+  }
+
+  async function archivedManifest(
+    paths: ProfileStoragePaths,
+    journal: ProfileLifecycleJournal,
+  ) {
+    const manifest = await repairManifest(
+      paths,
+      journal.hostId,
+      options.installationId,
+      ownership,
+    );
+    if (manifest.state === "archived") return manifest;
+    const archivedAt = clock();
+    return browserProfileManifestSchema.parse({
+      ...manifest,
+      state: "archived",
+      archivedAt: archivedAt.toISOString(),
+      expiresAt: archiveExpiration(archivedAt).toISOString(),
+      updatedAt: archivedAt.toISOString(),
+    });
+  }
+
+  async function activeManifest(
+    paths: ProfileStoragePaths,
+    journal: ProfileLifecycleJournal,
+  ) {
+    const manifest = await repairManifest(
+      paths,
+      journal.hostId,
+      options.installationId,
+      ownership,
+    );
+    if (manifest.state === "active") return manifest;
+    if (clock() > new Date(manifest.expiresAt)) {
+      throw new BrowserProfileError(
+        "profile-archive-expired",
+        `Archived Profile ${journal.profileId} has expired.`,
+      );
+    }
+    return browserProfileManifestSchema.parse({
+      ...manifest,
+      state: "active",
+      archivedAt: null,
+      expiresAt: null,
+      updatedAt: clock().toISOString(),
+    });
+  }
+
+  async function resetBrowserState(
+    paths: ProfileStoragePaths,
+    journal: ProfileLifecycleJournal,
+  ) {
+    const manifest = await repairManifest(
+      paths,
+      journal.hostId,
+      options.installationId,
+      ownership,
+    );
+    const replacementProfileId = journal.replacementProfileId;
+    if (manifest.state !== "active" && replacementProfileId === undefined) {
+      throw new BrowserProfileError(
+        "profile-not-found",
+        "Restore the Archived Profile before resetting it.",
+      );
+    }
+    if (replacementProfileId === undefined) {
+      throw new BrowserProfileError(
+        "profile-not-found",
+        "Legacy reset journal has no replacement Browser Profile.",
+      );
+    }
+    const resetAt = new Date(journal.startedAt);
+    await writeJson(
+      paths.manifestPath,
+      resetArchivedManifest(manifest, resetAt),
+      ownership,
+    );
+    return resetReplacementProfile(manifest, journal, replacementProfileId);
+  }
+
+  function resetArchivedManifest(
+    manifest: BrowserProfileManifest,
+    resetAt: Date,
+  ) {
+    return browserProfileManifestSchema.parse({
+      ...manifest,
+      state: "archived",
+      archivedAt: resetAt.toISOString(),
+      expiresAt: archiveExpiration(resetAt).toISOString(),
+      updatedAt: resetAt.toISOString(),
+    });
+  }
+
+  function resetReplacementManifest(
+    manifest: BrowserProfileManifest,
+    journal: ProfileLifecycleJournal,
+    replacementProfileId: string,
+  ) {
+    return profileManifest(
+      {
+        profileId: replacementProfileId,
+        name: manifest.name,
+        hostId: journal.hostId,
+        installationId: options.installationId,
+        locale: manifest.locale,
+        timezone: manifest.timezone,
+      },
+      () => new Date(journal.startedAt),
+    );
+  }
+
+  async function resetReplacementProfile(
+    manifest: BrowserProfileManifest,
+    journal: ProfileLifecycleJournal,
+    replacementProfileId: string,
+  ) {
+    const replacementPaths = profilePaths(
+      options.rootDirectory,
+      options.installationId,
+      journal.hostId,
+      replacementProfileId,
+    );
+    if (await pathExists(replacementPaths.profileDirectory)) {
+      return repairManifest(
+        replacementPaths,
+        journal.hostId,
+        options.installationId,
+        ownership,
+      );
+    }
+    const replacement = resetReplacementManifest(
+      manifest,
+      journal,
+      replacementProfileId,
+    );
+    await writeProfile(options, replacementPaths, replacement, ownership);
+    return replacement;
+  }
+
+  async function applyLifecycleStorage(
+    paths: ProfileStoragePaths,
+    journal: ProfileLifecycleJournal,
+  ) {
+    await reportLifecycleProgress(
+      "updating-storage",
+      lifecycleMessage(journal.operation),
+    );
+    if (journal.operation === "delete") {
+      await removeProfileArtifacts(paths);
+      return null;
+    }
+    const manifest =
+      journal.operation === "archive"
+        ? await archivedManifest(paths, journal)
+        : journal.operation === "restore"
+          ? await activeManifest(paths, journal)
+          : await resetBrowserState(paths, journal);
+    if (journal.operation !== "reset") {
+      await writeJson(paths.manifestPath, manifest, ownership);
+    }
+    return manifest;
+  }
+
+  async function executeLifecycleJournal(
+    paths: ProfileStoragePaths,
+    journal: ProfileLifecycleJournal,
+  ) {
+    const stopped =
+      journal.phase === "planned"
+        ? await stoppedLifecycleJournal(paths, journal)
+        : journal;
+    const manifest = await applyLifecycleStorage(paths, stopped);
+    await reportLifecycleProgress(
+      "completed",
+      `Browser Profile ${journal.operation} completed.`,
+    );
+    await rm(paths.lifecycleJournalPath, { force: true });
+    return manifest;
+  }
+
+  function beginLifecycle(
+    operation: "delete",
+    request: BrowserProfileTarget,
+  ): Promise<{ paths: ProfileStoragePaths; manifest: null }>;
+  function beginLifecycle(
+    operation: "archive" | "restore" | "reset",
+    request: BrowserProfileTarget,
+  ): Promise<{ paths: ProfileStoragePaths; manifest: BrowserProfileManifest }>;
+  async function beginLifecycle(
+    operation: ProfileLifecycleJournal["operation"],
+    request: BrowserProfileTarget,
+  ) {
+    const paths = profilePaths(
+      options.rootDirectory,
+      options.installationId,
+      request.hostId,
+      request.profileId,
+    );
+    const journal = {
+      operation,
+      hostId: request.hostId,
+      profileId: request.profileId,
+      startedAt: clock().toISOString(),
+      phase: "planned" as const,
+    };
+    await persistLifecycleJournal(paths, journal);
+    return { paths, manifest: await executeLifecycleJournal(paths, journal) };
+  }
+
+  async function beginResetLifecycle(request: BrowserProfileTarget) {
+    const paths = profilePaths(
+      options.rootDirectory,
+      options.installationId,
+      request.hostId,
+      request.profileId,
+    );
+    const journal: ProfileLifecycleJournal = {
+      operation: "reset",
+      hostId: request.hostId,
+      profileId: request.profileId,
+      replacementProfileId: profileIdFromFactory(idFactory),
+      startedAt: clock().toISOString(),
+      phase: "planned",
+    };
+    await persistLifecycleJournal(paths, journal);
+    return {
+      paths,
+      manifest: (await executeLifecycleJournal(paths, journal))!,
+    };
+  }
 
   async function ensureDefaultProfile(hostId: string) {
     const paths = profilePaths(
@@ -1085,6 +1556,169 @@ export function createFileBrowserProfileStore(
     });
   }
 
+  async function reconcileProfileLifecycleUnlocked(hostId: string) {
+    const paths = profilePaths(
+      options.rootDirectory,
+      options.installationId,
+      hostId,
+      DEFAULT_PROFILE_ID,
+    );
+    if (!(await pathExists(paths.lifecycleDirectory))) return;
+    const entries = await readdir(paths.lifecycleDirectory, {
+      withFileTypes: true,
+    });
+    for (const entry of entries.sort((left, right) =>
+      left.name.localeCompare(right.name),
+    )) {
+      if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+      const journalPath = join(paths.lifecycleDirectory, entry.name);
+      const journal = await readLifecycleJournal(journalPath);
+      if (journal === null || journal.hostId !== hostId) continue;
+      const journalPaths = profilePaths(
+        options.rootDirectory,
+        options.installationId,
+        hostId,
+        journal.profileId,
+      );
+      try {
+        await executeLifecycleJournal(journalPaths, journal);
+      } catch (error) {
+        if (!recoverableLifecycleJournalError(journal, error)) throw error;
+        await rm(journalPath, { force: true });
+      }
+    }
+  }
+
+  function recoverableLifecycleJournalError(
+    journal: ProfileLifecycleJournal,
+    error: unknown,
+  ) {
+    if (!(error instanceof BrowserProfileError)) return false;
+    const expiredRestore =
+      journal.operation === "restore" &&
+      error.code === "profile-archive-expired";
+    const invalidLegacyReset =
+      journal.operation === "reset" &&
+      journal.replacementProfileId === undefined;
+    return expiredRestore || invalidLegacyReset;
+  }
+
+  async function reconcileBeforeLifecycle(hostId: string) {
+    await reconcileProfileLifecycleUnlocked(hostId);
+    return listProfilesUnlocked(hostId);
+  }
+
+  async function archiveProfile(request: BrowserProfileTarget) {
+    return withMutationLock(options, request.hostId, ownership, async () => {
+      const inventory = await reconcileBeforeLifecycle(request.hostId);
+      const current = inventory.profiles.find(
+        (profile) => profile.profileId === request.profileId,
+      );
+      if (current === undefined) throw profileNotFound(request);
+      if (current.state === "archived") {
+        return lifecycleProfileResponse("already-archived", current);
+      }
+      const { manifest } = await beginLifecycle("archive", request);
+      return lifecycleProfileResponse(
+        "archived",
+        profileFromManifest(manifest, inventory.selectedProfileId),
+      );
+    });
+  }
+
+  async function restoreArchivedProfile(request: BrowserProfileTarget) {
+    return withMutationLock(options, request.hostId, ownership, async () => {
+      const inventory = await reconcileBeforeLifecycle(request.hostId);
+      const current = inventory.profiles.find(
+        (profile) => profile.profileId === request.profileId,
+      );
+      if (current === undefined) throw profileNotFound(request);
+      if (current.state === "active") {
+        return lifecycleProfileResponse("already-restored", current);
+      }
+      if (clock() > new Date(current.expiresAt)) {
+        throw new BrowserProfileError(
+          "profile-archive-expired",
+          `Archived Profile ${request.profileId} has expired.`,
+        );
+      }
+      const { manifest } = await beginLifecycle("restore", request);
+      return lifecycleProfileResponse(
+        "restored",
+        profileFromManifest(manifest, inventory.selectedProfileId),
+      );
+    });
+  }
+
+  async function resetProfile(request: BrowserProfileResetRequest) {
+    if (request.confirmation !== RESET_PROFILE_CONFIRMATION) {
+      throw new BrowserProfileError(
+        "profile-confirmation-required",
+        `Type exactly "${RESET_PROFILE_CONFIRMATION}" to confirm credential loss.`,
+      );
+    }
+    return withMutationLock(options, request.hostId, ownership, async () => {
+      const inventory = await reconcileBeforeLifecycle(request.hostId);
+      const current = inventory.profiles.find(
+        (profile) => profile.profileId === request.profileId,
+      );
+      if (current === undefined) throw profileNotFound(request);
+      if (current.state !== "active") {
+        throw new BrowserProfileError(
+          "profile-not-found",
+          "Restore the Archived Profile before resetting it.",
+        );
+      }
+      const { manifest } = await beginResetLifecycle(request);
+      return lifecycleProfileResponse(
+        "reset",
+        profileFromManifest(
+          manifest,
+          inventory.selectedProfileId === request.profileId
+            ? manifest.profileId
+            : inventory.selectedProfileId,
+        ),
+      );
+    });
+  }
+
+  async function deleteProfile(request: BrowserProfileDeleteRequest) {
+    return withMutationLock(options, request.hostId, ownership, async () => {
+      const inventory = await reconcileBeforeLifecycle(request.hostId);
+      const current = inventory.profiles.find(
+        (profile) => profile.profileId === request.profileId,
+      );
+      if (current === undefined)
+        return lifecycleDeleteResponse(request.profileId);
+      assertDeleteConfirmation(current, request);
+      await beginLifecycle("delete", request);
+      return lifecycleDeleteResponse(request.profileId, "deleted");
+    });
+  }
+
+  async function expireArchivedProfiles(hostId: string) {
+    return withMutationLock(options, hostId, ownership, async () => {
+      const inventory = await reconcileBeforeLifecycle(hostId);
+      const expired = inventory.profiles.filter(
+        (profile) =>
+          profile.state === "archived" && clock() > new Date(profile.expiresAt),
+      );
+      for (const profile of expired) {
+        await beginLifecycle("delete", {
+          hostId,
+          profileId: profile.profileId,
+        });
+      }
+      return { deletedProfileIds: expired.map(({ profileId }) => profileId) };
+    });
+  }
+
+  async function reconcileProfileLifecycle(hostId: string) {
+    await withMutationLock(options, hostId, ownership, () =>
+      reconcileProfileLifecycleUnlocked(hostId),
+    );
+  }
+
   return {
     listProfiles,
     initialize,
@@ -1092,5 +1726,11 @@ export function createFileBrowserProfileStore(
     publishStagedProfile,
     renameProfile,
     selectProfile,
+    archiveProfile,
+    restoreArchivedProfile,
+    resetProfile,
+    deleteProfile,
+    expireArchivedProfiles,
+    reconcileProfileLifecycle,
   };
 }
