@@ -28,7 +28,8 @@
     "lint": "eslint .",
     "test": "vitest run",
     "test:real-browser": "BB_BROWSER_REAL_INTEGRATION_REQUIRED=1 BB_BROWSER_REAL_INTEGRATION=1 vitest run test/browser-auth.integration.test.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "release-gate": "bash scripts/release-gate.sh"
   },
   "dependencies": {
     "dev-browser": "0.2.9",

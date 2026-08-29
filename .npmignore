@@ -1,0 +1,31 @@
+# This file defines the production package surface for `bb-plugin-browser`.
+# Once present, npm uses ONLY this file (not .gitignore) to decide what `npm
+# pack` and `npm publish` include. The release-artifact test
+# (test/release-artifact.test.ts) asserts the resulting tarball contains exactly
+# the intended runtime components (built dist/, source entry modules, skill,
+# shipped docs, license, dependency pins) and excludes fixture secrets, dev
+# endpoints, and build tooling.
+
+# Tests and their fixtures contain deterministic login/fixture secrets and
+# dev-only raw browser workers; they must never ship.
+test/
+
+# Build tooling and developer configuration are not runtime components.
+tsconfig.json
+eslint.config.js
+.github/
+
+# Developer process and planning documentation are not part of the shipped
+# user/operator documentation set (docs/browser/ ships in full).
+AGENTS.md
+docs/agents/
+docs/browser-plugin-spec.md
+docs/implementation-plan.md
+docs/verification-plan.md
+
+# Local artifacts that should never be published.
+coverage/
+.scratch/
+*.log
+.DS_Store
+bb-plugin-browser-*.tgz
