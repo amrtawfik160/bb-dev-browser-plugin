@@ -67,6 +67,9 @@ function dialogFixture() {
           'document.getElementById("alert").onclick = () => alert("alert-body");',
           'document.getElementById("confirm").onclick = () => confirm("confirm-body");',
           'document.getElementById("prompt").onclick = () => prompt("prompt-body", "default");',
+          // A real beforeunload handler so the controller must choose
+          // stay/leave through the panel pipeline (issue #17 SPEC-5).
+          "window.addEventListener('beforeunload', (event) => { event.preventDefault(); event.returnValue = 'leave-body'; });",
           "</script>",
         ].join("\n"),
       );
@@ -166,13 +169,12 @@ it.runIf(integrationEnabled)(
         BB_BROWSER_WORKER_ACTION: "dialogs",
       });
       expect(report.dialogs?.alertHandled).toBe(true);
-      expect(report.dialogs?.confirmAccepted).toBe(true);
-      expect(report.dialogs?.promptText).toBe("default");
+      expect(report.dialogs?.confirmAccepted).toBe(false);
+      expect(report.dialogs?.promptText).toBe("controller-answer");
       expect(report.dialogs?.beforeunloadStayed).toBe(true);
-      expect(report.dialogs?.contextActions).toEqual([
-        "open-link-new-tab",
-        "copy-link",
-      ]);
+      expect(report.dialogs?.contextActions).toContain("open-link-new-tab");
+      expect(report.dialogs?.contextActions).toContain("copy-link");
+      expect(report.dialogs?.performedAction).not.toBe(null);
       cleanupRequired = false;
     } finally {
       if (cleanupRequired) {

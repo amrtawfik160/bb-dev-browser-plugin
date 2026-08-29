@@ -1880,6 +1880,12 @@ export type BrowserPanelReleaseControlRequest = z.infer<
  * spectators see the dialog read-only. Unresolved dialogs are dismissed when a
  * Control Lease ends and survive bounded reconnects or fail closed without an
  * invisible modal block. beforeunload mirrors the native leave/stay choice.
+ *
+ * Fail-closed default per type (SPEC-8): when the controller never reclaims,
+ * a stranded dialog is resolved with the safe default that preserves page
+ * state — `alert` accepts (OK, no destructive choice), while `confirm`,
+ * `prompt`, and `beforeunload` cancel/stay (`accept:false`) so an unseen
+ * action is never silently confirmed and the page is never silently left.
  */
 export const browserDialogTypeSchema = z.enum([
   "alert",
@@ -1925,6 +1931,14 @@ export type BrowserDialogResponseMessage = z.infer<
  * query at a viewport point; the host inspects the element under it and reports
  * the available actions, then executes the chosen one. `targetUrl` is the
  * link href or image src the action applies to.
+ *
+ * Limitation (SPEC-2): `copy-link` and `copy-image-address` write through
+ * `navigator.clipboard.writeText` evaluated in the page, which requires
+ * transient activation the controller's CDP input does not reliably provide.
+ * The source surfaces each copy outcome (ok/not-ok) through its
+ * `onContextActionResult` callback rather than silently swallowing failures,
+ * so the host can disclose that a copy did not land; v1 does not guarantee
+ * delivery to the controller's clipboard.
  */
 export const browserContextActionKindSchema = z.enum([
   "open-link-new-tab",

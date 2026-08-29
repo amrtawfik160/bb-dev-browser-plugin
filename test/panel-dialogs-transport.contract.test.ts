@@ -395,4 +395,236 @@ describe("Panel transport dialog and context-action contract", () => {
       await transport.stop();
     }
   });
+
+  it("tracks multiple open dialogs by dialogId without stranding the first", async () => {
+    // SPEC-6: a single openDialog variable overwrote the first dialog when a
+    // second arrived before the first was resolved, so a dialog_response for
+    // the first was dropped by the dialogId guard. Track a map keyed by
+    // dialogId so both stay answerable.
+    const { transport, issued, source } = setup({ canInput: true });
+    const port = await transport.start();
+    try {
+      const socket = await connect(port);
+      const inbox = collectMessages(socket);
+      send(socket, redeemMessage(issued));
+      await inbox.waitFor(
+        (raw) => decode<{ type: string }>(raw).type === "ready",
+      );
+      source.emitDialog({
+        dialogId: "first",
+        type: "confirm",
+        message: "First?",
+        defaultValue: "",
+        url: "https://example.test",
+      });
+      await inbox.waitFor(
+        (raw) =>
+          decode<{ type: string; dialog: BrowserDialogEvent }>(raw).dialog
+            ?.dialogId === "first",
+      );
+      source.emitDialog({
+        dialogId: "second",
+        type: "prompt",
+        message: "Second?",
+        defaultValue: "",
+        url: "https://example.test",
+      });
+      await inbox.waitFor(
+        (raw) =>
+          decode<{ type: string; dialog: BrowserDialogEvent }>(raw).dialog
+            ?.dialogId === "second",
+      );
+      // Both dialogs remain answerable: respond to the first after the second
+      // opened, and the source receives the response.
+      send(socket, {
+        type: "dialog_response",
+        dialogId: "first",
+        accept: false,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(source.responses).toContainEqual({
+        dialogId: "first",
+        accept: false,
+      });
+      socket.close();
+    } finally {
+      await transport.stop();
+    }
+  });
+
+  it("re-pushes each open dialog exactly once after a reconnect", async () => {
+    // SPEC-9: a reconnecting panel received the open dialog twice because the
+    // transport pushed openDialog and then subscribeDialogs re-emitted every
+    // still-open dialog. Dedupe so each open dialog arrives exactly once.
+    const source = createFakeDialogSource({ canRespond: true });
+    const first = setup({ canInput: true }, source);
+    const port = await first.transport.start();
+    try {
+      const socket = await connect(port);
+      send(socket, redeemMessage(first.issued));
+      await onceMessage(socket); // ready
+      source.emitDialog({
+        dialogId: "solo",
+        type: "alert",
+        message: "Open",
+        defaultValue: "",
+        url: "https://example.test",
+      });
+      await onceMessage(socket);
+      socket.close();
+      await new Promise<void>((resolve) => socket.once("close", resolve));
+    } finally {
+      await first.transport.stop().catch(() => undefined);
+    }
+    const second = setup({ canInput: true }, source);
+    const port2 = await second.transport.start();
+    try {
+      const reconnected = await connect(port2);
+      const dialogs: BrowserDialogEvent[] = [];
+      reconnected.on("message", (raw) => {
+        const message = decode<{ type: string; dialog?: BrowserDialogEvent }>(
+          String(raw),
+        );
+        if (message.type === "dialog" && message.dialog !== undefined)
+          dialogs.push(message.dialog);
+      });
+      send(reconnected, redeemMessage(second.issued));
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(
+        dialogs.filter((dialog) => dialog.dialogId === "solo"),
+      ).toHaveLength(1);
+      reconnected.close();
+    } finally {
+      await second.transport.stop();
+    }
+  });
+
+  it("does not duplicate a dialog already open when the panel connects", async () => {
+    // SPEC-9: startStreaming pushes the persisted open dialog and then
+    // subscribeDialogs re-emits every still-open dialog from the source. A
+    // dialog the panel already received must not arrive twice. Open the
+    // dialog before redeeming so the re-emit path is exercised on connect.
+    const { transport, issued, source } = setup({ canInput: true });
+    const port = await transport.start();
+    try {
+      // Pre-open the dialog in the shared source before the panel connects,
+      // so subscribeDialogs re-emits it during startStreaming.
+      source.emitDialog({
+        dialogId: "preopen",
+        type: "alert",
+        message: "Already open",
+        defaultValue: "",
+        url: "https://example.test",
+      });
+      const socket = await connect(port);
+      const dialogs: BrowserDialogEvent[] = [];
+      socket.on("message", (raw) => {
+        const message = decode<{ type: string; dialog?: BrowserDialogEvent }>(
+          String(raw),
+        );
+        if (message.type === "dialog" && message.dialog !== undefined)
+          dialogs.push(message.dialog);
+      });
+      send(socket, redeemMessage(issued));
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(
+        dialogs.filter((dialog) => dialog.dialogId === "preopen"),
+      ).toHaveLength(1);
+      socket.close();
+    } finally {
+      await transport.stop();
+    }
+  });
+
+  it("fails a stranded confirm dialog closed by cancelling, not accepting", async () => {
+    // SPEC-8: the fail-closed default was accept:true, which for confirm means
+    // OK — silently confirming an action the controller never saw. Fail closed
+    // with accept:false (cancel/stay) so page state is preserved.
+    vi.useFakeTimers();
+    try {
+      const clock = { now: () => 1_000_000 };
+      const capabilities = createPanelCapabilityStore({ clock });
+      const gateway = createPanelGateway({
+        capabilities,
+        hostId,
+        profileId,
+        clock,
+      });
+      const stream = createAutomationStreamAdapter({ clock, capabilities });
+      stream.start();
+      const source = createFakeDialogSource({ canRespond: true });
+      const transport = createPanelTransportServer({
+        gateway,
+        stream,
+        source,
+        clock,
+        canInput: () => true,
+      });
+      const issued = capabilities.issue({
+        ownerSessionId,
+        panelId,
+        hostId,
+        profileId,
+      });
+      const port = await transport.start();
+      const socket = await connect(port);
+      send(socket, redeemMessage(issued));
+      await onceMessage(socket); // ready
+      source.emitDialog({
+        dialogId: "stranded-confirm",
+        type: "confirm",
+        message: "Delete everything?",
+        defaultValue: "",
+        url: "https://example.test",
+      });
+      await onceMessage(socket);
+      socket.close();
+      await new Promise<void>((resolve) => socket.once("close", resolve));
+      await vi.advanceTimersByTimeAsync(11_000);
+      expect(source.responses).toEqual([
+        { dialogId: "stranded-confirm", accept: false },
+      ]);
+      await transport.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("dismissOpenDialogs cancels stranded dialogs when the lease ends", async () => {
+    // SPEC-7 hook: when the agent Control Lease ends (revoked or owner takes
+    // control), the transport dismisses every still-open dialog with the
+    // fail-closed default rather than leaving an invisible modal block.
+    const { transport, issued, source } = setup({ canInput: true });
+    const port = await transport.start();
+    try {
+      const socket = await connect(port);
+      const inbox = collectMessages(socket);
+      send(socket, redeemMessage(issued));
+      await inbox.waitFor(
+        (raw) => decode<{ type: string }>(raw).type === "ready",
+      );
+      source.emitDialog({
+        dialogId: "open-confirm",
+        type: "confirm",
+        message: "Sure?",
+        defaultValue: "",
+        url: "https://example.test",
+      });
+      await inbox.waitFor(
+        (raw) =>
+          decode<{ type: string; dialog: BrowserDialogEvent }>(raw).dialog
+            ?.dialogId === "open-confirm",
+      );
+      // Lease end dismisses open dialogs with the fail-closed default.
+      transport.dismissOpenDialogs?.();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(source.responses).toContainEqual({
+        dialogId: "open-confirm",
+        accept: false,
+      });
+      socket.close();
+    } finally {
+      await transport.stop();
+    }
+  });
 });

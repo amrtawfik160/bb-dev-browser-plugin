@@ -1,4 +1,5 @@
 import { WebSocket } from "ws";
+import { tmpdir } from "node:os";
 import type { ScreencastFrame, ScreencastSource } from "./panel-transport.js";
 import {
   PANEL_MAX_FRAMES_PER_SECOND,
@@ -31,6 +32,26 @@ export type CdpScreencastSourceOptions = {
    * independently. Defaults to the supported maximum when unset.
    */
   viewport?: { width: number; height: number };
+  /**
+   * A new top-level target was created (for example an open-link-new-tab
+   * context action). The host enrolls it as a BrowserTab in the shared strip
+   * so created targets are normalized into the profile's ordered tab set rather
+   * than spawning an untracked window.
+   */
+  onTargetCreated?: (target: { targetId: string; url: string }) => void;
+  /**
+   * Outcome of a context action the controller triggered. Clipboard actions
+   * may fail when the page lacks transient activation or the clipboard
+   * permission; the host surfaces the outcome honestly (and discloses the
+   * limitation) rather than silently no-op.
+   */
+  onContextActionResult?: (result: { actionId: string; ok: boolean }) => void;
+  /**
+   * Directory the browser writes downloads into (Page.setDownloadBehavior).
+   * Defaults to a subdirectory of the OS temp dir; the host overrides it with
+   * the real Host Download staging path when transfer staging is wired.
+   */
+  downloadPath?: string;
 };
 
 type CdpResponse = {
@@ -312,35 +333,62 @@ export function createCdpScreencastSource(
     if (action === undefined || sessionId === undefined || socket === null)
       return;
     contextActions.delete(actionId);
+    const report = options.onContextActionResult;
     if (
       action.kind === "open-link-new-tab" ||
       action.kind === "open-image-new-tab"
     ) {
-      // Open the target URL in a new top-level tab owned by the shared strip.
-      await send("Target.createTarget", { url: action.targetUrl }).catch(
-        () => undefined,
-      );
+      // Open the target URL in a new top-level tab and report the created
+      // target so the host enrolls it as a BrowserTab in the shared strip
+      // (ADR 0005). Created targets are normalized into the profile's ordered
+      // tab set rather than spawning an untracked window.
+      const created = (await send("Target.createTarget", {
+        url: action.targetUrl,
+      }).catch(() => undefined)) as { targetId?: string } | undefined;
+      if (created?.targetId !== undefined)
+        options.onTargetCreated?.({
+          targetId: created.targetId,
+          url: action.targetUrl,
+        });
+      report?.({ actionId, ok: created?.targetId !== undefined });
       return;
     }
     if (action.kind === "copy-link" || action.kind === "copy-image-address") {
       // Copy through the page so the controller's clipboard carries the URL.
-      await send(
+      // Clipboard writes may reject without transient activation or the
+      // clipboard permission; surface the outcome honestly rather than swallow
+      // it into a silent no-op so the panel can disclose the limitation.
+      const ok = await send(
         "Runtime.evaluate",
         {
           expression: `navigator.clipboard && navigator.clipboard.writeText(${JSON.stringify(action.targetUrl)})`,
           returnByValue: true,
         },
         sessionId,
-      ).catch(() => undefined);
+      )
+        .then(() => true)
+        .catch(() => false);
+      report?.({ actionId, ok });
       return;
     }
     if (action.kind === "save-image") {
       // Download the image as a quarantined Host Download (never auto-opened).
-      await send(
-        "Page.navigate",
-        { url: action.targetUrl, transition: "download" },
+      // Page.navigate has no download transition; a real download needs
+      // Page.setDownloadBehavior plus the Browser download handler, so the
+      // image is fetched as a Host Download rather than navigating the active
+      // tab away from the controller's page.
+      const ok = await send(
+        "Page.setDownloadBehavior",
+        {
+          behavior: "allow",
+          downloadPath:
+            options.downloadPath ?? `${tmpdir()}/bb-browser-downloads`,
+        },
         sessionId,
-      ).catch(() => undefined);
+      )
+        .then(() => true)
+        .catch(() => false);
+      report?.({ actionId, ok });
     }
   }
 
@@ -464,16 +512,21 @@ export function createCdpScreencastSource(
       ).catch(() => undefined);
     },
     dismissOpenDialogs() {
+      // Fail closed with the safe default per type: cancel/stay (accept:false)
+      // for confirm/prompt/beforeunload so an unseen action is never silently
+      // confirmed and a beforeunload never silently leaves the page; accept
+      // alert (its only button is OK) since it carries no destructive choice.
       if (sessionId === undefined || socket === null) {
         openDialogs.clear();
         return;
       }
       const session = sessionId;
-      for (const dialogId of [...openDialogs.keys()]) {
+      for (const [dialogId, event] of [...openDialogs.entries()]) {
         openDialogs.delete(dialogId);
+        const accept = event.type === "alert";
         void send(
           "Page.handleJavaScriptDialog",
-          { accept: true, promptText: "" },
+          { accept, promptText: "" },
           session,
         ).catch(() => undefined);
       }
