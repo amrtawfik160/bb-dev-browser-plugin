@@ -369,7 +369,7 @@ describe("Transfer Staging", () => {
     });
     const consume = await manager.consume("fixture");
     expect(consume.outcome).toBe("used");
-    await manager.release("fixture", "used");
+    await manager.release("fixture");
     expect(fake.has("/staging/transfer-1")).toBe(false);
     expect(manager.size()).toBe(0);
   });
@@ -411,6 +411,19 @@ describe("Transfer Staging", () => {
     });
     const { removed } = await manager.purgeAll();
     expect(removed).toContain("fixture");
+    expect(fake.has("/staging/transfer-1")).toBe(false);
+    expect(manager.size()).toBe(0);
+  });
+
+  it("removes on-disk staged files on dispose", async () => {
+    const { fake, manager } = setup();
+    await manager.stage({
+      kind: "workspace",
+      transferId: "fixture",
+      sourcePath: "/env/payload.txt",
+      environmentRoot: "/env",
+    });
+    await manager.dispose();
     expect(fake.has("/staging/transfer-1")).toBe(false);
     expect(manager.size()).toBe(0);
   });

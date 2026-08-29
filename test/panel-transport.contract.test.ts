@@ -11,6 +11,7 @@ import {
 } from "../contracts.js";
 import { createPanelCapabilityStore } from "../panel-capability.js";
 import { createPanelGateway } from "../panel-gateway.js";
+import { createClipboardExchange } from "../clipboard-exchange.js";
 import {
   createAutomationStreamAdapter,
   frameIntervalMs,
@@ -391,5 +392,125 @@ describe("Panel transport server contract", () => {
     );
     // unique id to avoid unused import warning
     expect(randomUUID().length).toBeGreaterThan(0);
+  });
+
+  it("dispatches an explicit clipboard copy/paste to the clipboard exchange", async () => {
+    const clock = { now: () => 1_000_000 };
+    const capabilities = createPanelCapabilityStore({ clock });
+    const gateway = createPanelGateway({
+      capabilities,
+      hostId,
+      profileId,
+      clock,
+    });
+    const stream = createAutomationStreamAdapter({ clock, capabilities });
+    stream.start();
+    const source = createFakeScreencastSource({ frameCount: 0 });
+    const exchange = createClipboardExchange({
+      effects: {
+        readSelectionBytes: async () => 48,
+        writeClipboardToPage: async (_actor, bytes) => bytes,
+      },
+    });
+    const transport = createPanelTransportServer({
+      gateway,
+      stream,
+      source,
+      clock,
+      clipboardExchange: exchange,
+    });
+    const port = await transport.start();
+    const issued = capabilities.issue({
+      ownerSessionId,
+      panelId,
+      hostId,
+      profileId,
+    });
+    try {
+      const socket = await connect(port);
+      send(socket, redeemMessage(issued));
+      await onceMessage(socket); // ready
+      // An explicit owner copy dispatches to the exchange and the panel
+      // receives the privacy-safe outcome (bytes only, never contents).
+      send(socket, { type: "clipboard_copy", copyId: "copy-1" });
+      const copyRaw = await onceMessage(socket);
+      const copyOutcome = decode<{
+        type: string;
+        outcome: { outcome: string; copyId: string; bytes: number };
+      }>(copyRaw);
+      expect(copyOutcome.type).toBe("clipboard_outcome");
+      expect(copyOutcome.outcome).toEqual({
+        outcome: "copied",
+        copyId: "copy-1",
+        bytes: 48,
+      });
+      // An explicit owner paste dispatches to the exchange too.
+      send(socket, {
+        type: "clipboard_paste",
+        pasteId: "paste-1",
+        bytes: 32,
+      });
+      const pasteRaw = await onceMessage(socket);
+      const pasteOutcome = decode<{
+        type: string;
+        outcome: { outcome: string; pasteId: string; bytes: number };
+      }>(pasteRaw);
+      expect(pasteOutcome.type).toBe("clipboard_outcome");
+      expect(pasteOutcome.outcome).toEqual({
+        outcome: "pasted",
+        pasteId: "paste-1",
+        bytes: 32,
+      });
+      socket.close();
+    } finally {
+      await transport.stop();
+    }
+  });
+
+  it("routes a panel transfer cancellation to the onTransferCancel handler", async () => {
+    const clock = { now: () => 1_000_000 };
+    const capabilities = createPanelCapabilityStore({ clock });
+    const gateway = createPanelGateway({
+      capabilities,
+      hostId,
+      profileId,
+      clock,
+    });
+    const stream = createAutomationStreamAdapter({ clock, capabilities });
+    stream.start();
+    const source = createFakeScreencastSource({ frameCount: 0 });
+    const cancelled: string[] = [];
+    const transport = createPanelTransportServer({
+      gateway,
+      stream,
+      source,
+      clock,
+      onTransferCancel: async (transferId) => {
+        cancelled.push(transferId);
+      },
+    });
+    const port = await transport.start();
+    const issued = capabilities.issue({
+      ownerSessionId,
+      panelId,
+      hostId,
+      profileId,
+    });
+    try {
+      const socket = await connect(port);
+      send(socket, redeemMessage(issued));
+      await onceMessage(socket); // ready
+      send(socket, { type: "transfer_cancel", transferId: "transfer-1" });
+      const ackRaw = await onceMessage(socket);
+      const ack = decode<{ type: string; transferId: string }>(ackRaw);
+      expect(ack).toEqual({
+        type: "transfer_cancel_ack",
+        transferId: "transfer-1",
+      });
+      expect(cancelled).toEqual(["transfer-1"]);
+      socket.close();
+    } finally {
+      await transport.stop();
+    }
   });
 });

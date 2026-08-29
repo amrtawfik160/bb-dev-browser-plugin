@@ -769,7 +769,7 @@ if (action === "transfer") {
   });
   const consume = await manager.consume("fixture");
   if (consume.outcome === "used") {
-    await manager.release("fixture", "used");
+    await manager.release("fixture");
   }
   await manager.purgeAll();
   transfer = {

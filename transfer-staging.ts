@@ -162,6 +162,47 @@ export function createTransferStagingManager(options: TransferStagingOptions) {
   }
 
   /**
+   * Shared low-disk guard. Returns a `low-disk` rejection when the host does
+   * not have enough free space to stage `requiredBytes`, otherwise `undefined`.
+   * Failures reading free space fail open (allow staging) so a host without a
+   * `statfs` analogue (in-memory fakes, containers) is not blocked.
+   */
+  async function guardLowDisk(
+    transferId: string,
+    requiredBytes: number,
+  ): Promise<BrowserTransferStagingResponse | undefined> {
+    let available: number;
+    try {
+      available = await filesystem.availableBytes(stagingRoot);
+    } catch {
+      return undefined;
+    }
+    if (available < requiredBytes + lowDiskMarginBytes) {
+      return rejection(
+        transferId,
+        "low-disk",
+        "The host does not have enough free disk space to stage the transfer.",
+      );
+    }
+    return undefined;
+  }
+
+  /**
+   * Shared cleanup for a destination created during staging that must not leak
+   * when a later guard rejects. Removes the staged copy and reports the given
+   * rejection; the staged path is never left behind.
+   */
+  async function cleanupAndReject(
+    transferId: string,
+    destination: string,
+    reason: BrowserTransferRejection,
+    message: string,
+  ): Promise<BrowserTransferStagingResponse> {
+    await filesystem.rm(destination, { recursive: true, force: true });
+    return rejection(transferId, reason, message);
+  }
+
+  /**
    * Stage an explicitly selected workspace file. The selection must remain
    * inside `environmentRoot` after realpath resolution, must be a regular
    * file, and must not change between selection and copy. Traversal, symlink
@@ -223,19 +264,8 @@ export function createTransferStagingManager(options: TransferStagingOptions) {
         "The selected file exceeds the per-file transfer quota.",
       );
     }
-    let available: number;
-    try {
-      available = await filesystem.availableBytes(stagingRoot);
-    } catch {
-      available = Number.POSITIVE_INFINITY;
-    }
-    if (available < selectionStat.sizeBytes + lowDiskMarginBytes) {
-      return rejection(
-        transferId,
-        "low-disk",
-        "The host does not have enough free disk space to stage the transfer.",
-      );
-    }
+    const lowDisk = await guardLowDisk(transferId, selectionStat.sizeBytes);
+    if (lowDisk !== undefined) return lowDisk;
     let destination: string;
     try {
       destination = await stagePath(transferId);
@@ -256,26 +286,26 @@ export function createTransferStagingManager(options: TransferStagingOptions) {
         afterStat.sizeBytes !== selectionStat.sizeBytes ||
         afterStat.mtimeNs !== selectionStat.mtimeNs
       ) {
-        await filesystem.rm(destination, { recursive: true, force: true });
-        return rejection(
+        return cleanupAndReject(
           transferId,
+          destination,
           "changed-after-selection",
           "The selected file changed between selection and staging.",
         );
       }
       const copiedStat = await filesystem.stat(destination);
       if (!copiedStat.isFile) {
-        await filesystem.rm(destination, { recursive: true, force: true });
-        return rejection(
+        return cleanupAndReject(
           transferId,
+          destination,
           "special-file",
           "The staged copy is not a regular file.",
         );
       }
       if (copiedStat.sizeBytes > maxFileBytes) {
-        await filesystem.rm(destination, { recursive: true, force: true });
-        return rejection(
+        return cleanupAndReject(
           transferId,
+          destination,
           "oversized",
           "The staged copy exceeds the per-file transfer quota.",
         );
@@ -301,9 +331,9 @@ export function createTransferStagingManager(options: TransferStagingOptions) {
       staged.set(transferId, transfer);
       return privacySafe(transfer);
     } catch {
-      await filesystem.rm(destination, { recursive: true, force: true });
-      return rejection(
+      return cleanupAndReject(
         transferId,
+        destination,
         "low-disk",
         "The selected file could not be copied into Transfer Staging.",
       );
@@ -344,19 +374,8 @@ export function createTransferStagingManager(options: TransferStagingOptions) {
         "The client file size does not match the declared size.",
       );
     }
-    let available: number;
-    try {
-      available = await filesystem.availableBytes(stagingRoot);
-    } catch {
-      available = Number.POSITIVE_INFINITY;
-    }
-    if (available < sizeBytes + lowDiskMarginBytes) {
-      return rejection(
-        transferId,
-        "low-disk",
-        "The host does not have enough free disk space to stage the transfer.",
-      );
-    }
+    const lowDisk = await guardLowDisk(transferId, sizeBytes);
+    if (lowDisk !== undefined) return lowDisk;
     let destination: string;
     try {
       destination = await stagePath(transferId);
@@ -377,9 +396,9 @@ export function createTransferStagingManager(options: TransferStagingOptions) {
       );
       const copiedStat = await filesystem.stat(destination);
       if (!copiedStat.isFile || copiedStat.sizeBytes !== sizeBytes) {
-        await filesystem.rm(destination, { recursive: true, force: true });
-        return rejection(
+        return cleanupAndReject(
           transferId,
+          destination,
           "changed-after-selection",
           "The staged client file does not match the declared size.",
         );
@@ -404,9 +423,9 @@ export function createTransferStagingManager(options: TransferStagingOptions) {
       staged.set(transferId, transfer);
       return privacySafe(transfer);
     } catch {
-      await filesystem.rm(destination, { recursive: true, force: true });
-      return rejection(
+      return cleanupAndReject(
         transferId,
+        destination,
         "low-disk",
         "The client file could not be written into Transfer Staging.",
       );
@@ -452,18 +471,14 @@ export function createTransferStagingManager(options: TransferStagingOptions) {
   }
 
   /**
-   * Remove a staged transfer after the browser has used it (success), after a
+   * Remove a staged transfer after the browser has read it (release), after a
    * failure, or when the controller cancels. Always removes the staged file.
    */
-  async function release(
-    transferId: string,
-    reason: "used" | "cancelled" | "failed" | "expired" | "removed",
-  ): Promise<void> {
+  async function release(transferId: string): Promise<void> {
     const transfer = staged.get(transferId);
     if (transfer === undefined) return;
     await removeStaged(transfer);
     staged.delete(transferId);
-    void reason;
   }
 
   function progress(transferId: string): BrowserTransferProgress | undefined {
@@ -522,8 +537,16 @@ export function createTransferStagingManager(options: TransferStagingOptions) {
     return { outcome: "cancelled" };
   }
 
-  function dispose() {
+  /**
+   * Tear down the manager: remove every staged copy on disk and clear the
+   * in-memory index so leftover staging data never persists. Called on worker
+   * shutdown; profile lifecycle operations use {@link purgeAll}.
+   */
+  async function dispose(): Promise<void> {
     disposed = true;
+    for (const transfer of staged.values()) {
+      await removeStaged(transfer).catch(() => undefined);
+    }
     staged.clear();
   }
 

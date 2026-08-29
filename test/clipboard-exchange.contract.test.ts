@@ -86,10 +86,12 @@ describe("Clipboard exchange", () => {
     });
   });
 
-  it("never reports a continuous synchronization state", () => {
+  it("does not expose any continuous synchronization API", () => {
     const { effects } = createEffects();
     const exchange = createClipboardExchange({ effects });
-    expect(exchange.isSynchronizing()).toBe(false);
+    // The exchange is discrete copy/paste only; there is no ambient sync.
+    expect("isSynchronizing" in exchange).toBe(false);
+    expect("synchronize" in exchange).toBe(false);
   });
 
   it("rejects concurrent actions while one is in flight", async () => {

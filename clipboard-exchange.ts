@@ -119,17 +119,13 @@ export function createClipboardExchange(options: ClipboardExchangeOptions) {
     }
   }
 
-  /** There is never a continuous synchronization state to report. */
-  function isSynchronizing() {
-    return false;
-  }
-
+  /** There is never a continuous clipboard synchronization state. */
   function dispose() {
     disposed = true;
     inFlight = false;
   }
 
-  return { copy, paste, isSynchronizing, dispose };
+  return { copy, paste, dispose };
 }
 
 export type ClipboardExchange = ReturnType<typeof createClipboardExchange>;

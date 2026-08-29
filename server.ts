@@ -5,6 +5,8 @@ import type {
 } from "@get-bb/plugin-sdk";
 import type { z } from "zod";
 import { randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import { basename, join } from "node:path";
 import {
   createBrowserService,
   panelIdentity,
@@ -1180,12 +1182,13 @@ async function runAdministrationCli(
 }
 
 async function runCli(
+  bb: BbPluginApi,
   browser: BrowserService,
   argv: string[],
   context: PluginCliContext,
 ) {
   if (argv[0] === "transfer") {
-    return await runTransferCli(browser, argv.slice(1), context);
+    return await runTransferCli(bb, browser, argv.slice(1), context);
   }
   const parsed = parseCliArguments(argv);
   if ("error" in parsed) return { exitCode: 1, stderr: parsed.error };
@@ -1214,30 +1217,36 @@ async function runCli(
 }
 
 const TRANSFER_CLI_USAGE = [
-  "Usage: bb browser transfer <stage|cancel> [options]",
-  "  stage:  --kind workspace --source <path> --environment-root <path> [--profile <id>] [--host <id>] [--json]",
-  "  cancel: --cancel --transfer-id <id> [--profile <id>] [--host <id>] [--json]",
+  "Usage: bb browser transfer <stage|cancel|progress> [options]",
+  "  stage (workspace): --kind workspace --environment <id> --path <relative-path> [--actor owner|agent] [--profile <id>] [--host <id>] [--transfer-id <id>] [--json]",
+  "  stage (client):    --kind client --file <local-path> [--transfer-id <id>] [--profile <id>] [--host <id>] [--json]",
+  "  cancel:            --cancel --transfer-id <id> [--profile <id>] [--host <id>] [--json]",
+  "  progress:          --progress --transfer-id <id> [--profile <id>] [--host <id>] [--json]",
 ].join("\n");
 
 function readTransferOption(argv: string[], index: number, name: string) {
   if (index + 1 >= argv.length) {
     return { error: `${name} requires a value.\n${TRANSFER_CLI_USAGE}` };
   }
-  return { value: argv[index + 1]!, nextIndex: index + 1 };
+  return { value: argv[index + 1]!, nextIndex: index + 2 };
 }
 
 async function runTransferCli(
+  bb: BbPluginApi,
   browser: BrowserService,
   argv: string[],
   context: PluginCliContext,
 ) {
   let kind: string | undefined;
-  let sourcePath: string | undefined;
-  let environmentRoot: string | undefined;
+  let environmentId: string | undefined;
+  let relativePath: string | undefined;
+  let clientFile: string | undefined;
+  let actor: "owner" | "agent" | undefined;
   let transferId: string | undefined;
   let profileId: string | undefined;
   let hostId: string | undefined;
   let cancel = false;
+  let progress = false;
   let json = false;
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index]!;
@@ -1249,6 +1258,10 @@ async function runTransferCli(
       cancel = true;
       continue;
     }
+    if (argument === "--progress") {
+      progress = true;
+      continue;
+    }
     if (argument === "--kind") {
       const option = readTransferOption(argv, index, "--kind");
       if ("error" in option) return { exitCode: 1, stderr: option.error };
@@ -1256,17 +1269,31 @@ async function runTransferCli(
       index = option.nextIndex;
       continue;
     }
-    if (argument === "--source") {
-      const option = readTransferOption(argv, index, "--source");
+    if (argument === "--environment") {
+      const option = readTransferOption(argv, index, "--environment");
       if ("error" in option) return { exitCode: 1, stderr: option.error };
-      sourcePath = option.value;
+      environmentId = option.value;
       index = option.nextIndex;
       continue;
     }
-    if (argument === "--environment-root") {
-      const option = readTransferOption(argv, index, "--environment-root");
+    if (argument === "--path") {
+      const option = readTransferOption(argv, index, "--path");
       if ("error" in option) return { exitCode: 1, stderr: option.error };
-      environmentRoot = option.value;
+      relativePath = option.value;
+      index = option.nextIndex;
+      continue;
+    }
+    if (argument === "--file") {
+      const option = readTransferOption(argv, index, "--file");
+      if ("error" in option) return { exitCode: 1, stderr: option.error };
+      clientFile = option.value;
+      index = option.nextIndex;
+      continue;
+    }
+    if (argument === "--actor") {
+      const option = readTransferOption(argv, index, "--actor");
+      if ("error" in option) return { exitCode: 1, stderr: option.error };
+      actor = option.value as "owner" | "agent";
       index = option.nextIndex;
       continue;
     }
@@ -1305,13 +1332,15 @@ async function runTransferCli(
           stderr: `transfer --cancel requires --transfer-id.\n${TRANSFER_CLI_USAGE}`,
         };
       }
-      const outcome = await browser.transferConsume(
+      // Cancellation routes to `cancel()` (removing the staged copy), not to
+      // `transferConsume` (which reads the staged file for the browser).
+      const outcome = await browser.transferCancel(
         transferId,
         target.hostId,
         context.signal,
       );
       return {
-        exitCode: 0,
+        exitCode: outcome.outcome === "cancelled" ? 0 : 1,
         stdout: cliJsonOrText(
           json,
           outcome,
@@ -1319,26 +1348,94 @@ async function runTransferCli(
         ),
       };
     }
+    if (progress) {
+      if (transferId === undefined) {
+        return {
+          exitCode: 1,
+          stderr: `transfer --progress requires --transfer-id.\n${TRANSFER_CLI_USAGE}`,
+        };
+      }
+      const result = await browser.transferProgress(
+        transferId,
+        target.hostId,
+        context.signal,
+      );
+      const text =
+        result === null
+          ? `Transfer ${transferId}: not found.`
+          : `Transfer ${result.transferId}: ${result.phase} (${result.bytesCopied}/${result.totalBytes} bytes).`;
+      return {
+        exitCode: 0,
+        stdout: cliJsonOrText(json, result ?? {}, text),
+      };
+    }
+    if (kind === "client") {
+      if (clientFile === undefined) {
+        return {
+          exitCode: 1,
+          stderr: `transfer --kind client requires --file <local-path>.\n${TRANSFER_CLI_USAGE}`,
+        };
+      }
+      // The CLI stands in for the displaying-client file chooser: it reads the
+      // selected file's bytes and stages them through the client upload path
+      // so the same one-use staging policy applies.
+      const data = await readFile(clientFile);
+      const stagedTransferId = transferId ?? `transfer-${randomUUID()}`;
+      const response = await browser.transferStage(
+        {
+          kind: "client",
+          transferId: stagedTransferId,
+          fileName: basename(clientFile),
+          sizeBytes: data.byteLength,
+          hostId: target.hostId,
+          data: Buffer.from(data).toString("base64"),
+        },
+        context.signal,
+      );
+      const text =
+        response.outcome === "staged"
+          ? `Transfer ${response.transferId}: staged ${response.kind} file (${response.sizeBytes} bytes).`
+          : `Transfer ${response.transferId}: rejected (${response.reason}).`;
+      return {
+        exitCode: response.outcome === "staged" ? 0 : 1,
+        stdout: cliJsonOrText(json, response, text),
+      };
+    }
     if (kind !== "workspace") {
       return {
         exitCode: 1,
-        stderr: `transfer requires --kind workspace for CLI staging.\n${TRANSFER_CLI_USAGE}`,
+        stderr: `transfer staging requires --kind workspace or --kind client.\n${TRANSFER_CLI_USAGE}`,
       };
     }
-    if (sourcePath === undefined || environmentRoot === undefined) {
+    if (environmentId === undefined || relativePath === undefined) {
       return {
         exitCode: 1,
-        stderr: `transfer staging requires --source and --environment-root.\n${TRANSFER_CLI_USAGE}`,
+        stderr: `transfer --kind workspace requires --environment <id> and --path <relative-path>.\n${TRANSFER_CLI_USAGE}`,
       };
     }
+    // Resolve the workspace file through the BB environment file APIs rather
+    // than raw --source/--environment-root strings, so the environment root
+    // and host come from the resolved environment the transfer targets.
+    const environment = await bb.sdk.environments.get({
+      environmentId,
+      signal: context.signal,
+    });
+    if (environment.path === null) {
+      return {
+        exitCode: 1,
+        stderr: `Environment ${environmentId} has no workspace path.`,
+      };
+    }
+    const resolvedSourcePath = join(environment.path, relativePath);
     const stagedTransferId = transferId ?? `transfer-${randomUUID()}`;
     const response = await browser.transferStage(
       {
         kind: "workspace",
         transferId: stagedTransferId,
-        sourcePath,
-        environmentRoot,
-        hostId: target.hostId,
+        sourcePath: resolvedSourcePath,
+        environmentRoot: environment.path,
+        hostId: hostId ?? environment.hostId,
+        ...(actor === undefined ? {} : { actor }),
       },
       context.signal,
     );
@@ -1535,12 +1632,12 @@ function registerCli(bb: BbPluginApi, browser: BrowserService) {
       },
       {
         name: "transfer",
-        summary: "Stage or cancel an explicit workspace file transfer",
+        summary: "Stage, cancel, or watch a workspace/client file transfer",
         usage:
-          "bb browser transfer --kind workspace --source <path> --environment-root <path> [--profile <id>] [--host <id>] [--json]",
+          "bb browser transfer --kind workspace --environment <id> --path <relative-path> | --kind client --file <local-path> | --cancel --transfer-id <id> | --progress --transfer-id <id> [--json]",
       },
     ],
-    run: (argv, context) => runCli(browser, argv, context),
+    run: (argv, context) => runCli(bb, browser, argv, context),
   });
 }
 
@@ -1623,6 +1720,14 @@ export default function plugin(bb: BbPluginApi) {
     browser_transfer_stage: (input) => browser.transferStage(input),
     browser_transfer_consume: (input) =>
       browser.transferConsume(input.transferId, input.hostId),
+    browser_transfer_release: (input) =>
+      browser.transferRelease(input.transferId, input.hostId),
+    browser_transfer_cancel: (input) =>
+      browser.transferCancel(input.transferId, input.hostId),
+    browser_transfer_progress: (input) =>
+      browser.transferProgress(input.transferId, input.hostId),
+    browser_control_lease_state: (input) =>
+      browser.controlLeaseState(input.hostId, input.profileId),
     browser_file_transfer_authorize: (input) =>
       browser.fileTransferAuthorization(input),
     browser_host_choices: (input: BrowserHostChoicesInput) =>

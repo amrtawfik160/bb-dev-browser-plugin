@@ -2088,10 +2088,14 @@ export const browserTransferRejectionSchema = z.enum([
   "quota-exceeded",
   "low-disk",
   "cancelled",
+  "unauthorized",
 ]);
 export type BrowserTransferRejection = z.infer<
   typeof browserTransferRejectionSchema
 >;
+
+export const browserTransferActorSchema = z.enum(["owner", "agent"]);
+export type BrowserTransferActor = z.infer<typeof browserTransferActorSchema>;
 
 export const browserTransferStagingRequestSchema = z.discriminatedUnion(
   "kind",
@@ -2107,6 +2111,18 @@ export const browserTransferStagingRequestSchema = z.discriminatedUnion(
           .int()
           .positive()
           .max(BROWSER_TRANSFER_MAX_FILE_BYTES),
+        /**
+         * Who initiated the transfer. Enforced through {@link authorizeFileTransfer}
+         * before the host stages anything; agents additionally need the
+         * file-transfer grant and an active Control Lease. Defaults to `owner`
+         * when omitted.
+         */
+        actor: browserTransferActorSchema.optional(),
+        /**
+         * The Browser Profile the transfer targets (used to enforce the
+         * Control Lease for agent transfers). Defaults to the default profile.
+         */
+        profileId: z.string().min(1).max(120).optional(),
       })
       .strict(),
     z
@@ -2116,6 +2132,8 @@ export const browserTransferStagingRequestSchema = z.discriminatedUnion(
         sourcePath: z.string().min(1).max(4096),
         environmentRoot: z.string().min(1).max(4096),
         contentType: z.string().min(1).max(200).optional(),
+        actor: browserTransferActorSchema.optional(),
+        profileId: z.string().min(1).max(120).optional(),
       })
       .strict(),
   ],
@@ -2130,7 +2148,16 @@ export type BrowserTransferStagingRequest = z.infer<
  */
 export const browserTransferStageInputSchema = z.discriminatedUnion("kind", [
   browserTransferStagingRequestSchema.options[0]
-    .extend({ hostId: z.string().min(1) })
+    .extend({
+      hostId: z.string().min(1),
+      /**
+       * Base64-encoded file bytes for a displaying-client upload received
+       * through the active browser file chooser. The host decodes and routes
+       * to `stageClientFile`; the staging request itself never carries raw
+       * bytes so the manager policy stays byte-oriented and testable.
+       */
+      data: z.string(),
+    })
     .strict(),
   browserTransferStagingRequestSchema.options[1]
     .extend({ hostId: z.string().min(1) })
@@ -2148,6 +2175,82 @@ export const browserTransferConsumeInputSchema = z
   .strict();
 export type BrowserTransferConsumeInput = z.infer<
   typeof browserTransferConsumeInputSchema
+>;
+
+export const browserTransferReleaseInputSchema = z
+  .object({
+    hostId: z.string().min(1),
+    transferId: z.string().min(1).max(120),
+  })
+  .strict();
+export type BrowserTransferReleaseInput = z.infer<
+  typeof browserTransferReleaseInputSchema
+>;
+
+export const browserTransferReleaseOutcomeSchema = z
+  .object({
+    outcome: z.enum(["released", "missing"]),
+    transferId: z.string().min(1).max(120),
+  })
+  .strict();
+export type BrowserTransferReleaseOutcome = z.infer<
+  typeof browserTransferReleaseOutcomeSchema
+>;
+
+export const browserTransferCancelInputSchema = z
+  .object({
+    hostId: z.string().min(1),
+    transferId: z.string().min(1).max(120),
+  })
+  .strict();
+export type BrowserTransferCancelInput = z.infer<
+  typeof browserTransferCancelInputSchema
+>;
+
+export const browserTransferCancelOutcomeSchema = z
+  .object({
+    outcome: z.enum(["cancelled", "missing"]),
+    transferId: z.string().min(1).max(120),
+  })
+  .strict();
+export type BrowserTransferCancelOutcome = z.infer<
+  typeof browserTransferCancelOutcomeSchema
+>;
+
+export const browserTransferProgressInputSchema = z
+  .object({
+    hostId: z.string().min(1),
+    transferId: z.string().min(1).max(120),
+  })
+  .strict();
+export type BrowserTransferProgressInput = z.infer<
+  typeof browserTransferProgressInputSchema
+>;
+
+/**
+ * Control Lease state query (issue #19). Used by the transfer path to enforce
+ * that an agent-initiated transfer holds an active Control Lease. The host is
+ * the source of truth for lease state.
+ */
+export const browserControlLeaseStateInputSchema = z
+  .object({
+    hostId: z.string().min(1),
+    profileId: z.string().min(1),
+  })
+  .strict();
+export type BrowserControlLeaseStateInput = z.infer<
+  typeof browserControlLeaseStateInputSchema
+>;
+
+export const browserControlLeaseStateSchema = z
+  .object({
+    active: z.boolean(),
+    actor: z.enum(["owner", "agent"]).nullable(),
+    purpose: z.string().nullable(),
+  })
+  .strict();
+export type BrowserControlLeaseState = z.infer<
+  typeof browserControlLeaseStateSchema
 >;
 
 export const browserTransferStagingResponseSchema = z.discriminatedUnion(
@@ -2199,6 +2302,12 @@ export type BrowserTransferProgress = z.infer<
   typeof browserTransferProgressSchema
 >;
 
+export const browserTransferProgressResultSchema =
+  browserTransferProgressSchema.nullable();
+export type BrowserTransferProgressResult = z.infer<
+  typeof browserTransferProgressResultSchema
+>;
+
 export const browserTransferCancelMessageSchema = z
   .object({
     type: z.literal("transfer_cancel"),
@@ -2214,6 +2323,13 @@ export const browserTransferOutcomeSchema = z.discriminatedUnion("outcome", [
     .object({
       outcome: z.literal("used"),
       transferId: z.string().min(1).max(120),
+      /**
+       * The host-local staged path the browser must read before the host
+       * releases it. The path leaves the host so the browser process (CDP)
+       * can read the file; the caller invokes `transfer_release` after the
+       * read so the one-use copy is removed.
+       */
+      stagedPath: z.string().min(1).max(4096),
     })
     .strict(),
   z
@@ -2494,6 +2610,22 @@ export const rpcContract = defineRpcContract({
   browser_transfer_consume: {
     input: browserTransferConsumeInputSchema,
     output: browserTransferOutcomeSchema,
+  },
+  browser_transfer_release: {
+    input: browserTransferReleaseInputSchema,
+    output: browserTransferReleaseOutcomeSchema,
+  },
+  browser_transfer_cancel: {
+    input: browserTransferCancelInputSchema,
+    output: browserTransferCancelOutcomeSchema,
+  },
+  browser_transfer_progress: {
+    input: browserTransferProgressInputSchema,
+    output: browserTransferProgressResultSchema,
+  },
+  browser_control_lease_state: {
+    input: browserControlLeaseStateInputSchema,
+    output: browserControlLeaseStateSchema,
   },
   browser_file_transfer_authorize: {
     input: browserFileTransferAuthorizationSchema,

@@ -96,6 +96,10 @@ import {
   type BrowserTransferStageInput,
   type BrowserTransferStagingResponse,
   type BrowserTransferOutcome,
+  type BrowserTransferReleaseOutcome,
+  type BrowserTransferCancelOutcome,
+  type BrowserTransferProgressResult,
+  type BrowserControlLeaseState,
   type BrowserFileTransferAuthorization,
   type BrowserFileTransferDecision,
 } from "./contracts.js";
@@ -2512,6 +2516,8 @@ export function createBrowserService(
    * one-use Transfer Staging (issue #19). The host broker copies the file into
    * narrow-permission staging after realpath containment checks; the response
    * carries privacy-safe metadata and never the staged or unrelated paths.
+   * Agent-initiated transfers are authorized first: they require the
+   * file-transfer elevated grant and an active Control Lease.
    */
   async function transferStage(
     input: BrowserTransferStageInput,
@@ -2519,12 +2525,46 @@ export function createBrowserService(
   ): Promise<BrowserTransferStagingResponse> {
     const hostId = input.hostId;
     await requireConnectedHost(hostId, signal);
+    const actor = input.actor ?? "owner";
+    if (actor === "agent") {
+      const profileId = input.profileId ?? DEFAULT_PROFILE_ID;
+      const fileTransferGranted = grantStore
+        .list({ hostId, profileId })
+        .some(
+          (grant) =>
+            grant.fileTransfer &&
+            grant.revokedAt === null &&
+            elevationIsActive(grant.fileTransferExpiresAt, new Date()),
+        );
+      const leaseState = await host.call(
+        "controlLeaseState",
+        { hostId, profileId },
+        { hostId, signal },
+      );
+      const decision = authorizeFileTransfer({
+        actor,
+        fileTransferGranted,
+        leaseActive: leaseState.active,
+      });
+      if (!decision.authorized) {
+        return {
+          outcome: "rejected",
+          transferId: input.transferId,
+          reason: "unauthorized",
+          message:
+            decision.reason === "file-transfer-grant-required"
+              ? "Agent file transfers require the file-transfer grant."
+              : "Agent file transfers require an active Control Lease.",
+        };
+      }
+    }
     return host.call("transferStage", input, { hostId, signal });
   }
 
   /**
-   * Consume (or cancel) a staged transfer. The staged file is removed after
-   * use; the outcome is privacy-safe and never echoes paths.
+   * Consume a staged transfer: return the host-local staged path the browser
+   * must read. The staged file is NOT released here; the caller invokes
+   * `transferRelease` after the browser reads it so the one-use copy is removed.
    */
   async function transferConsume(
     transferId: string,
@@ -2536,6 +2576,76 @@ export function createBrowserService(
       "transferConsume",
       { hostId, transferId },
       { hostId, signal },
+    );
+  }
+
+  /**
+   * Release a staged transfer after the browser has read it (or after a
+   * failure), removing the one-use on-disk copy.
+   */
+  async function transferRelease(
+    transferId: string,
+    hostId: string,
+    signal?: AbortSignal,
+  ): Promise<BrowserTransferReleaseOutcome> {
+    await requireConnectedHost(hostId, signal);
+    return host.call(
+      "transferRelease",
+      { hostId, transferId },
+      { hostId, signal },
+    );
+  }
+
+  /**
+   * Cancel a staged transfer at the controller's request, removing the staged
+   * copy. Distinct from `transferConsume`: consume reads, cancel aborts.
+   */
+  async function transferCancel(
+    transferId: string,
+    hostId: string,
+    signal?: AbortSignal,
+  ): Promise<BrowserTransferCancelOutcome> {
+    await requireConnectedHost(hostId, signal);
+    return host.call(
+      "transferCancel",
+      { hostId, transferId },
+      { hostId, signal },
+    );
+  }
+
+  /**
+   * Report privacy-safe progress for a staged transfer (never paths).
+   */
+  async function transferProgress(
+    transferId: string,
+    hostId: string,
+    signal?: AbortSignal,
+  ): Promise<BrowserTransferProgressResult> {
+    await requireConnectedHost(hostId, signal);
+    return host.call(
+      "transferProgress",
+      { hostId, transferId },
+      { hostId, signal },
+    );
+  }
+
+  /**
+   * Report the active Control Lease state for a profile. Used by the transfer
+   * path to enforce that agent transfers hold an active lease.
+   */
+  async function controlLeaseState(
+    hostId: string,
+    profileId: string,
+    signal?: AbortSignal,
+  ): Promise<BrowserControlLeaseState> {
+    await requireConnectedHost(hostId, signal);
+    return host.call(
+      "controlLeaseState",
+      { hostId, profileId },
+      {
+        hostId,
+        signal,
+      },
     );
   }
 
@@ -2598,6 +2708,10 @@ export function createBrowserService(
     selectProfile,
     transferStage,
     transferConsume,
+    transferRelease,
+    transferCancel,
+    transferProgress,
+    controlLeaseState,
     fileTransferAuthorization,
   };
 }
