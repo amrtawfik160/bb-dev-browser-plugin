@@ -1,5 +1,4 @@
 import { execFile } from "node:child_process";
-import { createServer, type Server } from "node:http";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
@@ -10,6 +9,11 @@ import {
   hostInstallationId,
   provisionedBrowserStorageRoot,
 } from "../readiness.js";
+import {
+  closeLoopbackFixture,
+  createLoopbackAuthFixture,
+  listenLoopbackFixture,
+} from "./fixtures/loopback-auth-fixture.js";
 
 const integrationEnabled = process.env.BB_BROWSER_REAL_INTEGRATION === "1";
 const integrationRequired =
@@ -49,54 +53,6 @@ async function runWorker(environment: NodeJS.ProcessEnv) {
       activityMetadataOnly: boolean;
     };
   };
-}
-
-function authenticationFixture() {
-  return createServer((request, response) => {
-    const signedIn = request.headers.cookie?.includes("fixture-session=valid");
-    if (request.method === "POST" && request.url === "/sign-in") {
-      response.writeHead(303, {
-        location: "/account",
-        "set-cookie": "fixture-session=valid; Path=/; SameSite=Lax",
-      });
-      response.end();
-      return;
-    }
-    response.setHeader("content-type", "text/html; charset=utf-8");
-    if (request.url === "/account" && signedIn) {
-      response.end(
-        "<h1>Signed in</h1><button id=\"popup\" onclick=\"open('/popup', 'fixture-popup')\">Popup</button>",
-      );
-      return;
-    }
-    if (request.url === "/popup" && signedIn) {
-      response.end("<h1>Authenticated popup</h1>");
-      return;
-    }
-    response.end(
-      '<form method="post" action="/sign-in"><input name="user"><button>Sign in</button></form>',
-    );
-  });
-}
-
-function listen(server: Server) {
-  return new Promise<number>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address();
-      if (address === null || typeof address === "string") {
-        reject(new Error("The local authentication fixture did not bind TCP."));
-        return;
-      }
-      resolve(address.port);
-    });
-  });
-}
-
-function close(server: Server) {
-  return new Promise<void>((resolve, reject) => {
-    server.close((error) => (error === undefined ? resolve() : reject(error)));
-  });
 }
 
 describe("real-host Safe Login command fail-closed gate", () => {
@@ -142,8 +98,8 @@ it.runIf(integrationEnabled)(
     // Safe Login drives the same deterministic login fixture the auth gate
     // uses: spin up the local authentication server and point the worker at it
     // so the owner signs in through the fixture rather than bare stubs.
-    const fixtureServer = authenticationFixture();
-    const fixturePort = await listen(fixtureServer);
+    const fixtureServer = createLoopbackAuthFixture();
+    const fixturePort = await listenLoopbackFixture(fixtureServer);
     const fixtureAddress = projectLoopbackAddress(
       projectId,
       `http://localhost:${fixturePort}/account`,
@@ -183,7 +139,7 @@ it.runIf(integrationEnabled)(
           BB_BROWSER_WORKER_ACTION: "cleanup",
         });
       }
-      await close(fixtureServer);
+      await closeLoopbackFixture(fixtureServer);
     }
   },
   240_000,

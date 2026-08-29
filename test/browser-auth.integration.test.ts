@@ -1,5 +1,4 @@
 import { execFile } from "node:child_process";
-import { createServer, type Server } from "node:http";
 import { access, readFile, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -12,6 +11,11 @@ import {
   hostInstallationId,
   provisionedBrowserStorageRoot,
 } from "../readiness.js";
+import {
+  closeLoopbackFixture,
+  createLoopbackAuthFixture,
+  listenLoopbackFixture,
+} from "./fixtures/loopback-auth-fixture.js";
 
 const integrationEnabled = process.env.BB_BROWSER_REAL_INTEGRATION === "1";
 const integrationRequired =
@@ -35,54 +39,6 @@ function requiredEnvironment(name: string) {
     throw new Error(`The provisioned-host gate requires ${name}.`);
   }
   return setting;
-}
-
-function listen(server: Server) {
-  return new Promise<number>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address();
-      if (address === null || typeof address === "string") {
-        reject(new Error("The local authentication fixture did not bind TCP."));
-        return;
-      }
-      resolve(address.port);
-    });
-  });
-}
-
-function close(server: Server) {
-  return new Promise<void>((resolve, reject) => {
-    server.close((error) => (error === undefined ? resolve() : reject(error)));
-  });
-}
-
-function authenticationFixture() {
-  return createServer((request, response) => {
-    const signedIn = request.headers.cookie?.includes("fixture-session=valid");
-    if (request.method === "POST" && request.url === "/sign-in") {
-      response.writeHead(303, {
-        location: "/account",
-        "set-cookie": "fixture-session=valid; Path=/; SameSite=Lax",
-      });
-      response.end();
-      return;
-    }
-    response.setHeader("content-type", "text/html; charset=utf-8");
-    if (request.url === "/account" && signedIn) {
-      response.end(
-        "<h1>Signed in</h1><button id=\"popup\" onclick=\"open('/popup', 'fixture-popup')\">Popup</button>",
-      );
-      return;
-    }
-    if (request.url === "/popup" && signedIn) {
-      response.end("<h1>Authenticated popup</h1>");
-      return;
-    }
-    response.end(
-      '<form method="post" action="/sign-in"><input name="user"><button>Sign in</button></form>',
-    );
-  });
 }
 
 type WorkerReport = {
@@ -263,8 +219,8 @@ it.runIf(integrationEnabled)(
     expect(snapshot.browser?.compatible).toBe(true);
     expect(snapshot.sandbox.available).toBe(true);
 
-    const server = authenticationFixture();
-    const port = await listen(server);
+    const server = createLoopbackAuthFixture();
+    const port = await listenLoopbackFixture(server);
     const fixtureAddress = projectLoopbackAddress(
       projectId,
       `http://localhost:${port}/account`,
@@ -382,7 +338,7 @@ it.runIf(integrationEnabled)(
           BB_BROWSER_WORKER_ACTION: "cleanup",
         });
       }
-      await close(server);
+      await closeLoopbackFixture(server);
       await cleanupFixtureProfiles(fixtureProfiles);
     }
   },
