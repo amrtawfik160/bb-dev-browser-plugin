@@ -37,9 +37,7 @@
  * It reuses the existing `safe-login` worker action (which drives the
  * deterministic loopback authentication fixture, NOT a real third-party site)
  * so the privacy/isolation machinery is proven without entering real
- * credentials. It also reuses the #18 `deterministicLoginFixture` for the
- * policy-level mode-transition / agent-denial / authenticated-state-check
- * decision. It does not duplicate any helper.
+ * credentials. It does not duplicate any helper.
  */
 import { describe, expect, it } from "vitest";
 import {
@@ -58,10 +56,6 @@ import {
   type ProvisionedHostContext,
   type WorkerReport,
 } from "./fixtures/host-provisioning.js";
-import {
-  deterministicLoginFixture,
-  type DeterministicLoginFixture,
-} from "./fixtures/safe-login-fixture.js";
 import { projectLoopbackAddress } from "../browser-navigation.js";
 
 /**
@@ -99,53 +93,6 @@ export function deriveCompatibilityOutcome(
     return { result: "fail", category: "safe-login-isolation" };
   }
   return { result: "pass", category: "safe-login-compatible" };
-}
-
-/**
- * Run the #18 deterministic Safe Login fixture through its enter → authenticate
- * → done cycle and return the fixture plus the policy-level facts AC4 asserts
- * (Done returns to automation, agents were denied, the authenticated-state
- * check was the owner's decision rather than an asserted script). The owner's
- * real smoke test drives the SAME policy machine; this proves the transition
- * holds deterministically without entering real credentials.
- */
-function exerciseDeterministicSafeLoginPolicy(): {
-  fixture: DeterministicLoginFixture;
-  doneReturnedToAutomation: boolean;
-  agentDenied: boolean;
-  authenticatedStateCheckOwnerDecision: boolean;
-} {
-  const fixture = deterministicLoginFixture();
-  const relaunch = fixture.recordingRelaunch();
-  const interruption = fixture.interruption({ active: true, interrupted: 1 });
-  const entered = {
-    agentsWereActive: true,
-    interruptedAgents: 1,
-    warning: { transientStateLoss: ["unsaved-form"] },
-    sessionId: "session-fixture",
-  };
-  // The owner signs in through the deterministic fixture (stands in for the
-  // owner's manual third-party sign-in). The agent never sees the credential.
-  fixture.authenticate();
-  // Done returns the profile to Automation Mode (AC4): returnToAutomation is
-  // invoked exactly once and the fixture recorded no automation during the
-  // sign-in window.
-  void relaunch.effects.returnToAutomation(fixture.target);
-  const doneReturnedToAutomation =
-    relaunch.calls.returnToAutomation.length === 1;
-  // Agents are denied throughout Safe Login (AC3): the interruption reported
-  // active agent denial, and the fixture's policy machine holds the deny.
-  const agentDenied = entered.interruptedAgents > 0 && interruption !== null;
-  // AC4: whether a minimal non-sensitive authenticated-state check is
-  // appropriate is the owner's decision. The test asserts the mode transition
-  // and the no-leak guarantee — NOT that any particular check was performed.
-  const authenticatedStateCheckOwnerDecision = true;
-  return {
-    fixture,
-    doneReturnedToAutomation,
-    agentDenied,
-    authenticatedStateCheckOwnerDecision,
-  };
 }
 
 describe("issue #25 third-party login smoke-test privacy/isolation", () => {
@@ -262,31 +209,16 @@ describe("issue #25 third-party login smoke-test privacy/isolation", () => {
         expect(safe?.doneReturnedToAutomation).toBe(true);
         expect(safe?.reconciledToAutomation).toBe(true);
 
-        // Reuse the #18 deterministic Safe Login fixture to assert the
-        // policy-level mode transition holds (Done → automation, agents denied)
-        // and that the authenticated-state check is the owner's decision. This
-        // mirrors the owner's real smoke test against the SAME policy machine
-        // without entering real credentials.
-        const policy = exerciseDeterministicSafeLoginPolicy();
-        expect(policy.doneReturnedToAutomation).toBe(true);
-        expect(policy.agentDenied).toBe(true);
-        // The fixture's policy machine holds no sensitive payload.
-        const policyJson = JSON.stringify({
-          target: policy.fixture.target,
-          authenticated: policy.fixture.authenticated,
-          sessionToken: policy.fixture.sessionToken,
-        });
-        // The fixture mints a non-sensitive session token marker; assert the
-        // policy surface carries no password/credential/screenshot/cookie.
-        expect(policyJson).not.toMatch(/password|credential|screenshot/i);
-
-        // No sensitive data leaked across the worker + policy surfaces.
-        const combinedLeaks = findSensitiveData(
-          `${JSON.stringify(report)}${policyJson}`,
-        );
+        // No sensitive data leaked across the real worker report surface.
+        // The policy-level mode transition and agent denial are already proven
+        // by the real report assertions above and by the AC2/AC3/AC5 suite's
+        // non-vacuous scan of this same report; a separate self-built
+        // policyJson scan would be vacuous (the #21 manifest-scan anti-pattern),
+        // so it is intentionally omitted.
+        const reportLeaks = findSensitiveData(JSON.stringify(report));
         expect(
-          combinedLeaks,
-          `combined surfaces leaked: ${combinedLeaks.join(", ")}`,
+          reportLeaks,
+          `report surface leaked: ${reportLeaks.join(", ")}`,
         ).toEqual([]);
 
         await runHostWorker(context.workerEnv("cleanup"));
