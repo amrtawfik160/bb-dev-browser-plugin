@@ -4,10 +4,15 @@ import { z } from "zod";
 import {
   browserScriptParametersSchema,
   DEFAULT_PROFILE_ID,
+  hostOfflineStatus,
+  hostProbeFailedStatus,
   setupRequiredStatus,
+  type BrowserDiagnostics,
+  type BrowserStatus,
   type BrowserStatusInput,
 } from "./contracts.js";
 import { browserHostContract } from "./host-contract.js";
+import { dependencyInventory } from "./dependency-inventory.js";
 
 const migrations = [
   `CREATE TABLE browser_preferences (
@@ -61,6 +66,26 @@ async function resolvedHostId(bb: BbPluginApi, identity: BrowserIdentity) {
   return null;
 }
 
+function unavailableDiagnostics(status: BrowserStatus): BrowserDiagnostics {
+  return {
+    hostId: status.hostId!,
+    profileId: status.profileId,
+    generatedAt: new Date().toISOString(),
+    readiness: status,
+    dependencies: dependencyInventory(),
+    processes: [
+      { name: "host-worker", state: "stopped" },
+      { name: "browser", state: "stopped" },
+    ],
+    resourceUse: {
+      diskFreeBytes: 0,
+      diskTotalBytes: 0,
+      workerRssBytes: 0,
+    },
+    exitLogs: [],
+  };
+}
+
 export function panelIdentity(input: BrowserStatusInput): BrowserIdentity {
   return input.surface === "thread"
     ? { threadId: input.threadId }
@@ -72,6 +97,27 @@ export function createBrowserService(bb: BbPluginApi) {
   bb.storage.migrate(database, migrations);
   const host = bb.hosts.experimental_client({ contract: browserHostContract });
 
+  async function hostConnection(hostId: string, signal?: AbortSignal) {
+    const hosts = await bb.sdk.hosts.list({ signal });
+    return hosts.find((candidate) => candidate.id === hostId)?.status ?? null;
+  }
+
+  async function hostStatus(
+    hostId: string,
+    profileId: string,
+    signal?: AbortSignal,
+  ) {
+    const target = { hostId, profileId };
+    if ((await hostConnection(hostId, signal)) !== "connected") {
+      return hostOfflineStatus(target);
+    }
+    try {
+      return await host.call("status", target, { hostId, signal });
+    } catch {
+      return hostProbeFailedStatus(target);
+    }
+  }
+
   async function status(
     identity: BrowserIdentity,
     profileId = defaultProfileId(database),
@@ -79,7 +125,36 @@ export function createBrowserService(bb: BbPluginApi) {
   ) {
     const hostId = await resolvedHostId(bb, identity);
     if (hostId === null) return setupRequiredStatus({ hostId, profileId });
-    return host.call("status", { hostId, profileId }, { hostId, signal });
+    return hostStatus(hostId, profileId, signal);
+  }
+
+  async function settingsStatuses(profileId = defaultProfileId(database)) {
+    const hosts = await bb.sdk.hosts.list();
+    return Promise.all(
+      hosts.map((candidate) => hostStatus(candidate.id, profileId)),
+    );
+  }
+
+  async function diagnostics(
+    target: { hostId: string | null; profileId: string },
+    signal?: AbortSignal,
+  ) {
+    if (target.hostId === null) {
+      throw new Error("Select a workspace host before requesting diagnostics.");
+    }
+    const readiness = await hostStatus(target.hostId, target.profileId, signal);
+    if (readiness.state === "host-offline") {
+      return unavailableDiagnostics(readiness);
+    }
+    try {
+      return await host.call(
+        "diagnostics",
+        { hostId: target.hostId, profileId: target.profileId },
+        { hostId: target.hostId, signal },
+      );
+    } catch {
+      return unavailableDiagnostics(hostProbeFailedStatus(target));
+    }
   }
 
   async function browserScript(
@@ -110,7 +185,7 @@ export function createBrowserService(bb: BbPluginApi) {
     );
   }
 
-  return { browserScript, status };
+  return { browserScript, diagnostics, settingsStatuses, status };
 }
 
 export type BrowserService = ReturnType<typeof createBrowserService>;

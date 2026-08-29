@@ -1,34 +1,51 @@
 import { experimental_defineHostEntry } from "@get-bb/plugin-sdk/host";
-import {
-  setupRequiredStatus,
-  type BrowserHostTarget,
-  type BrowserStatus,
-} from "./contracts.js";
 import { browserHostContract } from "./host-contract.js";
+import {
+  createDefaultHostSnapshotReader,
+  createHostReadinessBoundary,
+  type HostReadinessBoundary,
+} from "./readiness.js";
 
-export interface HostSetupBoundary {
-  inspect(target: BrowserHostTarget): BrowserStatus | Promise<BrowserStatus>;
-  provision(): void | Promise<void>;
-}
+export type HostSetupBoundary = HostReadinessBoundary;
+type HostSetupBoundarySource =
+  HostSetupBoundary | ((dataDir: string) => HostSetupBoundary);
 
-export function createBrowserHostEntry(setup: HostSetupBoundary) {
+export function createBrowserHostEntry(source: HostSetupBoundarySource) {
+  let workerLease: { dispose(): Promise<void> } | undefined;
+  let retainedReadiness: HostSetupBoundary | undefined;
+  function readiness(dataDir: string) {
+    retainedReadiness ??=
+      typeof source === "function" ? source(dataDir) : source;
+    return retainedReadiness;
+  }
   return experimental_defineHostEntry({
     contract: browserHostContract,
     handlers: {
-      status: (target) => setup.inspect(target),
-      browserScript: async ({ hostId, profileId }) => ({
-        ok: false as const,
-        error: await setup.inspect({ hostId, profileId }),
-      }),
+      status: (target, context) => {
+        workerLease ??= context.experimental_retainWorker();
+        return readiness(context.experimental_paths.dataDir).inspect(target);
+      },
+      diagnostics: (target, context) => {
+        workerLease ??= context.experimental_retainWorker();
+        return readiness(context.experimental_paths.dataDir).diagnostics(
+          target,
+        );
+      },
+      browserScript: async ({ hostId, profileId }, context) => {
+        workerLease ??= context.experimental_retainWorker();
+        return {
+          ok: false as const,
+          error: await readiness(context.experimental_paths.dataDir).inspect({
+            hostId,
+            profileId,
+          }),
+        };
+      },
     },
+    dispose: async () => workerLease?.dispose(),
   });
 }
 
-const absentHostSetup: HostSetupBoundary = {
-  inspect: setupRequiredStatus,
-  provision() {
-    throw new Error("Privileged Browser setup is outside issue #2.");
-  },
-};
-
-export default createBrowserHostEntry(absentHostSetup);
+export default createBrowserHostEntry((dataDir) =>
+  createHostReadinessBoundary(createDefaultHostSnapshotReader(dataDir)),
+);
