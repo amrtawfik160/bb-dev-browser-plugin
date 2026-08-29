@@ -4,6 +4,9 @@ import type { PanelGateway } from "./panel-gateway.js";
 import type { PanelStreamAdapter } from "./panel-stream.js";
 import {
   PANEL_GATEWAY_BIND_HOST,
+  PANEL_RECLAIM_WINDOW_MS,
+  type BrowserDialogEvent,
+  type BrowserContextAction,
   type BrowserPanelControlState,
   type BrowserTabStrip,
 } from "./contracts.js";
@@ -47,6 +50,31 @@ export interface ScreencastSource {
    * sources without a dynamic viewport ignore it.
    */
   setViewport?(viewport: { width: number; height: number }): void;
+  /**
+   * Subscribe to page dialogs (alert/confirm/prompt/beforeunload). The source
+   * invokes {@link onDialog} for each `Page.javascriptDialogOpening` event so
+   * the transport can render actionable BB panel chrome. Returns an
+   * unsubscribe function. Optional for sources without a real browser.
+   */
+  subscribeDialogs?(onDialog: (event: BrowserDialogEvent) => void): () => void;
+  /** Resolve an open dialog. Maps directly to `Page.handleJavaScriptDialog`. */
+  respondToDialog?(dialogId: string, accept: boolean, text?: string): void;
+  /**
+   * Auto-resolve any still-open dialog with the browser default when the
+   * controller does not reclaim within the bounded window, so a stranded
+   * prompt never leaves an invisible modal block. Idempotent.
+   */
+  dismissOpenDialogs?(): void;
+  /**
+   * Inspect the element under a viewport point and report the common link and
+   * image actions available there, without native Chrome context menus.
+   */
+  resolveContextActions?(point: {
+    x: number;
+    y: number;
+  }): Promise<BrowserContextAction[]>;
+  /** Perform a chosen context action reported by {@link resolveContextActions}. */
+  performContextAction?(actionId: string): void;
 }
 
 export type PanelTransportServerOptions = {
@@ -84,6 +112,12 @@ export type PanelTransportServer = {
     control: BrowserPanelControlState,
     tabs: BrowserTabStrip,
   ): void;
+  /**
+   * Dismiss every still-open dialog with the fail-closed default. Wired to
+   * Control Lease end (revoked or owner takeover) so an unresolved agent
+   * dialog never leaves an invisible modal block.
+   */
+  dismissOpenDialogs(): void;
   get port(): number | undefined;
   get state(): "idle" | "listening" | "closed";
 };
@@ -110,6 +144,22 @@ export function createPanelTransportServer(
   let authorized = false;
   let firstMessageTimeout: ReturnType<typeof setTimeout> | undefined;
   const controller = new AbortController();
+  /**
+   * Open dialogs keyed by id, so multiple dialogs stay answerable and a
+   * reconnect re-pushes each still-open event exactly once. Cleared when the
+   * panel responds, when the page closes a dialog, or when the reclaim window
+   * expires (fail closed).
+   */
+  const openDialogs = new Map<string, BrowserDialogEvent>();
+  /** A pending context-menu query awaiting the source's element inspection. */
+  let pendingContextQueryId: string | null = null;
+  /**
+   * Timer that fails an open dialog closed if the controller does not reclaim
+   * within the bounded reconnect window, so a stranded prompt leaves no
+   * invisible modal block.
+   */
+  let failClosedTimer: ReturnType<typeof setTimeout> | undefined;
+  let unsubscribeDialogs: (() => void) | undefined;
 
   function sendJson(socket: WebSocket, message: unknown) {
     if (socket.readyState !== socket.OPEN) return;
@@ -121,6 +171,49 @@ export function createPanelTransportServer(
       sendJson(connection, { type: "error", reason });
       connection.close();
     }
+  }
+
+  function clearFailClosedTimer() {
+    if (failClosedTimer !== undefined) {
+      clearTimeout(failClosedTimer);
+      failClosedTimer = undefined;
+    }
+  }
+
+  /**
+   * The fail-closed default for a stranded dialog. confirm/prompt/beforeunload
+   * cancel (accept:false) so an unseen action is never silently confirmed and
+   * a beforeunload never silently leaves the page; alert accepts (its only
+   * button is OK) since it carries no destructive choice. Preserving page
+   * state is the safe default when the controller never reclaimed.
+   */
+  function failClosedAccept(event: BrowserDialogEvent): boolean {
+    return event.type === "alert";
+  }
+
+  function pushDialog(socket: WebSocket, event: BrowserDialogEvent) {
+    if (socket.readyState !== socket.OPEN) return;
+    sendJson(socket, { type: "dialog", dialog: event });
+  }
+
+  function startFailClosedTimer() {
+    clearFailClosedTimer();
+    if (openDialogs.size === 0) return;
+    const pending = [...openDialogs.values()];
+    failClosedTimer = setTimeout(() => {
+      failClosedTimer = undefined;
+      // No reclaim within the bounded window: resolve each stranded dialog
+      // with the fail-closed default (cancel/stay for confirm/prompt/
+      // beforeunload; OK for alert) and drop the panel's invisible modal.
+      for (const event of pending) {
+        openDialogs.delete(event.dialogId);
+        source.respondToDialog?.(
+          event.dialogId,
+          failClosedAccept(event),
+          undefined,
+        );
+      }
+    }, PANEL_RECLAIM_WINDOW_MS);
   }
 
   function handleDisconnect() {
@@ -138,6 +231,10 @@ export function createPanelTransportServer(
     void source.stop();
     connection = undefined;
     authorized = false;
+    pendingContextQueryId = null;
+    // Start the fail-closed timer so an open dialog is auto-resolved if the
+    // controller does not reclaim within the bounded window.
+    startFailClosedTimer();
     onDisconnect?.();
   }
 
@@ -149,10 +246,22 @@ export function createPanelTransportServer(
       viewport: stream.viewport,
       fps: stream.fps,
     });
+    clearFailClosedTimer();
     void source.start(
       (frame) => deliverFrame(socket, frame),
       controller.signal,
     );
+    if (source.subscribeDialogs !== undefined) {
+      unsubscribeDialogs?.();
+      // subscribeDialogs re-emits every still-open dialog exactly once, so it
+      // is the single source of truth for both fresh opens and reconnect
+      // re-pushes; an explicit re-push here would duplicate them.
+      unsubscribeDialogs = source.subscribeDialogs((event) => {
+        openDialogs.set(event.dialogId, event);
+        if (connection !== undefined && authorized)
+          pushDialog(connection, event);
+      });
+    }
   }
 
   function deliverFrame(socket: WebSocket, frame: ScreencastFrame) {
@@ -196,6 +305,48 @@ export function createPanelTransportServer(
       // controller may forward input to the browser.
       if (!canInput()) return;
       source.input(message.payload);
+      return;
+    }
+    if (message.kind === "dialog_response") {
+      // Only the controller can resolve a dialog; spectators observe it only.
+      if (!canInput()) return;
+      const open = openDialogs.get(message.dialogId);
+      if (open !== undefined) {
+        openDialogs.delete(message.dialogId);
+        source.respondToDialog?.(
+          message.dialogId,
+          message.accept,
+          message.text,
+        );
+        if (openDialogs.size === 0) clearFailClosedTimer();
+      }
+      return;
+    }
+    if (message.kind === "context_query") {
+      if (!canInput()) return;
+      pendingContextQueryId = message.queryId;
+      const queryId = message.queryId;
+      void Promise.resolve(
+        source.resolveContextActions?.({ x: message.x, y: message.y }),
+      )
+        .then((actions) => {
+          if (pendingContextQueryId !== queryId) return;
+          pendingContextQueryId = null;
+          const socketRef = connection;
+          if (socketRef === undefined || !authorized) return;
+          sendJson(socketRef, {
+            type: "context_menu",
+            queryId,
+            point: { x: message.x, y: message.y },
+            actions: actions ?? [],
+          });
+        })
+        .catch(() => undefined);
+      return;
+    }
+    if (message.kind === "context_action") {
+      if (!canInput()) return;
+      source.performContextAction?.(message.actionId);
       return;
     }
     // ack and ping are accepted by the gateway but carry no transport action.
@@ -254,6 +405,10 @@ export function createPanelTransportServer(
       clearTimeout(firstMessageTimeout);
       firstMessageTimeout = undefined;
     }
+    clearFailClosedTimer();
+    unsubscribeDialogs?.();
+    unsubscribeDialogs = undefined;
+    openDialogs.clear();
     controller.abort();
     await source.stop();
     closeConnection("closed");
@@ -284,10 +439,24 @@ export function createPanelTransportServer(
     sendJson(connection, { type: "control", control, tabs });
   }
 
+  function dismissOpenDialogs() {
+    clearFailClosedTimer();
+    const pending = [...openDialogs.values()];
+    openDialogs.clear();
+    for (const event of pending) {
+      source.respondToDialog?.(
+        event.dialogId,
+        failClosedAccept(event),
+        undefined,
+      );
+    }
+  }
+
   return {
     start,
     stop,
     broadcastControl,
+    dismissOpenDialogs,
     get port() {
       return boundPort;
     },

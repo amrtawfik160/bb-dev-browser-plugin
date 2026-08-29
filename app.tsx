@@ -17,6 +17,9 @@ import {
   PERSIST_BROWSER_ELEVATED_ACCESS_CONFIRMATION,
   RESET_PROFILE_CONFIRMATION,
   STOP_BROWSER_CONFIRMATION,
+  BROWSER_PANEL_STREAM_DISCLOSURE,
+  type BrowserContextAction,
+  type BrowserDialogEvent,
   type BrowserHostChoice,
   type BrowserHostChoicesInput,
   type BrowserDiagnostics,
@@ -36,6 +39,12 @@ import {
   type BrowserStatusInput,
   type rpcContract,
 } from "./contracts.js";
+import {
+  PanelDialogLayer,
+  PanelContextMenu,
+  usePrefersReducedMotion,
+  isBbGlobalShortcut,
+} from "./panel-chrome.js";
 import { ownerSessionIdFromContext } from "./panel-owner-session.js";
 import {
   createAutomationStreamAdapter,
@@ -243,6 +252,15 @@ function PanelStreamSurface({
   const ownerSessionId = ownerSessionIdFromContext(bbContext);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const streamRef = useRef<PanelStreamAdapter | null>(null);
+  const socketRef = useRef<WebSocket | null>(null);
+  const reducedMotion = usePrefersReducedMotion();
+  const [dialog, setDialog] = useState<BrowserDialogEvent | null>(null);
+  const [contextMenu, setContextMenu] = useState<{
+    queryId: string;
+    point: { x: number; y: number };
+    actions: BrowserContextAction[];
+  } | null>(null);
+  const [isController, setIsController] = useState(false);
   // The deterministic test environment has no real BB Connect tunnel; opening a
   // WebSocket there would attempt a real network call. The stream is exercised
   // against the provisioned host through the real-browser integration suite.
@@ -360,6 +378,7 @@ function PanelStreamSurface({
         if (!disposed) scheduleReconnect();
         return;
       }
+      socketRef.current = socket;
       socket.binaryType = "arraybuffer";
       socket.addEventListener("open", () => {
         if (disposed || socket === null) return;
@@ -381,6 +400,10 @@ function PanelStreamSurface({
           sequence?: number;
           mimeType?: string;
           data?: string;
+          dialog?: BrowserDialogEvent | null;
+          queryId?: string;
+          point?: { x: number; y: number };
+          actions?: BrowserContextAction[];
         };
         try {
           message = JSON.parse(event.data);
@@ -390,6 +413,23 @@ function PanelStreamSurface({
         if (message.type === "ready") {
           if (stream.state === "reconnecting") stream.reconnectSucceeded();
           setStreamState("streaming");
+          return;
+        }
+        if (message.type === "dialog") {
+          // A null dialog clears any open modal; a non-null dialog opens (or
+          // re-opens after a bounded reconnect) the actionable BB panel UI.
+          setDialog(message.dialog ?? null);
+          if (message.dialog === null) setContextMenu(null);
+          return;
+        }
+        if (message.type === "context_menu") {
+          if (message.queryId !== undefined && message.point !== undefined) {
+            setContextMenu({
+              queryId: message.queryId,
+              point: message.point,
+              actions: message.actions ?? [],
+            });
+          }
           return;
         }
         if (message.type === "control") {
@@ -404,6 +444,7 @@ function PanelStreamSurface({
             const own = payload.control.panels.find(
               (panel) => panel.panelId === panelId,
             );
+            setIsController(own?.role === "controller");
             onControlState?.({
               role: own?.role ?? "spectator",
               control: payload.control,
@@ -430,10 +471,16 @@ function PanelStreamSurface({
       });
       socket.addEventListener("close", () => {
         socket = null;
+        socketRef.current = null;
         if (disposed) return;
         // Input freezes immediately on disconnect; reconnect uses bounded
         // backoff driven by the stream adapter.
         stream.freezeInput();
+        // Fail closed: clear any open dialog and context menu so a stranded
+        // prompt never leaves an invisible modal block. The host re-pushes a
+        // still-open dialog after a bounded reconnect succeeds.
+        setDialog(null);
+        setContextMenu(null);
         scheduleReconnect();
       });
       socket.addEventListener("error", () => {
@@ -459,6 +506,45 @@ function PanelStreamSurface({
   // Render the stream surface whenever the panel is authorized to stream. The
   // region always carries the Automation Mode policy text so spectators see the
   // viewport bounds and FPS window regardless of the live connection state.
+  function sendStream(message: unknown) {
+    const socket = socketRef.current;
+    if (socket !== null && socket.readyState === WebSocket.OPEN)
+      socket.send(JSON.stringify(message));
+  }
+
+  function handleContext(event: React.MouseEvent<HTMLCanvasElement>) {
+    // The controller opens common link/image actions without native Chrome
+    // context menus. Translate the canvas point to the shared logical
+    // viewport and ask the host which actions apply there.
+    event.preventDefault();
+    if (!isController) return;
+    const canvas = canvasRef.current;
+    if (canvas === null) return;
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+    const x = (event.clientX - rect.left) * scaleX;
+    const y = (event.clientY - rect.top) * scaleY;
+    const queryId = `ctx-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    sendStream({ type: "context_query", queryId, x, y });
+  }
+
+  function respondToDialog(accept: boolean, text?: string) {
+    if (dialog === null) return;
+    sendStream({
+      type: "dialog_response",
+      dialogId: dialog.dialogId,
+      accept,
+      ...(text === undefined ? {} : { text }),
+    });
+    setDialog(null);
+  }
+
+  function chooseContextAction(action: BrowserContextAction) {
+    sendStream({ type: "context_action", actionId: action.actionId });
+    setContextMenu(null);
+  }
+
   if (capability?.outcome === "issued") {
     return (
       <section
@@ -472,6 +558,9 @@ function PanelStreamSurface({
           Frames adapt between 5 and 15 per second up to 1920×1080. Input is
           owner-gated and freezes immediately on disconnect.
         </p>
+        <p className="mt-2 text-xs text-muted-foreground" aria-live="polite">
+          {BROWSER_PANEL_STREAM_DISCLOSURE}
+        </p>
         <canvas
           ref={canvasRef}
           aria-label="Browser stream surface"
@@ -479,6 +568,7 @@ function PanelStreamSurface({
           width={controllerViewport?.width ?? 1920}
           height={controllerViewport?.height ?? 1080}
           className="mt-3 h-64 w-full rounded border bg-muted"
+          onContextMenu={handleContext}
         />
         <p className="mt-2 text-xs text-muted-foreground" aria-live="polite">
           {streamState === "streaming"
@@ -489,6 +579,25 @@ function PanelStreamSurface({
                 ? "Opening the authenticated Browser transport…"
                 : "The Browser stream is offline."}
         </p>
+        {dialog === null ? null : (
+          <PanelDialogLayer
+            dialog={dialog}
+            isController={isController}
+            reducedMotion={reducedMotion}
+            onRespond={respondToDialog}
+            onClose={() => setDialog(null)}
+          />
+        )}
+        {contextMenu === null ? null : (
+          <PanelContextMenu
+            actions={contextMenu.actions}
+            point={contextMenu.point}
+            isController={isController}
+            reducedMotion={reducedMotion}
+            onChoose={chooseContextAction}
+            onClose={() => setContextMenu(null)}
+          />
+        )}
       </section>
     );
   }
@@ -711,17 +820,47 @@ function BrowserTabStripView({
   tabs: BrowserPanelControlResponse["tabs"]["tabs"];
   activeTabId: string | null;
 }) {
+  const [activeIndex, setActiveIndex] = useState(0);
+  const itemRefs = useRef<Array<HTMLLIElement | null>>([]);
   if (tabs.length === 0) return null;
+  function focusTab(index: number) {
+    const count = tabs.length;
+    if (count === 0) return;
+    const wrapped = ((index % count) + count) % count;
+    setActiveIndex(wrapped);
+    itemRefs.current[wrapped]?.focus();
+  }
+  function handleKeyDown(event: React.KeyboardEvent<HTMLUListElement>) {
+    if (isBbGlobalShortcut(event.nativeEvent)) return;
+    if (event.key === "ArrowRight" || event.key === "ArrowDown") {
+      event.preventDefault();
+      focusTab(activeIndex + 1);
+    } else if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
+      event.preventDefault();
+      focusTab(activeIndex - 1);
+    } else if (event.key === "Home") {
+      event.preventDefault();
+      focusTab(0);
+    } else if (event.key === "End") {
+      event.preventDefault();
+      focusTab(tabs.length - 1);
+    }
+  }
   return (
     <ul
       aria-label="Shared Browser Tabs"
       className="mt-3 flex flex-wrap gap-1 text-xs"
+      onKeyDown={handleKeyDown}
     >
-      {tabs.map((tab) => {
+      {tabs.map((tab, index) => {
         const active = tab.tabId === activeTabId;
         return (
           <li
             key={tab.tabId}
+            ref={(el) => {
+              itemRefs.current[index] = el;
+            }}
+            tabIndex={index === activeIndex ? 0 : -1}
             className="max-w-[16rem] truncate rounded border px-2 py-1"
             style={{
               fontWeight: active ? 600 : 400,

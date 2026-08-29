@@ -4,6 +4,9 @@ import {
   PANEL_GATEWAY_BANDWIDTH_BYTES_PER_SECOND,
   PANEL_GATEWAY_INPUT_MAX_PER_SECOND,
   PANEL_GATEWAY_MESSAGE_MAX_BYTES,
+  browserDialogResponseMessageSchema,
+  browserContextQueryMessageSchema,
+  browserContextActionMessageSchema,
   browserPanelRedeemMessageSchema,
   type BrowserPanelRedeemMessage,
 } from "./contracts.js";
@@ -22,7 +25,15 @@ export type PanelGatewayMessage =
   | { kind: "input"; sequence: number; payload: unknown }
   | { kind: "frame"; sequence: number; bytes: number; deadlineAt: number }
   | { kind: "ack"; sequence: number }
-  | { kind: "ping" };
+  | { kind: "ping" }
+  | {
+      kind: "dialog_response";
+      dialogId: string;
+      accept: boolean;
+      text?: string;
+    }
+  | { kind: "context_query"; queryId: string; x: number; y: number }
+  | { kind: "context_action"; actionId: string };
 
 export type PanelGatewayValidationResult =
   | { outcome: "accepted"; message: PanelGatewayMessage }
@@ -92,6 +103,12 @@ export function createPanelGateway(options: PanelGatewayOptions) {
   const profileId = options.profileId;
   let redeemedCapabilityId: string | undefined;
   const inputBucket: RateBucket = { windowStart: clock.now(), count: 0 };
+  /**
+   * Dialog and context-action requests are controller-only chrome actions, not
+   * pixel input, but they share the gateway's input rate bucket so a flooding
+   * client cannot starve frames or bypass the per-second cap.
+   */
+  const chromeBucket: RateBucket = { windowStart: clock.now(), count: 0 };
   const frameState: FrameState = {
     lastEmittedSequence: 0,
     pendingBytesInWindow: 0,
@@ -121,6 +138,16 @@ export function createPanelGateway(options: PanelGatewayOptions) {
       inputBucket.windowStart = now;
       inputBucket.count = 0;
     }
+  }
+
+  function admitChromeAction(now: number): boolean {
+    if (now - chromeBucket.windowStart >= 1000) {
+      chromeBucket.windowStart = now;
+      chromeBucket.count = 0;
+    }
+    if (chromeBucket.count >= inputMaxPerSecond) return false;
+    chromeBucket.count += 1;
+    return true;
   }
 
   function resetBandwidthWindow(now: number) {
@@ -309,6 +336,82 @@ export function createPanelGateway(options: PanelGatewayOptions) {
     }
     if (envelope.type === "ping") {
       return { outcome: "accepted", message: { kind: "ping" } };
+    }
+    if (envelope.type === "dialog_response") {
+      const dialogResult = browserDialogResponseMessageSchema.safeParse(parsed);
+      if (!dialogResult.success) {
+        return {
+          outcome: "rejected",
+          reason: "malformed",
+          message: "Panel gateway dialog response failed shape validation.",
+        };
+      }
+      if (!admitChromeAction(clock.now())) {
+        return {
+          outcome: "rejected",
+          reason: "rate-limited",
+          message: `Panel gateway dialog response exceeded the ${inputMaxPerSecond}-per-second rate limit.`,
+        };
+      }
+      return {
+        outcome: "accepted",
+        message: {
+          kind: "dialog_response",
+          dialogId: dialogResult.data.dialogId,
+          accept: dialogResult.data.accept,
+          text: dialogResult.data.text,
+        },
+      };
+    }
+    if (envelope.type === "context_query") {
+      const queryResult = browserContextQueryMessageSchema.safeParse(parsed);
+      if (!queryResult.success) {
+        return {
+          outcome: "rejected",
+          reason: "malformed",
+          message: "Panel gateway context query failed shape validation.",
+        };
+      }
+      if (!admitChromeAction(clock.now())) {
+        return {
+          outcome: "rejected",
+          reason: "rate-limited",
+          message: `Panel gateway context query exceeded the ${inputMaxPerSecond}-per-second rate limit.`,
+        };
+      }
+      return {
+        outcome: "accepted",
+        message: {
+          kind: "context_query",
+          queryId: queryResult.data.queryId,
+          x: queryResult.data.x,
+          y: queryResult.data.y,
+        },
+      };
+    }
+    if (envelope.type === "context_action") {
+      const actionResult = browserContextActionMessageSchema.safeParse(parsed);
+      if (!actionResult.success) {
+        return {
+          outcome: "rejected",
+          reason: "malformed",
+          message: "Panel gateway context action failed shape validation.",
+        };
+      }
+      if (!admitChromeAction(clock.now())) {
+        return {
+          outcome: "rejected",
+          reason: "rate-limited",
+          message: `Panel gateway context action exceeded the ${inputMaxPerSecond}-per-second rate limit.`,
+        };
+      }
+      return {
+        outcome: "accepted",
+        message: {
+          kind: "context_action",
+          actionId: actionResult.data.actionId,
+        },
+      };
     }
     return {
       outcome: "rejected",

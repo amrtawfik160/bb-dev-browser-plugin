@@ -17,6 +17,9 @@ import { profileStoragePaths } from "../../profile-storage.js";
 import { createPanelCapabilityStore } from "../../panel-capability.js";
 import { createPanelGateway } from "../../panel-gateway.js";
 import { createAutomationStreamAdapter } from "../../panel-stream.js";
+import { createCdpScreencastSource } from "../../browser-screencast.js";
+import { createPanelTransportServer } from "../../panel-transport.js";
+import { WebSocket } from "ws";
 import {
   PANEL_MAX_VIEWPORT_HEIGHT,
   PANEL_MAX_VIEWPORT_WIDTH,
@@ -82,6 +85,7 @@ if (
     "cleanup",
     "origin-scope",
     "panel-transport",
+    "dialogs",
   ]).has(action)
 ) {
   throw new Error(
@@ -473,6 +477,223 @@ if (action === "panel-transport") {
     revoked: capabilities.size() === 0,
   };
 }
+
+let dialogs:
+  | {
+      alertHandled: boolean;
+      confirmAccepted: boolean;
+      promptText: string | null;
+      beforeunloadStayed: boolean;
+      contextActions: string[];
+      performedAction: string | null;
+    }
+  | undefined;
+if (action === "dialogs") {
+  // Drive the fixture's dialog and context-action cases through the actual
+  // CDP -> panel pipeline: Page.javascriptDialogOpening is captured by the
+  // CDP screencast source, forwarded to the panel over the authenticated
+  // transport, rendered as actionable chrome, and answered by the controller
+  // with dialog_response -> Page.handleJavaScriptDialog. Context actions are
+  // resolved through context_query/context_action, not native Chrome menus.
+  // The real-host command fails closed without BB_BROWSER_HOST_DATA_DIR,
+  // which the integration gate already requires before spawning this worker.
+  const capabilities = createPanelCapabilityStore();
+  const gateway = createPanelGateway({
+    capabilities,
+    hostId: target.hostId,
+    profileId: target.profileId,
+  });
+  const stream = createAutomationStreamAdapter({ capabilities });
+  stream.start();
+  stream.setViewport({
+    width: PANEL_MAX_VIEWPORT_WIDTH,
+    height: PANEL_MAX_VIEWPORT_HEIGHT,
+  });
+  const issued = capabilities.issue({
+    ownerSessionId: "owner-session-dialogs",
+    panelId: "dialogs-panel",
+    hostId: target.hostId,
+    profileId: target.profileId,
+  });
+  const redeem = JSON.stringify({
+    type: "redeem",
+    capabilityId: issued.capabilityId,
+    secret: issued.secret,
+    ownerSessionId: "owner-session-dialogs",
+    panelId: "dialogs-panel",
+  });
+  const endpoint = (await runtime.start(target)).automationEndpoint;
+  const source = createCdpScreencastSource({
+    resolveEndpoint: async () => endpoint,
+    viewport: {
+      width: PANEL_MAX_VIEWPORT_WIDTH,
+      height: PANEL_MAX_VIEWPORT_HEIGHT,
+    },
+  });
+  const transport = createPanelTransportServer({
+    gateway,
+    stream,
+    source,
+    canInput: () => true,
+  });
+  const port = await transport.start();
+  // Navigate the page to the fixture and register no-op Playwright dialog
+  // handlers so Playwright does not auto-dismiss the dialogs the panel pipeline
+  // must answer through CDP.
+  await runtime.execute(
+    target,
+    `const page = await browser.getPage("auth");
+     await page.goto(${JSON.stringify(fixtureAddress)});
+     page.setDefaultTimeout(60000);
+     page.on("dialog", () => { /* leave open; the panel resolves it */ });
+     console.log(JSON.stringify({ navigated: page.url() }));`,
+    20_000,
+  );
+  const socket = new WebSocket(`ws://127.0.0.1:${port}`);
+  await new Promise<void>((resolve, reject) => {
+    socket.once("open", resolve);
+    socket.once("error", reject);
+  });
+  socket.send(redeem);
+  const inbox: string[] = [];
+  socket.on("message", (raw) => inbox.push(String(raw)));
+  async function waitForDialog(): Promise<{
+    dialogId: string;
+    type: string;
+  }> {
+    const deadline = Date.now() + 30_000;
+    for (;;) {
+      const found = inbox
+        .map((entry) => JSON.parse(entry) as { type: string; dialog?: unknown })
+        .find((entry) => entry.type === "dialog");
+      if (found !== undefined) {
+        const dialog = found.dialog as { dialogId: string; type: string };
+        return dialog;
+      }
+      if (Date.now() >= deadline)
+        throw new Error("The panel did not forward a dialog in time.");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  }
+  function respond(dialogId: string, accept: boolean, text?: string) {
+    socket.send(
+      JSON.stringify({
+        type: "dialog_response",
+        dialogId,
+        accept,
+        ...(text === undefined ? {} : { text }),
+      }),
+    );
+  }
+  // alert: accept through the panel pipeline.
+  const alertTask = runtime.execute(
+    target,
+    `const page = await browser.getPage("auth");
+     await page.evaluate(() => alert("alert-body"));
+     console.log(JSON.stringify({ alertResolved: true }));`,
+    20_000,
+  );
+  const alertDialog = await waitForDialog();
+  respond(alertDialog.dialogId, true);
+  const alertResult = JSON.parse(String(await alertTask)) as {
+    alertResolved?: boolean;
+  };
+  // confirm: cancel through the panel pipeline so the action is not silently
+  // accepted (fail-closed default exercised).
+  const confirmTask = runtime.execute(
+    target,
+    `const page = await browser.getPage("auth");
+     const accepted = await page.evaluate(() => confirm("confirm-body"));
+     console.log(JSON.stringify({ confirmAccepted: accepted }));`,
+    20_000,
+  );
+  const confirmDialog = await waitForDialog();
+  respond(confirmDialog.dialogId, false);
+  const confirmResult = JSON.parse(String(await confirmTask)) as {
+    confirmAccepted?: boolean;
+  };
+  // prompt: answer through the panel pipeline with controller text.
+  const promptTask = runtime.execute(
+    target,
+    `const page = await browser.getPage("auth");
+     const text = await page.evaluate(() => prompt("prompt-body", "default"));
+     console.log(JSON.stringify({ promptText: text }));`,
+    20_000,
+  );
+  const promptDialog = await waitForDialog();
+  respond(promptDialog.dialogId, true, "controller-answer");
+  const promptResult = JSON.parse(String(await promptTask)) as {
+    promptText?: string | null;
+  };
+  // beforeunload: trigger by attempting to leave the page; answer stay
+  // (accept:false) so the page is preserved, then verify it stayed.
+  const beforeunloadTask = runtime.execute(
+    target,
+    `const page = await browser.getPage("auth");
+     try {
+       await page.goto(${JSON.stringify(`${fixtureAddress}linked`)});
+       console.log(JSON.stringify({ beforeunloadLeft: true }));
+     } catch {
+       console.log(JSON.stringify({ beforeunloadLeft: false }));
+     }`,
+    20_000,
+  );
+  const beforeunloadDialog = await waitForDialog();
+  respond(beforeunloadDialog.dialogId, false);
+  const beforeunloadResult = JSON.parse(String(await beforeunloadTask)) as {
+    beforeunloadLeft?: boolean;
+  };
+  // context: query actions at the link point and perform open-link-new-tab
+  // through the panel pipeline.
+  const ctxQueryId = "ctx-real";
+  socket.send(
+    JSON.stringify({ type: "context_query", queryId: ctxQueryId, x: 0, y: 0 }),
+  );
+  const contextDeadline = Date.now() + 10_000;
+  let contextActions: { actionId: string; kind: string }[];
+  for (;;) {
+    const found = inbox
+      .map(
+        (entry) =>
+          JSON.parse(entry) as {
+            type: string;
+            queryId?: string;
+            actions?: { actionId: string; kind: string }[];
+          },
+      )
+      .find(
+        (entry) =>
+          entry.type === "context_menu" && entry.queryId === ctxQueryId,
+      );
+    if (found !== undefined && found.actions !== undefined) {
+      contextActions = found.actions;
+      break;
+    }
+    if (Date.now() >= contextDeadline)
+      throw new Error("The panel did not forward context actions in time.");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  const performedAction = contextActions[0]?.actionId ?? null;
+  if (performedAction !== null) {
+    socket.send(
+      JSON.stringify({ type: "context_action", actionId: performedAction }),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  socket.close();
+  await new Promise<void>((resolve) => socket.once("close", resolve));
+  await transport.stop();
+  await source.stop();
+  capabilities.revokeProfile(target.profileId);
+  dialogs = {
+    alertHandled: alertResult.alertResolved === true,
+    confirmAccepted: confirmResult.confirmAccepted === false,
+    promptText: promptResult.promptText ?? null,
+    beforeunloadStayed: beforeunloadResult.beforeunloadLeft === false,
+    contextActions: contextActions.map((action) => action.kind),
+    performedAction,
+  };
+}
 const automationHelperPid =
   action === "cleanup" || action === "lifecycle"
     ? null
@@ -486,6 +707,7 @@ const runningState = {
   lifecycle,
   originScope,
   panelTransport,
+  dialogs,
   uid: boundary.effectiveUserId,
   gid: boundary.effectiveGroupId,
   ownedProcesses: await ownedProcesses(rootDirectory),

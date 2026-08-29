@@ -386,6 +386,22 @@ export function createBrowserHostEntry(
     return strip;
   }
 
+  /**
+   * Dismiss every still-open agent dialog for a profile when the agent's
+   * Control Lease ends (revoked or owner takes control), so an unresolved
+   * dialog never leaves an invisible modal block. No-op when the profile has
+   * no live transport.
+   */
+  function dismissOpenDialogsForProfile(target: {
+    hostId: string;
+    profileId: string;
+  }) {
+    const profilePrefix = `${target.hostId}\u0000${target.profileId}\u0000`;
+    for (const [key, transport] of panelTransports) {
+      if (key.startsWith(profilePrefix)) transport.dismissOpenDialogs();
+    }
+  }
+
   function toControlResponse(
     target: { hostId: string; profileId: string },
     role: "controller" | "spectator",
@@ -449,6 +465,9 @@ export function createBrowserHostEntry(
       async stopProfile(hostId, profileId) {
         const key = controlLeaseKey({ hostId, profileId });
         controlLeases.revoke(key);
+        // Stopping the profile ends every agent Control Lease: dismiss open
+        // dialogs before tearing down so they never strand.
+        dismissOpenDialogsForProfile({ hostId, profileId });
         // Stopping the profile releases every panel's control and invalidates
         // the shared tab strip so stale runtime tab ids fail closed.
         panelControlSessions.get(key)?.revoke();
@@ -472,6 +491,10 @@ export function createBrowserHostEntry(
   }
   async function disposeRuntime() {
     controlLeases.revokeAll();
+    // Disposing the runtime ends every agent Control Lease: dismiss open
+    // dialogs across every profile so none strand.
+    for (const transport of panelTransports.values())
+      transport.dismissOpenDialogs();
     const current = retainedRuntime;
     retainedRuntime = undefined;
     await current?.dispose();
@@ -505,10 +528,18 @@ export function createBrowserHostEntry(
     }
     if (request.state === "disconnected") {
       controlLeases.revokeHost(request.hostId);
-      // A host disconnect freezes control for every profile on that host and
-      // invalidates runtime tab ids so agents never target a stale page.
+      // A host disconnect ends every agent Control Lease on that host: dismiss
+      // open dialogs so they cannot strand behind an invisible modal.
       for (const [key, session] of panelControlSessions) {
-        if (key.startsWith(`${request.hostId}\u0000`)) session.revoke();
+        if (key.startsWith(`${request.hostId}\u0000`)) {
+          session.revoke();
+          const [, profileId] = key.split("\u0000");
+          if (profileId !== undefined)
+            dismissOpenDialogsForProfile({
+              hostId: request.hostId,
+              profileId,
+            });
+        }
       }
       for (const [key, strip] of browserTabStrips) {
         if (key.startsWith(`${request.hostId}\u0000`)) strip.resetInstance();
@@ -609,6 +640,9 @@ export function createBrowserHostEntry(
       controlLeaseKey(target),
       signal,
     );
+    // An owner navigation ends the agent's Control Lease: dismiss any open
+    // agent dialog so it cannot strand behind an invisible modal block.
+    dismissOpenDialogsForProfile(target);
     try {
       const response = await browserRuntime.navigate(
         {
@@ -651,6 +685,9 @@ export function createBrowserHostEntry(
       controlLeaseKey(target),
       signal,
     );
+    // An owner history action ends the agent's Control Lease: dismiss any open
+    // agent dialog so it cannot strand behind an invisible modal block.
+    dismissOpenDialogsForProfile(target);
     try {
       const response = await browserRuntime.history(
         {
@@ -771,12 +808,17 @@ export function createBrowserHostEntry(
         profileId: request.profileId,
       };
       const control = panelControlSession(controlTarget);
+      const strip = browserTabStrip(controlTarget);
       const source = createCdpScreencastSource({
         resolveEndpoint: async () =>
           (await browserRuntime.start(target)).automationEndpoint,
         // The controller's logical viewport drives the screencast capture size;
         // spectators scale and letterbox it rather than resizing it.
         viewport: control.controllerViewport ?? undefined,
+        // Enroll a created target (open-link/open-image-new-tab) as a
+        // BrowserTab in the shared strip so it is normalized into the
+        // profile's ordered tab set rather than spawning an untracked window.
+        onTargetCreated: (created) => strip.openTab(created.url, ""),
       });
       // Apply the controller's viewport to the stream policy so the ready frame
       // carries the controller viewport, and keep it in sync when control moves.
@@ -802,7 +844,6 @@ export function createBrowserHostEntry(
       });
       // Push live control transfers and tab changes to this panel so every
       // panel observes the shared state without re-fetching (ADR 0012).
-      const strip = browserTabStrip(controlTarget);
       const pushControlState = () => {
         applyControllerViewport();
         transport.broadcastControl(
@@ -1106,6 +1147,9 @@ export function createBrowserHostEntry(
         };
         const session = panelControlSession(target);
         await session.takeControl(request.panelId, request.viewport);
+        // Owner takeover ends the agent's Control Lease: dismiss any open agent
+        // dialog so it cannot strand behind an invisible modal block.
+        dismissOpenDialogsForProfile(target);
         return toControlResponse(
           target,
           session.role(request.panelId) ?? "spectator",
@@ -1137,6 +1181,9 @@ export function createBrowserHostEntry(
         // for human use.
         if (session.reclaimControl(request.panelId)) {
           await session.takeControl(request.panelId, request.viewport);
+          // Reclaiming the controller's own lease ends any agent lease that was
+          // acquired while the controller was disconnected.
+          dismissOpenDialogsForProfile(target);
         }
         return toControlResponse(
           target,
