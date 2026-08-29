@@ -30,10 +30,10 @@
  * the existing real-browser worker fixture; it adds no parallel driver.
  */
 import { execFile } from "node:child_process";
-import http from "node:http";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import type http from "node:http";
 import { DEFAULT_PROFILE_ID, type BrowserHostTarget } from "../../contracts.js";
 import { profileStoragePaths } from "../../profile-storage.js";
 import {
@@ -50,6 +50,11 @@ import {
   SENSITIVE_DATA_PATTERNS,
   createEvidenceHarness,
 } from "./evidence-helpers.js";
+import {
+  closeLoopbackFixture,
+  createLoopbackAuthFixture,
+  listenLoopbackFixture,
+} from "./loopback-auth-fixture.js";
 
 export {
   integrationEnabled,
@@ -63,60 +68,21 @@ const execFileAsync = promisify(execFile);
 
 /**
  * The deterministic loopback authentication fixture the real-browser worker's
- * `signInScript` drives. Mirrors the contract `browser-auth.integration.test.ts`
- * uses (`/sign-in` POST → `/account`, `#popup`, `/popup`); centralized here so
- * every #24 host-provisioning test reuses one fixture rather than each
+ * `signInScript` drives. Re-exported from the shared
+ * `loopback-auth-fixture.ts` module so every #24 host-provisioning test and
+ * `browser-auth.integration.test.ts` reuse one fixture rather than each
  * rebuilding it. Binds loopback only; never provisions or mutates the host.
  */
-export function createAuthenticationFixture(): http.Server {
-  return http.createServer((request, response) => {
-    const signedIn = request.headers.cookie?.includes("fixture-session=valid");
-    if (request.method === "POST" && request.url === "/sign-in") {
-      response.writeHead(303, {
-        location: "/account",
-        "set-cookie": "fixture-session=valid; Path=/; SameSite=Lax",
-      });
-      response.end();
-      return;
-    }
-    response.setHeader("content-type", "text/html; charset=utf-8");
-    if (request.url === "/account" && signedIn) {
-      response.end(
-        "<h1>Signed in</h1><button id=\"popup\" onclick=\"open('/popup', 'fixture-popup')\">Popup</button>",
-      );
-      return;
-    }
-    if (request.url === "/popup" && signedIn) {
-      response.end("<h1>Authenticated popup</h1>");
-      return;
-    }
-    response.end(
-      '<form method="post" action="/sign-in"><input name="user"><button>Sign in</button></form>',
-    );
-  });
-}
+export const createAuthenticationFixture: () => http.Server =
+  createLoopbackAuthFixture;
 
 /** Start a loopback fixture server and return its bound port. */
-export function listenFixture(server: http.Server): Promise<number> {
-  return new Promise<number>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address();
-      if (address === null || typeof address === "string") {
-        reject(new Error("The local authentication fixture did not bind TCP."));
-        return;
-      }
-      resolve(address.port);
-    });
-  });
-}
+export const listenFixture: (server: http.Server) => Promise<number> =
+  listenLoopbackFixture;
 
 /** Close a fixture server. */
-export function closeFixture(server: http.Server): Promise<void> {
-  return new Promise<void>((resolve, reject) => {
-    server.close((error) => (error === undefined ? resolve() : reject(error)));
-  });
-}
+export const closeFixture: (server: http.Server) => Promise<void> =
+  closeLoopbackFixture;
 
 /** Environment the owner sets on a provisioned host to run the gate. */
 export interface ProvisionedHostEnvironment {
@@ -151,13 +117,35 @@ export type WorkerAction =
   | "origin-scope"
   | "panel-transport"
   | "dialogs"
-  | "safe-login";
+  | "safe-login"
+  | "transfer"
+  | "disable-re-enable";
 
 /** A skip descriptor naming the exact missing capability. */
 export interface MissingHostCapability {
   ready: false;
   missingCapability: string;
   reason: string;
+}
+
+/**
+ * Skip the current test deterministically when the host is not provisioned,
+ * surfacing the exact missing capability and reason in vitest's skip output so
+ * a non-provisioned run names which capability is missing (issue #24 P1).
+ * Returns a type guard so the caller keeps the narrowed `ProvisionedHostContext`
+ * after a successful (non-skipped) probe.
+ */
+export function skipIfNotProvisioned(
+  ctx: { skip: (note?: string) => never },
+  result: ProvisionedHostContext | MissingHostCapability,
+): result is ProvisionedHostContext {
+  if ("missingCapability" in result) {
+    ctx.skip(
+      `host not provisioned: ${result.missingCapability} — ${result.reason}`,
+    );
+    return false;
+  }
+  return true;
 }
 
 /** The JSON report emitted by `test/fixtures/real-browser-worker.ts`. */
@@ -214,6 +202,55 @@ export interface WorkerReport {
     doneReturnedToAutomation: boolean;
     reconciledToAutomation: boolean;
     activityMetadataOnly: boolean;
+  };
+  /**
+   * Issue #24 S4/P2: the real worker `transfer` action exercises Transfer
+   * Staging (client/workspace upload) AND quarantined download export through
+   * the real host worker path, so AC3 is genuinely exercisable on a
+   * provisioned host rather than only delegated to in-memory suites.
+   */
+  transfer?: {
+    failClosedWithoutDataDir: boolean;
+    stagedWorkspace: boolean;
+    privacySafeNoPath: boolean;
+    removedAfterUse: boolean;
+    symlinkEscapeRejected: boolean;
+    traversalRejected: boolean;
+  };
+  downloadExport?: {
+    /** The download entered the profile-scoped quarantine. */
+    quarantined: boolean;
+    /** Owner export to the displaying client returns the base64 bytes. */
+    exportedToClient: boolean;
+    /** Exported bytes match the bytes written into quarantine. */
+    clientBytesMatch: boolean;
+    /** Owner export into the workspace copies host-to-host without escaping. */
+    exportedToWorkspace: boolean;
+    /** A workspace export resolving outside the environment is rejected. */
+    outsideEnvironmentRejected: boolean;
+    /** The quarantine file remains for later expiry after export. */
+    quarantineRetained: boolean;
+    /** Privacy-safe listing never echoes the quarantine path. */
+    privacySafeNoPath: boolean;
+  };
+  /**
+   * Issue #24 S3/P2: the real worker `disable-re-enable` action stops every
+   * Browser-owned process (disable), rebuilds a fresh runtime (re-enable), and
+   * verifies the profile's persisted sign-in/local/session state is retained
+   * across the cycle through the real worker path.
+   */
+  disableReEnable?: {
+    /** The profile's signed-in account heading is retained after re-enable. */
+    accountHeadingRetained: boolean;
+    /** localStorage survives the disable/re-enable cycle. */
+    localStorageRetained: boolean;
+    /** sessionStorage is restored from the persistent profile. */
+    sessionStorageRetained: boolean;
+    /** Locale/timezone preferences are retained. */
+    localeRetained: boolean;
+    timezoneRetained: boolean;
+    /** The pre-disable process is gone after re-enable (processes restarted). */
+    preDisableProcessGone: boolean;
   };
   postStop?: {
     ownedProcesses: { pid: number; command: string; status: string }[];

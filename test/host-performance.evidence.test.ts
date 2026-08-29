@@ -32,21 +32,11 @@ import {
   listenFixture,
   provisionedHostContext,
   runHostWorker,
-  type MissingHostCapability,
+  skipIfNotProvisioned,
   type ProvisionedHostContext,
 } from "./fixtures/host-provisioning.js";
 import { projectLoopbackAddress } from "../browser-navigation.js";
-
-function skipIfNotProvisioned(
-  ctx: { skip: () => void },
-  result: ProvisionedHostContext | MissingHostCapability,
-): result is ProvisionedHostContext {
-  if ("missingCapability" in result) {
-    ctx.skip();
-    return false;
-  }
-  return true;
-}
+import { WebSocket } from "ws";
 
 /** A captured performance sample with its host-side and remote-RTT split. */
 interface PerformanceSample {
@@ -86,6 +76,146 @@ async function measureWithRemoteRtt(
     remoteNetworkRttMs,
     hostSideMs: Math.max(0, totalMs - remoteNetworkRttMs),
   };
+}
+
+/** Compute the `q`-th percentile (0..1) of a sample array. */
+function percentile(samples: number[], q: number): number {
+  if (samples.length === 0) return Number.POSITIVE_INFINITY;
+  const sorted = [...samples].sort((a, b) => a - b);
+  const rank = q * (sorted.length - 1);
+  const lower = Math.floor(rank);
+  const upper = Math.ceil(rank);
+  if (lower === upper) return sorted[lower]!;
+  const fraction = rank - lower;
+  return sorted[lower]! + (sorted[upper]! - sorted[lower]!) * fraction;
+}
+
+/**
+ * Genuinely measure loopback input-to-frame latency over a real CDP stream
+ * (issue #24 S1). Connects a CDP client to the real loopback automation
+ * endpoint the worker exposes, attaches to the active page target, starts the
+ * screencast, and for each sample dispatches an input (a mouse move plus a DOM
+ * invalidating `Runtime.evaluate`) and measures the elapsed wall time until
+ * the next `Page.screencastFrame` event arrives. Returns the per-sample
+ * latencies in milliseconds so the caller can compute a real p95 — not a
+ * policy constant — over the real CDP stream.
+ */
+async function measureLoopbackInputToFrameP95(
+  endpoint: string,
+): Promise<number[]> {
+  const socket = new WebSocket(endpoint);
+  await new Promise<void>((resolve, reject) => {
+    socket.once("open", resolve);
+    socket.once("error", reject);
+  });
+  let nextId = 1;
+  const session: { id: string | undefined } = { id: undefined };
+  const pending = new Map<
+    number,
+    { resolve: (value: unknown) => void; reject: (error: Error) => void }
+  >();
+  const frameResolvers: Array<(timestamp: number) => void> = [];
+  function send(method: string, params: unknown, targetSessionId?: string) {
+    return new Promise<unknown>((resolve, reject) => {
+      const id = nextId;
+      nextId += 1;
+      pending.set(id, { resolve, reject });
+      const message: Record<string, unknown> = { id, method, params };
+      if (targetSessionId !== undefined) message.sessionId = targetSessionId;
+      socket.send(JSON.stringify(message));
+    });
+  }
+  socket.on("message", (raw) => {
+    let message: {
+      id?: number;
+      result?: unknown;
+      error?: { message: string };
+      method?: string;
+      params?: unknown;
+    };
+    try {
+      message = JSON.parse(String(raw));
+    } catch {
+      return;
+    }
+    if (typeof message.id === "number") {
+      const entry = pending.get(message.id);
+      if (entry !== undefined) {
+        pending.delete(message.id);
+        if (message.error !== undefined) {
+          entry.reject(new Error(message.error.message));
+        } else {
+          entry.resolve(message.result);
+        }
+      }
+      return;
+    }
+    if (message.method === "Page.screencastFrame" && session.id !== undefined) {
+      const resolver = frameResolvers.shift();
+      if (resolver !== undefined) resolver(performance.now());
+      // Acknowledge the frame so the next one can be captured.
+      void send("Page.screencastFrameAck", { sessionId: 0 }, session.id).catch(
+        () => undefined,
+      );
+    }
+  });
+  // Attach to the first page target the runtime pins as active.
+  const targets = (await send("Target.getTargets", {})) as {
+    targetInfos?: Array<{ type: string; targetId: string }>;
+  };
+  const page =
+    targets?.targetInfos?.find((entry) => entry.type === "page") ??
+    targets?.targetInfos?.[0];
+  if (page === undefined) {
+    socket.close();
+    throw new Error(
+      "The provisioned browser exposed no page target for the p95 measurement.",
+    );
+  }
+  const attached = (await send("Target.attachToTarget", {
+    targetId: page.targetId,
+    flatten: true,
+  })) as { sessionId?: string };
+  session.id = attached?.sessionId;
+  if (session.id === undefined) {
+    socket.close();
+    throw new Error("The CDP client could not attach to the page target.");
+  }
+  await send(
+    "Page.startScreencast",
+    { format: "jpeg", quality: 60 },
+    session.id,
+  );
+  const samples: number[] = [];
+  const sampleCount = 20;
+  for (let i = 0; i < sampleCount; i += 1) {
+    const started = performance.now();
+    const frame = new Promise<number>((resolve) =>
+      frameResolvers.push(resolve),
+    );
+    // Dispatch a genuine input (mouse move) plus a DOM invalidation so the
+    // next screencast frame reflects the controller input over the loopback
+    // stream. The x position moves across the viewport each sample.
+    await send(
+      "Input.dispatchMouseEvent",
+      { type: "mouseMoved", x: 100 + i, y: 100, button: "left", clickCount: 0 },
+      session.id,
+    ).catch(() => undefined);
+    await send(
+      "Runtime.evaluate",
+      {
+        expression: `document.body.style.transform = 'translateX(${i}px)';`,
+        returnByValue: true,
+      },
+      session.id,
+    ).catch(() => undefined);
+    const arrivedAt = await frame;
+    samples.push(arrivedAt - started);
+  }
+  await send("Page.stopScreencast", {}, session.id).catch(() => undefined);
+  socket.close();
+  await new Promise<void>((resolve) => socket.once("close", resolve));
+  return samples;
 }
 
 describe("issue #24 AC5 current-host performance thresholds", () => {
@@ -212,7 +342,7 @@ describe("issue #24 AC5 current-host performance thresholds", () => {
   );
 
   it.runIf(integrationEnabled)(
-    "measures loopback input-to-frame p95 < 200 ms and ≥ 10 FPS during interaction on a provisioned host",
+    "asserts the stream policy bounds are in force on a provisioned host",
     { timeout: 240_000 },
     async (ctx) => {
       const fixture = createAuthenticationFixture();
@@ -231,35 +361,82 @@ describe("issue #24 AC5 current-host performance thresholds", () => {
         await cleanupFixtureProfiles(context);
 
         // The "panel-transport" worker reports the real CDP stream's congestion
-        // FPS and the loopback gateway bind host. The stream policy enforces
-        // the FPS and frame-interval bounds; the worker's congestion FPS is the
-        // measured interaction stream rate.
+        // FPS and the loopback gateway bind host. This test asserts the stream
+        // policy bounds are in force — the reclaim window and reconnect backoff
+        // that back the input-to-frame latency policy — plus the interaction
+        // FPS target. It is a policy-bounds assertion (not a p95 measurement);
+        // the real loopback input-to-frame p95 is measured by the dedicated test
+        // below over a real CDP stream.
         const report = await runHostWorker(
           context.workerEnv("panel-transport"),
         );
         const panel = report.panelTransport;
         expect(panel).toBeDefined();
-        // Interaction FPS: the measured congestion FPS must meet the ≥ 10 FPS
-        // target during interaction.
-        expect(
-          panel?.fps,
-          `interaction stream ${panel?.fps} FPS (remote RTT reported separately)`,
-        ).toBeGreaterThanOrEqual(10);
-        // Loopback input-to-frame p95: the panel stream adapter's reconnect
-        // backoff and reclaim window bound the input-to-frame latency over the
-        // loopback CDP stream. The stream p95 target (< 200 ms) is enforced by
-        // the adapter's frame-interval policy; the panel-transport report
-        // carries the reclaim window that backs it. The real-stream p95 is
-        // measured by the mandatory gate; here we assert the stream policy
-        // bounds are in force on the provisioned host.
+        expect(panel?.gatewayBindHost).toBe("127.0.0.1");
         expect(panel?.reclaimWindowMs).toBeGreaterThan(0);
         expect(panel?.reconnectBackoffMs.length).toBeGreaterThan(0);
         for (const backoff of panel?.reconnectBackoffMs ?? []) {
           expect(backoff).toBeGreaterThanOrEqual(0);
         }
+        expect(
+          panel?.fps,
+          `interaction stream ${panel?.fps} FPS`,
+        ).toBeGreaterThanOrEqual(10);
         await assertLoopbackSocket(report.instance.automationEndpoint);
         await runHostWorker(context.workerEnv("cleanup"));
         await assertLoopbackSocketClosed(report.instance.automationEndpoint);
+        cleanupNeeded = false;
+      } finally {
+        if (cleanupNeeded && context !== undefined) {
+          await runHostWorker(context.workerEnv("cleanup"));
+        }
+        await closeFixture(fixture);
+        if (context !== undefined) {
+          await cleanupFixtureProfiles(context);
+        }
+      }
+    },
+  );
+
+  it.runIf(integrationEnabled)(
+    "measures loopback input-to-frame p95 < 200 ms over a real CDP stream on a provisioned host",
+    { timeout: 240_000 },
+    async (ctx) => {
+      const fixture = createAuthenticationFixture();
+      let context: ProvisionedHostContext | undefined;
+      let cleanupNeeded = false;
+      try {
+        const port = await listenFixture(fixture);
+        const fixtureAddress = projectLoopbackAddress(
+          "ci-browser-project",
+          `http://localhost:${port}/account`,
+        );
+        const probed = await provisionedHostContext(fixtureAddress);
+        if (!skipIfNotProvisioned(ctx, probed)) return;
+        context = probed;
+        cleanupNeeded = true;
+        await cleanupFixtureProfiles(context);
+
+        // Genuinely measure loopback input-to-frame p95 over a real CDP stream
+        // (issue #24 S1). The worker "start" action launches the real Chrome
+        // process and exposes its loopback CDP automation endpoint; this test
+        // connects a CDP client directly to that endpoint, starts the
+        // screencast, and for each sample dispatches an input (a mouse move
+        // plus a DOM invalidating evaluate) and measures the elapsed time until
+        // the next `Page.screencastFrame` event reflects it. The p95 of the
+        // measured samples — not a policy constant — must be < 200 ms.
+        const started = await runHostWorker(context.workerEnv("start"));
+        await assertLoopbackSocket(started.instance.automationEndpoint);
+        const samples = await measureLoopbackInputToFrameP95(
+          started.instance.automationEndpoint,
+        );
+        const p95 = percentile(samples, 0.95);
+        expect(
+          p95,
+          `loopback input-to-frame p95 ${p95.toFixed(1)}ms over ${samples.length} real CDP samples`,
+        ).toBeLessThan(200);
+        await runHostWorker(context.workerEnv("cleanup"));
+        await assertLoopbackSocketClosed(started.instance.automationEndpoint);
         cleanupNeeded = false;
       } finally {
         if (cleanupNeeded && context !== undefined) {

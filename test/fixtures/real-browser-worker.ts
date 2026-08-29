@@ -27,6 +27,11 @@ import {
   resolveTransferStagingRoot,
 } from "../../transfer-staging.js";
 import { createNodeTransferStagingFilesystem } from "../../transfer-staging-filesystem.js";
+import {
+  createHostDownloadsManager,
+  resolveHostDownloadsRoot,
+} from "../../host-downloads.js";
+import { createNodeHostDownloadsFilesystem } from "../../host-downloads-filesystem.js";
 import { WebSocket } from "ws";
 import {
   PANEL_MAX_VIEWPORT_HEIGHT,
@@ -95,6 +100,8 @@ if (
     "panel-transport",
     "dialogs",
     "safe-login",
+    "transfer",
+    "disable-re-enable",
   ]).has(action)
 ) {
   throw new Error(
@@ -713,6 +720,17 @@ let transfer:
       traversalRejected: boolean;
     }
   | undefined;
+let downloadExport:
+  | {
+      quarantined: boolean;
+      exportedToClient: boolean;
+      clientBytesMatch: boolean;
+      exportedToWorkspace: boolean;
+      outsideEnvironmentRejected: boolean;
+      quarantineRetained: boolean;
+      privacySafeNoPath: boolean;
+    }
+  | undefined;
 if (action === "transfer") {
   // Exercise Transfer Staging against the real running browser. The real-host
   // command fails closed without BB_BROWSER_HOST_DATA_DIR: this gate throws
@@ -783,6 +801,105 @@ if (action === "transfer") {
     traversalRejected:
       traversalResult.outcome === "rejected" &&
       (traversalResult as { reason?: string }).reason === "symlink-escape",
+  };
+
+  // Issue #24 P2/S4: also exercise quarantined download export through the real
+  // host worker path. A download enters the profile-scoped quarantine, the
+  // owner explicitly exports it to the displaying client (bytes leave
+  // quarantine) and into the workspace (host-to-host copy that must stay inside
+  // the environment), a traversal target is rejected, and the quarantine file
+  // remains for later expiry. The quarantine root is derived from the data
+  // directory; this never touches the workspace repository.
+  const downloadsRoot = resolveHostDownloadsRoot(dataDirectory);
+  if (downloadsRoot === null) {
+    throw new Error(
+      "The download export worker requires BB_BROWSER_HOST_DATA_DIR.",
+    );
+  }
+  const downloads = createHostDownloadsManager({
+    filesystem: createNodeHostDownloadsFilesystem(),
+    quarantineRoot: downloadsRoot,
+  });
+  const payload = "deterministic-download-fixture";
+  const downloadId = "download-fixture";
+  const startResponse = await downloads.startDownload({
+    downloadId,
+    profileId: target.profileId,
+    suggestedName: "fixture-download.txt",
+    contentType: "text/plain",
+    totalBytes: payload.length,
+  });
+  const startedDownload = startResponse.outcome === "quarantined";
+  if (startedDownload) {
+    await downloads.appendChunk({
+      hostId: target.hostId,
+      downloadId,
+      data: Buffer.from(payload).toString("base64"),
+      chunkBytes: payload.length,
+    });
+  }
+  const completed = await downloads.completeDownload({
+    hostId: target.hostId,
+    downloadId,
+  });
+  const quarantined = startedDownload && completed.outcome === "quarantined";
+  const ownerAuth = { actor: "owner" as const, leaseActive: false };
+  const clientExport = await downloads.exportToClient(
+    { hostId: target.hostId, downloadId },
+    ownerAuth,
+  );
+  const exportedToClient =
+    clientExport.outcome === "exported" &&
+    clientExport.destination === "client";
+  const clientBytesMatch =
+    exportedToClient &&
+    "data" in clientExport &&
+    Buffer.from(clientExport.data ?? "", "base64").toString() === payload;
+  const workspaceRoot = await mkdtemp(join(rootDirectory, "download-env-"));
+  const workspaceExport = await downloads.exportToWorkspace(
+    {
+      hostId: target.hostId,
+      downloadId,
+      environmentRoot: workspaceRoot,
+      relativePath: "exported-download.txt",
+    },
+    ownerAuth,
+    workspaceRoot,
+  );
+  const exportedToWorkspace = workspaceExport.outcome === "exported";
+  const outsideWorkspaceExport = await downloads.exportToWorkspace(
+    {
+      hostId: target.hostId,
+      downloadId,
+      environmentRoot: workspaceRoot,
+      relativePath: "../escape.txt",
+    },
+    ownerAuth,
+    workspaceRoot,
+  );
+  const outsideEnvironmentRejected =
+    outsideWorkspaceExport.outcome === "rejected" &&
+    (outsideWorkspaceExport as { reason?: string }).reason ===
+      "outside-environment";
+  const listing = await downloads.listDownloads({
+    hostId: target.hostId,
+    profileId: target.profileId,
+  });
+  const downloadPrivacySafeNoPath =
+    JSON.stringify(listing).search(/quarantinePath|environmentRoot/i) === -1;
+  const inspectRecord = downloads.inspect(downloadId);
+  const quarantineRetained =
+    inspectRecord !== undefined &&
+    (await pathExists(join(downloadsRoot, target.profileId)));
+  await downloads.dispose();
+  downloadExport = {
+    quarantined,
+    exportedToClient,
+    clientBytesMatch,
+    exportedToWorkspace,
+    outsideEnvironmentRejected,
+    quarantineRetained,
+    privacySafeNoPath: downloadPrivacySafeNoPath,
   };
 }
 let safeLogin:
@@ -914,8 +1031,65 @@ if (action === "safe-login") {
     activityMetadataOnly,
   };
 }
+let disableReEnable:
+  | {
+      accountHeadingRetained: boolean;
+      localStorageRetained: boolean;
+      sessionStorageRetained: boolean;
+      localeRetained: boolean;
+      timezoneRetained: boolean;
+      preDisableProcessGone: boolean;
+    }
+  | undefined;
+if (action === "disable-re-enable") {
+  // Issue #24 S3/P2: genuinely exercise disable/re-enable retention through the
+  // real worker path. A profile is created and a fixture sign-in is persisted;
+  // the runtime is then stopped and disposed (the plugin "disable" — every
+  // Browser-owned process is torn down). A FRESH runtime is built (the plugin
+  // "re-enable") and the SAME profile is started again. The persisted sign-in,
+  // localStorage, sessionStorage, locale, and timezone must survive the
+  // disable/re-enable cycle because profile data lives in protected storage
+  // that disable never purges. The real-host command fails closed without
+  // BB_BROWSER_HOST_DATA_DIR, so a non-provisioned host is never mutated.
+  // fails closed without BB_BROWSER_HOST_DATA_DIR so a non-provisioned
+  // host is never mutated by this worker action.
+  requiredEnvironment("BB_BROWSER_HOST_DATA_DIR");
+  // Persist a fixture sign-in into the real profile.
+  await runtime.execute(target, signInScript, 20_000);
+  const preDisablePid = initialInstance.pid;
+  // Disable: stop every Browser-owned process and tear down the runtime.
+  await runtime.stop(target);
+  await runtime.dispose();
+  // Re-enable: a fresh runtime shares the same protected profile storage, so
+  // the retained profile is restorable without re-authentication.
+  const reEnabledRuntime = createBrowserInstanceRuntime(runtimeOptions);
+  const reEnabledInstance = await reEnabledRuntime.start(target);
+  const restored = JSON.parse(
+    String(await reEnabledRuntime.execute(target, restoreScript, 20_000)),
+  ) as {
+    heading?: string;
+    local?: string;
+    session?: string;
+    locale?: string;
+    timezone?: string;
+  };
+  const preDisableProcessGone = !(await processExists(preDisablePid));
+  await reEnabledRuntime.stop(target);
+  await reEnabledRuntime.dispose();
+  await waitForProcessExit(reEnabledInstance.pid);
+  disableReEnable = {
+    accountHeadingRetained: restored.heading === "Signed in",
+    localStorageRetained: restored.local === "persistent",
+    sessionStorageRetained: restored.session === "restorable",
+    localeRetained: restored.locale === "en-GB",
+    timezoneRetained: restored.timezone === "Europe/London",
+    preDisableProcessGone,
+  };
+}
 const automationHelperPid =
-  action === "cleanup" || action === "lifecycle"
+  action === "cleanup" ||
+  action === "lifecycle" ||
+  action === "disable-re-enable"
     ? null
     : Number(
         await readFile(join(helperHome, ".dev-browser", "daemon.pid"), "utf8"),
@@ -930,6 +1104,8 @@ const runningState = {
   dialogs,
   safeLogin,
   transfer,
+  downloadExport,
+  disableReEnable,
   uid: boundary.effectiveUserId,
   gid: boundary.effectiveGroupId,
   ownedProcesses: await ownedProcesses(rootDirectory),

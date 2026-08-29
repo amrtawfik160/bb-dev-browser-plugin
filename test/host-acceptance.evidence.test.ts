@@ -16,50 +16,40 @@
  *
  * Real-host boundaries that the existing `real-browser-worker.ts` fixture
  * drives (start/crash-recover/lifecycle/origin-scope/panel-transport/
- * safe-login) are exercised by spawning that worker and asserting its report.
- * Boundaries the worker does not drive over BB Connect (client/workspace
- * transfer, quarantined download export, disable/re-enable retention) are
- * exercised by REUSING the #21 evidence helpers (`createEvidenceHarness`) and
- * the existing contract fixtures — the same code path the BB Connect transport
- * runs — rather than duplicating them.
+ * safe-login/transfer/disable-re-enable) are exercised by spawning that
+ * worker and asserting its report. The worker `transfer` action drives
+ * client/workspace transfer AND quarantined download export through the real
+ * host worker path; the worker `disable-re-enable` action drives disable/
+ * re-enable retention through the real worker path. The in-memory contract
+ * suites (transfer-staging, host-downloads-boundary, release-lifecycle)
+ * remain the always-on baseline. This makes AC3's "through the owner's
+ * authenticated BB Connect session" genuinely exercisable on a provisioned
+ * host rather than only delegated to in-memory suites.
  *
  * Without a provisioned host every test skips deterministically, naming the
- * exact missing capability (never fails). This file never provisions or
- * mutates the host. Gate convention matches `host-setup-verification.test.ts`:
- * importing the shared fixture imports `integrationEnabled` from
- * `evidence-helpers.ts`, which throws at module load when required-but-not-
- * enabled; tests register with `it.runIf(integrationEnabled)`.
+ * exact missing capability in the skip output (never fails). This file never
+ * provisions or mutates the host. Gate convention matches
+ * `host-setup-verification.test.ts`: importing the shared fixture imports
+ * `integrationEnabled` from `evidence-helpers.ts`, which throws at module load
+ * when required-but-not-enabled; tests register with `it.runIf(integrationEnabled)`.
  */
 import { describe, expect, it } from "vitest";
-import { DEFAULT_PROFILE_ID } from "../contracts.js";
 import {
   assertLoopbackSocket,
   assertLoopbackSocketClosed,
   cleanupFixtureProfiles,
   closeFixture,
   createAuthenticationFixture,
-  createEvidenceHarness,
   integrationEnabled,
   listenFixture,
   parsedScriptOutput,
   provisionedHostContext,
   runHostWorker,
-  type MissingHostCapability,
+  skipIfNotProvisioned,
   type ProvisionedHostContext,
   type WorkerReport,
 } from "./fixtures/host-provisioning.js";
 import { projectLoopbackAddress } from "../browser-navigation.js";
-
-function skipIfNotProvisioned(
-  ctx: { skip: () => void },
-  result: ProvisionedHostContext | MissingHostCapability,
-): result is ProvisionedHostContext {
-  if ("missingCapability" in result) {
-    ctx.skip();
-    return false;
-  }
-  return true;
-}
 
 describe("issue #24 AC3/AC4 deterministic remote acceptance", () => {
   it.runIf(integrationEnabled)(
@@ -341,72 +331,94 @@ describe("issue #24 AC3/AC4 deterministic remote acceptance", () => {
   );
 
   // Client/workspace transfer, quarantined download export, and disable/
-  // re-enable retention are not driven by a dedicated worker action; the real
-  // BB Connect transport path for them is the SAME public-plugin contract the
-  // #21 in-memory evidence harness exercises. These gated tests REUSE the #21
-  // `createEvidenceHarness` (the deterministic proxy for the BB Connect
-  // transport) to exercise those boundaries on a provisioned host rather than
-  // duplicating their contract suites.
+  // re-enable retention are exercised through the REAL host worker path on a
+  // provisioned host (issue #24 S4/P2) rather than only delegated to the
+  // in-memory contract suites. The worker `transfer` action drives Transfer
+  // Staging (client/workspace upload) AND quarantined download export through
+  // the real host worker; the worker `disable-re-enable` action stops every
+  // Browser-owned process, rebuilds a fresh runtime, and verifies the profile's
+  // persisted state survives the cycle. The in-memory contract suites
+  // (transfer-staging, host-downloads-boundary, release-lifecycle) remain the
+  // always-on baseline.
 
   it.runIf(integrationEnabled)(
-    "exercises client/workspace transfer and quarantined download export through the BB Connect contract path",
-    { timeout: 120_000 },
+    "exercises client/workspace transfer and quarantined download export through the real worker transfer action",
+    { timeout: 240_000 },
     async (ctx) => {
       const probed = await provisionedHostContext();
       if (!skipIfNotProvisioned(ctx, probed)) return;
       const context = probed;
-      // Reuse the #21 evidence harness (the same public-plugin contract the BB
-      // Connect transport serves) so transfer/download boundaries are exercised
-      // deterministically on the provisioned host without a parallel driver.
-      const evidence = await createEvidenceHarness();
       try {
-        await evidence.harness.createBrowserProfile({
-          hostId: context.hostId,
-          name: "Acceptance transfer/download target",
-        });
-        await evidence.harness.createBrowserGrant({
-          projectId: context.projectId,
-          hostId: context.hostId,
-          profileId: DEFAULT_PROFILE_ID,
-          originScope: "https://app.example.test",
-          wholeWeb: false,
-          fileTransfer: true,
-          invalidCertificateOrigins: [],
-        });
-        // The transfer and download boundaries are enforced by the public
-        // contract; a script that touches the in-scope origin succeeds through
-        // the same dispatch path BB Connect uses.
-        const result = await evidence.harness.runBrowserScriptWithProfile(
-          undefined,
-          {
-            purpose: "Acceptance transfer/download dispatch",
-            code: "return page.url();",
-            destinationOrigin: "https://app.example.test",
-          },
-        );
-        expect(typeof result).toBe("string");
-        // The contract suites (transfer-staging, host-downloads-boundary) prove
-        // traversal/symlink rejection and quarantine; this acceptance test only
-        // confirms the dispatch path is reachable through BB Connect here.
+        // The real worker `transfer` action stages a workspace file (symlink /
+        // traversal rejected), consumes and purges it, then runs a quarantined
+        // download → client export (bytes match) and workspace export
+        // (host-to-host copy, outside-environment rejected) through the real
+        // host worker path. This is the same path the BB Connect transport
+        // serves, so AC3's "through the owner's authenticated BB Connect
+        // session" is genuinely exercisable on a provisioned host.
+        const report = await runHostWorker(context.workerEnv("transfer"));
+        const transfer = report.transfer;
+        expect(transfer).toBeDefined();
+        expect(transfer?.failClosedWithoutDataDir).toBe(true);
+        expect(transfer?.stagedWorkspace).toBe(true);
+        expect(transfer?.privacySafeNoPath).toBe(true);
+        expect(transfer?.removedAfterUse).toBe(true);
+        expect(transfer?.symlinkEscapeRejected).toBe(true);
+        expect(transfer?.traversalRejected).toBe(true);
+        const download = report.downloadExport;
+        expect(download).toBeDefined();
+        expect(download?.quarantined).toBe(true);
+        expect(download?.exportedToClient).toBe(true);
+        expect(download?.clientBytesMatch).toBe(true);
+        expect(download?.exportedToWorkspace).toBe(true);
+        expect(download?.outsideEnvironmentRejected).toBe(true);
+        expect(download?.quarantineRetained).toBe(true);
+        expect(download?.privacySafeNoPath).toBe(true);
       } finally {
-        await evidence.cleanup();
+        await cleanupFixtureProfiles(context);
       }
     },
   );
 
   it.runIf(integrationEnabled)(
-    "exercises disable/re-enable retention through the lifecycle contract path on a provisioned host",
-    { timeout: 120_000 },
+    "exercises disable/re-enable retention through the real worker path on a provisioned host",
+    { timeout: 240_000 },
     async (ctx) => {
-      const probed = await provisionedHostContext();
-      if (!skipIfNotProvisioned(ctx, probed)) return;
-      // Disable/re-enable retention is proven by test/release-lifecycle.test.tsx
-      // (install, enable, disable, re-enable, uninstall-retain, purge planning)
-      // through the public contract. This acceptance test confirms that, on a
-      // provisioned host, the gate is on and the lifecycle retention contract
-      // remains the source of truth; it reuses that suite rather than
-      // duplicating it. Running it here does not provision or mutate the host.
-      expect(integrationEnabled).toBe(true);
+      const fixture = createAuthenticationFixture();
+      let context: ProvisionedHostContext | undefined;
+      try {
+        const port = await listenFixture(fixture);
+        const fixtureAddress = projectLoopbackAddress(
+          "ci-browser-project",
+          `http://localhost:${port}/account`,
+        );
+        const probed = await provisionedHostContext(fixtureAddress);
+        if (!skipIfNotProvisioned(ctx, probed)) return;
+        context = probed;
+        await cleanupFixtureProfiles(context);
+        // The real worker `disable-re-enable` action persists a fixture sign-in,
+        // stops and disposes the runtime (plugin "disable"), rebuilds a fresh
+        // runtime (plugin "re-enable"), and verifies the profile's persisted
+        // sign-in / localStorage / sessionStorage / locale / timezone survive
+        // the cycle. Disable never purges profile data, so re-enable restores
+        // the authenticated session without re-authentication.
+        const report = await runHostWorker(
+          context.workerEnv("disable-re-enable"),
+        );
+        const retention = report.disableReEnable;
+        expect(retention).toBeDefined();
+        expect(retention?.accountHeadingRetained).toBe(true);
+        expect(retention?.localStorageRetained).toBe(true);
+        expect(retention?.sessionStorageRetained).toBe(true);
+        expect(retention?.localeRetained).toBe(true);
+        expect(retention?.timezoneRetained).toBe(true);
+        expect(retention?.preDisableProcessGone).toBe(true);
+      } finally {
+        await closeFixture(fixture);
+        if (context !== undefined) {
+          await cleanupFixtureProfiles(context);
+        }
+      }
     },
   );
 
