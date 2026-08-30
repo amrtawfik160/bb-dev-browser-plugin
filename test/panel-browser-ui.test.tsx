@@ -200,9 +200,19 @@ describe("Browser Panel", () => {
         const panel = browser.renderPanel();
 
         // These resolve themselves in seconds; blanking the page for them
-        // would read as a fault. The toolbar says so instead.
+        // would read as a fault. The whole browser stays routed — toolbar,
+        // history controls, tab strip, page — and the toolbar says what is
+        // happening instead.
+        //
+        // Retention of the last painted frame across a live healthy → sleeping
+        // transition is not asserted here: the panel re-reads its status only
+        // when the state it already holds changes, so this harness has no way
+        // to drive that transition. The guard that keeps the frame is
+        // `browserStateIsSettling` in the capability and control effects.
         await panel.findByLabelText("Address or search");
         await panel.findByRole("region", { name: "Browser page" });
+        await panel.findByRole("list", { name: "Browser tabs" });
+        await panel.findByRole("button", { name: "Go back" });
         await panel.findByRole("status", { name: label });
         expect(panel.queryByLabelText("Host readiness checklist")).toBeNull();
       } finally {

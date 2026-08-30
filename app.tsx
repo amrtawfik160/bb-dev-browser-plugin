@@ -59,6 +59,7 @@ import {
   BrowserNewTabSurface,
   BrowserTabStripView,
   BrowserToolbar,
+  browserStateIsSettling,
   browserStateReplacesPage,
   type BrowserAccessRequest,
   type BrowserPanelOption,
@@ -328,7 +329,12 @@ function PanelStreamSurface({
 
   useEffect(() => {
     if (status.state !== "healthy" || status.hostId === null) {
-      setCapability(undefined);
+      // A sleeping or waking instance keeps the frame it last painted: those
+      // states resolve themselves within seconds, and blanking the page for
+      // them reads as a fault rather than as a browser about to come back
+      // (issue #50). The toolbar is what says so. Every other non-healthy
+      // state has no page left to keep.
+      if (!browserStateIsSettling(status.state)) setCapability(undefined);
       setStreamState("offline");
       return;
     }
@@ -902,7 +908,12 @@ function usePanelControlSession({
   const profileId = status?.profileId;
   useEffect(() => {
     if (status === null || status.state !== "healthy" || hostId === null) {
-      setControl(null);
+      // The shared session outlives a sleep: dropping it here would empty the
+      // tab strip and draw the new-tab surface over the frame the panel is
+      // deliberately still showing.
+      if (status === null || !browserStateIsSettling(status.state)) {
+        setControl(null);
+      }
       return;
     }
     let disposed = false;
@@ -1152,10 +1163,10 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
   useEffect(() => {
     if (status === null) return;
     const hostId = status.hostId;
-    if (
-      hostId === null ||
-      !["healthy", "sleeping", "waking"].includes(status.state)
-    ) {
+    // The panel stays pinned for exactly the states that keep a browser on
+    // screen: healthy, plus the sleeping and waking ones it is waiting out.
+    // Which states those are is the routing table, not a list repeated here.
+    if (hostId === null || browserStateReplacesPage(status.state)) {
       return;
     }
     const target = { hostId, profileId: status.profileId, panelId };
