@@ -369,15 +369,21 @@ export function createPanelControlState(options: PanelControlStateOptions) {
    * may, so a second panel that is view-only in the interface is view-only at
    * the boundary too, and two panels can never fight over one address bar.
    *
-   * A panel this session has never seen is refused while another panel holds
-   * control, and allowed when nobody does: a panel whose join failed is not a
-   * reason to freeze a browser no one else is driving, and a request that
-   * carries no panel identity at all — an agent script, the CLI, an owner tool
-   * — never asks this question.
+   * A panel this session has never seen is refused, the same as any other
+   * non-controller — otherwise a view-only panel could buy itself the address
+   * bar by inventing an identity. The one exception is a session no panel has
+   * joined at all: there is no control to usurp, and the panel asking is the
+   * one about to become the controller, so refusing it would fail the owner's
+   * first navigation for the length of a round trip.
+   *
+   * A request that carries no panel identity at all — an agent script, the
+   * CLI, an owner tool — never asks this question.
    */
   function canNavigate(panelId: string): boolean {
     if (controllerPanelId !== null) return controllerPanelId === panelId;
-    return panels.get(panelId)?.role !== "spectator";
+    const client = panels.get(panelId);
+    if (client !== undefined) return client.role !== "spectator";
+    return panels.size === 0;
   }
 
   function role(panelId: string): PanelRole | undefined {
