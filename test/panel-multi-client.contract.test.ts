@@ -269,21 +269,26 @@ describe("Browser Panel multi-client control (issue #16)", () => {
     await browser.dispose();
   });
 
-  it("renders the control surface and Take control control on the panel", async () => {
+  it("gives the panel that holds control the address bar, and a second panel the way to take it", async () => {
     const browser = await createPublicPluginHarness({ status: healthyStatus });
-    const panel = await browser.openExistingThreadPanel();
-    // The panel mounts and fetches control state; the control surface is
-    // labeled and exposes the Take/Release control action.
-    await waitFor(() =>
-      expect(
-        panel.panel.queryByLabelText("Browser Control Lease"),
-      ).not.toBeNull(),
-    );
-    // The control surface shows a Take control or Release control button.
-    const button = await panel.panel.findByRole("button", {
-      name: /control/iu,
-    });
-    expect(button).toBeTruthy();
-    await browser.dispose();
+    try {
+      const controller = browser.renderPanel();
+      const spectator = browser.renderPanel();
+
+      // The panel that holds control drives the browser, so it gets the
+      // address bar and the history controls.
+      await controller.findByLabelText("Address or search");
+      await controller.findByRole("button", { name: "Go back" });
+
+      // The second client is view-only, so where the address bar would be it
+      // gets the one action that changes that.
+      await waitFor(() =>
+        expect(spectator.queryByLabelText("Address or search")).toBeNull(),
+      );
+      await spectator.findByRole("button", { name: "Take control" });
+      expect(spectator.queryByRole("button", { name: "Go back" })).toBeNull();
+    } finally {
+      await browser.dispose();
+    }
   });
 });

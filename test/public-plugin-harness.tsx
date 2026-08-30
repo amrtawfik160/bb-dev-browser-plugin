@@ -10,7 +10,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
-import { act } from "@testing-library/react";
+import { act, within } from "@testing-library/react";
 import {
   createFakePluginHost,
   makeThreadResponse,
@@ -117,7 +117,10 @@ import {
   type BrowserScriptResponse,
 } from "../contracts.js";
 import { createBrowserHostEntry, type HostSetupBoundary } from "../host.js";
-import type { BrowserInstanceRuntime } from "../browser-runtime.js";
+import type {
+  BrowserInstanceRuntime,
+  RuntimeBrowserPage,
+} from "../browser-runtime.js";
 import {
   createHostAdministrationBoundary,
   type HostAdministrationStateStore,
@@ -249,6 +252,78 @@ function hostFixture(
 
 function panelKey(actionId: string, params: unknown) {
   return `${actionId}:${JSON.stringify(params)}`;
+}
+
+/**
+ * A runtime that keeps a page inventory, so tab actions can be asserted
+ * against what the instance actually holds rather than against a canned
+ * answer: opening adds a page, closing removes it, listing reports what is
+ * left, and pinning records the panels that woke the instance.
+ */
+export function createTabInventoryRuntime(): BrowserInstanceRuntime & {
+  readonly pinnedPanelIds: readonly string[];
+} {
+  const pages: RuntimeBrowserPage[] = [];
+  const pinnedPanelIds: string[] = [];
+  let opened = 0;
+  const instance = (target: { hostId: string; profileId: string }) => ({
+    state: "running" as const,
+    hostId: target.hostId,
+    profileId: target.profileId,
+    pid: 1,
+    browser: "chrome-stable" as const,
+    automationEndpoint: "http://127.0.0.1:9222",
+  });
+  return {
+    get pinnedPanelIds() {
+      return [...pinnedPanelIds];
+    },
+    start: async (target) => instance(target),
+    stop: async () => undefined,
+    execute: async () => "",
+    navigate: async (target, input) => ({
+      address: { kind: "address" as const, url: input },
+      location: { url: input },
+      tabId: target.tabId ?? pages[0]?.id ?? "inventory-tab",
+    }),
+    history: async (target, direction) => ({
+      address: { kind: "address" as const, url: "about:blank" },
+      location: { direction },
+      tabId: target.tabId ?? pages[0]?.id ?? "inventory-tab",
+    }),
+    openPage: async () => {
+      opened += 1;
+      const page: RuntimeBrowserPage = {
+        id: `tab-opened-${opened}`,
+        url: "about:blank",
+        title: "",
+        openerTabId: null,
+      };
+      pages.push(page);
+      return page;
+    },
+    focusPage: async () => undefined,
+    closePages: async (_target, tabIds) => {
+      const remaining = pages.filter((page) => !tabIds.includes(page.id));
+      const closed = pages.length - remaining.length;
+      pages.splice(0, pages.length, ...remaining);
+      return closed;
+    },
+    listPages: async () => [...pages],
+    status: async (target) => ({
+      state: "running" as const,
+      hostId: target.hostId,
+      profileId: target.profileId,
+    }),
+    pinPanel: async (target, panelId) => {
+      pinnedPanelIds.push(panelId);
+      return instance(target);
+    },
+    unpinPanel: async () => undefined,
+    hostDisconnected: () => undefined,
+    hostReconnected: async () => undefined,
+    dispose: async () => undefined,
+  };
 }
 
 /**
@@ -1414,7 +1489,11 @@ export async function createPublicPluginHarness(options?: {
         ? renderNewThreadPanel({ profileId: DEFAULT_PROFILE_ID })
         : renderExistingPanel({ profileId: DEFAULT_PROFILE_ID });
     renderedPanels.push(panel);
-    return panel;
+    // Queries from a render are bound to the whole document, so with two
+    // panels mounted a query for "the omnibox" would answer with whichever
+    // panel rendered one first. Scoping them to this panel's own container is
+    // what makes a controller and a view-only spectator separable.
+    return { ...panel, ...within(panel.container) };
   }
 
   function renderExistingPanel(params: JsonValue | null) {

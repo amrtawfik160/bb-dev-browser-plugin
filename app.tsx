@@ -4,7 +4,6 @@ import {
   useRef,
   useState,
   type FormEvent,
-  type ReactNode,
 } from "react";
 import { definePluginApp, useBbContext, useRpc } from "@get-bb/plugin-sdk/app";
 import type {
@@ -18,6 +17,8 @@ import {
   RESET_PROFILE_CONFIRMATION,
   STOP_BROWSER_CONFIRMATION,
   BROWSER_PANEL_STREAM_DISCLOSURE,
+  PANEL_MAX_VIEWPORT_HEIGHT,
+  PANEL_MAX_VIEWPORT_WIDTH,
   type BrowserContextAction,
   type BrowserDialogEvent,
   type BrowserDownloadListingEntry,
@@ -39,6 +40,8 @@ import {
   type BrowserSetupPlan,
   type BrowserStatus,
   type BrowserStatusInput,
+  type BrowserTabAction,
+  type BrowserTabStrip,
   type rpcContract,
 } from "./contracts.js";
 import {
@@ -46,8 +49,15 @@ import {
   PanelContextMenu,
   PanelDownloadsSurface,
   usePrefersReducedMotion,
-  isBbGlobalShortcut,
 } from "./panel-chrome.js";
+import {
+  BrowserBlockedSurface,
+  BrowserNewTabSurface,
+  BrowserTabStripView,
+  BrowserToolbar,
+  browserStateReplacesPage,
+  type BrowserPanelOption,
+} from "./panel-browser.js";
 import { ownerSessionIdFromContext } from "./panel-owner-session.js";
 import { SAFE_LOGIN_LIMITATIONS_NOTICE } from "./safe-login-notice.js";
 import {
@@ -75,45 +85,6 @@ function ReadinessChecklist({ status }: { status: BrowserStatus }) {
         </li>
       ))}
     </ul>
-  );
-}
-
-function ReadinessView({
-  status,
-  children,
-}: {
-  status: BrowserStatus;
-  children?: ReactNode;
-}) {
-  return (
-    <main className="flex h-full min-h-0 items-center justify-center bg-background p-6">
-      <section
-        role="status"
-        aria-label={status.label}
-        className="max-w-md text-center"
-      >
-        <h2 className="text-lg font-semibold text-foreground">
-          {status.label}
-        </h2>
-        <p className="mt-2 text-sm text-muted-foreground">{status.message}</p>
-        {status.controlLease === undefined ? null : (
-          <p
-            aria-label="Active Browser Control Lease"
-            className="mt-3 text-sm text-muted-foreground"
-          >
-            {status.controlLease.actor === "owner" ? "Owner" : "Agent"} control
-            {status.controlLease.purpose === null
-              ? " is active."
-              : `: ${status.controlLease.purpose}`}
-          </p>
-        )}
-        <p className="mt-3 font-mono text-xs text-muted-foreground">
-          {status.profileId}
-        </p>
-        <ReadinessChecklist status={status} />
-        {children}
-      </section>
-    </main>
   );
 }
 
@@ -241,10 +212,17 @@ function PanelGrantRequestNotices({
 function PanelStreamSurface({
   status,
   panelId,
+  isController,
   onControlState,
 }: {
   status: BrowserStatus;
   panelId: string;
+  /**
+   * Whether this panel may drive the browser. The shared control session is
+   * the single source of that answer (ADR 0012); the stream applies it to
+   * dialogs, context actions, and download control.
+   */
+  isController: boolean;
   /**
    * Live control-state updates pushed from the host over the stream so every
    * panel observes control transfers and tab changes without re-fetching.
@@ -275,7 +253,6 @@ function PanelStreamSurface({
     point: { x: number; y: number };
     actions: BrowserContextAction[];
   } | null>(null);
-  const [isController, setIsController] = useState(false);
   // Host Downloads quarantine state (issue #20): progress, quarantine state,
   // limits, expiry, export, cancellation, and errors surfaced from the host.
   const [downloads, setDownloads] = useState<
@@ -495,7 +472,6 @@ function PanelStreamSurface({
             const own = payload.control.panels.find(
               (panel) => panel.panelId === panelId,
             );
-            setIsController(own?.role === "controller");
             onControlState?.({
               role: own?.role ?? "spectator",
               control: payload.control,
@@ -663,107 +639,105 @@ function PanelStreamSurface({
     URL.revokeObjectURL(url);
   }
 
-  if (capability?.outcome === "issued") {
-    return (
-      <section
-        aria-label="Browser Automation Mode stream"
-        className="mt-5 text-left"
-      >
-        <p className="text-sm">
-          Automation Mode is streaming the shared Browser viewport.
-        </p>
-        <p className="mt-2 text-xs text-muted-foreground">
-          Frames adapt between 5 and 15 per second up to 1920×1080. Input is
-          owner-gated and freezes immediately on disconnect.
-        </p>
-        <p className="mt-2 text-xs text-muted-foreground" aria-live="polite">
-          {BROWSER_PANEL_STREAM_DISCLOSURE}
-        </p>
+  // The page fills the panel. What used to sit around it — the streaming
+  // policy and the version-one screen-reader limitation — is still announced,
+  // but only to assistive technology: it is a disclosure the owner needs once,
+  // not three paragraphs standing between them and the page (issue #17
+  // disclosure, issue #50 layout).
+  return (
+    <section
+      aria-label="Browser page"
+      className="relative h-full min-h-0 w-full"
+    >
+      <p className="sr-only">
+        This browser streams the page as pixels between 5 and 15 frames per
+        second, up to 1920×1080. Input is owner-gated and freezes immediately on
+        disconnect. {BROWSER_PANEL_STREAM_DISCLOSURE}
+      </p>
+      {capability?.outcome === "issued" ? (
         <canvas
           ref={canvasRef}
-          aria-label="Browser stream surface"
+          aria-label="Browser page view"
           role="img"
-          width={controllerViewport?.width ?? 1920}
-          height={controllerViewport?.height ?? 1080}
-          className="mt-3 h-64 w-full rounded border bg-muted"
+          width={controllerViewport?.width ?? PANEL_MAX_VIEWPORT_WIDTH}
+          height={controllerViewport?.height ?? PANEL_MAX_VIEWPORT_HEIGHT}
+          className="h-full w-full bg-muted object-contain"
           onContextMenu={handleContext}
         />
-        <p className="mt-2 text-xs text-muted-foreground" aria-live="polite">
-          {streamState === "streaming"
-            ? "Stream live."
-            : streamState === "reconnecting"
-              ? "Reconnecting the Browser stream with bounded backoff…"
-              : streamState === "connecting"
-                ? "Opening the authenticated Browser transport…"
-                : "The Browser stream is offline."}
-        </p>
-        {dialog === null ? null : (
-          <PanelDialogLayer
-            dialog={dialog}
-            isController={isController}
-            reducedMotion={reducedMotion}
-            onRespond={respondToDialog}
-            onClose={() => setDialog(null)}
-          />
-        )}
-        {contextMenu === null ? null : (
-          <PanelContextMenu
-            actions={contextMenu.actions}
-            point={contextMenu.point}
-            isController={isController}
-            reducedMotion={reducedMotion}
-            onChoose={chooseContextAction}
-            onClose={() => setContextMenu(null)}
-          />
-        )}
-        <PanelDownloadsSurface
-          downloads={downloads}
-          limits={downloadsLimits}
-          isController={isController}
-          exportState={{
-            inFlightDownloadId: exportInFlightDownloadId,
-            error: exportError,
-          }}
-          onCancel={cancelDownload}
-          onExportClient={exportDownloadToClient}
-        />
-      </section>
-    );
-  }
-  return (
-    <section aria-label="Browser transport status" className="mt-5 text-left">
-      <p className="text-sm">
-        {streamState === "connecting"
-          ? "Opening the authenticated Browser transport…"
-          : streamState === "reconnecting"
-            ? "Reconnecting the Browser stream with bounded backoff…"
-            : "The Browser stream is offline."}
+      ) : null}
+      <p className="sr-only" aria-live="polite">
+        {capability?.outcome !== "issued"
+          ? (streamError ?? streamStateMessage(streamState))
+          : streamState === "streaming"
+            ? "The page is live."
+            : streamStateMessage(streamState)}
       </p>
-      {streamError === null ? null : (
-        <p role="alert" className="mt-2 text-xs text-muted-foreground">
-          {streamError}
-        </p>
+      {dialog === null ? null : (
+        <PanelDialogLayer
+          dialog={dialog}
+          isController={isController}
+          reducedMotion={reducedMotion}
+          onRespond={respondToDialog}
+          onClose={() => setDialog(null)}
+        />
+      )}
+      {contextMenu === null ? null : (
+        <PanelContextMenu
+          actions={contextMenu.actions}
+          point={contextMenu.point}
+          isController={isController}
+          reducedMotion={reducedMotion}
+          onChoose={chooseContextAction}
+          onClose={() => setContextMenu(null)}
+        />
+      )}
+      {downloads.length === 0 ? null : (
+        // Downloads appear only once there is one, the way a browser reveals
+        // its download shelf, and never as a permanent empty section under the
+        // page. Managing them afterwards lives in Browser Settings.
+        <div className="absolute inset-x-0 bottom-0 max-h-1/2 overflow-auto border-t bg-background p-2">
+          <PanelDownloadsSurface
+            downloads={downloads}
+            limits={downloadsLimits}
+            isController={isController}
+            exportState={{
+              inFlightDownloadId: exportInFlightDownloadId,
+              error: exportError,
+            }}
+            onCancel={cancelDownload}
+            onExportClient={exportDownloadToClient}
+          />
+        </div>
       )}
     </section>
   );
 }
 
+function streamStateMessage(
+  streamState: "connecting" | "streaming" | "reconnecting" | "offline",
+) {
+  if (streamState === "connecting") return "Connecting to the browser…";
+  if (streamState === "reconnecting") return "Reconnecting to the browser…";
+  if (streamState === "streaming") return "The page is live.";
+  return "This browser is not connected.";
+}
+
 /**
- * Shared Control Lease surface for one profile (issue #16). Every Browser Panel
- * for one profile observes one coordinated control state: a controller and
- * view-only spectators, the controller's logical viewport, the live
- * agent-purpose indicator, and the shared ordered Browser Tab strip with one
- * active tab. A spectator cannot send browser input until the owner explicitly
- * chooses Take control; control transfer is atomic and visible to every
- * panel.
+ * Join the shared control session for this profile and expose the transfers
+ * the owner can make (issue #16, ADR 0012). Every Browser Panel for one
+ * profile observes one coordinated state: a controller and view-only
+ * spectators, the controller's logical viewport, the live agent-purpose
+ * indicator, and one shared ordered tab strip with one active tab. A spectator
+ * cannot send browser input until the owner explicitly chooses Take control;
+ * transfer is atomic and visible to every panel.
  */
-function PanelControlSurface({
+function usePanelControlSession({
   status,
   panelId,
   control,
   setControl,
 }: {
-  status: BrowserStatus;
+  status: BrowserStatus | null;
   panelId: string;
   control: BrowserPanelControlResponse | null;
   setControl: (response: BrowserPanelControlResponse | null) => void;
@@ -773,19 +747,20 @@ function PanelControlSurface({
   const ownerSessionId = ownerSessionIdFromContext(bbContext);
   const [transferPending, setTransferPending] = useState(false);
 
-  // Join the shared control session for this profile on mount and whenever the
-  // profile or panel identity changes. The first panel becomes the controller;
-  // later panels are view-only spectators. Repeated launches and reconnects
-  // never create duplicate controllers because the panel id is stable.
+  // The first panel becomes the controller; later panels are view-only
+  // spectators. Repeated launches and reconnects never create duplicate
+  // controllers because the panel id is stable.
+  const hostId = status?.hostId ?? null;
+  const profileId = status?.profileId;
   useEffect(() => {
-    if (status.state !== "healthy" || status.hostId === null) {
+    if (status === null || status.state !== "healthy" || hostId === null) {
       setControl(null);
       return;
     }
     let disposed = false;
     void rpc
       .call("browser_panel_control", {
-        hostId: status.hostId,
+        hostId,
         profileId: status.profileId,
         panelId,
         ownerSessionId,
@@ -799,29 +774,22 @@ function PanelControlSurface({
     return () => {
       disposed = true;
     };
-  }, [
-    rpc,
-    status.state,
-    status.hostId,
-    status.profileId,
-    panelId,
-    ownerSessionId,
-  ]);
+  }, [rpc, status?.state, hostId, profileId, panelId, ownerSessionId]);
 
   async function transfer(take: boolean) {
-    if (status.hostId === null) return;
+    if (hostId === null || profileId === undefined) return;
     setTransferPending(true);
     try {
       const response = take
         ? await rpc.call("browser_panel_take_control", {
-            hostId: status.hostId,
-            profileId: status.profileId,
+            hostId,
+            profileId,
             panelId,
             ownerSessionId,
           })
         : await rpc.call("browser_panel_release_control", {
-            hostId: status.hostId,
-            profileId: status.profileId,
+            hostId,
+            profileId,
             panelId,
           });
       setControl(response);
@@ -835,12 +803,12 @@ function PanelControlSurface({
   // explicit action that re-grants input without silently re-granting it on
   // reconnect.
   async function reclaim() {
-    if (status.hostId === null) return;
+    if (hostId === null || profileId === undefined) return;
     setTransferPending(true);
     try {
       const response = await rpc.call("browser_panel_reclaim_control", {
-        hostId: status.hostId,
-        profileId: status.profileId,
+        hostId,
+        profileId,
         panelId,
         ownerSessionId,
       });
@@ -850,161 +818,40 @@ function PanelControlSurface({
     }
   }
 
-  if (control === null) return null;
-  const isController = control.role === "controller";
-  const ownEntry = control.control.panels.find(
-    (panel) => panel.panelId === panelId,
-  );
+  const ownEntry =
+    control?.control.panels.find((panel) => panel.panelId === panelId) ?? null;
   // The reclaim window is live while the deadline is in the future. The host
   // clock drives the deadline, so compare against the observed value only to
   // decide which explicit action to surface.
   const canReclaim =
-    !isController &&
+    control?.role !== "controller" &&
     ownEntry?.reclaimUntil !== undefined &&
-    ownEntry.reclaimUntil !== null &&
+    ownEntry?.reclaimUntil !== null &&
     ownEntry.reclaimUntil > Date.now();
-  const spectatorCount = control.control.panels.filter(
-    (panel) => panel.role === "spectator",
-  ).length;
-  return (
-    <section
-      aria-label="Browser Control Lease"
-      className="mt-3 rounded border border-border p-3"
-    >
-      <div className="flex flex-wrap items-center gap-2">
-        <span
-          aria-label={
-            isController ? "You control the Browser" : "You are a spectator"
-          }
-          className="rounded px-2 py-1 text-xs font-medium"
-          style={{
-            backgroundColor: isController
-              ? "var(--color-primary, #2563eb)"
-              : "transparent",
-            color: isController ? "white" : "inherit",
-            border: isController
-              ? undefined
-              : "1px solid var(--color-border, #ccc)",
-          }}
-        >
-          {isController ? "Controlling" : "View-only"}
-        </span>
-        {control.control.controllerPanelId === null ? (
-          <span className="text-xs text-muted-foreground">
-            Control is available
-          </span>
-        ) : (
-          <span className="text-xs text-muted-foreground">
-            {spectatorCount} spectator{spectatorCount === 1 ? "" : "s"}
-          </span>
-        )}
-        {control.control.agentPurpose === null ? null : (
-          <span
-            aria-label="Active agent purpose"
-            className="text-xs text-muted-foreground"
-          >
-            Agent: {control.control.agentPurpose}
-          </span>
-        )}
-        <button
-          type="button"
-          className="ml-auto rounded border px-3 py-1 text-xs"
-          disabled={transferPending}
-          onClick={() =>
-            void (isController
-              ? transfer(false)
-              : canReclaim
-                ? reclaim()
-                : transfer(true))
-          }
-        >
-          {isController
-            ? "Release control"
-            : canReclaim
-              ? "Reclaim control"
-              : "Take control"}
-        </button>
-      </div>
-      {control.control.controllerViewport === null ? null : (
-        <p className="mt-2 text-xs text-muted-foreground">
-          Shared viewport: {control.control.controllerViewport.width}×
-          {control.control.controllerViewport.height}
-          {isController
-            ? " (you drive layout)"
-            : " (spectators scale and letterbox)"}
-        </p>
-      )}
-      <BrowserTabStripView
-        tabs={control.tabs.tabs}
-        activeTabId={control.tabs.activeTabId}
-      />
-    </section>
-  );
-}
 
-function BrowserTabStripView({
-  tabs,
-  activeTabId,
-}: {
-  tabs: BrowserPanelControlResponse["tabs"]["tabs"];
-  activeTabId: string | null;
-}) {
-  const [activeIndex, setActiveIndex] = useState(0);
-  const itemRefs = useRef<Array<HTMLLIElement | null>>([]);
-  if (tabs.length === 0) return null;
-  function focusTab(index: number) {
-    const count = tabs.length;
-    if (count === 0) return;
-    const wrapped = ((index % count) + count) % count;
-    setActiveIndex(wrapped);
-    itemRefs.current[wrapped]?.focus();
-  }
-  function handleKeyDown(event: React.KeyboardEvent<HTMLUListElement>) {
-    if (isBbGlobalShortcut(event.nativeEvent)) return;
-    if (event.key === "ArrowRight" || event.key === "ArrowDown") {
-      event.preventDefault();
-      focusTab(activeIndex + 1);
-    } else if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
-      event.preventDefault();
-      focusTab(activeIndex - 1);
-    } else if (event.key === "Home") {
-      event.preventDefault();
-      focusTab(0);
-    } else if (event.key === "End") {
-      event.preventDefault();
-      focusTab(tabs.length - 1);
-    }
-  }
-  return (
-    <ul
-      aria-label="Shared Browser Tabs"
-      className="mt-3 flex flex-wrap gap-1 text-xs"
-      onKeyDown={handleKeyDown}
-    >
-      {tabs.map((tab, index) => {
-        const active = tab.tabId === activeTabId;
-        return (
-          <li
-            key={tab.tabId}
-            ref={(el) => {
-              itemRefs.current[index] = el;
-            }}
-            tabIndex={index === activeIndex ? 0 : -1}
-            className="max-w-[16rem] truncate rounded border px-2 py-1"
-            style={{
-              fontWeight: active ? 600 : 400,
-              borderColor: active ? "var(--color-primary, #2563eb)" : undefined,
-            }}
-            title={tab.url}
-          >
-            {tab.origin === "popup" ? "↗ " : ""}
-            {tab.title === "" ? tab.url : tab.title}
-            {active ? " •" : ""}
-          </li>
-        );
-      })}
-    </ul>
-  );
+  return {
+    /**
+     * A panel with no control state yet is treated as the controller it is
+     * about to become: the first panel on a profile always is, and the
+     * navigation boundary rejects the request if it turns out not to be.
+     */
+    isController: control === null || control.role === "controller",
+    spectatorCount:
+      control === null
+        ? 0
+        : control.control.panels.filter(
+            (panel) => panel.role === "spectator" && panel.panelId !== panelId,
+          ).length,
+    agentPurpose: control?.control.agentPurpose ?? null,
+    transferPending,
+    /**
+     * Take the session. The same action interrupts an agent that holds
+     * control, so the owner never needs a second, differently named button to
+     * take their browser back.
+     */
+    takeControl: () => void (canReclaim ? reclaim() : transfer(true)),
+    releaseControl: () => void transfer(false),
+  };
 }
 
 function BrowserPanel({ request }: { request: BrowserStatusInput }) {
@@ -1017,17 +864,22 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
   );
   const [grantRequests, setGrantRequests] = useState<BrowserGrantRequest[]>([]);
   const [profileError, setProfileError] = useState<string | null>(null);
-  const [navigationInput, setNavigationInput] = useState("");
   const [rawLocalhost, setRawLocalhost] = useState(false);
   const [navigationLocation, setNavigationLocation] = useState<string | null>(
     null,
   );
+  const [statusHint, setStatusHint] = useState<string | null>(null);
   const [panelId] = useState(() => `browser-panel-${nextBrowserPanelId++}`);
+  const reducedMotion = usePrefersReducedMotion();
   // Shared control state lifted so the stream's live control broadcasts keep
-  // the control surface current without re-fetching (ADR 0012).
+  // the toolbar and tab strip current without re-fetching (ADR 0012).
   const [control, setControl] = useState<BrowserPanelControlResponse | null>(
     null,
   );
+  // The shared tab strip is tracked separately from the control state because
+  // the owner's own tab actions answer with a newer strip than the last
+  // control broadcast carried.
+  const [tabStrip, setTabStrip] = useState<BrowserTabStrip | null>(null);
 
   const statusRequest: BrowserStatusInput =
     selectedHostId === undefined
@@ -1043,6 +895,23 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
       ? { threadId: request.threadId }
       : { projectId: request.projectId };
   }
+
+  /**
+   * One place the shared control state lands, whether it arrived from the join
+   * RPC, an explicit transfer, or a live broadcast over the stream. The tab
+   * strip travels with it, so every panel on this browser shows the same tabs.
+   */
+  function applyControlState(response: BrowserPanelControlResponse | null) {
+    setControl(response);
+    setTabStrip(response === null ? null : response.tabs);
+  }
+
+  const controlSession = usePanelControlSession({
+    status,
+    panelId,
+    control,
+    setControl: applyControlState,
+  });
 
   useEffect(() => {
     const currentStatus = status;
@@ -1131,8 +1000,11 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
     };
   }, [panelId, rpc, status?.hostId, status?.profileId, status?.state]);
 
+  // The panel names the host it is browsing on — on the new-tab surface and in
+  // the status detail — so the choices are read for a resolved host too, not
+  // only when the owner still has to pick one.
   useEffect(() => {
-    if (status?.hostId !== null || status === null) {
+    if (status === null) {
       setHostChoices([]);
       return;
     }
@@ -1187,11 +1059,6 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
       );
   }
 
-  function navigate(event: FormEvent) {
-    event.preventDefault();
-    navigateTo(navigationInput);
-  }
-
   function navigateTo(input: string) {
     const hostId = status?.hostId;
     const profileId = status?.profileId;
@@ -1242,6 +1109,82 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
       );
   }
 
+  /**
+   * Drive the shared tab strip. The answer is the whole strip because the tabs
+   * belong to the browser rather than to this panel, so a tab opened here is a
+   * tab every panel on this browser now has.
+   */
+  function driveTabs(action: BrowserTabAction, tabId?: string) {
+    const hostId = status?.hostId;
+    const profileId = status?.profileId;
+    if (hostId === null || hostId === undefined || profileId === undefined) {
+      return;
+    }
+    setProfileError(null);
+    void rpc
+      .call("browser_tab_action", {
+        ...request,
+        hostId,
+        profileId,
+        action,
+        ...(tabId === undefined ? {} : { tabId }),
+      })
+      .then(setTabStrip)
+      .catch((error: unknown) =>
+        setProfileError(administrationErrorMessage(error)),
+      );
+  }
+
+  const tabs = tabStrip?.tabs ?? [];
+  const activeTab =
+    tabs.find((tab) => tab.tabId === tabStrip?.activeTabId) ?? null;
+  // The omnibox shows where this browser is: the address this panel last
+  // navigated to, or the address of the tab the browser is on when someone
+  // else moved it.
+  const address =
+    navigationLocation ??
+    (activeTab === null || isBlankBrowserPage(activeTab.url)
+      ? ""
+      : activeTab.url);
+  const showsNewTabSurface =
+    activeTab === null || isBlankBrowserPage(activeTab.url);
+  const hostName =
+    hostChoices.find((choice) => choice.hostId === status?.hostId)?.name ??
+    null;
+  const sessionOptions: BrowserPanelOption[] = [
+    controlSession.isController
+      ? {
+          kind: "action",
+          id: "release-control",
+          label: "Let another panel take over",
+          description: "Hands this browser to the next panel that asks for it.",
+          onSelect: controlSession.releaseControl,
+          disabled: controlSession.transferPending,
+        }
+      : {
+          kind: "action",
+          id: "take-control",
+          label: "Take control",
+          onSelect: controlSession.takeControl,
+          disabled: controlSession.transferPending,
+        },
+    {
+      kind: "toggle",
+      id: "raw-localhost",
+      label: "Use plain localhost addresses",
+      description:
+        "Only for sites that reject this project's own localhost name.",
+      checked: rawLocalhost,
+      onChange: setRawLocalhost,
+    },
+    {
+      kind: "note",
+      id: "settings",
+      label:
+        "Browser profiles, agent access, downloads, and activity are in BB settings under Browser.",
+    },
+  ];
+
   if (status === null) {
     return (
       <div role="status" className="p-6 text-sm text-muted-foreground">
@@ -1249,101 +1192,103 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
       </div>
     );
   }
+  if (browserStateReplacesPage(status.state)) {
+    // Nothing can be browsed until the host is fixed, so the failure gets the
+    // whole panel rather than a line above an empty page.
+    return (
+      <BrowserBlockedSurface status={status}>
+        <ReadinessChecklist status={status} />
+        {status.hostId === null && hostChoices.length > 0 ? (
+          <PanelHostPicker choices={hostChoices} onChange={setSelectedHostId} />
+        ) : null}
+        {profiles === null || status.hostId === null ? null : (
+          <PanelProfilePicker inventory={profiles} onChange={selectProfile} />
+        )}
+        {status.state === "safe-login-elsewhere" ? (
+          <SafeLoginLimitationsNotice />
+        ) : null}
+        <PanelGrantRequestNotices requests={grantRequests} />
+        {profileError === null ? null : <p role="alert">{profileError}</p>}
+      </BrowserBlockedSurface>
+    );
+  }
   return (
-    <ReadinessView status={status}>
-      {status.hostId === null && hostChoices.length > 0 ? (
-        <PanelHostPicker choices={hostChoices} onChange={setSelectedHostId} />
-      ) : null}
-      {profiles === null || status.hostId === null ? null : (
-        <PanelProfilePicker inventory={profiles} onChange={selectProfile} />
-      )}
-      {status.state === "safe-login-elsewhere" ? (
-        <SafeLoginLimitationsNotice />
-      ) : null}
-      {status.state !== "healthy" ? null : (
-        <form className="mt-5 text-left" onSubmit={navigate}>
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              aria-label="Go back"
-              className="rounded border px-2 py-1 text-sm"
-              onClick={() => navigateHistory("back")}
-            >
-              ←
-            </button>
-            <button
-              type="button"
-              aria-label="Go forward"
-              className="rounded border px-2 py-1 text-sm"
-              onClick={() => navigateHistory("forward")}
-            >
-              →
-            </button>
-            <button
-              type="button"
-              aria-label="Reload page"
-              className="rounded border px-2 py-1 text-sm"
-              onClick={() => navigateHistory("reload")}
-            >
-              ⟳
-            </button>
-            <span
-              role="img"
-              aria-label="Browser mode indicator"
-              className="ml-auto text-xs text-muted-foreground"
-            >
-              Automation Mode
-            </span>
-          </div>
-          <label className="mt-2 block text-sm" htmlFor="browser-address">
-            Address or search
-          </label>
-          <div className="mt-2 flex gap-2">
-            <input
-              id="browser-address"
-              aria-label="Address or search"
-              className="min-w-0 grow rounded border px-3 py-2 text-sm"
-              value={navigationInput}
-              onChange={(event) => setNavigationInput(event.target.value)}
-            />
-            <button type="submit" className="rounded border px-3 py-2 text-sm">
-              Go
-            </button>
-          </div>
-          <label className="mt-2 flex items-center gap-2 text-xs">
-            <input
-              type="checkbox"
-              checked={rawLocalhost}
-              onChange={(event) => setRawLocalhost(event.target.checked)}
-            />
-            Use raw localhost compatibility
-          </label>
-          {navigationLocation === null ? null : (
-            <p className="mt-2 break-all text-xs text-muted-foreground">
-              {navigationLocation}
-            </p>
-          )}
-        </form>
-      )}
-      {status.state === "healthy" ? (
-        <>
-          <PanelControlSurface
-            status={status}
-            panelId={panelId}
-            control={control}
-            setControl={setControl}
-          />
-          <PanelStreamSurface
-            status={status}
-            panelId={panelId}
-            onControlState={setControl}
-          />
-        </>
-      ) : null}
+    <div className="flex h-full min-h-0 w-full flex-col bg-background">
+      <BrowserToolbar
+        status={status}
+        navigation={{
+          address,
+          focusAddress: showsNewTabSurface,
+          onSubmit: navigateTo,
+          onHistory: navigateHistory,
+        }}
+        control={{
+          role: controlSession.isController ? "controller" : "spectator",
+          spectatorCount: controlSession.spectatorCount,
+          agentPurpose: controlSession.agentPurpose,
+          onTakeControl: controlSession.takeControl,
+        }}
+        options={sessionOptions}
+        reducedMotion={reducedMotion}
+        statusHint={statusHint}
+        onStatusSelect={() =>
+          setStatusHint((current) =>
+            current === null ? hostStatusHint(status, hostName) : null,
+          )
+        }
+      />
+      <BrowserTabStripView
+        tabs={tabs}
+        activeTabId={tabStrip?.activeTabId ?? null}
+        canDrive={controlSession.isController}
+        onSelect={(tabId) => driveTabs("activate", tabId)}
+        onClose={(tabId) => driveTabs("close", tabId)}
+        onOpen={() => driveTabs("open")}
+      />
       <PanelGrantRequestNotices requests={grantRequests} />
-      {profileError === null ? null : <p role="alert">{profileError}</p>}
-    </ReadinessView>
+      {profileError === null ? null : (
+        <p role="alert" className="px-2 py-1 text-xs">
+          {profileError}
+        </p>
+      )}
+      <div className="relative min-h-0 flex-1">
+        <PanelStreamSurface
+          status={status}
+          panelId={panelId}
+          isController={controlSession.isController}
+          onControlState={applyControlState}
+        />
+        {showsNewTabSurface ? (
+          <div className="absolute inset-0">
+            <BrowserNewTabSurface hostName={hostName} />
+          </div>
+        ) : null}
+      </div>
+    </div>
   );
+}
+
+/**
+ * What the host-status indicator says when the owner asks it. The panel has no
+ * way to open a settings section from a panel surface, so the indicator names
+ * where the detail lives instead of pretending to navigate there.
+ */
+function hostStatusHint(status: BrowserStatus, hostName: string | null) {
+  const host = hostName ?? "this workspace host";
+  const state =
+    status.state === "healthy"
+      ? `This browser is ready on ${host}.`
+      : `${status.label} on ${host}. ${status.message}`;
+  return `${state} Browser profiles, agent access, downloads, and activity are in BB settings under Browser.`;
+}
+
+/**
+ * A page the owner cannot read anything from. A browser that has just started
+ * with nothing to restore sits on one, and showing its blank pixels reads as a
+ * failed load rather than as a browser waiting for an address.
+ */
+function isBlankBrowserPage(url: string) {
+  return url === "" || url.startsWith("about:");
 }
 
 function administrationErrorMessage(error: unknown) {
