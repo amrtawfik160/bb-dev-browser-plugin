@@ -67,7 +67,6 @@ import {
   type BrowserPanelNavigationInput,
   type BrowserPanelHistoryInput,
   type BrowserPanelTabActionInput,
-  type BrowserTabActionRequest,
   type BrowserPanelCapabilityResponse,
   type BrowserPanelControlResponse,
   type BrowserNavigationRequest,
@@ -763,7 +762,6 @@ export async function createPublicPluginHarness(options?: {
       }
       if (method === "tabAction") {
         const request = browserTabActionRequestSchema.parse(input);
-        tabActionRequests.push(request);
         return host.experimental_call("tabAction", request, { signal });
       }
       if (method === "activityOutbox") {
@@ -941,7 +939,6 @@ export async function createPublicPluginHarness(options?: {
   let grantRequestRpcCallIndex = 0;
   const navigationRequests: BrowserNavigationRequest[] = [];
   const historyRequests: BrowserHistoryRequest[] = [];
-  const tabActionRequests: BrowserTabActionRequest[] = [];
   const panelCapabilityRequests: {
     hostId: string;
     profileId: string;
@@ -2181,9 +2178,6 @@ export async function createPublicPluginHarness(options?: {
     },
     get historyRequests() {
       return [...historyRequests];
-    },
-    get tabActionRequests() {
-      return [...tabActionRequests];
     },
     get panelCapabilityRequests() {
       return [...panelCapabilityRequests];

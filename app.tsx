@@ -63,6 +63,7 @@ import {
   browserAccessRequestKey,
   browserStateIsSettling,
   browserStateReplacesPage,
+  isBlankBrowserPage,
   type BrowserAccessRequest,
   type BrowserPanelOption,
 } from "./panel-browser.js";
@@ -1599,15 +1600,6 @@ function hostStatusHint(status: BrowserStatus, hostName: string | null) {
       ? `This browser is ready on ${host}.`
       : `${status.label} on ${host}. ${status.message}`;
   return `${state} Browser profiles, agent access, downloads, and activity are in BB settings under Browser.`;
-}
-
-/**
- * A page the owner cannot read anything from. A browser that has just started
- * with nothing to restore sits on one, and showing its blank pixels reads as a
- * failed load rather than as a browser waiting for an address.
- */
-function isBlankBrowserPage(url: string) {
-  return url === "" || url.startsWith("about:");
 }
 
 /**

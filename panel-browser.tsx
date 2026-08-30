@@ -4,6 +4,9 @@ import type { ReactNode } from "react";
 import {
   BROWSER_PANEL_ACCENT_CONTRAST,
   BROWSER_PANEL_BORDER_CONTRAST,
+  BROWSER_PANEL_STATUS_BLOCKED_CONTRAST,
+  BROWSER_PANEL_STATUS_READY_CONTRAST,
+  BROWSER_PANEL_STATUS_SETTLING_CONTRAST,
   type BrowserStatus,
   type BrowserTab,
 } from "./contracts.js";
@@ -31,14 +34,13 @@ import { isBbGlobalShortcut } from "./panel-chrome.js";
  * resolve themselves within seconds and blanking the page for them reads as a
  * fault.
  */
-export const PAGE_REPLACING_BROWSER_STATES: readonly BrowserStatus["state"][] =
-  [
-    "setup-required",
-    "host-offline",
-    "repair-required",
-    "unsupported",
-    "safe-login-elsewhere",
-  ];
+const PAGE_REPLACING_BROWSER_STATES: readonly BrowserStatus["state"][] = [
+  "setup-required",
+  "host-offline",
+  "repair-required",
+  "unsupported",
+  "safe-login-elsewhere",
+];
 
 export function browserStateReplacesPage(state: BrowserStatus["state"]) {
   return PAGE_REPLACING_BROWSER_STATES.includes(state);
@@ -54,7 +56,7 @@ export function browserStateIsSettling(state: BrowserStatus["state"]) {
  * second client watching someone else's session: it gets a way to take the
  * session, not a disabled copy of the controls it cannot use.
  */
-export type BrowserPanelRole = "controller" | "spectator";
+type BrowserPanelRole = "controller" | "spectator";
 
 export type BrowserPanelOption =
   | {
@@ -82,7 +84,7 @@ export type BrowserPanelOption =
  * frontend is mounted: Escape closes it and restores focus, arrows move
  * between items, and BB's own global shortcuts pass straight through.
  */
-export function BrowserOptionsMenu({
+function BrowserOptionsMenu({
   options,
   reducedMotion,
 }: {
@@ -287,14 +289,14 @@ function BrowserOmnibox({
   );
 }
 
-export type BrowserToolbarNavigation = {
+type BrowserToolbarNavigation = {
   address: string;
   focusAddress: boolean;
   onSubmit: (input: string) => void;
   onHistory: (direction: "back" | "forward" | "reload") => void;
 };
 
-export type BrowserToolbarControl = {
+type BrowserToolbarControl = {
   role: BrowserPanelRole;
   /** Other clients watching this session; the owner alone sees no count. */
   spectatorCount: number;
@@ -405,10 +407,10 @@ export function BrowserToolbar({
             style={{
               backgroundColor:
                 status.state === "healthy"
-                  ? "#15803d"
+                  ? BROWSER_PANEL_STATUS_READY_CONTRAST
                   : settling
-                    ? "#b45309"
-                    : "#b91c1c",
+                    ? BROWSER_PANEL_STATUS_SETTLING_CONTRAST
+                    : BROWSER_PANEL_STATUS_BLOCKED_CONTRAST,
             }}
           />
         </button>
@@ -560,9 +562,18 @@ export function BrowserAccessRequestNotices({
   );
 }
 
+/**
+ * A page the owner cannot read anything from. A browser that has just started
+ * with nothing to restore sits on one, and showing its blank pixels reads as a
+ * failed load rather than as a browser waiting for an address.
+ */
+export function isBlankBrowserPage(url: string) {
+  return url === "" || url.startsWith("about:");
+}
+
 function browserTabLabel(tab: BrowserTab) {
   if (tab.title !== "") return tab.title;
-  return tab.url === "" || tab.url === "about:blank" ? "New tab" : tab.url;
+  return isBlankBrowserPage(tab.url) ? "New tab" : tab.url;
 }
 
 /**

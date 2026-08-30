@@ -2911,6 +2911,15 @@ export const BROWSER_PANEL_DIALOG_RECONNECT_REPUSH_MS = PANEL_RECLAIM_WINDOW_MS;
 export const BROWSER_PANEL_TEXT_CONTRAST = "#111827";
 export const BROWSER_PANEL_BORDER_CONTRAST = "#9ca3af";
 export const BROWSER_PANEL_ACCENT_CONTRAST = "#1d4ed8";
+/**
+ * The host-status dot in the browser toolbar (issue #50). Colour is never the
+ * only signal — the control carries the state in its accessible name — but it
+ * is what the owner reads at a glance, so the three live here with the rest of
+ * the AA-audited chrome rather than as literals in the toolbar.
+ */
+export const BROWSER_PANEL_STATUS_READY_CONTRAST = "#15803d";
+export const BROWSER_PANEL_STATUS_SETTLING_CONTRAST = "#b45309";
+export const BROWSER_PANEL_STATUS_BLOCKED_CONTRAST = "#b91c1c";
 export const BROWSER_PANEL_STREAM_DISCLOSURE =
   "Streamed webpage pixels are not fully screen-reader accessible in version one.";
 
