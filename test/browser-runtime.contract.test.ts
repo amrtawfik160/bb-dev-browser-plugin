@@ -17,6 +17,7 @@ import {
   createBrowserInstanceRuntime,
   selectBrowserExecutable,
   validateBrowserLaunchPolicy,
+  type BrowserExecutionRequest,
   type BrowserLaunchBoundary,
   type BrowserLaunchRequest,
 } from "../browser-runtime.js";
@@ -35,8 +36,7 @@ function launchFixture(
   } = {},
 ) {
   const launches: BrowserLaunchRequest[] = [];
-  const executions: { endpoint: string; code: string; timeoutMs: number }[] =
-    [];
+  const executions: BrowserExecutionRequest[] = [];
   const stopped: number[] = [];
   const exits = new Map<number, (error?: Error) => void>();
   const pages = new Set(["actual-active-tab"]);
@@ -1283,14 +1283,14 @@ describe("Browser Instance runtime", () => {
 });
 
 describe("Browser Instance runtime Origin Scope enforcement", () => {
-  it("issue #14 injects the enforcement preamble only when an origin scope is set", async () => {
+  it("passes Origin Scope enforcement to the host process boundary", async () => {
     const fixture = await runtimeFixture();
     try {
       await fixture.runtime.start(fixture.target);
       await fixture.runtime.execute(fixture.target, "return page.url()", 5_000);
-      const unenforcedCode = fixture.processFixture.executions[0]!.code;
-      expect(unenforcedCode).not.toContain("__bbOriginPermitted");
-      expect(unenforcedCode).toContain("return page.url()");
+      const unenforced = fixture.processFixture.executions[0]!;
+      expect(unenforced.originPolicy).toBeUndefined();
+      expect(unenforced.code).toContain("return page.url()");
 
       await fixture.runtime.execute(
         fixture.target,
@@ -1300,20 +1300,23 @@ describe("Browser Instance runtime Origin Scope enforcement", () => {
           originScope: "https://app.example.test",
         },
       );
-      const enforcedCode = fixture.processFixture.executions[1]!.code;
-      expect(enforcedCode).toContain("__bbOriginPermitted");
-      expect(enforcedCode).toContain('"kind":"exact"');
-      expect(enforcedCode).toContain('"https://app.example.test"');
-      expect(enforcedCode).toContain("return page.url()");
-      expect(enforcedCode.indexOf("__bbOriginPermitted")).toBeLessThan(
-        enforcedCode.indexOf("return page.url()"),
-      );
+      const enforced = fixture.processFixture.executions[1]!;
+      expect(enforced.originPolicy).toEqual({
+        matcher: {
+          kind: "exact",
+          origin: "https://app.example.test",
+        },
+        invalidCertificateOrigins: [],
+        timeoutMs: 5_000,
+      });
+      expect(enforced.code).not.toContain("__bbOriginPermitted");
+      expect(enforced.code).toContain("return page.url()");
     } finally {
       await fixture.dispose();
     }
   });
 
-  it("issue #14 AC4 carries per-origin invalid-certificate flags into the enforcement preamble", async () => {
+  it("carries per-origin invalid-certificate approvals to the host guard", async () => {
     const fixture = await runtimeFixture();
     try {
       await fixture.runtime.start(fixture.target);
@@ -1327,17 +1330,11 @@ describe("Browser Instance runtime Origin Scope enforcement", () => {
           invalidCertificateOrigins: [grantedOrigin],
         },
       );
-      const enforcedCode = fixture.processFixture.executions[0]!.code;
-      expect(enforcedCode).toContain("__bbOriginRequiresCertificateBypass");
-      expect(enforcedCode).toContain(JSON.stringify([grantedOrigin]));
-      // The bypass used to fulfil the navigation through the context request
-      // context from inside a route handler. The sandbox never calls back into
-      // an agent-supplied handler, so that path never executed; the approved
-      // origins now reach the policy without a route.
-      expect(enforcedCode).not.toContain("route.fulfill");
-      expect(enforcedCode.indexOf("return page.url()")).toBeGreaterThan(
-        enforcedCode.indexOf("__bbGuardNavigation"),
-      );
+      expect(fixture.processFixture.executions[0]!.originPolicy).toEqual({
+        matcher: { kind: "exact", origin: grantedOrigin },
+        invalidCertificateOrigins: [grantedOrigin],
+        timeoutMs: 5_000,
+      });
     } finally {
       await fixture.dispose();
     }
@@ -1377,17 +1374,8 @@ describe("Browser Instance runtime Origin Scope enforcement", () => {
           commandHash: `fixture-command-${pid}`,
         };
       },
-      async execute(request) {
-        const markerMatch =
-          /const __bbDenialMarker = ("(?:[^"\\]|\\.)*")/u.exec(request.code);
-        if (markerMatch === null) return { output: "no marker" };
-        const marker = JSON.parse(markerMatch[1]!);
-        return {
-          output: JSON.stringify({
-            __bbOriginDenied: marker,
-            origin: deniedOrigin,
-          }),
-        };
+      async execute() {
+        throw new BrowserOriginScopeDeniedError(deniedOrigin);
       },
       async configuredSearchUrl({ text }) {
         return `https://search.fixture.test/?q=${encodeURIComponent(text)}`;

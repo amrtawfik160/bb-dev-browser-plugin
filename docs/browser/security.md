@@ -68,6 +68,13 @@ active agent work without closing the owner's page. Profile Grants confer **full
 automation** within scope because arbitrary Playwright scripts cannot be
 reliably classified as read-only.
 
+Grant administration and Grant Request decisions require the authenticated
+owner session available to Browser Settings. The CLI exposes no owner identity,
+so its grant-administration compatibility commands fail closed with Settings
+guidance. Shell access, TTY presence, and confirmation flags are not
+authentication. CLI URL opens and scripts instead use project/host-derived
+agent authorization, a Control Lease, and `agent` Activity attribution.
+
 ### Panel Capabilities
 
 A **Panel Capability** authorizes transport to one Workspace Browser. It is
@@ -86,39 +93,24 @@ localhost port is separate; `*` is a distinct whole-web permission. Cross-origin
 subresources may render normally. A denied origin produces a typed
 `origin_denied` result and a non-blocking Grant Request.
 
-Enforcement is a policy check on navigation, not request interception:
+Enforcement is host-owned request interception. Before the QuickJS helper starts,
+the host connects independently to the profile's Playwright context, rejects
+and closes any existing out-of-scope web page, and installs a navigation route.
+The agent sandbox supplies no callback and cannot remove the route.
 
-- `page.goto` on the tab bound for the script is guarded, so the common
-  out-of-scope navigation fails immediately and never reaches the network.
-  This is a fast path, not the boundary — the sandbox `browser` global is
-  frozen and cannot be wrapped, so a page the script fetches itself through
-  `browser.getPage` is not guarded.
-- After the script finishes, **every tab this call opened or navigated** is
-  checked against the scope. That is the boundary: a redirect, an in-page
-  navigation, a link click, a popup, or a navigation through an unguarded page
-  denies the call and discards the result.
+- Out-of-scope top-level pages, redirects, popups, and frame documents are
+  aborted before commit. Ordinary cross-origin subresources continue normally.
+- The first denied origin is sticky for the operation. Navigating back into
+  scope, closing a popup, or throwing a later exception cannot erase it.
+- Denied popups and pre-existing denied tabs are closed, so a later call cannot
+  recover their page objects or content.
+- Every new sandbox page uses the one routed context, so `browser.newPage()`
+  cannot create an unenforced context.
 
-Two limits are worth stating plainly:
-
-- An out-of-scope page **loads** before the second check sees it. The agent
-  never receives the result, but the request happened.
-- A tab the call never moved is not checked, so Origin Scope constrains
-  agent-controlled **navigation**, not reading a tab the owner already had
-  open. Checking untouched tabs instead would deny every call whenever an
-  unrelated tab sits outside the scope — including a raw `localhost` tab under
-  a whole-web grant.
-
-This is a deliberate change from the earlier design, which registered a
-`BrowserContext.route` intended to abort out-of-scope navigation before commit.
-The sandbox does not call back into agent-supplied JavaScript, so that handler
-never ran: every intercepted request hung until the script deadline,
-grant-scoped automation could not navigate at all, and no origin was ever
-actually checked.
-
-The same limitation removed the per-origin invalid-certificate bypass. Approved
-origins are still recorded and reach the policy, but the fulfil-through-fetch
-path that was supposed to load them despite a bad certificate depended on the
-same route handler and never executed.
+Invalid-certificate elevation uses the same host-owned route. Only a navigation
+whose exact origin appears in the active grant's approved list is fetched with
+certificate validation disabled and fulfilled through the route. Other allowed
+origins use normal certificate validation; unrelated origins receive no bypass.
 
 ### Control Leases
 

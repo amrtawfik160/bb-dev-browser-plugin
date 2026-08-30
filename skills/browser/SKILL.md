@@ -11,20 +11,14 @@ stays signed in for later automation.
 
 ## Start here
 
-```text
-bb browser trust                       # once per project: unlock automation
-bb browser open https://example.com    # navigate, then report url + title
-```
+Use `browser_script` with the exact HTTP(S) origin you need. If it returns
+`origin_denied`, surface its Grant Request to the owner and pause until the
+owner makes a decision in authenticated Browser Settings.
 
-`trust` creates a persistent whole-web Profile Grant for this project and the
-selected profile. Until it exists, scripts fail `origin_denied`. `bb browser
-untrust` revokes it. Scope it narrower with `bb browser trust --origin
-https://example.com` or `--origin 'https://*.example.com'`.
-
-`open` navigates as the owner, so it works before anything is trusted and wakes
-a sleeping browser. With no argument it reports the tab the profile is already
-on. Bare text goes to the profile's configured search engine, and says so when
-the profile has none — pass a URL in that case.
+`bb browser open https://example.com` is the shell equivalent for opening an
+authorized URL: it runs as an agent operation under the same Profile Grant,
+Control Lease, and Activity attribution. With no argument it only reports the
+current tab, including a fresh `about:blank` tab. It does not accept search text.
 
 ## Automating a page
 
@@ -44,7 +38,7 @@ return JSON.stringify({
 
 Required fields: `purpose` (shown to the owner while you hold control) and
 `destinationOrigin` (the exact origin you are driving, e.g.
-`https://example.com`). Optional: `profileId`, `tabId`, `timeoutMs` (1–30000,
+`https://example.com`). Optional: `profileId`, `tabId`, `timeoutMs` (1000–30000,
 default 30000), `screenshot: true`, `fileTransfer`, `invalidCertificate`.
 
 The same boundary from a shell:
@@ -65,9 +59,9 @@ workspace access.
   runtime-only and change when the browser restarts.
 - Tab state persists between scripts. If a tab is already on your granted
   origin, `page` binds to it — read it instead of navigating again.
-- `page.setDefaultTimeout` and `page.setDefaultNavigationTimeout` are already
-  set 5s below your script timeout, so a stuck action fails with a Playwright
-  call log instead of an opaque transport error.
+- `page.setDefaultTimeout` and `page.setDefaultNavigationTimeout` leave 25%
+  headroom (capped at 5 seconds) inside the host deadline, so a stuck action
+  fails with a Playwright call log instead of an opaque transport error.
 
 ## Things that actually bite
 
@@ -103,7 +97,7 @@ await Promise.all([page.waitForURL(/\/search\?/), box.press("Enter")]);
 
 | Code                | Meaning                           | Do                                                                 |
 | ------------------- | --------------------------------- | ------------------------------------------------------------------ |
-| `origin_denied`     | No grant covers that origin       | Run `bb browser trust`, then retry. Never resumes on its own       |
+| `origin_denied`     | No grant covers that origin       | Surface the Grant Request to the owner; retry only after approval  |
 | `browser_busy`      | Someone else holds control        | Wait and retry once; queued work is not kept                       |
 | `browser_timeout`   | Script hit its deadline           | Split the work or wait on a condition instead of a timer           |
 | `script_failed`     | Playwright error                  | Read the call log at the end of the message — it names the reason  |
@@ -114,27 +108,24 @@ await Promise.all([page.waitForURL(/\/search\?/), box.press("Enter")]);
 `bb browser status` reports host readiness and live control state; `bb browser
 diagnostics` adds repair detail.
 
-## Grants
+## Authorization
 
 ```text
-bb browser grants                        # what this project may drive
-bb browser trust [--origin <scope>]      # unlock (default: whole web)
-bb browser untrust [--origin <scope>]    # revoke
-bb browser grant --origin <scope>        # add one scope
-bb browser revoke --grant <id>           # remove one grant
 bb browser requests                      # pending grant requests
-bb browser approve --request <id>        # approve (add --one-hour for temporary)
-bb browser deny --request <id>
+bb browser request-status --request <id> # inspect one scoped request
 ```
 
 Grantable scopes are exact origins (`https://example.com`) or explicit
 subdomain patterns (`https://*.example.com`) or `*`. Paths are not grantable.
-Grants can also be managed in authenticated Browser Settings. A grant change
-applies to the next call and never resumes a denied one.
+The owner manages grants and request decisions in authenticated Browser
+Settings. CLI grant-administration names fail closed with Settings guidance
+because shell access, a TTY, or a confirmation flag does not authenticate an
+owner. A grant change applies to the next call and never resumes a denied one.
 
-Owners can manage grants from a terminal, which means an agent with shell
-access on this host can grant itself the browser. Treat the Browser Profile as
-reachable by anything that can run `bb`.
+Origin Scope is enforced outside the QuickJS sandbox by a host-owned navigation
+guard. It blocks denied top-level pages, popups, redirects, and frames before
+commit and removes denied pages. An invalid-certificate elevation applies only
+to its explicitly approved origin.
 
 ## Control, profiles, and records
 

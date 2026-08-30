@@ -3,6 +3,7 @@ import {
   prepareAgentExecution,
   wrapAgentScriptResult,
 } from "../agent-script.js";
+import { browserScriptParametersSchema } from "../contracts.js";
 
 async function capturedLogs(code: string) {
   const logs: string[] = [];
@@ -85,13 +86,29 @@ describe("agent script convenience wrapping", () => {
     expect(prepared).toContain("page.setDefaultTimeout(25000)");
   });
 
-  it("floors both bounded timeouts for a very short script timeout", () => {
+  it("leaves helper headroom at the minimum accepted host timeout", () => {
     const prepared = prepareAgentExecution({
       code: "return page.url()",
       timeoutMs: 1_000,
     });
-    expect(prepared).toContain("page.setDefaultTimeout(1000)");
-    expect(prepared).toContain("page.setDefaultNavigationTimeout(1000)");
+    expect(prepared).toContain("page.setDefaultTimeout(750)");
+    expect(prepared).toContain("page.setDefaultNavigationTimeout(750)");
+  });
+
+  it("rejects subsecond host timeouts at the public schema boundary", () => {
+    const input = {
+      purpose: "Exercise the deadline boundary",
+      code: "return page.url()",
+    };
+
+    expect(
+      browserScriptParametersSchema.safeParse({ ...input, timeoutMs: 999 })
+        .success,
+    ).toBe(false);
+    expect(
+      browserScriptParametersSchema.safeParse({ ...input, timeoutMs: 1_000 })
+        .success,
+    ).toBe(true);
   });
 
   it("declares page before the native screenshot finally block", () => {

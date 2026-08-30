@@ -624,58 +624,127 @@ describe("Browser public plugin contract", () => {
     await browser.dispose();
   });
 
-  it("offers grant administration on both the CLI and Settings RPC", async () => {
+  it("fails closed for unauthenticated CLI grant administration", async () => {
     const browser = await createPublicPluginHarness({
       snapshot: preparedSnapshot,
     });
-    await browser.createBrowserProfile({
-      hostId: "host-browser-test",
-      name: "Owner authority target",
-    });
+    try {
+      await browser.createBrowserProfile({
+        hostId: "host-browser-test",
+        name: "Owner authority target",
+      });
+      const existingGrant = await browser.createBrowserGrant({
+        projectId: "project-browser-test",
+        hostId: "host-browser-test",
+        profileId: DEFAULT_PROFILE_ID,
+        originScope: "https://owner-settings.example.test",
+        wholeWeb: false,
+        fileTransfer: false,
+        invalidCertificateOrigins: [],
+      });
+      const approvalRequest = browserScriptFailureSchema.parse(
+        JSON.parse(
+          (
+            await browser.runBrowserScriptWithProfile(undefined, {
+              destinationOrigin: "https://approve.example.test",
+            })
+          ).content[0]!.text,
+        ),
+      ).error.grantRequest!.requestId;
+      const denialRequest = browserScriptFailureSchema.parse(
+        JSON.parse(
+          (
+            await browser.runBrowserScriptWithProfile(undefined, {
+              destinationOrigin: "https://deny.example.test",
+            })
+          ).content[0]!.text,
+        ),
+      ).error.grantRequest!.requestId;
+      const activityBeforeCli = await browser.runBrowserActivityRecords();
 
-    // Approval used to exist only as an authenticated Settings action, so an
-    // agent denied an origin could do nothing but wait for someone to open a
-    // panel. The owner can now decide from a terminal too; the trade is that
-    // anything able to run `bb` can grant itself the browser.
-    const help = await browser.runBrowserCli([]);
-    expect(help.stderr).toContain("trust [--origin <scope>]");
-    expect(help.stderr).toContain("approve --request <id>");
-    const registeredNames = browser
-      .registeredBrowserCliCommands()
-      .map((command) => command.name);
-    for (const name of [
-      "trust",
-      "untrust",
-      "grants",
-      "grant",
-      "revoke",
-      "approve",
-      "deny",
-    ]) {
-      expect(registeredNames).toContain(name);
+      const attempts = await Promise.all([
+        browser.runBrowserCli(["trust"]),
+        browser.runBrowserCli(["untrust"]),
+        browser.runBrowserCli(["grants"]),
+        browser.runBrowserCli([
+          "grant",
+          "--origin",
+          "https://self-grant.example.test",
+        ]),
+        browser.runBrowserCli(["grant"]),
+        browser.runBrowserCli(["revoke", "--grant", existingGrant.grantId]),
+        browser.runBrowserCli(["approve", "--request", approvalRequest]),
+        browser.runBrowserCli(["deny", "--request", denialRequest]),
+      ]);
+
+      for (const attempt of attempts) {
+        expect(attempt).toEqual(
+          expect.objectContaining({
+            exitCode: 1,
+            stderr: expect.stringContaining("Browser Settings"),
+          }),
+        );
+      }
+      expect(await browser.inspectBrowserGrant(existingGrant.grantId)).toEqual(
+        existingGrant,
+      );
+      expect(
+        (await browser.inspectBrowserGrantRequest(approvalRequest))?.status,
+      ).toBe("pending");
+      expect(
+        (await browser.inspectBrowserGrantRequest(denialRequest))?.status,
+      ).toBe("pending");
+      expect(await browser.runBrowserActivityRecords()).toEqual(
+        activityBeforeCli,
+      );
+    } finally {
+      await browser.dispose();
     }
+  });
 
-    const missingOrigin = await browser.runBrowserCli(["grant"]);
-    expect(missingOrigin.exitCode).not.toBe(0);
-    expect(missingOrigin.stderr).toContain("grant requires --origin");
+  it("denies CLI renewal after a file-transfer elevation expires", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-08-28T00:00:00.000Z"));
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+    });
+    try {
+      await browser.createBrowserProfile({
+        hostId: "host-browser-test",
+        name: "Expired file-transfer target",
+      });
+      const grant = await browser.createBrowserGrant({
+        projectId: "project-browser-test",
+        hostId: "host-browser-test",
+        profileId: DEFAULT_PROFILE_ID,
+        originScope: "https://expired-transfer.example.test",
+        fileTransfer: true,
+      });
+      vi.setSystemTime(new Date("2026-08-28T01:00:01.000Z"));
 
-    const created = await browser.createBrowserGrant({
-      projectId: "project-browser-test",
-      hostId: "host-browser-test",
-      profileId: DEFAULT_PROFILE_ID,
-      originScope: "https://owner-settings.example.test",
-      wholeWeb: false,
-      fileTransfer: false,
-      invalidCertificateOrigins: [],
-    });
-    expect(await browser.inspectBrowserGrant(created.grantId)).toMatchObject(
-      created,
-    );
-    expect(await browser.revokeBrowserGrant(created.grantId)).toMatchObject({
-      grantId: created.grantId,
-      outcome: "revoked",
-    });
-    await browser.dispose();
+      const renewal = await browser.runBrowserCli([
+        "trust",
+        "--origin",
+        grant.originScope,
+        "--file-transfer",
+      ]);
+
+      const fileTransferExpiresAt = grant.fileTransferExpiresAt;
+      expect(fileTransferExpiresAt).not.toBeNull();
+      if (fileTransferExpiresAt === null) {
+        throw new Error("Expected a temporary file-transfer expiry.");
+      }
+      expect(new Date(fileTransferExpiresAt).getTime()).toBeLessThan(
+        Date.now(),
+      );
+      expect(renewal.exitCode).toBe(1);
+      expect(renewal.stderr).toContain("Browser Settings");
+      expect(renewal.stderr).not.toMatch(/already trusted/i);
+      expect(await browser.inspectBrowserGrant(grant.grantId)).toEqual(grant);
+    } finally {
+      await browser.dispose();
+      vi.useRealTimers();
+    }
   });
 
   it("keeps safe request reads registered while removing unsupported agent mutations", async () => {
@@ -2210,6 +2279,110 @@ describe("Browser public plugin contract", () => {
     }
   });
 
+  it("routes CLI open through agent authorization and a Control Lease", async () => {
+    const executedCodes: string[] = [];
+    const runtime: BrowserInstanceRuntime = {
+      ...publicRuntime(async (_target, code) => {
+        executedCodes.push(code);
+        return {
+          output: JSON.stringify({
+            url: "https://example.com/",
+            title: "Example",
+          }),
+          screenshots: [],
+        };
+      }),
+      listPages: async () => [
+        {
+          id: "public-tab",
+          url: "https://example.com/",
+          title: "Example",
+          openerTabId: null,
+        },
+      ],
+    };
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+      browserRuntime: runtime,
+    });
+
+    try {
+      await grantDefaultProfileOrigin(browser, "https://example.com");
+      const opened = await browser.runBrowserCli([
+        "open",
+        "https://example.com/path",
+        "--json",
+      ]);
+
+      expect(opened.exitCode).toBe(0);
+      expect(browser.navigationRequests).toEqual([]);
+      expect(executedCodes).toHaveLength(1);
+      expect(executedCodes[0]).toContain(
+        'page.goto("https://example.com/path")',
+      );
+      expect(await browser.runBrowserActivityRecords()).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            actor: "agent",
+            projectId: "project-browser-test",
+            kind: "agent-operation",
+            action: "browser-script",
+            destinationOrigin: "https://example.com",
+            outcome: "succeeded",
+          }),
+        ]),
+      );
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("reports a fresh about:blank tab when CLI open omits a URL", async () => {
+    let executions = 0;
+    const runtime: BrowserInstanceRuntime = {
+      ...publicRuntime(async () => {
+        executions += 1;
+        return "seeded";
+      }),
+      listPages: async () => [
+        {
+          id: "fresh-tab",
+          url: "about:blank",
+          title: "",
+          openerTabId: null,
+        },
+      ],
+    };
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+      browserRuntime: runtime,
+    });
+
+    try {
+      await grantDefaultProfileOrigin(browser, "https://example.com");
+      await browser.runBrowserScriptWithProfile(undefined, {
+        purpose: "Initialize the fresh browser tab",
+        code: "return page.url()",
+        destinationOrigin: "https://example.com",
+      });
+
+      const opened = await browser.runBrowserCli(["open", "--json"]);
+
+      expect(opened.exitCode).toBe(0);
+      expect(JSON.parse(opened.stdout)).toEqual({
+        url: "about:blank",
+        title: null,
+        tabId: "fresh-tab",
+        profileId: DEFAULT_PROFILE_ID,
+        hostId: "host-browser-test",
+        trusted: false,
+      });
+      expect(executions).toBe(1);
+    } finally {
+      await browser.dispose();
+    }
+  });
+
   it("requires an exact --origin on the script CLI and destinationOrigin on browser_script", async () => {
     const browser = await createPublicPluginHarness({
       snapshot: preparedSnapshot,
@@ -2244,6 +2417,49 @@ describe("Browser public plugin contract", () => {
         code: "origin_denied",
         message: AGENT_EXACT_ORIGIN_REQUIRED,
       });
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("rejects subsecond CLI deadlines and accepts the 1,000ms boundary", async () => {
+    const runtimeTimeouts: number[] = [];
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+      browserRuntime: publicRuntime(async (_target, _code, timeoutMs) => {
+        runtimeTimeouts.push(timeoutMs);
+        return "deadline accepted";
+      }),
+    });
+
+    try {
+      await grantDefaultProfileOrigin(browser, "https://example.com");
+      const command = [
+        "script",
+        "--purpose",
+        "Exercise the deadline boundary",
+        "--code",
+        "return page.url()",
+        "--origin",
+        "https://example.com",
+      ];
+      const rejected = await browser.runBrowserCli([
+        ...command,
+        "--timeout",
+        "999",
+      ]);
+      const accepted = await browser.runBrowserCli([
+        ...command,
+        "--timeout",
+        "1000",
+      ]);
+
+      expect(rejected.exitCode).toBe(1);
+      expect(rejected.stderr).toContain(
+        "--timeout must be an integer from 1000 to 30000.",
+      );
+      expect(accepted.exitCode).toBe(0);
+      expect(runtimeTimeouts).toEqual([1_000]);
     } finally {
       await browser.dispose();
     }
@@ -2362,7 +2578,7 @@ describe("Browser public plugin contract", () => {
   });
 
   it.each([
-    ["timeout", "Script timed out after 250ms.", "browser_timeout"],
+    ["timeout", "Browser script timed out after 1000ms.", "browser_timeout"],
     [
       "oversize",
       "Browser Result exceeds the 256 KiB limit.",
@@ -2373,56 +2589,21 @@ describe("Browser public plugin contract", () => {
   ] as const)(
     "returns a typed %s result through both public automation surfaces",
     async (_caseName, message, expectedCode) => {
-      const timeoutMs = expectedCode === "browser_timeout" ? 25 : 30_000;
-      const runtime = publicRuntime(
-        async (_target, _code, runtimeTimeoutMs, options) => {
-          if (expectedCode === "browser_timeout") {
-            await new Promise<never>((_resolve, reject) => {
-              let settled = false;
-              const timeout = {
-                handle: undefined as ReturnType<typeof setTimeout> | undefined,
-              };
-              const finish = (error: Error) => {
-                if (settled) return;
-                settled = true;
-                if (timeout.handle !== undefined) {
-                  clearTimeout(timeout.handle);
-                }
-                options?.signal?.removeEventListener("abort", abort);
-                reject(error);
-              };
-              const abort = () => {
-                finish(new Error("Browser script aborted."));
-              };
-              timeout.handle = setTimeout(
-                () =>
-                  finish(
-                    new BrowserScriptExecutionError(
-                      "browser_timeout",
-                      `Browser script timed out after ${runtimeTimeoutMs}ms.`,
-                    ),
-                  ),
-                runtimeTimeoutMs,
-              );
-              if (options?.signal?.aborted) {
-                abort();
-                return;
-              }
-              options?.signal?.addEventListener("abort", abort, { once: true });
-            });
-          }
-          if (expectedCode === "result_too_large") {
-            return "x".repeat(BROWSER_SCRIPT_RESULT_LIMIT_BYTES + 1);
-          }
-          throw new BrowserScriptExecutionError(
-            expectedCode === "sandbox_violation" ||
-              expectedCode === "tab_invalid"
-              ? expectedCode
-              : "script_failed",
-            message,
-          );
-        },
-      );
+      const timeoutMs = expectedCode === "browser_timeout" ? 1_000 : 30_000;
+      const runtime = publicRuntime(async () => {
+        if (expectedCode === "browser_timeout") {
+          throw new BrowserScriptExecutionError("browser_timeout", message);
+        }
+        if (expectedCode === "result_too_large") {
+          return "x".repeat(BROWSER_SCRIPT_RESULT_LIMIT_BYTES + 1);
+        }
+        throw new BrowserScriptExecutionError(
+          expectedCode === "sandbox_violation" || expectedCode === "tab_invalid"
+            ? expectedCode
+            : "script_failed",
+          message,
+        );
+      });
       const browser = await createPublicPluginHarness({
         snapshot: preparedSnapshot,
         browserRuntime: runtime,

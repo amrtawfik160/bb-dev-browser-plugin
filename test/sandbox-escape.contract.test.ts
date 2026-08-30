@@ -2,10 +2,6 @@ import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
-import {
-  enforcementPostambleScript,
-  enforcementPreambleScript,
-} from "../origin-scope.js";
 
 /**
  * Issue #14 AC6: no raw Chrome, CDP, dev-browser, or helper endpoint bypasses
@@ -21,9 +17,9 @@ import {
  *    so the agent cannot create a fresh context that the enforcement route was
  *    never registered on.
  * 3. `newPage` reuses the one connected context (`entry.context.newPage()`),
- *    and the enforcement preamble registers a context-level `context.route()`
- *    on that same context, so any page the agent opens shares the interception
- *    instead of escaping it.
+ *    where the host-owned Origin Scope guard is installed before agent code.
+ *    The guard's navigation behavior is covered in
+ *    `origin-scope-host.contract.test.ts`.
  *
  * The contracts assert against the pinned `dev-browser` source so a version
  * bump that widens the sandbox surface fails loudly instead of silently
@@ -86,31 +82,5 @@ describe("issue #14 AC6 sandbox cannot escape the policy layer", () => {
     // The manager reuses the one connected context rather than spawning another.
     expect(source).toContain("async newPage(browserName)");
     expect(source).toContain("return entry.context.newPage();");
-  });
-
-  it("checks every page the profile ends on, so a new page cannot escape the scope", () => {
-    const preamble = enforcementPreambleScript(
-      { kind: "exact", origin: "https://app.example.test" },
-      "bb-denial-escape",
-      [],
-    );
-    const postamble = enforcementPostambleScript();
-    // Request interception cannot enforce anything here: a route handler is
-    // agent-supplied JavaScript the sandbox never calls back into. The guard
-    // is installed before the agent code instead, and the postamble sweeps
-    // every page afterwards, so a page the agent opened is still checked.
-    expect(preamble).not.toContain(".route(");
-    const wrapped = `${preamble}\nawait browser.newPage()\n${postamble}`;
-    expect(wrapped.indexOf("__bbGuardNavigation")).toBeLessThan(
-      wrapped.indexOf("browser.newPage()"),
-    );
-    expect(wrapped.indexOf("browser.newPage()")).toBeLessThan(
-      wrapped.lastIndexOf("browser.listPages()"),
-    );
-    // A page opened during the call has no entry in the before-snapshot, so
-    // the sweep sees a changed URL and checks it.
-    expect(preamble).toContain("__bbTabsBefore");
-    expect(postamble).toContain("__bbUrlBefore");
-    expect(postamble).toContain("__bbReportOriginDenied");
   });
 });

@@ -40,16 +40,15 @@ exposes automation to agents only through explicit, revocable authorization.
 - **Safe Login Mode** — owner-only mode for sign-in flows that reject
   automation. Relaunches the same profile without an automation attachment;
   agents get neither pixels nor DOM access while it is active.
-- **Profile Grants & Grant Requests** — agents are denied by default. One
-  `bb browser trust` gives a project whole-web automation of a profile, and
-  `--origin <scope>` narrows it instead. Denied origins produce a typed result
-  and a non-blocking Grant Request the owner can approve — from Settings or
-  with `bb browser approve` — for one retry, one hour, or persistent access.
+- **Profile Grants & Grant Requests** — agents are denied by default. An owner
+  grants exact origins, subdomain scopes, or whole-web access in authenticated
+  Browser Settings. Denied origins produce a typed result and a non-blocking
+  Grant Request the owner can approve for one retry, one hour, or persistent
+  access.
 - **Origin Scope enforcement** — exact `scheme://host:port` origins and
-  optional subdomain patterns. An out-of-scope navigation on the bound page is
-  refused outright, and every tab the call opened or moved is re-checked when
-  the script ends. See [security.md](docs/browser/security.md) for what that
-  does and does not stop.
+  optional subdomain patterns. A host-owned guard blocks out-of-scope top-level,
+  popup, and frame navigations before commit, closes denied pages, and retains
+  denial even when a script navigates back or throws.
 - **Control Leases** — one owner client or agent controls input at a time. The
   owner has priority and can revoke an agent's lease; control transfers
   explicitly between owner clients.
@@ -99,22 +98,22 @@ is healthy.
 ### Owner
 
 Open the **Browser** action from any thread's right panel or the New thread
-launcher, or drive it from a terminal:
+launcher. Use the authenticated Browser Settings surface to manage grants.
+Read host state from a terminal:
 
 ```text
-bb browser open https://example.com          # navigate and report url + title
-bb browser trust                             # let this project's agents automate
+bb browser status                            # host, instance, lease, and mode state
+bb browser list                              # host-local profiles
 ```
 
-The default profile is `bb-personal`. Manage profiles and grants from
-authenticated Browser Settings or the CLI:
+The default profile is `bb-personal`. Manage grants only from authenticated
+Browser Settings. Profile and host operations remain available on the CLI:
 
 ```text
 bb browser list                              # list host-local profiles
 bb browser create --name "Work"              # create a profile
 bb browser select --profile <id>             # set the selected profile
 bb browser status [--json]                   # host, instance, lease, and mode state
-bb browser grants                            # what this project may drive
 bb browser setup                             # consent-gated host provisioning
 ```
 
@@ -124,10 +123,10 @@ profile without an automation attachment for up to 30 minutes.
 
 ### Agent
 
-Agents are denied by default until the owner runs `bb browser trust` (or grants
-specific origins in Browser Settings). An agent then drives the browser through
-`browser_script` or `bb browser script`. `page` is the active tab; `return`
-values become the result. Always pass an exact origin:
+Agents are denied by default until the owner grants an origin in authenticated
+Browser Settings. An agent then drives the browser through `browser_script` or
+`bb browser script`. `page` is the active tab; `return` values become the
+result. Always pass an exact origin:
 
 ```text
 bb browser script --purpose "Read the page title" \
@@ -144,7 +143,7 @@ contract, typed results, contention, and retry behavior.
 
 ## CLI surface
 
-The complete `bb browser` command surface — profiles, grants, requests,
+The complete `bb browser` command surface — profiles, safe request reads,
 transfers, downloads, activity, diagnostics, and status — is documented with
 exact flags in [`docs/browser/cli-reference.md`](docs/browser/cli-reference.md).
 Most commands accept `--json` for structured output.
@@ -166,7 +165,7 @@ authorization.ts      Profile Grants, Origin Scope, and Grant Requests
 grant-requests.ts    Grant Request lifecycle and owner approvals
 control-lease.ts     Exclusive input lease for owner or agent
 safe-login.ts        Owner-only Safe Login Mode policy
-origin-scope.ts      Origin Scope enforcement preamble
+origin-scope.ts      Host-owned Origin Scope navigation guard
 transfer-staging.ts  One-use host storage brokering file transfers
 host-downloads.ts    Profile-scoped download quarantine and export
 activity-records.ts  Metadata-only audit entries

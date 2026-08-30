@@ -1,4 +1,7 @@
-import { BROWSER_SCRIPT_MAX_TIMEOUT_MS } from "./contracts.js";
+import {
+  BROWSER_SCRIPT_MAX_TIMEOUT_MS,
+  BROWSER_SCRIPT_MIN_TIMEOUT_MS,
+} from "./contracts.js";
 
 /**
  * Convenience wrapping for agent Playwright scripts.
@@ -24,7 +27,6 @@ export function preferredTabOrigin(originScope?: string): string | undefined {
   return originScope;
 }
 
-const MIN_NAVIGATION_TIMEOUT_MS = 1_000;
 const NAVIGATION_TIMEOUT_HEADROOM_MS = 5_000;
 
 /**
@@ -38,10 +40,16 @@ const NAVIGATION_TIMEOUT_HEADROOM_MS = 5_000;
  * error win the race.
  */
 function boundedOperationTimeoutMs(scriptTimeoutMs: number): number {
-  return Math.max(
-    MIN_NAVIGATION_TIMEOUT_MS,
-    scriptTimeoutMs - NAVIGATION_TIMEOUT_HEADROOM_MS,
+  if (scriptTimeoutMs < BROWSER_SCRIPT_MIN_TIMEOUT_MS) {
+    throw new RangeError(
+      `Browser script timeout must be at least ${BROWSER_SCRIPT_MIN_TIMEOUT_MS}ms.`,
+    );
+  }
+  const headroomMs = Math.min(
+    NAVIGATION_TIMEOUT_HEADROOM_MS,
+    Math.floor(scriptTimeoutMs / 4),
   );
+  return scriptTimeoutMs - headroomMs;
 }
 
 export function agentPagePreamble(
@@ -90,50 +98,23 @@ if (__bbResult !== undefined) {
 }`;
 }
 
-/**
- * Let an Origin Scope denial end the agent code without failing the call as an
- * ordinary script error. The postamble reports the denied origin, so the host
- * can classify the outcome as `origin_denied` and discard the result.
- */
-function catchOriginDenial(body: string): string {
-  return `try {
-${body}
-} catch (__bbError) {
-  if (__bbError === null || typeof __bbError !== "object" || __bbError.__bbOriginDenied !== true) throw __bbError;
-}`;
-}
-
 export function prepareAgentExecution(input: {
   code: string;
   tabId?: string;
   preferredOrigin?: string;
-  originPreamble?: string;
-  /**
-   * Origin Scope guard for the bound page. It runs after the page preamble
-   * because that is where `page` comes into existence.
-   */
-  boundPageGuard?: string;
-  originPostamble?: string;
   timeoutMs?: number;
   screenshot?: { fileName: string; marker: string };
 }): string {
-  const originPreamble = input.originPreamble ?? "";
   const pagePreamble = agentPagePreamble(input.tabId, input.preferredOrigin);
-  const enforced =
-    input.originPostamble !== undefined && input.originPostamble.length > 0;
-  const wrappedUser = enforced
-    ? catchOriginDenial(wrapAgentScriptResult(input.code))
-    : wrapAgentScriptResult(input.code);
+  const wrappedUser = wrapAgentScriptResult(input.code);
   const operationTimeoutMs = boundedOperationTimeoutMs(
     input.timeoutMs ?? BROWSER_SCRIPT_MAX_TIMEOUT_MS,
   );
-  const prefix = `${originPreamble}${pagePreamble}
+  const prefix = `${pagePreamble}
 page.setDefaultNavigationTimeout(${operationTimeoutMs});
-page.setDefaultTimeout(${operationTimeoutMs});
-${enforced ? (input.boundPageGuard ?? "") : ""}`;
-  const postamble = enforced ? `\n${input.originPostamble}` : "";
+page.setDefaultTimeout(${operationTimeoutMs});`;
   if (input.screenshot === undefined) {
-    return `${prefix}${wrappedUser}${postamble}`;
+    return `${prefix}${wrappedUser}`;
   }
   const markerLine = JSON.stringify({
     __bbScreenshot: input.screenshot.marker,
@@ -143,5 +124,5 @@ ${wrappedUser}
 } finally {
 await saveScreenshot(await page.screenshot({ type: "png" }), ${JSON.stringify(input.screenshot.fileName)});
 console.log(${JSON.stringify(markerLine)});
-}${postamble}`;
+}`;
 }

@@ -3,28 +3,37 @@ import type { BrowserNavigationResponse } from "./contracts.js";
 /**
  * `bb browser open` — the "just open the browser" entry point.
  *
- * Opening runs through the owner navigation boundary, which wakes a sleeping
- * Browser Instance, resolves bare search text through the profile's configured
- * search engine, and applies the Project Loopback Alias. It needs no Profile
- * Grant, so a fresh install can reach a page before anyone has decided
- * anything about automation.
- *
- * Reading the page back is a separate, grant-gated step. `open` attempts it
- * and degrades to the navigation result plus a one-line unlock hint when the
- * project has not been trusted yet, so the first failure explains its own fix.
+ * Opening a URL is an agent operation: it requires a Profile Grant and runs
+ * under the same host-owned Control Lease and Origin Scope enforcement as
+ * `browser_script`. Omitting the URL only reports the current Browser Tab.
  */
 
 export const OPEN_UNLOCK_HINT =
-  "Run `bb browser trust` to let agents read and automate pages in this project.";
+  "Open Browser Settings in BB to grant this project access to the current origin.";
 
 export type BrowserOpenPageState = {
   url: string;
   title: string;
 };
 
-/** Read the page the owner navigation just landed on. */
-export function openBrowserScript() {
-  return "return JSON.stringify({ url: page.url(), title: await page.title() });";
+export function browserOpenDestinationOrigin(address: string): string | null {
+  let url: URL;
+  try {
+    url = new URL(address);
+  } catch {
+    return null;
+  }
+  return url.protocol === "http:" || url.protocol === "https:"
+    ? url.origin
+    : null;
+}
+
+export function openBrowserScript(address?: string) {
+  const navigation =
+    address === undefined
+      ? ""
+      : `await page.goto(${JSON.stringify(address)});\n`;
+  return `${navigation}return JSON.stringify({ url: page.url(), title: await page.title() });`;
 }
 
 export function parseOpenPageState(

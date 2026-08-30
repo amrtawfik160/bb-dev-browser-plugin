@@ -55,17 +55,14 @@ each.
 
 ## Origin Scope enforcement
 
-- Origin Scope is enforced as a policy check on navigation, not as request
-  interception. A navigation the agent script requests is refused before it is
-  issued, and every page is re-checked after the script finishes. An
-  out-of-scope page reached by **in-page navigation loads** before that second
-  check sees it — the agent never receives the result, but the request
-  happened. See [security.md](security.md) for why interception is not
-  available in the sandbox.
-- The **per-origin invalid-certificate bypass no longer loads** a
-  bad-certificate origin. The grant and its approved origins are still recorded
-  and reach the policy, but the mechanism that was meant to fulfil such a
-  navigation depended on the same unavailable interception.
+- Origin Scope applies to HTTP(S) document navigation. The host-owned guard
+  blocks denied top-level pages, popups, redirects, and frame documents before
+  commit, while ordinary cross-origin subresources may render. Cross-origin
+  frame documents therefore need their own grant.
+- Browser-internal pages such as `about:blank` may be reported as the current
+  tab, but they are not widened into navigable destination origins.
+- Invalid-certificate access is an exact-origin elevation. It does not disable
+  certificate validation globally or for another allowed origin.
 
 ## Anti-automation defenses
 

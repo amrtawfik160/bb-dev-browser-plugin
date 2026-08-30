@@ -324,8 +324,7 @@ export function originScopeMatcher(scope: string): OriginScopeMatcher {
  * Decides whether a candidate web origin is within one Origin Scope policy.
  *
  * This is the single matcher shared by the server grant store (via
- * {@link scopeMatchesOrigin}) and the host real-browser enforcement preamble,
- * which re-implements the same data-driven comparisons in the QuickJS sandbox.
+ * {@link scopeMatchesOrigin}) and the host-owned real-browser navigation guard.
  * An origin that is not a valid URL is treated as out of scope rather than
  * throwing, so the policy never lets an unparseable destination through.
  */

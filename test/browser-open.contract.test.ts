@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  browserOpenDestinationOrigin,
   OPEN_UNLOCK_HINT,
   openBrowserScript,
   openCliText,
@@ -16,6 +17,22 @@ describe("browser open", () => {
   it("reads the landed page without navigating again", () => {
     expect(openBrowserScript()).toContain("page.url()");
     expect(openBrowserScript()).not.toContain("page.goto");
+  });
+
+  it("navigates an authorized URL inside the agent script", () => {
+    expect(openBrowserScript("https://example.com/path")).toContain(
+      'page.goto("https://example.com/path")',
+    );
+  });
+
+  it.each([
+    ["https://example.com/path", "https://example.com"],
+    ["http://localhost:3000/", "http://localhost:3000"],
+    ["about:blank", null],
+    ["chrome://new-tab-page", null],
+    ["not a URL", null],
+  ])("derives only an HTTP(S) destination from %s", (address, expected) => {
+    expect(browserOpenDestinationOrigin(address)).toBe(expected);
   });
 
   it("parses the page state a read returns", () => {
@@ -47,5 +64,6 @@ describe("browser open", () => {
     expect(text).toContain("Opened https://example.com/");
     expect(text).not.toContain("Title:");
     expect(text).toContain(OPEN_UNLOCK_HINT);
+    expect(text).toContain("Browser Settings");
   });
 });

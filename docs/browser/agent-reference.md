@@ -25,19 +25,19 @@ Parameters are defined by `browserScriptParametersSchema` (`.strict()`):
 | `destinationOrigin`  | no       | exact `scheme://host:port` origin | Omitting it returns `origin_denied`. Access is denied until the owner grants that origin to this project and profile. Grant changes apply to the next call. |
 | `profileId`          | no       | string                            | Host-local Browser Profile ID. Omit to use the selected profile (`bb-personal` by default).                                                                 |
 | `tabId`              | no       | string                            | Opaque runtime-only tab ID from `browser.listPages()`. Omit to use the active tab.                                                                          |
-| `timeoutMs`          | no       | integer 1–30000                   | Default `30000` (`BROWSER_SCRIPT_MAX_TIMEOUT_MS`).                                                                                                          |
+| `timeoutMs`          | no       | integer 1000–30000                | Default `30000`; the minimum is `BROWSER_SCRIPT_MIN_TIMEOUT_MS`.                                                                                            |
 | `screenshot`         | no       | boolean (default false)           | Request up to 3 native screenshots explicitly.                                                                                                              |
 | `fileTransfer`       | no       | boolean (default false)           | Separate elevation; needs its own owner grant.                                                                                                              |
-| `invalidCertificate` | no       | boolean (default false)           | Per-origin opt-in; needs its own owner grant. The approval is recorded but no longer loads a bad-certificate origin — see [security.md](security.md).       |
+| `invalidCertificate` | no       | boolean (default false)           | Per-origin opt-in; the host bypasses certificate validation only for the exact approved origin.                                                             |
 
 The script runs with Playwright `page` bound to the active tab (or `tabId`).
 `return` values become the tool result. There is no `document` global.
 
-`page.setDefaultTimeout` and `page.setDefaultNavigationTimeout` are set 5s below
-the script timeout before your code runs, so a locator action that never becomes
-possible fails with the Playwright call log naming the reason instead of
-outliving the call. That call log is the most useful part of a failure message,
-so failures keep its tail and drop the sandbox stack frames.
+`page.setDefaultTimeout` and `page.setDefaultNavigationTimeout` reserve 25% of
+the script timeout, capped at five seconds, for the host to return the result.
+At the minimum accepted 1,000 ms timeout, Playwright helpers receive 750 ms.
+A locator action that never becomes possible therefore returns its useful call
+log before the host deadline.
 
 ```javascript
 return await page.title();
@@ -61,9 +61,9 @@ The CLI derives project and host from BB context and does **not** accept
 
 The bundled skill lives at [`skills/browser/SKILL.md`](../../skills/browser/SKILL.md)
 and is configured for agents via `bb.agents.configure(() => ({ tools: ["browser_script"], skills: ["browser"] }))`.
-It opens with the two commands that get an agent working — `bb browser trust`
-once per project, then `bb browser open <url>` — followed by the automation
-recipes and the failure table. It carries the gotchas that cost real time:
+It opens with the `browser_script` authorization flow and the agent-scoped
+`bb browser open <url>` equivalent, followed by automation recipes and the
+failure table. It carries the gotchas that cost real time:
 overlays that swallow clicks, keeping one script under ~25 seconds, preferring
 `fill` over `click` on inputs, and waiting on conditions rather than timers.
 
@@ -133,9 +133,9 @@ diagnostics, or the database (verified by the sensitive-data evidence suite).
 
 ## Time and result bounds
 
-- Script timeout is capped at **30 seconds**. Playwright navigation waits are
-  set five seconds below that timeout so a hung `page.goto` fails as
-  `script_failed` instead of a host deadline.
+- Script timeout is **1–30 seconds**. Playwright navigation and locator waits
+  reserve 25% headroom, capped at five seconds, so a hung helper fails as
+  `script_failed` before the host deadline.
 - Structured results are capped at **256 KiB**.
 - Screenshots: at most **3** per call, each ≤ 1 MiB, PNG/JPEG/WebP only, and only
   when explicitly requested (`screenshot: true`).
@@ -161,6 +161,10 @@ Every script holds one atomic **Control Lease** for its host and profile.
    or persistent. The **default is one retry**.
 3. After approval, **retry explicitly**. The failed script never resumes
    automatically; grant changes apply to the **next** call only.
+
+The CLI has no authenticated owner identity. Grant administration and request
+decisions therefore fail closed there with Browser Settings guidance; a TTY,
+shell access, or confirmation flag does not confer owner authority.
 
 Grant Request expiry (verified in `grant-requests.ts`):
 

@@ -29,12 +29,8 @@ import {
   originScopeMatcher,
   type OriginScopeMatcher,
 } from "./authorization.js";
-import {
-  enforcementPreambleScript,
-  enforcementPostambleScript,
-  boundPageGuardScript,
-  extractOriginDenial,
-} from "./origin-scope.js";
+import { type BrowserOriginScopePolicy } from "./origin-scope.js";
+export { BrowserOriginScopeDeniedError } from "./origin-scope.js";
 import {
   prepareAgentExecution,
   preferredTabOrigin,
@@ -103,13 +99,7 @@ export type BrowserExecutionRequest = {
     marker: string;
     mimeType: "image/png";
   };
-  /**
-   * An opaque Origin Scope denial marker the enforcement preamble prints when it
-   * blocks an out-of-scope navigation. When set, the process boundary surfaces
-   * stdout even on a non-zero exit if the marker appears, so the runtime can
-   * classify the denial instead of reporting a generic script failure.
-   */
-  denialMarker?: string;
+  originPolicy?: BrowserOriginScopePolicy;
 };
 
 export type BrowserOperationOptions = {
@@ -118,15 +108,14 @@ export type BrowserOperationOptions = {
   screenshot?: boolean;
   /**
    * The resolved Profile Grant Origin Scope to enforce during real browser
-   * navigation while an agent script runs. When present, the runtime wraps the
-   * agent code with a preamble that aborts out-of-scope navigation requests
-   * before commit and surfaces a typed origin_denied result. Omitting it leaves
-   * navigation unrestricted (owner browsing through the panel).
+   * navigation while an agent script runs. The process boundary installs a
+   * host-owned guard before starting the sandbox helper. Omitting it leaves
+   * navigation unrestricted for owner browsing through the panel.
    */
   originScope?: string;
   /**
    * The per-origin invalid-certificate opt-ins resolved from the active grant.
-   * When set alongside {@link originScope}, the enforcement preamble bypasses
+   * When set alongside {@link originScope}, the host-owned guard bypasses
    * TLS certificate errors for navigation to these granted origins so they can
    * load despite a bad certificate, using the same normalized policy the grant
    * store approved. Origins within scope that lack the opt-in continue
@@ -223,15 +212,6 @@ export class BrowserScriptExecutionError extends Error {
  * The host turns this into a typed `origin_denied` Browser Result carrying the
  * denied origin so the server can attach a Grant Request.
  */
-export class BrowserOriginScopeDeniedError extends Error {
-  constructor(public readonly origin: string) {
-    super(
-      `Browser navigation to ${origin} was denied by the active Profile Grant.`,
-    );
-    this.name = "BrowserOriginScopeDeniedError";
-  }
-}
-
 export function validateBrowserLaunchPolicy(launch: {
   runAsUser: string;
   effectiveUserId: number;
@@ -849,7 +829,7 @@ function executionRequest(
   timeoutMs: number,
   signal?: AbortSignal,
   screenshot?: BrowserExecutionRequest["screenshot"],
-  denialMarker?: string,
+  originPolicy?: BrowserOriginScopePolicy,
 ): BrowserExecutionRequest {
   return {
     endpoint: held.publicState.automationEndpoint,
@@ -859,7 +839,7 @@ function executionRequest(
     runtimeDirectory: held.runtimeDirectory,
     ...(signal === undefined ? {} : { signal }),
     ...(screenshot === undefined ? {} : { screenshot }),
-    ...(denialMarker === undefined ? {} : { denialMarker }),
+    ...(originPolicy === undefined ? {} : { originPolicy }),
   };
 }
 
@@ -1547,25 +1527,19 @@ export function createBrowserInstanceRuntime(
         operationOptions.originScope === undefined
           ? undefined
           : originScopeMatcher(operationOptions.originScope);
-      const denialMarker =
-        matcher === undefined ? undefined : `bb-denial-${randomUUID()}`;
-      const originPreamble =
-        matcher === undefined || denialMarker === undefined
-          ? ""
-          : `${enforcementPreambleScript(
+      const originPolicy: BrowserOriginScopePolicy | undefined =
+        matcher === undefined
+          ? undefined
+          : {
               matcher,
-              denialMarker,
-              operationOptions.invalidCertificateOrigins ?? [],
-            )}
-`;
+              invalidCertificateOrigins:
+                operationOptions.invalidCertificateOrigins ?? [],
+              timeoutMs,
+            };
       const executionCode = prepareAgentExecution({
         code,
         tabId: target.tabId,
         preferredOrigin: preferredTabOrigin(operationOptions.originScope),
-        originPreamble,
-        boundPageGuard: matcher === undefined ? "" : boundPageGuardScript(),
-        originPostamble:
-          matcher === undefined ? "" : enforcementPostambleScript(),
         timeoutMs,
         screenshot,
       });
@@ -1581,16 +1555,10 @@ export function createBrowserInstanceRuntime(
                 timeoutMs,
                 operationSignal.signal,
                 screenshot,
-                denialMarker,
+                originPolicy,
               ),
             ),
           );
-          if (matcher !== undefined && denialMarker !== undefined) {
-            const denial = extractOriginDenial(browserResult, denialMarker);
-            if (denial !== null) {
-              throw new BrowserOriginScopeDeniedError(denial.origin);
-            }
-          }
           if (target.tabId !== undefined) activeTabs.set(key, target.tabId);
           return browserResult;
         } catch (error) {

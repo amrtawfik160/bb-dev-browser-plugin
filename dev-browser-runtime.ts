@@ -4,6 +4,7 @@ import { dirname, join, delimiter } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const DEV_BROWSER_PACKAGE_NAME = "dev-browser";
+export const DEV_BROWSER_PACKAGE_VERSION = "0.2.9";
 
 export type DevBrowserRuntimePaths = {
   packageDirectory: string;
@@ -16,14 +17,15 @@ export type ResolveDevBrowserRuntimeOptions = {
   extraSearchRoots?: readonly string[];
 };
 
-function packageDirectoryLooksValid(directory: string): boolean {
+function devBrowserPackageVersion(directory: string): string | null {
   try {
     const pkg = JSON.parse(
       readFileSync(join(directory, "package.json"), "utf8"),
-    ) as { name?: unknown };
-    return pkg.name === DEV_BROWSER_PACKAGE_NAME;
+    ) as { name?: unknown; version?: unknown };
+    if (pkg.name !== DEV_BROWSER_PACKAGE_NAME) return null;
+    return typeof pkg.version === "string" ? pkg.version : "<missing>";
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -68,6 +70,15 @@ function requireResolvedDirectory(fromFileUrl: string): string | undefined {
 export function resolveDevBrowserRuntime(
   options: ResolveDevBrowserRuntimeOptions = {},
 ): DevBrowserRuntimePaths | null {
+  return searchDevBrowserRuntime(options).runtime;
+}
+
+type RuntimeMismatch = { directory: string; version: string };
+
+function searchDevBrowserRuntime(options: ResolveDevBrowserRuntimeOptions): {
+  runtime: DevBrowserRuntimePaths | null;
+  mismatches: RuntimeMismatch[];
+} {
   const env = options.env ?? process.env;
   const fromFileUrl = options.fromFileUrl ?? import.meta.url;
   const fromFilePath = fromFileUrl.startsWith("file:")
@@ -76,13 +87,20 @@ export function resolveDevBrowserRuntime(
   const fromFileDirectory = dirname(fromFilePath);
   const candidates: string[] = [];
   const envDirectory = envPackageDirectory(env);
-  if (envDirectory !== undefined) candidates.push(envDirectory);
+  if (envDirectory !== undefined) {
+    const directory = directoryFromCandidate(envDirectory);
+    const version = devBrowserPackageVersion(directory);
+    if (version !== null && version !== DEV_BROWSER_PACKAGE_VERSION) {
+      return { runtime: null, mismatches: [{ directory, version }] };
+    }
+    candidates.push(envDirectory);
+  }
   const required = requireResolvedDirectory(fromFileUrl);
   if (required !== undefined) candidates.push(required);
   for (const root of options.extraSearchRoots ?? []) {
     candidates.push(join(root, "node_modules", DEV_BROWSER_PACKAGE_NAME));
     candidates.push(join(root, DEV_BROWSER_PACKAGE_NAME));
-    if (packageDirectoryLooksValid(root)) candidates.push(root);
+    if (devBrowserPackageVersion(root) !== null) candidates.push(root);
   }
   candidates.push(...ancestorPackageDirectories(fromFileDirectory));
   for (const nodePath of (env.NODE_PATH ?? "")
@@ -92,30 +110,45 @@ export function resolveDevBrowserRuntime(
   }
 
   const seen = new Set<string>();
+  const mismatches: RuntimeMismatch[] = [];
   for (const candidate of candidates) {
     const directory = directoryFromCandidate(candidate);
     if (seen.has(directory)) continue;
     seen.add(directory);
-    if (!packageDirectoryLooksValid(directory)) continue;
+    const version = devBrowserPackageVersion(directory);
+    if (version === null) continue;
+    if (version !== DEV_BROWSER_PACKAGE_VERSION) {
+      mismatches.push({ directory, version });
+      continue;
+    }
     const executable = executablePath(directory);
     try {
       accessSync(executable, constants.F_OK);
-      return { packageDirectory: directory, executable };
+      return {
+        runtime: { packageDirectory: directory, executable },
+        mismatches,
+      };
     } catch {
       continue;
     }
   }
-  return null;
+  return { runtime: null, mismatches };
 }
 
 export function requireDevBrowserRuntime(
   options: ResolveDevBrowserRuntimeOptions = {},
 ): DevBrowserRuntimePaths {
-  const resolved = resolveDevBrowserRuntime(options);
-  if (resolved === null) {
+  const search = searchDevBrowserRuntime(options);
+  if (search.runtime === null) {
+    const mismatch = search.mismatches[0];
+    if (mismatch !== undefined) {
+      throw new Error(
+        `Incompatible ${DEV_BROWSER_PACKAGE_NAME} package at ${mismatch.directory}: expected ${DEV_BROWSER_PACKAGE_VERSION}, found ${mismatch.version}.`,
+      );
+    }
     throw new Error(
-      "Cannot find the pinned dev-browser package. Install it next to the plugin or set BB_DEV_BROWSER_PACKAGE to its directory.",
+      `Cannot find the pinned ${DEV_BROWSER_PACKAGE_NAME} package (expected ${DEV_BROWSER_PACKAGE_VERSION}). Install it next to the plugin or set BB_DEV_BROWSER_PACKAGE to its directory.`,
     );
   }
-  return resolved;
+  return search.runtime;
 }
