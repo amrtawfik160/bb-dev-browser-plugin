@@ -916,6 +916,19 @@ export async function createPublicPluginHarness(options?: {
           { signal },
         );
       }
+      if (
+        method === "downloadStart" ||
+        method === "downloadAppend" ||
+        method === "downloadComplete" ||
+        method === "downloadList" ||
+        method === "downloadExportClient"
+      ) {
+        // Host Downloads run against the real host boundary so quarantine,
+        // limits, and export behave the way they do on a workspace host.
+        return host.experimental_call(method, input as never, {
+          signal,
+        }) as Promise<unknown>;
+      }
       throw new Error(`Unexpected host method: ${method}`);
     },
   });
@@ -1881,6 +1894,39 @@ export async function createPublicPluginHarness(options?: {
     return rpc.browser_panel_reclaim_control(input);
   }
 
+  /**
+   * Put a completed download in host quarantine through the same boundary the
+   * browser uses, so a test can assert what the owner does with a quarantined
+   * file rather than what a stubbed listing returns.
+   */
+  async function quarantineBrowserDownload(input: {
+    downloadId: string;
+    suggestedName: string;
+    contents: string;
+    profileId?: string;
+    contentType?: string | null;
+  }) {
+    const data = Buffer.from(input.contents, "utf8");
+    await rpc.browser_download_start({
+      hostId: configuredHostId,
+      downloadId: input.downloadId,
+      profileId: input.profileId ?? DEFAULT_PROFILE_ID,
+      suggestedName: input.suggestedName,
+      contentType: input.contentType ?? "text/plain",
+      totalBytes: data.byteLength,
+    });
+    await rpc.browser_download_append({
+      hostId: configuredHostId,
+      downloadId: input.downloadId,
+      data: data.toString("base64"),
+      chunkBytes: data.byteLength,
+    });
+    return rpc.browser_download_complete({
+      hostId: configuredHostId,
+      downloadId: input.downloadId,
+    });
+  }
+
   function runBrowserTabs(hostId: string, profileId = DEFAULT_PROFILE_ID) {
     return rpc.browser_tabs({ hostId, profileId });
   }
@@ -2211,6 +2257,7 @@ export async function createPublicPluginHarness(options?: {
     runBrowserReleaseControl,
     runBrowserReclaimControl,
     runBrowserTabs,
+    quarantineBrowserDownload,
     runBrowserTabAction,
     runBrowserScript,
     runBrowserScriptWithProfile,

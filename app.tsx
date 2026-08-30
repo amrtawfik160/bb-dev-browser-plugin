@@ -23,6 +23,7 @@ import {
   type BrowserDialogEvent,
   type BrowserDownloadListingEntry,
   type BrowserDownloadLimits,
+  type BrowserDownloadListResult,
   type BrowserHostChoice,
   type BrowserHostChoicesInput,
   type BrowserDiagnostics,
@@ -207,6 +208,31 @@ function PanelGrantRequestNotices({
       </ul>
     </section>
   );
+}
+
+/**
+ * Save exported client bytes as a browser download so the owner receives the
+ * file. Privacy-safe: the bytes are the owner's own quarantined file, and
+ * leaving quarantine took an explicit owner decision to get here.
+ */
+function saveExportedBytes(
+  safeName: string,
+  contentType: string | null | undefined,
+  data: string | undefined,
+) {
+  if (data === undefined) return;
+  const bytes = new Uint8Array(Buffer.from(data, "base64"));
+  const blob = new Blob([bytes], {
+    type: contentType === null ? undefined : (contentType ?? undefined),
+  });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = safeName;
+  document.body.appendChild(anchor);
+  anchor.click();
+  document.body.removeChild(anchor);
+  URL.revokeObjectURL(url);
 }
 
 function PanelStreamSurface({
@@ -615,30 +641,6 @@ function PanelStreamSurface({
     }
   }
 
-  /**
-   * Save the exported client bytes as a browser download so the owner receives
-   * the file. Privacy-safe: the bytes are the owner's own quarantined file.
-   */
-  function saveExportedBytes(
-    safeName: string,
-    contentType: string | null | undefined,
-    data: string | undefined,
-  ) {
-    if (data === undefined) return;
-    const bytes = new Uint8Array(Buffer.from(data, "base64"));
-    const blob = new Blob([bytes], {
-      type: contentType === null ? undefined : (contentType ?? undefined),
-    });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = safeName;
-    document.body.appendChild(anchor);
-    anchor.click();
-    document.body.removeChild(anchor);
-    URL.revokeObjectURL(url);
-  }
-
   // The page fills the panel. What used to sit around it — the streaming
   // policy and the version-one screen-reader limitation — is still announced,
   // but only to assistive technology: it is a disclosure the owner needs once,
@@ -962,7 +964,7 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
   const [navigationLocation, setNavigationLocation] = useState<string | null>(
     null,
   );
-  const [statusHint, setStatusHint] = useState<string | null>(null);
+  const [showStatusDetail, setShowStatusDetail] = useState(false);
   const [panelId] = useState(() => `browser-panel-${nextBrowserPanelId++}`);
   const reducedMotion = usePrefersReducedMotion();
   // The page surface is measured, not guessed: its size is the viewport this
@@ -1333,12 +1335,8 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
         }}
         options={sessionOptions}
         reducedMotion={reducedMotion}
-        statusHint={statusHint}
-        onStatusSelect={() =>
-          setStatusHint((current) =>
-            current === null ? hostStatusHint(status, hostName) : null,
-          )
-        }
+        statusHint={showStatusDetail ? hostStatusHint(status, hostName) : null}
+        onStatusSelect={() => setShowStatusDetail((shown) => !shown)}
       />
       <BrowserTabStripView
         tabs={tabs}
@@ -2493,6 +2491,104 @@ function PurgeControls({ target }: { target: BrowserAdministrationTarget }) {
   );
 }
 
+/**
+ * Host Downloads management (issue #50). The panel shows a download while it
+ * is happening, the way a browser reveals its download shelf; what the owner
+ * does with a quarantined file afterwards belongs here, in the one place
+ * everything about this browser is managed. Quarantine is unchanged: the bytes
+ * stay on the workspace host until this explicit owner decision moves them.
+ */
+function DownloadControls({
+  target,
+  available,
+}: {
+  target: BrowserAdministrationTarget;
+  available: boolean;
+}) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [listing, setListing] = useState<BrowserDownloadListResult | null>(
+    null,
+  );
+  const [pendingAction, setPendingAction] = useState<string | null>(null);
+  const [exportError, setExportError] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  function inspectDownloads() {
+    setPendingAction("inspect");
+    setError(null);
+    void rpc
+      .call("browser_download_list", target)
+      .then(setListing)
+      .catch((requestError: unknown) =>
+        setError(administrationErrorMessage(requestError)),
+      )
+      .finally(() => setPendingAction(null));
+  }
+
+  async function exportToClient(downloadId: string) {
+    setPendingAction(downloadId);
+    setExportError(null);
+    try {
+      const outcome = await rpc.call("browser_download_export_client", {
+        hostId: target.hostId,
+        downloadId,
+        profileId: target.profileId,
+      });
+      if (outcome.outcome !== "exported") {
+        setExportError(
+          outcome.outcome === "rejected"
+            ? `Export rejected: ${outcome.reason}.`
+            : "Export failed.",
+        );
+        return;
+      }
+      saveExportedBytes(outcome.safeName, outcome.contentType, outcome.data);
+    } catch (requestError: unknown) {
+      setExportError(administrationErrorMessage(requestError));
+    } finally {
+      setPendingAction(null);
+    }
+  }
+
+  return (
+    <section
+      aria-label={`Browser Host Downloads for ${target.profileId}`}
+      className="border-t pt-5 text-left"
+    >
+      <h4 className="font-semibold">Host Downloads</h4>
+      {!available ? (
+        <p className="mt-3 text-sm">
+          Host Downloads are unavailable while this host is offline.
+        </p>
+      ) : (
+        <>
+          <button
+            type="button"
+            className="mt-3 rounded border px-3 py-2 text-sm"
+            disabled={pendingAction !== null}
+            onClick={inspectDownloads}
+          >
+            Inspect Host Downloads
+          </button>
+          {listing === null ? null : (
+            <PanelDownloadsSurface
+              downloads={listing.downloads}
+              limits={listing.limits}
+              isController={true}
+              exportState={{
+                inFlightDownloadId: pendingAction,
+                error: exportError,
+              }}
+              onExportClient={(downloadId) => void exportToClient(downloadId)}
+            />
+          )}
+        </>
+      )}
+      <AdministrationFeedback message={null} error={error} />
+    </section>
+  );
+}
+
 function ActivityControls({ target }: { target: BrowserAdministrationTarget }) {
   const rpc = useRpc<typeof rpcContract>();
   const [records, setRecords] = useState<BrowserActivityRecord[] | null>(null);
@@ -3314,6 +3410,16 @@ function BrowserSettings() {
               hostId={status.hostId}
               available={status.state !== "host-offline"}
               onProfileSelected={handleProfileSelected}
+            />
+          )}
+          {status.hostId === null ? null : (
+            <DownloadControls
+              target={{
+                hostId: status.hostId,
+                profileId:
+                  selectedProfileIds[status.hostId] ?? status.profileId,
+              }}
+              available={status.state !== "host-offline"}
             />
           )}
           {status.hostId === null ? null : (

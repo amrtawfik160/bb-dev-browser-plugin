@@ -251,6 +251,74 @@ describe("Browser Panel", () => {
     }
   });
 
+  it("keeps session actions in the overflow menu and management out of the panel", async () => {
+    const browser = await createPublicPluginHarness({
+      status: healthyBrowserStatus,
+      navigationResponse: {
+        address: { kind: "address", url: "http://localhost:4173/" },
+        location: { url: "http://localhost:4173/" },
+        tabId: "shared-tab-1",
+      },
+    });
+    try {
+      const panel = browser.renderPanel();
+      // Nothing configured once sits above the page: profiles, agent access,
+      // activity, and downloads are managed in Browser Settings.
+      await panel.findByLabelText("Address or search");
+      expect(panel.queryByRole("combobox", { name: "Browser Profile" })).toBe(
+        null,
+      );
+      expect(
+        panel.queryByLabelText("Browser Host Downloads quarantine"),
+      ).toBeNull();
+      expect(panel.container.textContent).not.toContain("Browser Activity");
+
+      fireEvent.click(
+        await panel.findByRole("button", { name: "Browser options" }),
+      );
+      const menu = await panel.findByRole("menu", { name: "Browser options" });
+      expect(menu.textContent).toMatch(/settings/iu);
+      // A rarely-used compatibility toggle is a menu item, not a permanent
+      // checkbox under the address bar.
+      const rawLocalhost = within(menu).getByRole("menuitemcheckbox", {
+        name: /plain localhost/iu,
+      });
+      expect(rawLocalhost.getAttribute("aria-checked")).toBe("false");
+      fireEvent.click(rawLocalhost);
+      await waitFor(() =>
+        expect(rawLocalhost.getAttribute("aria-checked")).toBe("true"),
+      );
+
+      const address = await panel.findByLabelText("Address or search");
+      fireEvent.change(address, { target: { value: "localhost:4173" } });
+      fireEvent.submit(address);
+      await waitFor(() => expect(browser.navigationRequests).toHaveLength(1));
+      expect(browser.navigationRequests[0]).toMatchObject({
+        rawLocalhost: true,
+      });
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("says where this browser runs and where it is managed when asked", async () => {
+    const browser = await createPublicPluginHarness({
+      status: healthyBrowserStatus,
+    });
+    try {
+      const panel = browser.renderPanel();
+
+      fireEvent.click(
+        await panel.findByRole("button", { name: "Browser status: Ready" }),
+      );
+      const hint = await panel.findByText(/ready on/iu);
+      expect(hint.textContent).toMatch(/browser contract host/iu);
+      expect(hint.textContent).toMatch(/settings/iu);
+    } finally {
+      await browser.dispose();
+    }
+  });
+
   it("asks the host to capture at the panel's own size, once a resize settles", async () => {
     const resizes = installResizeObserverStub();
     const browser = await createPublicPluginHarness({

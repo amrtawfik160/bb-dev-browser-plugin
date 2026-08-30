@@ -346,7 +346,12 @@ export function PanelDownloadsSurface({
     /** Privacy-safe error message for the last export, if it failed. */
     error: string | null;
   };
-  onCancel: (downloadId: string) => void;
+  /**
+   * Cancel an in-flight download. Cancellation is low-latency over the panel
+   * transport, so a surface without one — Browser Settings, which has no live
+   * transport — simply does not offer it.
+   */
+  onCancel?: (downloadId: string) => void;
   onExportClient: (downloadId: string) => void;
 }) {
   return (
@@ -407,7 +412,9 @@ export function PanelDownloadsSurface({
                   </p>
                 )}
                 <div className="mt-2 flex flex-wrap gap-2">
-                  {download.phase === "downloading" && isController ? (
+                  {download.phase === "downloading" &&
+                  isController &&
+                  onCancel !== undefined ? (
                     <button
                       type="button"
                       className="rounded border px-2 py-1"

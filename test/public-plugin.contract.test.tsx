@@ -4484,6 +4484,37 @@ describe("Browser public plugin contract", () => {
     await browser.dispose();
   });
 
+  it("manages quarantined Host Downloads from Settings", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+    });
+    try {
+      await browser.quarantineBrowserDownload({
+        downloadId: "download-settings-1",
+        suggestedName: "statement.pdf",
+        contents: "quarantined bytes",
+      });
+      const settings = browser.renderSettings();
+
+      fireEvent.click(
+        await settings.findByRole("button", {
+          name: "Inspect Host Downloads",
+        }),
+      );
+
+      // The file is named and its quarantine state is stated; leaving
+      // quarantine stays an explicit owner decision.
+      await settings.findByText("statement.pdf");
+      const listing = await settings.findByLabelText(
+        "Browser Host Downloads quarantine",
+      );
+      expect(listing.textContent).toContain("quarantined");
+      await settings.findByRole("button", { name: "Export to client" });
+    } finally {
+      await browser.dispose();
+    }
+  });
+
   it("shows destructive consequences, progress, recovery deadline, and final state in Settings", async () => {
     const browser = await createPublicPluginHarness({
       snapshot: preparedSnapshot,
