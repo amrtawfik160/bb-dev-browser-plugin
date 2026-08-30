@@ -485,6 +485,58 @@ describe("Browser Panel", () => {
     }
   });
 
+  it("asks about a site once, however many times an agent was denied on it", async () => {
+    const browser = await createPublicPluginHarness({
+      status: healthyBrowserStatus,
+      browserRuntime: createTabInventoryRuntime(),
+    });
+    try {
+      await browser.createBrowserProfile({
+        hostId: "host-browser-test",
+        name: "Repeated denial target",
+      });
+      for (const purpose of ["First try", "Second try"]) {
+        await browser.runBrowserScriptWithProfile(undefined, {
+          purpose,
+          destinationOrigin: "https://repeated.example.test",
+        });
+      }
+      expect(
+        (await browser.listBrowserGrantRequests({ status: "pending" })).length,
+      ).toBe(2);
+
+      const panel = browser.renderPanel();
+      const question = await panel.findByRole("region", {
+        name: "Site access requests",
+      });
+      // One site, one question — being asked the same thing twice is not more
+      // information.
+      expect(
+        within(question).getAllByRole("button", {
+          name: "Allow https://repeated.example.test",
+        }),
+      ).toHaveLength(1);
+
+      fireEvent.click(
+        within(question).getByRole("button", {
+          name: "Allow https://repeated.example.test",
+        }),
+      );
+
+      // Answering it answers every request that asked it.
+      await waitFor(() =>
+        expect(
+          panel.queryByRole("region", { name: "Site access requests" }),
+        ).toBeNull(),
+      );
+      expect(
+        await browser.listBrowserGrantRequests({ status: "pending" }),
+      ).toEqual([]);
+    } finally {
+      await browser.dispose();
+    }
+  });
+
   it("trusts the whole project from the panel when the owner is tired of being asked", async () => {
     const browser = await createPublicPluginHarness({
       status: healthyBrowserStatus,

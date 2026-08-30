@@ -444,7 +444,11 @@ export function BrowserToolbar({
  * the owner decides about a site, not about a UUID (ADR 0014).
  */
 export type BrowserAccessRequest = {
-  requestId: string;
+  /**
+   * Every pending request this question stands for. One site denied five times
+   * is one question to the owner, and answering it answers all five.
+   */
+  requestIds: readonly string[];
   /** The BB project whose agents were denied; named in a decision, not shown. */
   projectId: string;
   origin: string;
@@ -475,7 +479,9 @@ export function BrowserAccessRequestNotices({
   return (
     <section
       aria-label="Site access requests"
-      className="border-b px-2 py-2 text-left"
+      className="overflow-auto border-b px-2 py-2 text-left"
+      // However many sites are waiting, the page keeps most of the panel.
+      style={{ maxHeight: "40%" }}
     >
       <ul className="space-y-2">
         {requests.map((request) => {
@@ -487,7 +493,7 @@ export function BrowserAccessRequestNotices({
             ? `Allow ${request.origin} for an hour`
             : `Allow ${request.origin}`;
           return (
-            <li key={request.requestId} className="text-sm">
+            <li key={request.origin} className="text-sm">
               <p>
                 Let agents in this project use{" "}
                 <strong className="break-all">{request.origin}</strong>?

@@ -191,19 +191,27 @@ function PanelProfilePicker({
 function pendingAccessRequests(
   requests: readonly BrowserGrantRequest[],
 ): BrowserAccessRequest[] {
-  return requests
-    .filter((request) => request.status === "pending")
-    .map((request) => ({
-      requestId: request.requestId,
+  const questions = new Map<string, BrowserAccessRequest>();
+  for (const request of requests) {
+    if (request.status !== "pending") continue;
+    const elevations = [
+      request.requestedElevations.fileTransfer ? "file transfer" : null,
+      request.requestedElevations.invalidCertificate
+        ? "an invalid certificate"
+        : null,
+    ].filter((elevation): elevation is string => elevation !== null);
+    // An agent denied five times on one site asked one question, so the owner
+    // is asked it once, and answering it answers every one of them.
+    const key = `${request.projectId}\u0000${request.origin}`;
+    const asked = questions.get(key);
+    questions.set(key, {
+      requestIds: [...(asked?.requestIds ?? []), request.requestId],
       projectId: request.projectId,
       origin: request.origin,
-      elevations: [
-        request.requestedElevations.fileTransfer ? "file transfer" : null,
-        request.requestedElevations.invalidCertificate
-          ? "an invalid certificate"
-          : null,
-      ].filter((elevation): elevation is string => elevation !== null),
-    }));
+      elevations: [...new Set([...(asked?.elevations ?? []), ...elevations])],
+    });
+  }
+  return [...questions.values()];
 }
 
 /**
@@ -723,7 +731,10 @@ function PanelStreamSurface({
         // Downloads appear only once there is one, the way a browser reveals
         // its download shelf, and never as a permanent empty section under the
         // page. Managing them afterwards lives in Browser Settings.
-        <div className="absolute inset-x-0 bottom-0 max-h-1/2 overflow-auto border-t bg-background p-2">
+        <div
+          className="absolute inset-x-0 bottom-0 overflow-auto border-t bg-background p-2"
+          style={{ maxHeight: "50%" }}
+        >
           <PanelDownloadsSurface
             downloads={downloads}
             limits={downloadsLimits}
@@ -1282,12 +1293,12 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
   }
 
   /**
-   * A decided request is not a question any more, so it leaves the panel at
+   * An answered question is not a question any more, so it leaves the panel at
    * once rather than at the next refresh.
    */
-  function forgetAccessRequest(requestId: string) {
+  function forgetAccessRequests(requestIds: readonly string[]) {
     setGrantRequests((current) =>
-      current.filter((request) => request.requestId !== requestId),
+      current.filter((request) => !requestIds.includes(request.requestId)),
     );
   }
 
@@ -1303,21 +1314,24 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
     decision: "deny" | "allow",
   ) {
     const persist = decision === "allow" && request.elevations.length === 0;
-    setAccessDecision(request.requestId);
+    setAccessDecision(request.origin);
     setProfileError(null);
-    void rpc
-      .call("browser_grant_request_decide", {
-        requestId: request.requestId,
-        decision:
-          decision === "deny" ? "deny" : persist ? "persist" : "one-hour",
-        ...(persist
-          ? {
-              persistenceConfirmation:
-                PERSIST_BROWSER_ELEVATED_ACCESS_CONFIRMATION,
-            }
-          : {}),
-      })
-      .then(() => forgetAccessRequest(request.requestId))
+    void Promise.all(
+      request.requestIds.map((requestId) =>
+        rpc.call("browser_grant_request_decide", {
+          requestId,
+          decision:
+            decision === "deny" ? "deny" : persist ? "persist" : "one-hour",
+          ...(persist
+            ? {
+                persistenceConfirmation:
+                  PERSIST_BROWSER_ELEVATED_ACCESS_CONFIRMATION,
+              }
+            : {}),
+        }),
+      ),
+    )
+      .then(() => forgetAccessRequests(request.requestIds))
       .catch((error: unknown) =>
         setProfileError(administrationErrorMessage(error)),
       )
@@ -1341,7 +1355,17 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
   function trustProjectForAccessRequest(request: BrowserAccessRequest) {
     const hostId = status?.hostId;
     if (hostId === null || hostId === undefined) return;
-    setAccessDecision(request.requestId);
+    // Every site this project was waiting on is covered by the broader grant,
+    // so every one of those questions is withdrawn — "stop asking me" means
+    // all of them, not the one that happened to be on top.
+    const answered = grantRequests
+      .filter(
+        (pending) =>
+          pending.status === "pending" &&
+          pending.projectId === request.projectId,
+      )
+      .map((pending) => pending.requestId);
+    setAccessDecision(request.origin);
     setProfileError(null);
     void rpc
       .call("browser_grant_create", {
@@ -1356,11 +1380,13 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
         persistenceConfirmation: PERSIST_BROWSER_ELEVATED_ACCESS_CONFIRMATION,
       })
       .then(() =>
-        rpc.call("browser_grant_request_revoke", {
-          requestId: request.requestId,
-        }),
+        Promise.all(
+          answered.map((requestId) =>
+            rpc.call("browser_grant_request_revoke", { requestId }),
+          ),
+        ),
       )
-      .then(() => forgetAccessRequest(request.requestId))
+      .then(() => forgetAccessRequests(answered))
       .catch((error: unknown) =>
         setProfileError(administrationErrorMessage(error)),
       )
