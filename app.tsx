@@ -723,6 +723,100 @@ function streamStateMessage(
 }
 
 /**
+ * A panel edge is dragged continuously, and every intermediate size would
+ * otherwise re-lay-out the live page. A quarter second is long enough that a
+ * drag reports once when it settles, and short enough that the page has
+ * re-flowed by the time the owner lets go.
+ */
+const VIEWPORT_REPORT_DEBOUNCE_MS = 250;
+
+/**
+ * Report the panel's own pixel size as the shared viewport it drives while it
+ * holds control. The capture then matches what is displayed, instead of the
+ * host encoding a full-HD frame that the panel downscales into a thumbnail.
+ * The host clamps the request to the streaming ceiling (ADR 0007) and applies
+ * a spectator's size only to its own letterbox (ADR 0005), so this reports
+ * from every panel and lets the shared session decide what it means.
+ */
+function usePanelViewportReport({
+  status,
+  panelId,
+  surface,
+  onControlState,
+}: {
+  status: BrowserStatus | null;
+  panelId: string;
+  surface: React.RefObject<HTMLElement | null>;
+  onControlState: (response: BrowserPanelControlResponse) => void;
+}) {
+  const rpc = useRpc<typeof rpcContract>();
+  const bbContext = useBbContext();
+  const ownerSessionId = ownerSessionIdFromContext(bbContext);
+  const hostId = status?.hostId ?? null;
+  const profileId = status?.profileId;
+
+  useEffect(() => {
+    const element = surface.current;
+    if (
+      element === null ||
+      hostId === null ||
+      profileId === undefined ||
+      // A displaying client without ResizeObserver — or a test environment
+      // with no layout at all — keeps the host's default viewport rather than
+      // reporting a size nothing measured.
+      typeof ResizeObserver !== "function"
+    ) {
+      return;
+    }
+    const reportedHostId = hostId;
+    const reportedProfileId = profileId;
+    let disposed = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let reported: { width: number; height: number } | null = null;
+
+    function report(width: number, height: number) {
+      if (disposed || width < 1 || height < 1) return;
+      if (reported?.width === width && reported.height === height) return;
+      reported = { width, height };
+      void rpc
+        .call("browser_panel_control", {
+          hostId: reportedHostId,
+          profileId: reportedProfileId,
+          panelId,
+          ownerSessionId,
+          viewport: { width, height },
+        })
+        .then((response) => {
+          if (!disposed) onControlState(response);
+        })
+        .catch(() => {
+          // A viewport report is advisory: the shared session keeps its last
+          // size, and the next resize reports again.
+          reported = null;
+        });
+    }
+
+    const observer = new ResizeObserver((entries) => {
+      const box = entries[entries.length - 1]?.contentRect;
+      if (box === undefined) return;
+      const width = Math.round(box.width);
+      const height = Math.round(box.height);
+      if (timer !== null) clearTimeout(timer);
+      timer = setTimeout(() => {
+        timer = null;
+        report(width, height);
+      }, VIEWPORT_REPORT_DEBOUNCE_MS);
+    });
+    observer.observe(element);
+    return () => {
+      disposed = true;
+      if (timer !== null) clearTimeout(timer);
+      observer.disconnect();
+    };
+  }, [rpc, surface, hostId, profileId, panelId, ownerSessionId, status?.state]);
+}
+
+/**
  * Join the shared control session for this profile and expose the transfers
  * the owner can make (issue #16, ADR 0012). Every Browser Panel for one
  * profile observes one coordinated state: a controller and view-only
@@ -871,6 +965,9 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
   const [statusHint, setStatusHint] = useState<string | null>(null);
   const [panelId] = useState(() => `browser-panel-${nextBrowserPanelId++}`);
   const reducedMotion = usePrefersReducedMotion();
+  // The page surface is measured, not guessed: its size is the viewport this
+  // panel asks the host to capture while it holds control.
+  const pageSurfaceRef = useRef<HTMLDivElement | null>(null);
   // Shared control state lifted so the stream's live control broadcasts keep
   // the toolbar and tab strip current without re-fetching (ADR 0012).
   const [control, setControl] = useState<BrowserPanelControlResponse | null>(
@@ -911,6 +1008,12 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
     panelId,
     control,
     setControl: applyControlState,
+  });
+  usePanelViewportReport({
+    status,
+    panelId,
+    surface: pageSurfaceRef,
+    onControlState: applyControlState,
   });
 
   useEffect(() => {
@@ -1251,7 +1354,7 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
           {profileError}
         </p>
       )}
-      <div className="relative min-h-0 flex-1">
+      <div ref={pageSurfaceRef} className="relative min-h-0 flex-1">
         <PanelStreamSurface
           status={status}
           panelId={panelId}

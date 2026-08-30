@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
-import { fireEvent, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, waitFor, within } from "@testing-library/react";
+import type { RenderedSlot } from "@get-bb/plugin-sdk/testing/app";
 import { describe, expect, it } from "vitest";
 import { browserStatusSchema } from "../contracts.js";
 import {
@@ -7,6 +8,47 @@ import {
   createTabInventoryRuntime,
   healthyBrowserStatus,
 } from "./public-plugin-harness.js";
+
+/**
+ * jsdom lays nothing out and has no ResizeObserver, so the panel's own size is
+ * driven here instead of measured. The stub reports what a real observer would
+ * report when the owner drags a panel edge.
+ */
+function installResizeObserverStub() {
+  const callbacks: ResizeObserverCallback[] = [];
+  const original = (globalThis as { ResizeObserver?: unknown }).ResizeObserver;
+  class StubResizeObserver implements ResizeObserver {
+    constructor(callback: ResizeObserverCallback) {
+      callbacks.push(callback);
+    }
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  }
+  (globalThis as { ResizeObserver?: unknown }).ResizeObserver =
+    StubResizeObserver;
+  return {
+    resizeTo(size: { width: number; height: number }) {
+      for (const callback of callbacks) {
+        callback(
+          [{ contentRect: size } as ResizeObserverEntry],
+          {} as ResizeObserver,
+        );
+      }
+    },
+    restore() {
+      (globalThis as { ResizeObserver?: unknown }).ResizeObserver = original;
+    },
+  };
+}
+
+/** Every viewport this panel asked the shared session to capture at. */
+function reportedViewports(panel: RenderedSlot) {
+  return panel.inspection.rpcCalls
+    .filter((call) => call.method === "browser_panel_control")
+    .map((call) => (call.input as { viewport?: unknown }).viewport)
+    .filter((viewport) => viewport !== undefined);
+}
 
 /**
  * The Browser Panel the owner actually sees (issue #50), asserted through the
@@ -206,6 +248,32 @@ describe("Browser Panel", () => {
       await waitFor(() => expect(runtime.pinnedPanelIds).toHaveLength(1));
     } finally {
       await browser.dispose();
+    }
+  });
+
+  it("asks the host to capture at the panel's own size, once a resize settles", async () => {
+    const resizes = installResizeObserverStub();
+    const browser = await createPublicPluginHarness({
+      status: healthyBrowserStatus,
+    });
+    try {
+      const panel = browser.renderPanel();
+      await panel.findByLabelText("Address or search");
+
+      // Dragging a panel edge produces a stream of sizes; only the size the
+      // owner let go at reaches the live page.
+      act(() => {
+        resizes.resizeTo({ width: 900.4, height: 600.6 });
+        resizes.resizeTo({ width: 1024, height: 768 });
+      });
+      await waitFor(() => expect(reportedViewports(panel)).toHaveLength(1));
+      expect(reportedViewports(panel)[0]).toEqual({
+        width: 1024,
+        height: 768,
+      });
+    } finally {
+      await browser.dispose();
+      resizes.restore();
     }
   });
 

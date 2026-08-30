@@ -1679,6 +1679,13 @@ export function createBrowserHostEntry(
           request.ownerSessionId,
           request.viewport,
         );
+        // A panel reports its size every time it changes, not only when it
+        // first joins, so the capture tracks the size the owner is actually
+        // looking at. Only the controller's size drives page layout; a
+        // spectator's only letterboxes its own view (ADR 0005/0007).
+        if (request.viewport !== undefined) {
+          session.setViewport(request.panelId, request.viewport);
+        }
         return toControlResponse(target, role);
       },
       takeControl: async (request, context) => {
