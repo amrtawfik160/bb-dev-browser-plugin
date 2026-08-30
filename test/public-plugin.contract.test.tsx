@@ -1412,8 +1412,16 @@ describe("Browser public plugin contract", () => {
       expect(failure.error.message).not.toContain("secret denied script");
 
       const panel = await browser.openExistingThreadPanel();
-      await panel.panel.findByText(requestId);
-      await panel.panel.findByText(/explicitly retry.*current page state/i);
+      // The panel asks about the site, not about an identifier, and says the
+      // agent will not carry on by itself (ADR 0014).
+      const question = await panel.panel.findByRole("region", {
+        name: "Site access requests",
+      });
+      expect(question.textContent).toContain(
+        "https://expired-request.example.test",
+      );
+      expect(question.textContent).toMatch(/has to try again/iu);
+      expect(panel.panel.container.textContent).not.toContain(requestId);
 
       vi.setSystemTime(new Date("2026-08-28T00:16:00.000Z"));
       const settings = browser.renderSettings();
@@ -1425,8 +1433,15 @@ describe("Browser public plugin contract", () => {
       const list = await settings.findByRole("list", {
         name: "Browser Grant Request list",
       });
+      // The full history, identifiers and all, stays in Settings.
       expect(list.textContent).toMatch(
         new RegExp(`${requestId}.*expired`, "i"),
+      );
+      // An expired question is not a question any more, so the panel drops it.
+      await waitFor(() =>
+        expect(panel.panel.container.textContent).not.toMatch(
+          /expired-request\.example\.test/u,
+        ),
       );
     } finally {
       await browser.dispose();
@@ -1451,7 +1466,12 @@ describe("Browser public plugin contract", () => {
         JSON.parse(denied.content[0]!.text),
       ).error.grantRequest!.requestId;
       const panel = await browser.openExistingThreadPanel();
-      await panel.panel.findByText(requestId);
+      const question = await panel.panel.findByRole("region", {
+        name: "Site access requests",
+      });
+      expect(question.textContent).toContain(
+        "https://live-request.example.test",
+      );
 
       await browser.decideBrowserGrantRequest({
         requestId,
@@ -1459,13 +1479,12 @@ describe("Browser public plugin contract", () => {
       });
       window.dispatchEvent(new Event("focus"));
 
-      const notices = await panel.panel.findByRole("region", {
-        name: "Browser Grant Request notices",
-      });
+      // A decision made elsewhere answers the question here too, so the panel
+      // stops asking it.
       await waitFor(() =>
-        expect(notices.textContent).toMatch(
-          new RegExp(`${requestId}.*approved`, "i"),
-        ),
+        expect(
+          panel.panel.queryByRole("region", { name: "Site access requests" }),
+        ).toBeNull(),
       );
     } finally {
       await browser.dispose();
@@ -1512,27 +1531,25 @@ describe("Browser public plugin contract", () => {
       window.dispatchEvent(new Event("focus"));
       await secondStarted.promise;
 
+      // The newer answer says the question was decided elsewhere, so the panel
+      // stops asking it.
       await act(async () => {
         secondResponse.resolve(snapshots[1]!);
         await secondResponse.promise;
       });
-      const notices = await panel.panel.findByRole("region", {
-        name: "Browser Grant Request notices",
-      });
-      expect(notices.textContent).toMatch(
-        new RegExp(`${requestId}.*approved`, "i"),
-      );
+      expect(
+        panel.panel.queryByRole("region", { name: "Site access requests" }),
+      ).toBeNull();
 
+      // The older answer, which still says pending, must not put the question
+      // back on screen when it finally lands.
       await act(async () => {
         firstResponse.resolve(snapshots[0]!);
         await firstResponse.promise;
       });
-      expect(notices.textContent).toMatch(
-        new RegExp(`${requestId}.*approved`, "i"),
-      );
-      expect(notices.textContent).not.toMatch(
-        new RegExp(`${requestId}.*pending`, "i"),
-      );
+      expect(
+        panel.panel.queryByRole("region", { name: "Site access requests" }),
+      ).toBeNull();
     } finally {
       await browser.dispose();
     }

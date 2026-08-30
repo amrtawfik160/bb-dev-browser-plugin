@@ -11,6 +11,8 @@ import type {
   PluginThreadPanelProps,
 } from "@get-bb/plugin-sdk/app";
 import {
+  BROWSER_PANEL_ACCENT_CONTRAST,
+  BROWSER_WHOLE_WEB_ORIGIN_SCOPE,
   CLEAR_ACTIVITY_CONFIRMATION,
   DEFAULT_PROFILE_ID,
   PERSIST_BROWSER_ELEVATED_ACCESS_CONFIRMATION,
@@ -52,11 +54,13 @@ import {
   usePrefersReducedMotion,
 } from "./panel-chrome.js";
 import {
+  BrowserAccessRequestNotices,
   BrowserBlockedSurface,
   BrowserNewTabSurface,
   BrowserTabStripView,
   BrowserToolbar,
   browserStateReplacesPage,
+  type BrowserAccessRequest,
   type BrowserPanelOption,
 } from "./panel-browser.js";
 import { ownerSessionIdFromContext } from "./panel-owner-session.js";
@@ -179,35 +183,27 @@ function PanelProfilePicker({
   );
 }
 
-function PanelGrantRequestNotices({
-  requests,
-}: {
-  requests: readonly BrowserGrantRequest[];
-}) {
-  if (requests.length === 0) return null;
-  return (
-    <section
-      aria-label="Browser Grant Request notices"
-      className="mt-6 border-t pt-5 text-left"
-    >
-      <h3 className="font-semibold">Browser Grant Requests</h3>
-      <ul className="mt-3 space-y-3">
-        {requests.map((request) => (
-          <li key={request.requestId} className="text-sm">
-            <p>
-              Browser Grant Request <code>{request.requestId}</code>{" "}
-              <strong>{request.status}</strong>
-            </p>
-            <p className="mt-1 text-xs text-muted-foreground">
-              The denied script will not resume automatically. After an owner
-              decision, the agent must explicitly retry against current page
-              state.
-            </p>
-          </li>
-        ))}
-      </ul>
-    </section>
-  );
+/**
+ * The pending site-access questions this panel can answer. A request that
+ * expired, was decided, or was consumed is not a question any more, so it
+ * leaves the panel; the full history stays in Browser Settings.
+ */
+function pendingAccessRequests(
+  requests: readonly BrowserGrantRequest[],
+): BrowserAccessRequest[] {
+  return requests
+    .filter((request) => request.status === "pending")
+    .map((request) => ({
+      requestId: request.requestId,
+      projectId: request.projectId,
+      origin: request.origin,
+      elevations: [
+        request.requestedElevations.fileTransfer ? "file transfer" : null,
+        request.requestedElevations.invalidCertificate
+          ? "an invalid certificate"
+          : null,
+      ].filter((elevation): elevation is string => elevation !== null),
+    }));
 }
 
 /**
@@ -239,7 +235,9 @@ function PanelStreamSurface({
   status,
   panelId,
   isController,
+  agentDriven,
   onControlState,
+  onLiveChange,
 }: {
   status: BrowserStatus;
   panelId: string;
@@ -250,10 +248,22 @@ function PanelStreamSurface({
    */
   isController: boolean;
   /**
+   * Whether an agent is holding control right now. The owner's authenticated
+   * session being driven by something that is not them is the one piece of
+   * internal state that earns permanent screen space, so the page carries a
+   * border for exactly as long as that is true (ADR 0014).
+   */
+  agentDriven: boolean;
+  /**
    * Live control-state updates pushed from the host over the stream so every
    * panel observes control transfers and tab changes without re-fetching.
    */
   onControlState?: (response: BrowserPanelControlResponse) => void;
+  /**
+   * Whether this stream is currently the live channel for those updates. When
+   * it is not, the panel has to ask for control state instead of being told.
+   */
+  onLiveChange?: (live: boolean) => void;
 }) {
   const rpc = useRpc<typeof rpcContract>();
   const bbContext = useBbContext();
@@ -264,6 +274,10 @@ function PanelStreamSurface({
     "connecting" | "streaming" | "reconnecting" | "offline"
   >("connecting");
   const [streamError, setStreamError] = useState<string | null>(null);
+  // Whether the host is actually pushing over this stream. The capability being
+  // issued is not the same thing: it authorizes a connection that may not be
+  // open, and control transfers only arrive once one is.
+  const [livePush, setLivePush] = useState(false);
   const [controllerViewport, setControllerViewport] = useState<{
     width: number;
     height: number;
@@ -448,6 +462,7 @@ function PanelStreamSurface({
         if (message.type === "ready") {
           if (stream.state === "reconnecting") stream.reconnectSucceeded();
           setStreamState("streaming");
+          setLivePush(true);
           return;
         }
         if (message.type === "dialog") {
@@ -525,6 +540,7 @@ function PanelStreamSurface({
       socket.addEventListener("close", () => {
         socket = null;
         socketRef.current = null;
+        setLivePush(false);
         if (disposed) return;
         // Input freezes immediately on disconnect; reconnect uses bounded
         // backoff driven by the stream adapter.
@@ -546,6 +562,7 @@ function PanelStreamSurface({
 
     return () => {
       disposed = true;
+      setLivePush(false);
       clearReconnect();
       stream.release();
       streamRef.current = null;
@@ -641,6 +658,10 @@ function PanelStreamSurface({
     }
   }
 
+  useEffect(() => {
+    onLiveChange?.(livePush);
+  }, [livePush, onLiveChange]);
+
   // The page fills the panel. What used to sit around it — the streaming
   // policy and the version-one screen-reader limitation — is still announced,
   // but only to assistive technology: it is a disclosure the owner needs once,
@@ -650,6 +671,11 @@ function PanelStreamSurface({
     <section
       aria-label="Browser page"
       className="relative h-full min-h-0 w-full"
+      style={
+        agentDriven
+          ? { boxShadow: `inset 0 0 0 3px ${BROWSER_PANEL_ACCENT_CONTRAST}` }
+          : undefined
+      }
     >
       <p className="sr-only">
         This browser streams the page as pixels between 5 and 15 frames per
@@ -723,6 +749,13 @@ function streamStateMessage(
   if (streamState === "streaming") return "The page is live.";
   return "This browser is not connected.";
 }
+
+/**
+ * How often a panel with no live stream re-reads the shared control state. An
+ * agent taking control, and giving it back, has to show up quickly enough that
+ * the owner never mistakes agent-driven navigation for their own.
+ */
+const CONTROL_REFRESH_INTERVAL_MS = 1_000;
 
 /**
  * A panel edge is dragged continuously, and every intermediate size would
@@ -832,11 +865,19 @@ function usePanelControlSession({
   panelId,
   control,
   setControl,
+  streamIsLive,
 }: {
   status: BrowserStatus | null;
   panelId: string;
   control: BrowserPanelControlResponse | null;
   setControl: (response: BrowserPanelControlResponse | null) => void;
+  /**
+   * Whether the stream is pushing control state to this panel. When it is not,
+   * the panel asks instead: an agent taking or giving back control has to be
+   * visible here, or the border and purpose would describe a session that
+   * ended.
+   */
+  streamIsLive: boolean;
 }) {
   const rpc = useRpc<typeof rpcContract>();
   const bbContext = useBbContext();
@@ -854,23 +895,40 @@ function usePanelControlSession({
       return;
     }
     let disposed = false;
-    void rpc
-      .call("browser_panel_control", {
-        hostId,
-        profileId: status.profileId,
-        panelId,
-        ownerSessionId,
-      })
-      .then((response) => {
-        if (!disposed) setControl(response);
-      })
-      .catch(() => {
-        if (!disposed) setControl(null);
-      });
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const join = () => {
+      void rpc
+        .call("browser_panel_control", {
+          hostId,
+          profileId: status.profileId,
+          panelId,
+          ownerSessionId,
+        })
+        .then((response) => {
+          if (!disposed) setControl(response);
+        })
+        .catch(() => {
+          if (!disposed) setControl(null);
+        })
+        .finally(() => {
+          if (disposed || streamIsLive) return;
+          timer = setTimeout(join, CONTROL_REFRESH_INTERVAL_MS);
+        });
+    };
+    join();
     return () => {
       disposed = true;
+      if (timer !== null) clearTimeout(timer);
     };
-  }, [rpc, status?.state, hostId, profileId, panelId, ownerSessionId]);
+  }, [
+    rpc,
+    status?.state,
+    hostId,
+    profileId,
+    panelId,
+    ownerSessionId,
+    streamIsLive,
+  ]);
 
   async function transfer(take: boolean) {
     if (hostId === null || profileId === undefined) return;
@@ -965,6 +1023,12 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
     null,
   );
   const [showStatusDetail, setShowStatusDetail] = useState(false);
+  // The request a decision is in flight for, so a second click cannot answer
+  // the same question twice.
+  const [accessDecision, setAccessDecision] = useState<string | null>(null);
+  // Whether the stream is pushing control state to this panel, or the panel has
+  // to ask for it.
+  const [streamIsLive, setStreamIsLive] = useState(false);
   const [panelId] = useState(() => `browser-panel-${nextBrowserPanelId++}`);
   const reducedMotion = usePrefersReducedMotion();
   // The page surface is measured, not guessed: its size is the viewport this
@@ -1010,6 +1074,7 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
     panelId,
     control,
     setControl: applyControlState,
+    streamIsLive,
   });
   usePanelViewportReport({
     status,
@@ -1215,6 +1280,92 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
   }
 
   /**
+   * A decided request is not a question any more, so it leaves the panel at
+   * once rather than at the next refresh.
+   */
+  function forgetAccessRequest(requestId: string) {
+    setGrantRequests((current) =>
+      current.filter((request) => request.requestId !== requestId),
+    );
+  }
+
+  /**
+   * Answer a site-access question. Allowing a plain origin grants this project
+   * that one site for good — the same decision `bb browser approve` makes —
+   * while a request that also asks for an extra permission is allowed for an
+   * hour, because persisting an elevated permission takes the second, typed
+   * confirmation that lives in Browser Settings.
+   */
+  function decideAccessRequest(
+    request: BrowserAccessRequest,
+    decision: "deny" | "allow",
+  ) {
+    const persist = decision === "allow" && request.elevations.length === 0;
+    setAccessDecision(request.requestId);
+    setProfileError(null);
+    void rpc
+      .call("browser_grant_request_decide", {
+        requestId: request.requestId,
+        decision:
+          decision === "deny" ? "deny" : persist ? "persist" : "one-hour",
+        ...(persist
+          ? {
+              persistenceConfirmation:
+                PERSIST_BROWSER_ELEVATED_ACCESS_CONFIRMATION,
+            }
+          : {}),
+      })
+      .then(() => forgetAccessRequest(request.requestId))
+      .catch((error: unknown) =>
+        setProfileError(administrationErrorMessage(error)),
+      )
+      .finally(() => setAccessDecision(null));
+  }
+
+  function allowAccessRequest(request: BrowserAccessRequest) {
+    decideAccessRequest(request, "allow");
+  }
+
+  function denyAccessRequest(request: BrowserAccessRequest) {
+    decideAccessRequest(request, "deny");
+  }
+
+  /**
+   * Stop being asked: give this project the whole web on this profile, which
+   * is exactly what `bb browser trust` does. The narrow request that prompted
+   * it is then withdrawn rather than left pending, because a broader grant has
+   * already answered it and the panel would otherwise keep asking.
+   */
+  function trustProjectForAccessRequest(request: BrowserAccessRequest) {
+    const hostId = status?.hostId;
+    if (hostId === null || hostId === undefined) return;
+    setAccessDecision(request.requestId);
+    setProfileError(null);
+    void rpc
+      .call("browser_grant_create", {
+        projectId: request.projectId,
+        hostId,
+        profileId: status?.profileId ?? DEFAULT_PROFILE_ID,
+        originScope: BROWSER_WHOLE_WEB_ORIGIN_SCOPE,
+        wholeWeb: true,
+        fileTransfer: false,
+        invalidCertificateOrigins: [],
+        persistentElevations: true,
+        persistenceConfirmation: PERSIST_BROWSER_ELEVATED_ACCESS_CONFIRMATION,
+      })
+      .then(() =>
+        rpc.call("browser_grant_request_revoke", {
+          requestId: request.requestId,
+        }),
+      )
+      .then(() => forgetAccessRequest(request.requestId))
+      .catch((error: unknown) =>
+        setProfileError(administrationErrorMessage(error)),
+      )
+      .finally(() => setAccessDecision(null));
+  }
+
+  /**
    * Drive the shared tab strip. The answer is the whole strip because the tabs
    * belong to the browser rather than to this panel, so a tab opened here is a
    * tab every panel on this browser now has.
@@ -1312,7 +1463,13 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
         {status.state === "safe-login-elsewhere" ? (
           <SafeLoginLimitationsNotice />
         ) : null}
-        <PanelGrantRequestNotices requests={grantRequests} />
+        <BrowserAccessRequestNotices
+          requests={pendingAccessRequests(grantRequests)}
+          pendingRequestId={accessDecision}
+          onAllow={allowAccessRequest}
+          onDeny={denyAccessRequest}
+          onTrustProject={trustProjectForAccessRequest}
+        />
         {profileError === null ? null : <p role="alert">{profileError}</p>}
       </BrowserBlockedSurface>
     );
@@ -1346,7 +1503,13 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
         onClose={(tabId) => driveTabs("close", tabId)}
         onOpen={() => driveTabs("open")}
       />
-      <PanelGrantRequestNotices requests={grantRequests} />
+      <BrowserAccessRequestNotices
+        requests={pendingAccessRequests(grantRequests)}
+        pendingRequestId={accessDecision}
+        onAllow={allowAccessRequest}
+        onDeny={denyAccessRequest}
+        onTrustProject={trustProjectForAccessRequest}
+      />
       {profileError === null ? null : (
         <p role="alert" className="px-2 py-1 text-xs">
           {profileError}
@@ -1357,7 +1520,9 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
           status={status}
           panelId={panelId}
           isController={controlSession.isController}
+          agentDriven={controlSession.agentPurpose !== null}
           onControlState={applyControlState}
+          onLiveChange={setStreamIsLive}
         />
         {showsNewTabSurface ? (
           <div className="absolute inset-0">

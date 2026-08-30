@@ -438,6 +438,105 @@ export function BrowserToolbar({
   );
 }
 
+/**
+ * One site an agent was denied and is waiting on. The identifier the request
+ * is stored under is carried so a decision can name it, and is never rendered:
+ * the owner decides about a site, not about a UUID (ADR 0014).
+ */
+export type BrowserAccessRequest = {
+  requestId: string;
+  /** The BB project whose agents were denied; named in a decision, not shown. */
+  projectId: string;
+  origin: string;
+  /** Extra permissions asked for alongside ordinary browsing, if any. */
+  elevations: readonly string[];
+};
+
+/**
+ * A denied site, presented as the question the owner can answer. Approving
+ * this one site is the primary action because it is the narrow one; trusting
+ * the whole project is available for an owner tired of being asked, and is the
+ * same unlock `bb browser trust` performs.
+ */
+export function BrowserAccessRequestNotices({
+  requests,
+  pendingRequestId,
+  onAllow,
+  onDeny,
+  onTrustProject,
+}: {
+  requests: readonly BrowserAccessRequest[];
+  pendingRequestId: string | null;
+  onAllow: (request: BrowserAccessRequest) => void;
+  onDeny: (request: BrowserAccessRequest) => void;
+  onTrustProject: (request: BrowserAccessRequest) => void;
+}) {
+  if (requests.length === 0) return null;
+  return (
+    <section
+      aria-label="Site access requests"
+      className="border-b px-2 py-2 text-left"
+    >
+      <ul className="space-y-2">
+        {requests.map((request) => {
+          // Persistent access to an extra permission takes a second,
+          // deliberate confirmation, which lives in Browser Settings. Here the
+          // owner can still unblock the agent, for an hour.
+          const elevated = request.elevations.length > 0;
+          const allowLabel = elevated
+            ? `Allow ${request.origin} for an hour`
+            : `Allow ${request.origin}`;
+          return (
+            <li key={request.requestId} className="text-sm">
+              <p>
+                Let agents in this project use{" "}
+                <strong className="break-all">{request.origin}</strong>?
+                {elevated
+                  ? ` They also asked for ${request.elevations.join(" and ")}.`
+                  : ""}
+              </p>
+              <div className="mt-2 flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  className="rounded px-3 py-1 text-xs"
+                  style={{
+                    backgroundColor: BROWSER_PANEL_ACCENT_CONTRAST,
+                    color: "white",
+                  }}
+                  disabled={pendingRequestId !== null}
+                  onClick={() => onAllow(request)}
+                >
+                  {allowLabel}
+                </button>
+                <button
+                  type="button"
+                  className="rounded border px-3 py-1 text-xs"
+                  disabled={pendingRequestId !== null}
+                  onClick={() => onDeny(request)}
+                >
+                  {`Deny ${request.origin}`}
+                </button>
+                <button
+                  type="button"
+                  className="rounded px-2 py-1 text-xs underline"
+                  disabled={pendingRequestId !== null}
+                  onClick={() => onTrustProject(request)}
+                >
+                  Allow every site for this project
+                </button>
+              </div>
+              <p className="mt-1 text-xs text-muted-foreground">
+                Whatever you choose, the agent does not carry on by itself: it
+                has to try again.
+              </p>
+            </li>
+          );
+        })}
+      </ul>
+    </section>
+  );
+}
+
 function browserTabLabel(tab: BrowserTab) {
   if (tab.title !== "") return tab.title;
   return tab.url === "" || tab.url === "about:blank" ? "New tab" : tab.url;

@@ -1,6 +1,7 @@
 import type { PluginCliContext, PluginCliResult } from "@get-bb/plugin-sdk";
 import type { BrowserService } from "./browser-service.js";
 import {
+  BROWSER_WHOLE_WEB_ORIGIN_SCOPE,
   PERSIST_BROWSER_ELEVATED_ACCESS_CONFIRMATION,
   normalizeBrowserOriginScope,
   type BrowserGrantRequestDecisionResponse,
@@ -22,7 +23,7 @@ import {
  * so grants stay recorded as Activity Records and remain revocable.
  */
 
-export const WHOLE_WEB_SCOPE = "*";
+export const WHOLE_WEB_SCOPE = BROWSER_WHOLE_WEB_ORIGIN_SCOPE;
 
 export type GrantCliCommand =
   "trust" | "untrust" | "grants" | "grant" | "revoke" | "approve" | "deny";

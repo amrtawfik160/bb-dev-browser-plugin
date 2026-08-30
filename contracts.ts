@@ -770,6 +770,12 @@ export const browserGrantRequestDecisionSchema = z.enum([
   "one-hour",
   "persist",
 ]);
+/**
+ * The Origin Scope that matches every site. A Profile Grant carrying it is a
+ * whole-web grant: the project's agents may drive this profile anywhere.
+ */
+export const BROWSER_WHOLE_WEB_ORIGIN_SCOPE = "*";
+
 export const browserGrantRequestStatusSchema = z.enum([
   "pending",
   "denied",

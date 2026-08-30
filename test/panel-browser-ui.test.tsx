@@ -2,7 +2,7 @@
 import { act, fireEvent, waitFor, within } from "@testing-library/react";
 import type { RenderedSlot } from "@get-bb/plugin-sdk/testing/app";
 import { describe, expect, it } from "vitest";
-import { browserStatusSchema } from "../contracts.js";
+import { browserStatusSchema, DEFAULT_PROFILE_ID } from "../contracts.js";
 import {
   createPublicPluginHarness,
   createTabInventoryRuntime,
@@ -334,7 +334,9 @@ describe("Browser Panel", () => {
         resizes.resizeTo({ width: 900.4, height: 600.6 });
         resizes.resizeTo({ width: 1024, height: 768 });
       });
-      await waitFor(() => expect(reportedViewports(panel)).toHaveLength(1));
+      await waitFor(() => expect(reportedViewports(panel)).toHaveLength(1), {
+        timeout: 5_000,
+      });
       expect(reportedViewports(panel)[0]).toEqual({
         width: 1024,
         height: 768,
@@ -342,6 +344,181 @@ describe("Browser Panel", () => {
     } finally {
       await browser.dispose();
       resizes.restore();
+    }
+  });
+
+  it("shows no other clients when the owner browses alone, and counts them when they arrive", async () => {
+    const browser = await createPublicPluginHarness({
+      status: healthyBrowserStatus,
+    });
+    try {
+      const panel = browser.renderPanel();
+      await panel.findByLabelText("Address or search");
+      // "0 spectators" is precise and tells a solitary owner nothing.
+      expect(panel.container.textContent).not.toMatch(/watching/iu);
+
+      browser.renderPanel();
+      await waitFor(
+        () => expect(panel.container.textContent).toMatch(/1 watching/iu),
+        { timeout: 5_000 },
+      );
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("marks the page and names the purpose while an agent drives the browser, and clears when it stops", async () => {
+    let releaseAgent!: () => void;
+    const agentFinished = new Promise<void>((resolve) => {
+      releaseAgent = resolve;
+    });
+    const browser = await createPublicPluginHarness({
+      status: healthyBrowserStatus,
+      browserRuntime: {
+        ...createTabInventoryRuntime(),
+        execute: async () => {
+          await agentFinished;
+          return "";
+        },
+      },
+    });
+    try {
+      await browser.createBrowserProfile({
+        hostId: "host-browser-test",
+        name: "Agent control target",
+      });
+      await browser.createBrowserGrant({
+        projectId: "project-browser-test",
+        hostId: "host-browser-test",
+        profileId: DEFAULT_PROFILE_ID,
+        originScope: "https://agent-control.example.test",
+        wholeWeb: false,
+        fileTransfer: false,
+        invalidCertificateOrigins: [],
+      });
+      const script = browser.runBrowserScriptWithProfile(undefined, {
+        purpose: "Book the flight",
+        destinationOrigin: "https://agent-control.example.test",
+      });
+
+      const panel = browser.renderPanel();
+      // The owner never mistakes agent-driven navigation for their own: the
+      // page is marked and the agent says what it is doing.
+      await panel.findByText(/Book the flight/u, undefined, { timeout: 5_000 });
+      const page = await panel.findByRole("region", { name: "Browser page" });
+      expect(page.getAttribute("style")).toContain("box-shadow");
+      // And the owner can take the browser back from here.
+      await panel.findByRole("button", { name: "Interrupt the agent" });
+
+      releaseAgent();
+      await script;
+      // The moment the agent gives control back, the panel stops saying it has
+      // it.
+      await waitFor(
+        () => expect(panel.queryByText(/Book the flight/u)).toBeNull(),
+        { timeout: 5_000 },
+      );
+      expect(
+        (
+          await panel.findByRole("region", { name: "Browser page" })
+        ).getAttribute("style") ?? "",
+      ).not.toContain("box-shadow");
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("asks about a denied site by name, with allowing that one site the primary answer", async () => {
+    const browser = await createPublicPluginHarness({
+      status: healthyBrowserStatus,
+      browserRuntime: createTabInventoryRuntime(),
+    });
+    try {
+      await browser.createBrowserProfile({
+        hostId: "host-browser-test",
+        name: "Denied site target",
+      });
+      const denied = await browser.runBrowserScriptWithProfile(undefined, {
+        destinationOrigin: "https://denied-site.example.test",
+      });
+      expect(denied.isError).toBe(true);
+
+      const panel = browser.renderPanel();
+      const question = await panel.findByRole("region", {
+        name: "Site access requests",
+      });
+      expect(question.textContent).toContain(
+        "https://denied-site.example.test",
+      );
+      // Nothing on screen is an identifier the owner cannot act on.
+      expect(panel.container.textContent).not.toMatch(/grant-request-/u);
+      await panel.findByRole("button", {
+        name: "Deny https://denied-site.example.test",
+      });
+      await panel.findByRole("button", {
+        name: "Allow every site for this project",
+      });
+
+      fireEvent.click(
+        panel.getByRole("button", {
+          name: "Allow https://denied-site.example.test",
+        }),
+      );
+
+      // Answering it grants this project that one site and takes the question
+      // off the panel.
+      await waitFor(() =>
+        expect(
+          panel.queryByRole("region", { name: "Site access requests" }),
+        ).toBeNull(),
+      );
+      const grants = await browser.listBrowserGrants({
+        hostId: "host-browser-test",
+        profileId: DEFAULT_PROFILE_ID,
+      });
+      expect(grants.map((grant) => grant.originScope)).toContain(
+        "https://denied-site.example.test",
+      );
+      expect(grants.every((grant) => !grant.wholeWeb)).toBe(true);
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("trusts the whole project from the panel when the owner is tired of being asked", async () => {
+    const browser = await createPublicPluginHarness({
+      status: healthyBrowserStatus,
+      browserRuntime: createTabInventoryRuntime(),
+    });
+    try {
+      await browser.createBrowserProfile({
+        hostId: "host-browser-test",
+        name: "Trust project target",
+      });
+      await browser.runBrowserScriptWithProfile(undefined, {
+        destinationOrigin: "https://trust-project.example.test",
+      });
+
+      const panel = browser.renderPanel();
+      await panel.findByRole("region", { name: "Site access requests" });
+      fireEvent.click(
+        panel.getByRole("button", {
+          name: "Allow every site for this project",
+        }),
+      );
+
+      await waitFor(() =>
+        expect(
+          panel.queryByRole("region", { name: "Site access requests" }),
+        ).toBeNull(),
+      );
+      const grants = await browser.listBrowserGrants({
+        hostId: "host-browser-test",
+        profileId: DEFAULT_PROFILE_ID,
+      });
+      expect(grants.some((grant) => grant.wholeWeb)).toBe(true);
+    } finally {
+      await browser.dispose();
     }
   });
 
