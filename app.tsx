@@ -44,6 +44,7 @@ import {
   type BrowserStatus,
   type BrowserStatusInput,
   type BrowserTabAction,
+  type BrowserTab,
   type BrowserTabStrip,
   type rpcContract,
 } from "./contracts.js";
@@ -1041,9 +1042,19 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
   const [grantRequests, setGrantRequests] = useState<BrowserGrantRequest[]>([]);
   const [profileError, setProfileError] = useState<string | null>(null);
   const [rawLocalhost, setRawLocalhost] = useState(false);
-  const [navigationLocation, setNavigationLocation] = useState<string | null>(
-    null,
-  );
+  /**
+   * Where the last navigation this panel drove ended up, remembered against
+   * the Browser Tab it happened in. The shared tab strip is the real answer —
+   * it is what an agent or another panel moved — but it arrives on the
+   * control-state poll, so this covers the gap between the owner pressing
+   * Enter and the strip catching up. Tying it to a tab is what stops it
+   * outliving the page: switching tabs or opening a new one shows that tab's
+   * address, never the last one this panel asked for.
+   */
+  const [lastNavigation, setLastNavigation] = useState<{
+    tabId: string | null;
+    url: string;
+  } | null>(null);
   const [showStatusDetail, setShowStatusDetail] = useState(false);
   // The request a decision is in flight for, so a second click cannot answer
   // the same question twice.
@@ -1273,7 +1284,10 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
         rawLocalhost,
       })
       .then((response) => {
-        setNavigationLocation(response.address.url);
+        setLastNavigation({
+          tabId: response.tabId ?? null,
+          url: response.address.url,
+        });
       })
       .catch((error: unknown) =>
         setProfileError(administrationErrorMessage(error)),
@@ -1296,7 +1310,10 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
         direction,
       })
       .then((response) => {
-        setNavigationLocation(response.address.url);
+        setLastNavigation({
+          tabId: response.tabId ?? null,
+          url: response.address.url,
+        });
       })
       .catch((error: unknown) =>
         setProfileError(administrationErrorMessage(error)),
@@ -1434,16 +1451,11 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
   const tabs = tabStrip?.tabs ?? [];
   const activeTab =
     tabs.find((tab) => tab.tabId === tabStrip?.activeTabId) ?? null;
-  // The omnibox shows where this browser is: the address this panel last
-  // navigated to, or the address of the tab the browser is on when someone
-  // else moved it.
-  const address =
-    navigationLocation ??
-    (activeTab === null || isBlankBrowserPage(activeTab.url)
-      ? ""
-      : activeTab.url);
-  const showsNewTabSurface =
-    activeTab === null || isBlankBrowserPage(activeTab.url);
+  const address = omniboxAddress(activeTab, lastNavigation);
+  // Nothing to read means nothing to show: the new-tab surface stands in for a
+  // page only while the browser has not reached one, so a navigation this
+  // panel just drove takes it down without waiting for the strip.
+  const showsNewTabSurface = address === "";
   const hostName =
     hostChoices.find((choice) => choice.hostId === status?.hostId)?.name ??
     null;
@@ -1595,6 +1607,28 @@ function hostStatusHint(status: BrowserStatus, hostName: string | null) {
  */
 function isBlankBrowserPage(url: string) {
   return url === "" || url.startsWith("about:");
+}
+
+/**
+ * What the omnibox shows. The tab the browser is on is the truth, because it
+ * is what an agent or another panel moved; the navigation this panel drove is
+ * only a stand-in for the second or so before the shared strip reports it, and
+ * it stands in for exactly the tab it happened in. Anything else and the field
+ * would keep naming a page the owner has already left.
+ */
+function omniboxAddress(
+  activeTab: BrowserTab | null,
+  lastNavigation: { tabId: string | null; url: string } | null,
+) {
+  if (activeTab !== null && !isBlankBrowserPage(activeTab.url)) {
+    return activeTab.url;
+  }
+  if (lastNavigation === null) return "";
+  const belongsToAnotherTab =
+    activeTab !== null &&
+    lastNavigation.tabId !== null &&
+    lastNavigation.tabId !== activeTab.tabId;
+  return belongsToAnotherTab ? "" : lastNavigation.url;
 }
 
 function administrationErrorMessage(error: unknown) {

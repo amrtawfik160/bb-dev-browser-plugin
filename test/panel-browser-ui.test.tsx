@@ -146,6 +146,53 @@ describe("Browser Panel", () => {
     }
   });
 
+  it("stops showing an address once the browser has moved off it", async () => {
+    const browser = await createPublicPluginHarness({
+      status: healthyBrowserStatus,
+      browserRuntime: createTabInventoryRuntime(),
+      navigationResponse: {
+        address: { kind: "address", url: "https://example.test/account" },
+        location: { url: "https://example.test/account" },
+        tabId: "tab-opened-1",
+      },
+    });
+    try {
+      await browser.createBrowserProfile({
+        hostId: "host-browser-test",
+        name: "Address tracking",
+      });
+      const panel = browser.renderPanel();
+      const strip = await panel.findByRole("list", { name: "Browser tabs" });
+      const newTab = await panel.findByRole("button", {
+        name: "Open a new tab",
+      });
+      fireEvent.click(newTab);
+      await waitFor(() =>
+        expect(within(strip).getAllByRole("listitem")).toHaveLength(1),
+      );
+
+      const address = await panel.findByLabelText("Address or search");
+      fireEvent.change(address, { target: { value: "example.test/account" } });
+      fireEvent.submit(address);
+      await waitFor(() =>
+        expect((address as HTMLInputElement).value).toBe(
+          "https://example.test/account",
+        ),
+      );
+
+      // The omnibox says where the browser is, not where this panel last sent
+      // it: a second tab is a different page, so the first tab's address must
+      // not follow the owner onto it.
+      fireEvent.click(newTab);
+      await waitFor(() =>
+        expect(within(strip).getAllByRole("listitem")).toHaveLength(2),
+      );
+      await waitFor(() => expect((address as HTMLInputElement).value).toBe(""));
+    } finally {
+      await browser.dispose();
+    }
+  });
+
   it.each([
     ["setup-required", "setup_required", "Setup required"],
     ["host-offline", "host_offline", "Host offline"],
