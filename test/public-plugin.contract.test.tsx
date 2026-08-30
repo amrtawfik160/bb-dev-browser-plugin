@@ -542,10 +542,14 @@ describe("Browser public plugin contract", () => {
       const second = (await browser.runBrowserTabAction("open")).tabs[1]!.tabId;
       expect(second).not.toBe(first);
 
-      const switched = await browser.runBrowserTabAction("activate", first);
+      const switched = await browser.runBrowserTabAction("activate", {
+        tabId: first,
+      });
       expect(switched.activeTabId).toBe(first);
 
-      const closed = await browser.runBrowserTabAction("close", first);
+      const closed = await browser.runBrowserTabAction("close", {
+        tabId: first,
+      });
       expect(closed.tabs.map((tab) => tab.tabId)).toEqual([second]);
       expect(closed.activeTabId).toBe(second);
 
@@ -566,6 +570,66 @@ describe("Browser public plugin contract", () => {
     try {
       await expect(browser.runBrowserTabAction("activate")).rejects.toThrow();
       await expect(browser.runBrowserTabAction("close")).rejects.toThrow();
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("refuses to drive the browser from a view-only panel, whatever its interface offers", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+      browserRuntime: createTabInventoryRuntime(),
+    });
+    try {
+      await browser.createBrowserProfile({
+        hostId: "host-browser-test",
+        name: "View-only target",
+      });
+      const controller = await browser.runBrowserPanelControl({
+        hostId: "host-browser-test",
+        profileId: DEFAULT_PROFILE_ID,
+        panelId: "panel-controller",
+        ownerSessionId: "session-controller",
+      });
+      const spectator = await browser.runBrowserPanelControl({
+        hostId: "host-browser-test",
+        profileId: DEFAULT_PROFILE_ID,
+        panelId: "panel-spectator",
+        ownerSessionId: "session-spectator",
+      });
+      expect(controller.role).toBe("controller");
+      expect(spectator.role).toBe("spectator");
+
+      // The guarantee is the boundary's, not the interface's: hiding the
+      // address bar is not what stops a second panel driving the browser.
+      await expect(
+        browser.runBrowserNavigation("https://example.com/spectator", {
+          panelId: "panel-spectator",
+        }),
+      ).rejects.toThrow(/view-only/iu);
+      await expect(
+        browser.runBrowserTabAction("open", { panelId: "panel-spectator" }),
+      ).rejects.toThrow(/view-only/iu);
+
+      // The panel that holds control drives it, and so does every path that is
+      // not a panel at all.
+      await expect(
+        browser.runBrowserNavigation("https://example.com/controller", {
+          panelId: "panel-controller",
+        }),
+      ).resolves.toMatchObject({
+        address: { url: "https://example.com/controller" },
+      });
+      await expect(
+        browser.runBrowserNavigation("https://example.com/cli"),
+      ).resolves.toMatchObject({
+        address: { url: "https://example.com/cli" },
+      });
+      await grantDefaultProfileOrigin(browser, "https://example.com");
+      const agent = await browser.runBrowserScriptWithProfile(undefined, {
+        destinationOrigin: "https://example.com",
+      });
+      expect(agent.isError).toBe(false);
     } finally {
       await browser.dispose();
     }

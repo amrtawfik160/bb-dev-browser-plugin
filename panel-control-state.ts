@@ -363,6 +363,23 @@ export function createPanelControlState(options: PanelControlStateOptions) {
     return client.role === "controller";
   }
 
+  /**
+   * Whether a Browser Panel may drive the shared browser: navigate it, move
+   * through its history, or change its tab set. Only the panel holding control
+   * may, so a second panel that is view-only in the interface is view-only at
+   * the boundary too, and two panels can never fight over one address bar.
+   *
+   * A panel this session has never seen is refused while another panel holds
+   * control, and allowed when nobody does: a panel whose join failed is not a
+   * reason to freeze a browser no one else is driving, and a request that
+   * carries no panel identity at all — an agent script, the CLI, an owner tool
+   * — never asks this question.
+   */
+  function canNavigate(panelId: string): boolean {
+    if (controllerPanelId !== null) return controllerPanelId === panelId;
+    return panels.get(panelId)?.role !== "spectator";
+  }
+
   function role(panelId: string): PanelRole | undefined {
     return panels.get(panelId)?.role;
   }
@@ -423,6 +440,7 @@ export function createPanelControlState(options: PanelControlStateOptions) {
     releaseControl,
     setViewport,
     canInput,
+    canNavigate,
     role,
     state,
     subscribe,

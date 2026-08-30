@@ -1246,6 +1246,7 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
         ...request,
         hostId,
         profileId,
+        panelId,
         input,
         rawLocalhost,
       })
@@ -1269,6 +1270,7 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
         ...request,
         hostId,
         profileId,
+        panelId,
         direction,
       })
       .then((response) => {
@@ -1382,6 +1384,7 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
         ...request,
         hostId,
         profileId,
+        panelId,
         action,
         ...(tabId === undefined ? {} : { tabId }),
       })

@@ -1603,7 +1603,7 @@ export async function createPublicPluginHarness(options?: {
 
   function runBrowserNavigation(
     input: string,
-    tabId?: string,
+    options?: { tabId?: string; panelId?: string },
   ): Promise<ReturnType<typeof browserNavigationResponseSchema.parse>> {
     return rpc.browser_navigate({
       surface: "thread",
@@ -1611,7 +1611,8 @@ export async function createPublicPluginHarness(options?: {
       profileId: DEFAULT_PROFILE_ID,
       hostId: configuredHostId,
       input,
-      ...(tabId === undefined ? {} : { tabId }),
+      ...(options?.tabId === undefined ? {} : { tabId: options.tabId }),
+      ...(options?.panelId === undefined ? {} : { panelId: options.panelId }),
       rawLocalhost: false,
     });
   }
@@ -1933,16 +1934,16 @@ export async function createPublicPluginHarness(options?: {
 
   function runBrowserTabAction(
     action: BrowserPanelTabActionInput["action"],
-    tabId?: string,
-    profileId = DEFAULT_PROFILE_ID,
+    options?: { tabId?: string; panelId?: string; profileId?: string },
   ) {
     return rpc.browser_tab_action({
       surface: "thread",
       threadId: THREAD_ID,
-      profileId,
+      profileId: options?.profileId ?? DEFAULT_PROFILE_ID,
       hostId: configuredHostId,
       action,
-      ...(tabId === undefined ? {} : { tabId }),
+      ...(options?.tabId === undefined ? {} : { tabId: options.tabId }),
+      ...(options?.panelId === undefined ? {} : { panelId: options.panelId }),
     });
   }
 

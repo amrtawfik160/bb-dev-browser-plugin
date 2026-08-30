@@ -1095,6 +1095,33 @@ export function createBrowserHostEntry(
     }
   }
   /**
+   * Only the Browser Panel that holds control may drive the shared browser.
+   * The interface gives a view-only panel a Take control button where its
+   * address bar would be; this is the same answer at the boundary, so a panel
+   * that says view-only cannot navigate even if its interface offered the
+   * field, and two panels can never silently fight over one address bar.
+   *
+   * A request that carries no panel identity is not a panel: agent scripts,
+   * the CLI, and owner tools reach the browser exactly as before.
+   */
+  function assertPanelMayDriveBrowser(request: {
+    hostId: string;
+    profileId: string;
+    panelId?: string;
+  }) {
+    const panelId = request.panelId;
+    if (panelId === undefined) return;
+    const session = panelControlSession({
+      hostId: request.hostId,
+      profileId: request.profileId,
+    });
+    if (session.canNavigate(panelId)) return;
+    throw new Error(
+      "This Browser Panel is view-only. Take control to drive this browser.",
+    );
+  }
+
+  /**
    * Open, switch, or close a Browser Tab for the owner. Tab state belongs to
    * the Browser Profile (ADR 0005), so the answer is the whole shared strip
    * every panel for that profile renders rather than the one tab that changed.
@@ -1633,6 +1660,7 @@ export function createBrowserHostEntry(
       },
       navigate: async (request, context) => {
         retainWorker(context);
+        assertPanelMayDriveBrowser(request);
         return navigateBrowser(
           request,
           context.experimental_paths.dataDir,
@@ -1641,6 +1669,7 @@ export function createBrowserHostEntry(
       },
       history: async (request, context) => {
         retainWorker(context);
+        assertPanelMayDriveBrowser(request);
         return historyBrowser(
           request,
           context.experimental_paths.dataDir,
@@ -1649,6 +1678,7 @@ export function createBrowserHostEntry(
       },
       tabAction: async (request, context) => {
         retainWorker(context);
+        assertPanelMayDriveBrowser(request);
         return applyTabAction(
           request,
           context.experimental_paths.dataDir,

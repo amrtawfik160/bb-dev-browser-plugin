@@ -2404,6 +2404,7 @@ export function createBrowserService(
         projectId,
         input: request.input,
         ...(request.tabId === undefined ? {} : { tabId: request.tabId }),
+        ...(request.panelId === undefined ? {} : { panelId: request.panelId }),
         rawLocalhost: request.rawLocalhost ?? false,
       },
       { hostId, signal },
@@ -2429,6 +2430,7 @@ export function createBrowserService(
         projectId,
         direction: request.direction,
         ...(request.tabId === undefined ? {} : { tabId: request.tabId }),
+        ...(request.panelId === undefined ? {} : { panelId: request.panelId }),
       },
       { hostId, signal },
     );
@@ -2459,6 +2461,7 @@ export function createBrowserService(
         projectId,
         action: request.action,
         ...(request.tabId === undefined ? {} : { tabId: request.tabId }),
+        ...(request.panelId === undefined ? {} : { panelId: request.panelId }),
       },
       { hostId, signal },
     );

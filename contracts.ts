@@ -1599,10 +1599,22 @@ export const browserStatusInputSchema = z.discriminatedUnion("surface", [
 
 export type BrowserStatusInput = z.infer<typeof browserStatusInputSchema>;
 
+/**
+ * The Browser Panel a request came from, when it came from one. The shared
+ * browser is driven by exactly one panel at a time, so a request that carries
+ * a panel identity is authorized against the control session before it reaches
+ * the browser. Agent scripts, the CLI, and owner tools carry none and are
+ * unaffected.
+ */
+const browserPanelOriginField = {
+  panelId: z.string().min(1).optional(),
+} as const;
+
 const browserNavigationFields = {
   input: z.string().min(1).max(2048),
   tabId: z.string().min(1).optional(),
   rawLocalhost: z.boolean().default(false),
+  ...browserPanelOriginField,
 } as const;
 
 export const browserPanelNavigationRequestSchema = z.discriminatedUnion(
@@ -1621,12 +1633,14 @@ export const browserNavigationRequestSchema = z
     input: z.string().min(1).max(2048),
     tabId: z.string().min(1).optional(),
     rawLocalhost: z.boolean(),
+    ...browserPanelOriginField,
   })
   .strict();
 
 const browserHistoryFields = {
   direction: z.enum(["back", "forward", "reload"]),
   tabId: z.string().min(1).optional(),
+  ...browserPanelOriginField,
 } as const;
 
 export const browserPanelHistoryRequestSchema = z.discriminatedUnion(
@@ -1644,6 +1658,7 @@ export const browserHistoryRequestSchema = z
     projectId: z.string().min(1),
     direction: z.enum(["back", "forward", "reload"]),
     tabId: z.string().min(1).optional(),
+    ...browserPanelOriginField,
   })
   .strict();
 
@@ -1660,6 +1675,7 @@ export type BrowserTabAction = z.infer<typeof browserTabActionSchema>;
 const browserTabActionFields = {
   action: browserTabActionSchema,
   tabId: z.string().min(1).optional(),
+  ...browserPanelOriginField,
 } as const;
 
 export const browserPanelTabActionRequestSchema = z.discriminatedUnion(
