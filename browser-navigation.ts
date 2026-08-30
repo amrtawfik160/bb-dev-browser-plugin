@@ -98,6 +98,35 @@ await page.evaluate(() => ${action});
 console.log(JSON.stringify({ tabId: ${JSON.stringify(tabId)}, url: page.url() }));`;
 }
 
+/**
+ * Open a tab in the running instance and report it, so the shared strip and
+ * the browser agree on the tab that now exists. The new page lands on the
+ * browser's own blank page: the panel draws its new-tab surface over a blank
+ * page rather than presenting the owner with an empty white canvas, so the
+ * script never navigates anywhere on the owner's behalf.
+ */
+export function browserTabOpenScript() {
+  return `const __bbBefore = (await browser.listPages()).map(function (entry) { return entry.id; });
+await browser.newPage();
+const __bbAfter = await browser.listPages();
+const __bbOpened = __bbAfter.filter(function (entry) { return __bbBefore.indexOf(entry.id) === -1; });
+const __bbTab = __bbOpened.length > 0 ? __bbOpened[__bbOpened.length - 1] : __bbAfter[__bbAfter.length - 1];
+if (!__bbTab) throw new Error("The Workspace Browser did not open a Browser Tab");
+console.log(JSON.stringify({ tabId: __bbTab.id, url: __bbTab.url, title: __bbTab.title }));`;
+}
+
+/**
+ * Bring a Browser Tab to the front of the instance so the tab the owner picked
+ * in the strip is the one the browser treats as current.
+ */
+export function browserTabActivateScript(tabId: string) {
+  return `const pages = await browser.listPages();
+if (!pages.some((entry) => entry.id === ${JSON.stringify(tabId)})) throw new Error("Browser Tab is invalid or belongs to a previous runtime");
+const page = await browser.getPage(${JSON.stringify(tabId)});
+await page.bringToFront();
+console.log(JSON.stringify({ tabId: ${JSON.stringify(tabId)}, url: page.url() }));`;
+}
+
 export function activeBrowserTabScript() {
   return `const pages = await browser.listPages();
 if (pages.length === 0) throw new Error("The Browser Profile has no open tabs");

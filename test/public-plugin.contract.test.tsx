@@ -101,6 +101,44 @@ async function grantDefaultProfileOrigin(
   });
 }
 
+/**
+ * A runtime that keeps a page inventory, so tab actions can be asserted
+ * against what the instance actually holds rather than against a canned
+ * answer: opening adds a page, closing removes it, and listing reports what
+ * is left.
+ */
+function tabInventoryRuntime(): BrowserInstanceRuntime {
+  const pages: {
+    id: string;
+    url: string;
+    title: string;
+    openerTabId: string | null;
+  }[] = [];
+  let opened = 0;
+  return {
+    ...publicRuntime(async () => ({})),
+    openPage: async () => {
+      opened += 1;
+      const page = {
+        id: `tab-opened-${opened}`,
+        url: "about:blank",
+        title: "",
+        openerTabId: null,
+      };
+      pages.push(page);
+      return page;
+    },
+    focusPage: async () => undefined,
+    closePages: async (_target, tabIds) => {
+      const remaining = pages.filter((page) => !tabIds.includes(page.id));
+      const closed = pages.length - remaining.length;
+      pages.splice(0, pages.length, ...remaining);
+      return closed;
+    },
+    listPages: async () => [...pages],
+  };
+}
+
 function deferred<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((fulfill) => {
@@ -134,6 +172,13 @@ function publicRuntime(
       location: { direction, tabId: target.tabId ?? "public-tab" },
       tabId: target.tabId ?? "public-tab",
     }),
+    openPage: async () => ({
+      id: "public-tab-opened",
+      url: "about:blank",
+      title: "",
+      openerTabId: null,
+    }),
+    focusPage: async () => undefined,
     closePages: async () => 0,
     listPages: async () => [],
     status: async (target) => ({
@@ -504,6 +549,56 @@ describe("Browser public plugin contract", () => {
         direction: "forward",
       });
       expect(browser.historyRequests[2]).toMatchObject({ direction: "reload" });
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("opens, switches, and closes a Browser Tab in the profile's shared strip", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+      browserRuntime: tabInventoryRuntime(),
+    });
+    try {
+      // Creating a profile initializes this host's profile storage, so the
+      // default profile the panel opens is present and active.
+      await browser.createBrowserProfile({
+        hostId: "host-browser-test",
+        name: "Tab strip target",
+      });
+      const opened = await browser.runBrowserTabAction("open");
+      // Opening a tab activates it, the way opening a tab does in a browser.
+      expect(opened.tabs).toHaveLength(1);
+      const first = opened.tabs[0]!.tabId;
+      expect(opened.activeTabId).toBe(first);
+
+      const second = (await browser.runBrowserTabAction("open")).tabs[1]!.tabId;
+      expect(second).not.toBe(first);
+
+      const switched = await browser.runBrowserTabAction("activate", first);
+      expect(switched.activeTabId).toBe(first);
+
+      const closed = await browser.runBrowserTabAction("close", first);
+      expect(closed.tabs.map((tab) => tab.tabId)).toEqual([second]);
+      expect(closed.activeTabId).toBe(second);
+
+      // The strip belongs to the profile, so a panel that asks for it later
+      // sees the same tabs rather than a per-panel set.
+      const shared = await browser.runBrowserTabs("host-browser-test");
+      expect(shared).toEqual(closed);
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("refuses to switch or close a Browser Tab without naming one", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+      browserRuntime: tabInventoryRuntime(),
+    });
+    try {
+      await expect(browser.runBrowserTabAction("activate")).rejects.toThrow();
+      await expect(browser.runBrowserTabAction("close")).rejects.toThrow();
     } finally {
       await browser.dispose();
     }

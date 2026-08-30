@@ -45,6 +45,7 @@ import {
   type BrowserScriptRuntimeError,
   type BrowserNavigationRequest,
   type BrowserHistoryRequest,
+  type BrowserTabActionRequest,
   type BrowserPanelVisibilityRequest,
   type BrowserPanelTransportRequest,
   type BrowserPanelControlResponse,
@@ -1093,6 +1094,75 @@ export function createBrowserHostEntry(
       lease.release();
     }
   }
+  /**
+   * Open, switch, or close a Browser Tab for the owner. Tab state belongs to
+   * the Browser Profile (ADR 0005), so the answer is the whole shared strip
+   * every panel for that profile renders rather than the one tab that changed.
+   *
+   * Each action holds the owner Control Lease while it runs, exactly as owner
+   * navigation does, so a tab command never races an agent script driving the
+   * same instance. The strip is updated from the action's own result rather
+   * than by re-reading the runtime inventory: a tab command must feel
+   * immediate, and navigation and script completion already reconcile the
+   * strip against real browser state.
+   */
+  async function applyTabAction(
+    request: BrowserTabActionRequest,
+    dataDir: string,
+    signal?: AbortSignal,
+  ): Promise<BrowserTabStrip> {
+    const target = { hostId: request.hostId, profileId: request.profileId };
+    const readiness = await administration(dataDir).inspect(target);
+    if (readiness.state !== "healthy") throw new Error(readiness.message);
+    const profile = await resolveActiveProfile(
+      dataDir,
+      request.hostId,
+      request.profileId,
+    );
+    const browserRuntime = runtime(dataDir);
+    if (browserRuntime === undefined) {
+      throw new Error("The Workspace Browser runtime is unavailable.");
+    }
+    const strip = browserTabStrip(target);
+    const instanceTarget = {
+      ...target,
+      locale: profile.locale,
+      timezone: profile.timezone,
+    };
+    const lease = await controlLeases.acquireOwner(
+      controlLeaseKey(target),
+      signal,
+    );
+    // A tab command is owner interaction: it ends an agent's Control Lease, so
+    // dismiss any open agent dialog rather than stranding it behind the tab
+    // the owner just moved to.
+    dismissOpenDialogsForProfile(target);
+    try {
+      const operationOptions = { signal, leaseSignal: lease.signal };
+      if (request.action === "open") {
+        const opened = await browserRuntime.openPage(
+          instanceTarget,
+          operationOptions,
+        );
+        strip.openTab(opened.url, opened.title, opened.id);
+        return strip.snapshot() as BrowserTabStrip;
+      }
+      const tabId = request.tabId;
+      if (tabId === undefined) {
+        throw new Error("Switching or closing a Browser Tab requires a tab.");
+      }
+      if (request.action === "activate") {
+        await browserRuntime.focusPage(instanceTarget, tabId, operationOptions);
+        strip.activateTab(tabId);
+        return strip.snapshot() as BrowserTabStrip;
+      }
+      strip.closeTab(tabId);
+      await browserRuntime.closePages(target, [tabId]);
+      return strip.snapshot() as BrowserTabStrip;
+    } finally {
+      lease.release();
+    }
+  }
   async function setPanelVisibility(
     request: BrowserPanelVisibilityRequest,
     dataDir: string,
@@ -1572,6 +1642,14 @@ export function createBrowserHostEntry(
       history: async (request, context) => {
         retainWorker(context);
         return historyBrowser(
+          request,
+          context.experimental_paths.dataDir,
+          context.signal,
+        );
+      },
+      tabAction: async (request, context) => {
+        retainWorker(context);
+        return applyTabAction(
           request,
           context.experimental_paths.dataDir,
           context.signal,

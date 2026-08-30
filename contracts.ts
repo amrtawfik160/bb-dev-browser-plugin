@@ -1641,6 +1641,51 @@ export const browserHistoryRequestSchema = z
   })
   .strict();
 
+/**
+ * Owner tab actions on the shared Browser Tab strip (ADR 0005). Opening,
+ * switching, and closing a tab are the three things a browser lets its owner
+ * do with a tab strip; each one changes state that belongs to the Browser
+ * Profile, so the result is the whole strip every panel for that profile then
+ * observes. `open` takes no tab, while `activate` and `close` name one.
+ */
+export const browserTabActionSchema = z.enum(["open", "activate", "close"]);
+export type BrowserTabAction = z.infer<typeof browserTabActionSchema>;
+
+const browserTabActionFields = {
+  action: browserTabActionSchema,
+  tabId: z.string().min(1).optional(),
+} as const;
+
+export const browserPanelTabActionRequestSchema = z.discriminatedUnion(
+  "surface",
+  [
+    threadSurfaceSchema.extend(browserTabActionFields).strict(),
+    newThreadSurfaceSchema.extend(browserTabActionFields).strict(),
+  ],
+);
+export type BrowserPanelTabActionInput = z.infer<
+  typeof browserPanelTabActionRequestSchema
+>;
+
+export const browserTabActionRequestSchema = z
+  .object({
+    hostId: z.string().min(1),
+    profileId: z.string().min(1),
+    projectId: z.string().min(1),
+    ...browserTabActionFields,
+  })
+  .strict()
+  .refine(
+    (request) => request.action === "open" || request.tabId !== undefined,
+    {
+      path: ["tabId"],
+      message: "Switching or closing a Browser Tab requires a tab.",
+    },
+  );
+export type BrowserTabActionRequest = z.infer<
+  typeof browserTabActionRequestSchema
+>;
+
 export const browserPanelVisibilityRequestSchema = z
   .object({
     hostId: z.string().min(1),
@@ -2898,6 +2943,10 @@ export const rpcContract = defineRpcContract({
   },
   browser_tabs: {
     input: browserTabsRequestSchema,
+    output: browserTabStripSchema,
+  },
+  browser_tab_action: {
+    input: browserPanelTabActionRequestSchema,
     output: browserTabStripSchema,
   },
   browser_panel_control: {

@@ -20,6 +20,8 @@ import {
   activeBrowserTabScript,
   browserHistoryScript,
   browserNavigationScript,
+  browserTabActivateScript,
+  browserTabOpenScript,
   projectLoopbackAddress,
   resolveBrowserAddress,
 } from "./browser-navigation.js";
@@ -919,6 +921,38 @@ function linkedOperationSignal(options: BrowserOperationOptions) {
   };
 }
 
+/**
+ * A tab command runs one short scripted step in the instance the owner is
+ * already looking at, so it is held to a shorter deadline than the 30-second
+ * script cap: opening or focusing a page either happens promptly or the
+ * instance is not answering.
+ */
+const PAGE_COMMAND_TIMEOUT_MS = 10_000;
+
+function parseOpenedPage(openedPageOutput: unknown): RuntimeBrowserPage {
+  const invalid = new Error(
+    "Automation Mode returned an invalid Browser Tab for the opened page.",
+  );
+  if (typeof openedPageOutput !== "string") throw invalid;
+  const opened = JSON.parse(openedPageOutput) as unknown;
+  if (
+    typeof opened !== "object" ||
+    opened === null ||
+    !("tabId" in opened) ||
+    typeof opened.tabId !== "string" ||
+    opened.tabId === ""
+  ) {
+    throw invalid;
+  }
+  const page = opened as { tabId: string; url?: unknown; title?: unknown };
+  return {
+    id: page.tabId,
+    url: typeof page.url === "string" ? page.url : "about:blank",
+    title: typeof page.title === "string" ? page.title : "",
+    openerTabId: null,
+  };
+}
+
 function activeTabId(activeTabOutput: unknown) {
   if (typeof activeTabOutput !== "string") {
     throw new Error("Automation Mode returned an invalid active Browser Tab.");
@@ -1776,6 +1810,70 @@ export function createBrowserInstanceRuntime(
         openerTabId:
           typeof page.openerTabId === "string" ? page.openerTabId : null,
       }));
+    },
+    /**
+     * Open a page in the running instance and report the tab it created. The
+     * page is left on the browser's own blank page: the panel draws a new-tab
+     * surface over it, so opening a tab never navigates anywhere on the
+     * owner's behalf.
+     */
+    async openPage(
+      target: BrowserInstanceTarget,
+      operationOptions: BrowserOperationOptions = {},
+    ): Promise<RuntimeBrowserPage> {
+      const held = await heldInstance(target);
+      const key = runtimeKey(target);
+      const operationSignal = linkedOperationSignal(operationOptions);
+      try {
+        const raw = assertBrowserScriptResultWithinBounds(
+          await options.launchBoundary.execute(
+            executionRequest(
+              held,
+              target.profileId,
+              browserTabOpenScript(),
+              PAGE_COMMAND_TIMEOUT_MS,
+              operationSignal.signal,
+            ),
+          ),
+        );
+        const opened = parseOpenedPage(raw);
+        // The tab the owner just opened is the one later owner navigation
+        // targets, exactly as if they had navigated in it.
+        activeTabs.set(key, opened.id);
+        noteActivity(key, held);
+        return opened;
+      } finally {
+        operationSignal.dispose();
+      }
+    },
+    /**
+     * Bring a page to the front so the tab the owner picked in the shared
+     * strip is the one the instance treats as current, and the one later
+     * owner navigation targets.
+     */
+    async focusPage(
+      target: BrowserInstanceTarget,
+      tabId: string,
+      operationOptions: BrowserOperationOptions = {},
+    ): Promise<void> {
+      const held = await heldInstance(target);
+      const key = runtimeKey(target);
+      const operationSignal = linkedOperationSignal(operationOptions);
+      try {
+        await options.launchBoundary.execute(
+          executionRequest(
+            held,
+            target.profileId,
+            browserTabActivateScript(tabId),
+            PAGE_COMMAND_TIMEOUT_MS,
+            operationSignal.signal,
+          ),
+        );
+        activeTabs.set(key, tabId);
+        noteActivity(key, held);
+      } finally {
+        operationSignal.dispose();
+      }
     },
     /**
      * Close pages in the running instance. Best-effort and lease-free, like

@@ -42,6 +42,7 @@ import {
   browserScriptRequestSchema,
   browserSetupRequestSchema,
   browserHostTargetSchema,
+  browserTabActionRequestSchema,
   browserTabStripSchema,
   browserHostConnectionRequestSchema,
   browserPurgePlanSchema,
@@ -65,6 +66,8 @@ import {
   browserProfileGrantRevokeRequestSchema,
   type BrowserPanelNavigationInput,
   type BrowserPanelHistoryInput,
+  type BrowserPanelTabActionInput,
+  type BrowserTabActionRequest,
   type BrowserPanelCapabilityResponse,
   type BrowserPanelControlResponse,
   type BrowserNavigationRequest,
@@ -683,6 +686,11 @@ export async function createPublicPluginHarness(options?: {
         }
         return host.experimental_call("history", request, { signal });
       }
+      if (method === "tabAction") {
+        const request = browserTabActionRequestSchema.parse(input);
+        tabActionRequests.push(request);
+        return host.experimental_call("tabAction", request, { signal });
+      }
       if (method === "activityOutbox") {
         return host.experimental_call(
           "activityOutbox",
@@ -845,6 +853,7 @@ export async function createPublicPluginHarness(options?: {
   let grantRequestRpcCallIndex = 0;
   const navigationRequests: BrowserNavigationRequest[] = [];
   const historyRequests: BrowserHistoryRequest[] = [];
+  const tabActionRequests: BrowserTabActionRequest[] = [];
   const panelCapabilityRequests: {
     hostId: string;
     profileId: string;
@@ -890,6 +899,10 @@ export async function createPublicPluginHarness(options?: {
     },
     browser_tabs: (input: { hostId: string; profileId: string }) =>
       backend.harness.behavior.callRpc("browser_tabs", input) as Promise<
+        ReturnType<typeof browserTabStripSchema.parse>
+      >,
+    browser_tab_action: (input: BrowserPanelTabActionInput) =>
+      backend.harness.behavior.callRpc("browser_tab_action", input) as Promise<
         ReturnType<typeof browserTabStripSchema.parse>
       >,
     browser_panel_control: (input: {
@@ -1793,6 +1806,21 @@ export async function createPublicPluginHarness(options?: {
     return rpc.browser_tabs({ hostId, profileId });
   }
 
+  function runBrowserTabAction(
+    action: BrowserPanelTabActionInput["action"],
+    tabId?: string,
+    profileId = DEFAULT_PROFILE_ID,
+  ) {
+    return rpc.browser_tab_action({
+      surface: "thread",
+      threadId: THREAD_ID,
+      profileId,
+      hostId: configuredHostId,
+      action,
+      ...(tabId === undefined ? {} : { tabId }),
+    });
+  }
+
   function runBrowserStatus(input: BrowserStatusInput) {
     return rpc.browser_status(input);
   }
@@ -2028,6 +2056,9 @@ export async function createPublicPluginHarness(options?: {
     get historyRequests() {
       return [...historyRequests];
     },
+    get tabActionRequests() {
+      return [...tabActionRequests];
+    },
     get panelCapabilityRequests() {
       return [...panelCapabilityRequests];
     },
@@ -2101,6 +2132,7 @@ export async function createPublicPluginHarness(options?: {
     runBrowserReleaseControl,
     runBrowserReclaimControl,
     runBrowserTabs,
+    runBrowserTabAction,
     runBrowserScript,
     runBrowserScriptWithProfile,
     privilegedExecutor: options?.privilegedExecutor ?? null,
