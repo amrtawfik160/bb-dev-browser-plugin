@@ -248,6 +248,39 @@ function panelKey(actionId: string, params: unknown) {
   return `${actionId}:${JSON.stringify(params)}`;
 }
 
+/**
+ * A host that passes every readiness capability, so the panel renders the
+ * browser rather than a setup surface. Shared by every suite that needs a
+ * healthy host: the readiness snapshot and this status must agree, and one
+ * definition keeps them from drifting apart.
+ */
+export const healthyBrowserStatus: BrowserStatus = {
+  hostId: HOST_ID,
+  profileId: DEFAULT_PROFILE_ID,
+  state: "healthy",
+  code: "healthy",
+  label: "Ready",
+  message: "Workspace Browser is ready on this host.",
+  capabilities: (
+    [
+      ["operating-system", "Operating system", "Ubuntu 24.04 is supported."],
+      ["architecture", "Architecture", "x86_64 is supported."],
+      ["bb-connect", "BB Connect", "The host is enrolled in BB Connect."],
+      ["browser", "Browser", "Google Chrome 140 is available."],
+      ["sandbox", "Browser sandbox", "The Chrome sandbox is available."],
+      ["dedicated-user", "Dedicated browser user", "bb-browser is configured."],
+      ["protected-storage", "Protected storage", "Storage is protected."],
+      ["disk-headroom", "Disk headroom", "At least 5 GiB is free."],
+      ["loopback", "Loopback networking", "Loopback is available."],
+    ] as const
+  ).map(([id, label, reason]) => ({
+    id: id as BrowserStatus["capabilities"][number]["id"],
+    label,
+    status: "ready" as const,
+    reason,
+  })),
+};
+
 export async function createPublicPluginHarness(options?: {
   hostId?: string;
   status?: BrowserStatus;
@@ -808,6 +841,7 @@ export async function createPublicPluginHarness(options?: {
   const threadPanels = new Map<string, RenderedSlot>();
   const newThreadPanels = new Map<string, RenderedSlot>();
   const settingsPanels: RenderedSlot[] = [];
+  const renderedPanels: RenderedSlot[] = [];
   let grantRequestRpcCallIndex = 0;
   const navigationRequests: BrowserNavigationRequest[] = [];
   const historyRequests: BrowserHistoryRequest[] = [];
@@ -1350,6 +1384,23 @@ export async function createPublicPluginHarness(options?: {
       { rpc },
     );
     settingsPanels.push(panel);
+    return panel;
+  }
+
+  /**
+   * Mount the Browser Panel the way the BB app mounts it, once per call. This
+   * is the panel counterpart to {@link renderSettings}: `openExistingThreadPanel`
+   * reuses one panel per params key the way BB reuses an open tab, while every
+   * `renderPanel` call is an independent client — which is what makes a
+   * controller and a view-only spectator observable through the assembled
+   * interface rather than through re-declared components.
+   */
+  function renderPanel(options: { surface?: "thread" | "new-thread" } = {}) {
+    const panel =
+      options.surface === "new-thread"
+        ? renderNewThreadPanel({ profileId: DEFAULT_PROFILE_ID })
+        : renderExistingPanel({ profileId: DEFAULT_PROFILE_ID });
+    renderedPanels.push(panel);
     return panel;
   }
 
@@ -1930,6 +1981,7 @@ export async function createPublicPluginHarness(options?: {
       for (const panel of threadPanels.values()) panel.lifecycle.unmount();
       for (const panel of newThreadPanels.values()) panel.lifecycle.unmount();
       for (const panel of settingsPanels) panel.lifecycle.unmount();
+      for (const panel of renderedPanels) panel.lifecycle.unmount();
       await act(async () => undefined);
       await backend.harness.lifecycle.dispose();
       await host.experimental_dispose();
@@ -1984,6 +2036,7 @@ export async function createPublicPluginHarness(options?: {
     },
     openExistingThreadPanel,
     openNewThreadPanel,
+    renderPanel,
     renderSettings,
     runBrowserStatus,
     runSettingsStatuses,

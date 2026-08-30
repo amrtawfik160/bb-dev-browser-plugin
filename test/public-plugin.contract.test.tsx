@@ -34,9 +34,11 @@ import {
   RESET_PROFILE_CONFIRMATION,
   setupRequiredStatus,
   type BrowserGrantRequest,
-  type BrowserStatus,
 } from "../contracts.js";
-import { createPublicPluginHarness } from "./public-plugin-harness.js";
+import {
+  createPublicPluginHarness,
+  healthyBrowserStatus as healthyStatus,
+} from "./public-plugin-harness.js";
 import {
   projectLoopbackAlias,
   AGENT_EXACT_ORIGIN_REQUIRED,
@@ -79,31 +81,6 @@ const preparedSnapshot: HostProbeSnapshot = {
 };
 
 const profileImportCommand = ["imp", "ort"].join("");
-
-const healthyStatus: BrowserStatus = {
-  hostId: "host-browser-test",
-  profileId: DEFAULT_PROFILE_ID,
-  state: "healthy",
-  code: "healthy",
-  label: "Ready",
-  message: "Workspace Browser is ready on this host.",
-  capabilities: [
-    ["operating-system", "Operating system", "Ubuntu 24.04 is supported."],
-    ["architecture", "Architecture", "x86_64 is supported."],
-    ["bb-connect", "BB Connect", "The host is enrolled in BB Connect."],
-    ["browser", "Browser", "Google Chrome 140 is available."],
-    ["sandbox", "Browser sandbox", "The Chrome sandbox is available."],
-    ["dedicated-user", "Dedicated browser user", "bb-browser is configured."],
-    ["protected-storage", "Protected storage", "Storage is protected."],
-    ["disk-headroom", "Disk headroom", "At least 5 GiB is free."],
-    ["loopback", "Loopback networking", "Loopback is available."],
-  ].map(([id, label, reason]) => ({
-    id: id as BrowserStatus["capabilities"][number]["id"],
-    label,
-    status: "ready" as const,
-    reason,
-  })),
-};
 
 async function grantDefaultProfileOrigin(
   browser: Awaited<ReturnType<typeof createPublicPluginHarness>>,
