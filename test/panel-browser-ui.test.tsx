@@ -542,6 +542,54 @@ describe("Browser Panel", () => {
     }
   });
 
+  it("keeps two projects' questions about one site apart", async () => {
+    const keyWarnings: unknown[][] = [];
+    const consoleError = console.error;
+    console.error = (...args: unknown[]) => {
+      if (String(args[0] ?? "").includes("same key")) keyWarnings.push(args);
+      else consoleError(...args);
+    };
+    const browser = await createPublicPluginHarness({
+      status: healthyBrowserStatus,
+      browserRuntime: createTabInventoryRuntime(),
+    });
+    try {
+      await browser.createBrowserProfile({
+        hostId: "host-browser-test",
+        name: "Two project target",
+      });
+      // One profile serves every project on the host, so two projects can be
+      // waiting on the same site at once. They are two questions: answering
+      // one must not be taken for answering the other.
+      await browser.runBrowserScriptWithProfile(undefined, {
+        destinationOrigin: "https://shared-site.example.test",
+      });
+      await browser.runBrowserScriptWithProfile(undefined, {
+        destinationOrigin: "https://shared-site.example.test",
+        projectId: "project-foreign",
+        threadId: "thread-foreign-project",
+      });
+      const pending = await browser.listBrowserGrantRequests({
+        status: "pending",
+      });
+      expect(new Set(pending.map((request) => request.projectId)).size).toBe(2);
+
+      const panel = browser.renderPanel();
+      const question = await panel.findByRole("region", {
+        name: "Site access requests",
+      });
+      expect(
+        within(question).getAllByRole("button", {
+          name: "Allow https://shared-site.example.test",
+        }),
+      ).toHaveLength(2);
+      expect(keyWarnings).toEqual([]);
+    } finally {
+      console.error = consoleError;
+      await browser.dispose();
+    }
+  });
+
   it("asks about a site once, however many times an agent was denied on it", async () => {
     const browser = await createPublicPluginHarness({
       status: healthyBrowserStatus,

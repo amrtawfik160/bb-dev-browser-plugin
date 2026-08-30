@@ -60,6 +60,7 @@ import {
   BrowserNewTabSurface,
   BrowserTabStripView,
   BrowserToolbar,
+  browserAccessRequestKey,
   browserStateIsSettling,
   browserStateReplacesPage,
   type BrowserAccessRequest,
@@ -204,7 +205,7 @@ function pendingAccessRequests(
     ].filter((elevation): elevation is string => elevation !== null);
     // An agent denied five times on one site asked one question, so the owner
     // is asked it once, and answering it answers every one of them.
-    const key = `${request.projectId}\u0000${request.origin}`;
+    const key = browserAccessRequestKey(request);
     const asked = questions.get(key);
     questions.set(key, {
       requestIds: [...(asked?.requestIds ?? []), request.requestId],
@@ -1056,8 +1057,8 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
     url: string;
   } | null>(null);
   const [showStatusDetail, setShowStatusDetail] = useState(false);
-  // The request a decision is in flight for, so a second click cannot answer
-  // the same question twice.
+  // The question a decision is in flight for, keyed the way the panel groups
+  // them, so a second click cannot answer the same question twice.
   const [accessDecision, setAccessDecision] = useState<string | null>(null);
   // Whether the stream is pushing control state to this panel, or the panel has
   // to ask for it.
@@ -1342,7 +1343,7 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
     decision: "deny" | "allow",
   ) {
     const persist = decision === "allow" && request.elevations.length === 0;
-    setAccessDecision(request.origin);
+    setAccessDecision(browserAccessRequestKey(request));
     setProfileError(null);
     void Promise.all(
       request.requestIds.map((requestId) =>
@@ -1393,7 +1394,7 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
           pending.projectId === request.projectId,
       )
       .map((pending) => pending.requestId);
-    setAccessDecision(request.origin);
+    setAccessDecision(browserAccessRequestKey(request));
     setProfileError(null);
     void rpc
       .call("browser_grant_create", {
@@ -1517,7 +1518,7 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
         ) : null}
         <BrowserAccessRequestNotices
           requests={pendingAccessRequests(grantRequests)}
-          pendingRequestId={accessDecision}
+          answering={accessDecision}
           onAllow={allowAccessRequest}
           onDeny={denyAccessRequest}
           onTrustProject={trustProjectForAccessRequest}
@@ -1557,7 +1558,7 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
       />
       <BrowserAccessRequestNotices
         requests={pendingAccessRequests(grantRequests)}
-        pendingRequestId={accessDecision}
+        answering={accessDecision}
         onAllow={allowAccessRequest}
         onDeny={denyAccessRequest}
         onTrustProject={trustProjectForAccessRequest}

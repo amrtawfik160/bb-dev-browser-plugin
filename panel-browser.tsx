@@ -457,6 +457,19 @@ export type BrowserAccessRequest = {
 };
 
 /**
+ * What identifies one question to the owner: the project whose agents were
+ * denied, and the site they were denied on. One profile serves every project
+ * on the host, so two projects can be waiting on the same site at once — those
+ * are two questions, and answering one leaves the other standing.
+ */
+export function browserAccessRequestKey(request: {
+  projectId: string;
+  origin: string;
+}) {
+  return `${request.projectId} ${request.origin}`;
+}
+
+/**
  * A denied site, presented as the question the owner can answer. Approving
  * this one site is the primary action because it is the narrow one; trusting
  * the whole project is available for an owner tired of being asked, and is the
@@ -464,13 +477,17 @@ export type BrowserAccessRequest = {
  */
 export function BrowserAccessRequestNotices({
   requests,
-  pendingRequestId,
+  answering,
   onAllow,
   onDeny,
   onTrustProject,
 }: {
   requests: readonly BrowserAccessRequest[];
-  pendingRequestId: string | null;
+  /**
+   * The question a decision is currently in flight for, if any. Every answer
+   * is held while one is, so a second click cannot race the first.
+   */
+  answering: string | null;
   onAllow: (request: BrowserAccessRequest) => void;
   onDeny: (request: BrowserAccessRequest) => void;
   onTrustProject: (request: BrowserAccessRequest) => void;
@@ -493,7 +510,7 @@ export function BrowserAccessRequestNotices({
             ? `Allow ${request.origin} for an hour`
             : `Allow ${request.origin}`;
           return (
-            <li key={request.origin} className="text-sm">
+            <li key={browserAccessRequestKey(request)} className="text-sm">
               <p>
                 Let agents in this project use{" "}
                 <strong className="break-all">{request.origin}</strong>?
@@ -509,7 +526,7 @@ export function BrowserAccessRequestNotices({
                     backgroundColor: BROWSER_PANEL_ACCENT_CONTRAST,
                     color: "white",
                   }}
-                  disabled={pendingRequestId !== null}
+                  disabled={answering !== null}
                   onClick={() => onAllow(request)}
                 >
                   {allowLabel}
@@ -517,7 +534,7 @@ export function BrowserAccessRequestNotices({
                 <button
                   type="button"
                   className="rounded border px-3 py-1 text-xs"
-                  disabled={pendingRequestId !== null}
+                  disabled={answering !== null}
                   onClick={() => onDeny(request)}
                 >
                   {`Deny ${request.origin}`}
@@ -525,7 +542,7 @@ export function BrowserAccessRequestNotices({
                 <button
                   type="button"
                   className="rounded px-2 py-1 text-xs underline"
-                  disabled={pendingRequestId !== null}
+                  disabled={answering !== null}
                   onClick={() => onTrustProject(request)}
                 >
                   Allow every site for this project
