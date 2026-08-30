@@ -358,6 +358,132 @@ describe("Browser Panel", () => {
     }
   });
 
+  it("drives the overflow menu from the keyboard and gives focus back", async () => {
+    const browser = await createPublicPluginHarness({
+      status: healthyBrowserStatus,
+    });
+    try {
+      const panel = browser.renderPanel();
+      const trigger = await panel.findByRole("button", {
+        name: "Browser options",
+      });
+      expect(trigger.getAttribute("aria-expanded")).toBe("false");
+
+      fireEvent.click(trigger);
+      const menu = await panel.findByRole("menu", { name: "Browser options" });
+      expect(trigger.getAttribute("aria-expanded")).toBe("true");
+      // The menu's own items, in the order the owner meets them: the session
+      // action, then the compatibility toggle. The trailing note is not one.
+      const items = [
+        within(menu).getByRole("menuitem", { name: /take over/iu }),
+        within(menu).getByRole("menuitemcheckbox", {
+          name: /plain localhost/iu,
+        }),
+      ];
+      // Opening puts the owner on the first item, and the arrows walk the
+      // menu without them reaching for the mouse.
+      await waitFor(() => expect(document.activeElement).toBe(items[0]));
+      fireEvent.keyDown(menu, { key: "ArrowDown" });
+      expect(document.activeElement).toBe(items[1]);
+      fireEvent.keyDown(menu, { key: "End" });
+      expect(document.activeElement).toBe(items[items.length - 1]);
+      fireEvent.keyDown(menu, { key: "Home" });
+      expect(document.activeElement).toBe(items[0]);
+
+      // BB's own shortcuts belong to BB: the menu lets them through rather
+      // than swallowing them as menu navigation.
+      fireEvent.keyDown(menu, { key: "ArrowDown", metaKey: true });
+      expect(document.activeElement).toBe(items[0]);
+
+      // Escape abandons the menu and puts the owner back where they opened it
+      // from, rather than dropping focus to the document.
+      fireEvent.keyDown(menu, { key: "Escape" });
+      await waitFor(() =>
+        expect(
+          panel.queryByRole("menu", { name: "Browser options" }),
+        ).toBeNull(),
+      );
+      expect(document.activeElement).toBe(trigger);
+      expect(trigger.getAttribute("aria-expanded")).toBe("false");
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("walks the tab strip with the arrow keys", async () => {
+    const browser = await createPublicPluginHarness({
+      status: healthyBrowserStatus,
+      browserRuntime: createTabInventoryRuntime(),
+    });
+    try {
+      await browser.createBrowserProfile({
+        hostId: "host-browser-test",
+        name: "Keyboard tab strip",
+      });
+      const panel = browser.renderPanel();
+      const strip = await panel.findByRole("list", { name: "Browser tabs" });
+      const newTab = await panel.findByRole("button", {
+        name: "Open a new tab",
+      });
+      fireEvent.click(newTab);
+      fireEvent.click(newTab);
+      await waitFor(() =>
+        expect(within(strip).getAllByRole("listitem")).toHaveLength(2),
+      );
+
+      const tabs = within(strip).getAllByRole("button", { name: "New tab" });
+      // One stop in the page's tab order, then the arrows move between tabs —
+      // the roving pattern a tab strip is expected to follow.
+      expect(tabs[0]!.getAttribute("tabindex")).toBe("0");
+      expect(tabs[1]!.getAttribute("tabindex")).toBe("-1");
+
+      fireEvent.keyDown(strip, { key: "ArrowRight" });
+      expect(document.activeElement).toBe(tabs[1]);
+      fireEvent.keyDown(strip, { key: "ArrowLeft" });
+      expect(document.activeElement).toBe(tabs[0]);
+      // The ends wrap, so the owner never hits a dead stop.
+      fireEvent.keyDown(strip, { key: "ArrowLeft" });
+      expect(document.activeElement).toBe(tabs[1]);
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("abandons a half-typed address on Escape and shows the page again", async () => {
+    const browser = await createPublicPluginHarness({
+      status: healthyBrowserStatus,
+      navigationResponse: {
+        address: { kind: "address", url: "https://example.test/account" },
+        location: { url: "https://example.test/account" },
+        tabId: "shared-tab-1",
+      },
+    });
+    try {
+      const panel = browser.renderPanel();
+      const address = await panel.findByLabelText("Address or search");
+      fireEvent.change(address, { target: { value: "example.test/account" } });
+      fireEvent.submit(address);
+      await waitFor(() =>
+        expect((address as HTMLInputElement).value).toBe(
+          "https://example.test/account",
+        ),
+      );
+
+      fireEvent.change(address, { target: { value: "somewhere-else.test" } });
+      fireEvent.keyDown(address, { key: "Escape" });
+      // Escape is the browser gesture for "forget what I typed", and what is
+      // left is where the browser actually is.
+      await waitFor(() =>
+        expect((address as HTMLInputElement).value).toBe(
+          "https://example.test/account",
+        ),
+      );
+      expect(browser.navigationRequests).toHaveLength(1);
+    } finally {
+      await browser.dispose();
+    }
+  });
+
   it("says where this browser runs and where it is managed when asked", async () => {
     const browser = await createPublicPluginHarness({
       status: healthyBrowserStatus,
