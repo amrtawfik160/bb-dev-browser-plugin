@@ -15,6 +15,8 @@ import {
   BrowserInstanceError,
   BrowserOriginScopeDeniedError,
   createBrowserInstanceRuntime,
+  RENDERER_HEAP_LIMIT_MB,
+  RENDERER_PROCESS_LIMIT,
   selectBrowserExecutable,
   validateBrowserLaunchPolicy,
   type BrowserLaunchBoundary,
@@ -748,6 +750,14 @@ describe("Browser Instance runtime", () => {
       expect(launch.chromeArguments.join(" ")).toContain("AutofillCreditCard");
       expect(launch.chromeArguments).not.toContain("--password-store=basic");
       expect(launch.chromeArguments).not.toContain("about:blank");
+      // The browser shares the BB host daemon's memory budget, so an
+      // unbounded Chromium can exhaust it and take the agent service down.
+      expect(launch.chromeArguments).toContain(
+        `--renderer-process-limit=${RENDERER_PROCESS_LIMIT}`,
+      );
+      expect(launch.chromeArguments).toContain(
+        `--js-flags=--max-old-space-size=${RENDERER_HEAP_LIMIT_MB}`,
+      );
 
       await fixture.runtime.stop(fixture.target);
       for (const [name, contents] of retainedFiles) {

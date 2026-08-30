@@ -67,6 +67,22 @@ each.
   and reach the policy, but the mechanism that was meant to fulfil such a
   navigation depended on the same unavailable interception.
 
+## Memory
+
+- The browser is spawned by the host worker, so it **runs in whatever cgroup
+  the BB host daemon runs in** and spends the same memory budget as every
+  agent on the machine. The plugin cannot place it in a slice of its own
+  without privileged cgroup setup.
+- What the plugin does bound: Chromium launches with
+  `--renderer-process-limit` and a per-renderer V8 old-space cap, and pages
+  evicted past the shared tab strip's retention cap are closed rather than
+  left resident. Worst-case browser memory is roughly
+  `renderer limit × (heap cap + native overhead)`.
+- Operators who want a hard ceiling should set `MemoryMax` on the BB host
+  daemon unit, and note that Chromium sets `oom_score_adj=300` on its
+  renderers — so under cgroup pressure the browser is the kernel's preferred
+  victim even when another process caused the pressure.
+
 ## Anti-automation defenses
 
 - Major search engines and other sites serve bot-detection challenges to an

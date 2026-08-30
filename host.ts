@@ -756,6 +756,13 @@ export function createBrowserHostEntry(
     }
     strip.syncPages(pages);
     if (activeTabId !== undefined) strip.activateTab(activeTabId);
+    // Tabs past the retention cap are dropped from the strip; close their
+    // pages too, or the browser keeps every renderer alive for the life of the
+    // profile and the cap bounds nothing.
+    const evicted = strip.takeEvictedTabIds();
+    if (evicted.length > 0) {
+      await browserRuntime.closePages(target, evicted).catch(() => 0);
+    }
   }
   const hostConnectionGenerations = new Map<string, number>();
   function administration(dataDir: string) {

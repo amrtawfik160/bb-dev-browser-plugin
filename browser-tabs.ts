@@ -57,6 +57,7 @@ export function createBrowserTabStrip(options: BrowserTabStripOptions = {}) {
   let tabs = new Map<string, BrowserTab>();
   let order: string[] = [];
   let activeTabId: string | null = null;
+  let evicted: string[] = [];
   const listeners = new Set<BrowserTabStripListener>();
 
   function snapshot(): BrowserTabStrip {
@@ -71,13 +72,41 @@ export function createBrowserTabStrip(options: BrowserTabStripOptions = {}) {
     for (const listener of listeners) listener(strip);
   }
 
+  /**
+   * Drop the oldest tabs past the retention cap and record which real pages
+   * they were.
+   *
+   * Trimming used to forget a tab and leave its page open in the browser, so
+   * the cap bounded nothing: the next inventory reported the same page, the
+   * strip re-added it, and something else was evicted. Pages accumulated for
+   * the life of the profile — and `--restore-last-session` brought them all
+   * back on the next launch — with each one holding renderer memory. The
+   * caller drains {@link takeEvictedTabIds} and closes those pages, which is
+   * what makes the cap a real bound.
+   *
+   * The active tab is never evicted; the owner is looking at it.
+   */
   function trimToMax() {
     while (order.length > maxTabs) {
-      const dropped = order.shift()!;
-      tabs.delete(dropped);
-      if (activeTabId === dropped)
-        activeTabId = order[order.length - 1] ?? null;
+      const oldest = order.findIndex((id) => id !== activeTabId);
+      if (oldest === -1) break;
+      const [dropped] = order.splice(oldest, 1);
+      tabs.delete(dropped!);
+      // One reconcile both adds pages individually and re-syncs the whole
+      // inventory, so the same page can be trimmed twice before the caller
+      // drains. Report it once.
+      if (!evicted.includes(dropped!)) evicted.push(dropped!);
     }
+  }
+
+  /**
+   * Hand back the pages evicted since the last call, so the caller can close
+   * them in the browser. Draining keeps a page from being closed twice.
+   */
+  function takeEvictedTabIds(): string[] {
+    const drained = evicted;
+    evicted = [];
+    return drained;
   }
 
   /**
@@ -91,6 +120,9 @@ export function createBrowserTabStrip(options: BrowserTabStripOptions = {}) {
     tabs = new Map();
     order = [];
     activeTabId = null;
+    // A new instance owns no pages from the previous one, so pending
+    // evictions would name ids that no longer exist.
+    evicted = [];
     emit();
   }
 
@@ -233,6 +265,7 @@ export function createBrowserTabStrip(options: BrowserTabStripOptions = {}) {
     syncPages,
     activateTab,
     closeTab,
+    takeEvictedTabIds,
     tab,
     isValidTabId,
     snapshot,
