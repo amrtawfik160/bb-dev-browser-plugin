@@ -172,6 +172,15 @@ describe("Browser Profile Grant public authorization contract", () => {
         store.authorize({
           projectId: "project-a",
           hostId: "host-a",
+          installationId: "installation-a",
+          profileId: "profile-other",
+          origin: "https://app.example.test",
+        }),
+      ).toMatchObject({ allowed: false, code: "origin_denied" });
+      expect(
+        store.authorize({
+          projectId: "project-a",
+          hostId: "host-a",
           installationId: "installation-other",
           profileId: "profile-a",
           origin: "https://app.example.test",
@@ -242,6 +251,59 @@ describe("Browser Profile Grant public authorization contract", () => {
       await backend.harness.lifecycle.dispose();
     }
   });
+
+  it.each([
+    ["narrow-before-broad", ["narrow", "broad"], "grant-whole-web", "*"],
+    ["broad-before-narrow", ["broad", "narrow"], "grant-whole-web", "*"],
+    ["narrow-only", ["narrow"], "grant-exact", "https://app.example.test"],
+  ] as const)(
+    "authorizes the broadest matching grant for %s",
+    async (_scenario, insertionOrder, expectedGrantId, expectedOriginScope) => {
+      const { backend, store } = createStore();
+
+      try {
+        const grantsByKind = {
+          narrow: grant({
+            grantId: "grant-exact",
+            originScope: "https://app.example.test",
+          }),
+          broad: grant({
+            grantId: "grant-whole-web",
+            originScope: "*",
+            wholeWeb: true,
+          }),
+        } as const;
+        for (const [index, grantKind] of insertionOrder.entries()) {
+          const createdAt = new Date(
+            NOW.getTime() + index * 1000,
+          ).toISOString();
+          store.create({
+            ...grantsByKind[grantKind],
+            createdAt,
+            updatedAt: createdAt,
+          });
+        }
+
+        const decision = store.authorize({
+          projectId: "project-a",
+          hostId: "host-a",
+          installationId: "installation-a",
+          profileId: "profile-a",
+          origin: "https://app.example.test",
+        });
+
+        expect(decision).toMatchObject({
+          allowed: true,
+          grant: { grantId: expectedGrantId, originScope: expectedOriginScope },
+        });
+        expect(store.list({ projectId: "project-a" })).toHaveLength(
+          insertionOrder.length,
+        );
+      } finally {
+        await backend.harness.lifecycle.dispose();
+      }
+    },
+  );
 
   it("requires file transfer and invalid certificates to be explicitly scoped", async () => {
     const { backend, store } = createStore();
