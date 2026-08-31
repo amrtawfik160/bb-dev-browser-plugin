@@ -42,13 +42,14 @@ exposes automation to agents only through explicit, revocable authorization.
   agents get neither pixels nor DOM access while it is active.
 - **Profile Grants & Grant Requests** — agents are denied by default. An owner
   grants exact origins, subdomain scopes, or whole-web access in authenticated
-  Browser Settings. Denied origins produce a typed result and a non-blocking
+  Browser Settings. Denied web origins produce a typed result and a non-blocking
   Grant Request the owner can approve for one retry, one hour, or persistent
-  access.
+  access; non-web navigation is denied without a request.
 - **Origin Scope enforcement** — exact `scheme://host:port` origins and
-  optional subdomain patterns. A host-owned guard blocks out-of-scope top-level,
-  popup, and frame navigations before commit, closes denied pages, and retains
-  denial even when a script navigates back or throws.
+  optional subdomain patterns. A host-owned guard blocks out-of-scope web and
+  non-web document navigations before commit, closes denied pages, and retains
+  denial even when a script navigates back or throws. Exact `about:blank` is
+  the only safe internal exception.
 - **Control Leases** — one owner client or agent controls input at a time. The
   owner has priority and can revoke an agent's lease; control transfers
   explicitly between owner clients.
@@ -134,8 +135,9 @@ bb browser script --purpose "Read the page title" \
   --code "return await page.title()"
 ```
 
-A denied origin returns a typed `origin_denied` result and raises a Grant
-Request the owner can approve. There is no `document` global.
+A denied web origin returns a typed `origin_denied` result and raises a Grant
+Request the owner can approve. Non-web navigation returns the same typed error
+without a request. There is no `document` global.
 
 See the bundled skill at [`skills/browser/SKILL.md`](skills/browser/SKILL.md)
 and the [agent reference](docs/browser/agent-reference.md) for the full

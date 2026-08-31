@@ -17,7 +17,7 @@ Common conventions:
 ## Opening the browser
 
 ```text
-bb browser open [url] [--profile <id>] [--timeout <ms>] [--screenshot] [--json]
+bb browser open <url> [--profile <id>] [--timeout <ms>] [--screenshot] [--json]
 ```
 
 With an HTTP(S) URL, navigates the active tab and reports the resulting URL,
@@ -25,14 +25,11 @@ page title, and tab ID. URL navigation is an agent operation: it derives the
 project and host from BB context, requires a matching Profile Grant, holds a
 Control Lease, and records the actor as `agent`.
 
-With no argument, `open` reports the tab the profile is already on without
-navigating; this safely reports browser-internal pages such as `about:blank`
-without treating their `null` origin as a web destination. A profile with no
-open tab yet says so and asks for a URL. Bare search text is rejected; enter
+The URL is required. A no-argument `open` fails before resolving the profile or
+reading the host's tab inventory, so it cannot disclose an owner's tab URL,
+title, or runtime tab ID. Use the authenticated Browser Panel to inspect or
+navigate the current tab. Bare search text is rejected for agent opens; enter
 searches in the Browser Panel.
-
-If the current HTTP(S) page is not granted, no-argument `open` reports the tab
-without reading page content and points to authenticated Browser Settings.
 
 ## Readiness and diagnostics
 

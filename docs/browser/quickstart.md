@@ -106,13 +106,15 @@ managed in authenticated Browser Settings, not from a thread.
   threads, environments, and worktrees. It does **not** follow copied projects.
   Deleting a project or revoking a grant interrupts active agent work without
   closing your page.
-- Disallowed top-level navigation, redirects, and popups are blocked before
-  commit and fail the operation. Cross-origin subresources may render normally.
+- Disallowed web and non-web top-level navigation, redirects, and popups are
+  blocked before commit and fail the operation. Exact `about:blank` is the only
+  safe internal exception; cross-origin subresources may render normally.
 
 ### Grant Requests (after a denial)
 
-A denied origin produces a typed `origin_denied` result and a non-blocking
-**Grant Request** that surfaces as an in-app badge. The owner may permit:
+A denied web origin produces a typed `origin_denied` result and a non-blocking
+**Grant Request** that surfaces as an in-app badge. Non-web navigation produces
+the typed denial without a request. For a web origin, the owner may permit:
 
 - the next matching retry,
 - one hour, or

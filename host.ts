@@ -404,8 +404,12 @@ function scriptRuntimeFailure(
 
 function originScopeDeniedFailure(
   request: BrowserScriptRequest,
-  origin: string,
+  origin: string | null,
 ): BrowserScriptResponse {
+  const message =
+    origin === null
+      ? "Browser navigation to a non-web URL was denied by the active Profile Grant. The denied script will not resume automatically; after an owner decision, explicitly retry against current page state."
+      : `Browser navigation to ${origin} was denied by the active Profile Grant. The denied script will not resume automatically; after an owner decision, explicitly retry against current page state.`;
   return {
     ok: false,
     error: {
@@ -414,7 +418,7 @@ function originScopeDeniedFailure(
       label: "Origin denied",
       hostId: request.hostId,
       profileId: request.profileId,
-      message: `Browser navigation to ${origin} was denied by the active Profile Grant. The denied script will not resume automatically; after an owner decision, explicitly retry against current page state.`,
+      message,
       origin,
       grantRequest: null,
     },

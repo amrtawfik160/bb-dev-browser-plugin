@@ -55,12 +55,15 @@ each.
 
 ## Origin Scope enforcement
 
-- Origin Scope applies to HTTP(S) document navigation. The host-owned guard
+- Origin Scope applies to HTTP(S) document navigation and to `blob:` documents
+  when the browser exposes an embedded HTTP(S) origin. The host-owned guard
   blocks denied top-level pages, popups, redirects, and frame documents before
   commit, while ordinary cross-origin subresources may render. Cross-origin
   frame documents therefore need their own grant.
-- Browser-internal pages such as `about:blank` may be reported as the current
-  tab, but they are not widened into navigable destination origins.
+- Exact `about:blank` is allowed as a safe internal page. Other `about:`,
+  `data:`, `file:`, `chrome:`, `javascript:`, malformed, and unknown non-web
+  document navigations fail closed; they are never treated as an unscoped
+  destination.
 - Invalid-certificate access is an exact-origin elevation. It does not disable
   certificate validation globally or for another allowed origin.
 

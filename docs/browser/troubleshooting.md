@@ -86,8 +86,10 @@ Connect session, panel capability redemption) and reconnect behavior.
 
 ## Common operations
 
-- **Agent denial** — `origin_denied` with a Grant Request: surface to the owner;
-  after approval, retry explicitly. The failed call never resumes automatically.
+- **Agent denial** — a denied web origin returns `origin_denied` with a Grant
+  Request: surface it to the owner; after approval, retry explicitly. A
+  non-web denial has no Grant Request and cannot be approved. The failed call
+  never resumes automatically.
   If the message asks for `destinationOrigin`, pass `--origin https://example.com`
   (or the tool parameter) as an exact origin. A Grant Request is only created
   for a real origin.

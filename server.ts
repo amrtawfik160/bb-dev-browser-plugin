@@ -19,7 +19,6 @@ import {
   isGrantCliCommand,
 } from "./grant-cli.js";
 import {
-  browserOpenDestinationOrigin,
   openBrowserScript,
   openCliText,
   parseOpenPageState,
@@ -56,7 +55,7 @@ import {
 
 const CLI_USAGE = [
   "Usage: bb browser <open|trust|untrust|grants|grant|revoke|approve|deny|status|diagnostics|script|activity|activity-export|activity-clear|requests|request-status|list|create|rename|select|backup|restore|import|archive|restore-archived|reset|delete|setup|disable|uninstall|purge> [options]",
-  "  open [url] [--profile <id>] [--timeout <ms>] [--screenshot] [--json]",
+  "  open <url> [--profile <id>] [--timeout <ms>] [--screenshot] [--json]",
   "  trust|untrust|grants|grant|revoke|approve|deny: authenticated Browser Settings required",
   "  script --purpose <text> --code <source> --origin <origin> [--profile <id>] [--tab <id>] [--timeout <ms>] [--screenshot] [--file-transfer] [--invalid-certificate] [--json]",
   "  setup [--profile <id>] [--step <id> --confirm <text>] [--json]",
@@ -822,6 +821,11 @@ async function runOpenCli(
       "browser open requires BB project and thread context; invoke it from a project thread.",
     );
   }
+  if (cliArguments.address === undefined) {
+    throw new Error(
+      "browser open requires an HTTP(S) URL; omit the URL only in the Browser Panel.",
+    );
+  }
   const target = await browser.grantScope(context, {
     ...(cliArguments.profileId === undefined
       ? {}
@@ -830,17 +834,6 @@ async function runOpenCli(
       ? {}
       : { hostId: cliArguments.hostId }),
   });
-  if (cliArguments.address === undefined) {
-    const navigation = await currentOpenTab(browser, target, context);
-    const page = await readOpenedPage(
-      browser,
-      target,
-      navigation,
-      cliArguments,
-      context,
-    );
-    return openCliResult(target, navigation, page, cliArguments.json);
-  }
   const address = agentOpenAddress(cliArguments.address, target.projectId);
   const response = await browser.browserScript(
     browserScriptParametersSchema.parse({
@@ -887,25 +880,25 @@ function agentOpenAddress(input: string, projectId: string) {
 function openCliResult(
   target: { hostId: string; profileId: string },
   navigation: BrowserNavigationResponse,
-  page: ReturnType<typeof parseOpenPageState>,
+  page: NonNullable<ReturnType<typeof parseOpenPageState>>,
   json: boolean,
 ) {
   if (json) {
     return {
       exitCode: 0,
       stdout: JSON.stringify({
-        url: page?.url ?? navigation.address.url,
-        title: page?.title ?? null,
+        url: page.url,
+        title: page.title,
         tabId: navigation.tabId,
         profileId: target.profileId,
         hostId: target.hostId,
-        trusted: page !== null,
+        trusted: true,
       }),
     };
   }
   return {
     exitCode: 0,
-    stdout: openCliText(navigation, page, page === null),
+    stdout: openCliText(navigation, page),
   };
 }
 
@@ -926,7 +919,7 @@ async function currentOpenTab(
     strip.tabs.find((tab) => tab.tabId === strip.activeTabId) ?? strip.tabs[0];
   if (active === undefined) {
     // A sleeping or freshly restarted instance reports no tabs until something
-    // navigates it, and there is nothing to report without an address.
+    // navigates it, and there is nothing to report after an authorized open.
     throw new Error(
       "This Browser Profile has no open tab yet. Pass a URL to open one: bb browser open <url>",
     );
@@ -936,45 +929,6 @@ async function currentOpenTab(
     location: null,
     tabId: active.tabId,
   };
-}
-
-async function readOpenedPage(
-  browser: BrowserService,
-  target: { hostId: string; profileId: string },
-  navigation: BrowserNavigationResponse,
-  cliArguments: ParsedCliArguments,
-  context: PluginCliContext,
-) {
-  if (context.projectId === undefined || context.threadId === undefined) {
-    return null;
-  }
-  const destinationOrigin = browserOpenDestinationOrigin(
-    navigation.address.url,
-  );
-  if (destinationOrigin === null) return null;
-  const response = await browser.browserScript(
-    browserScriptParametersSchema.parse({
-      purpose: "Report the current Workspace Browser page",
-      code: openBrowserScript(),
-      destinationOrigin,
-      profileId: target.profileId,
-      tabId: navigation.tabId,
-      ...(cliArguments.timeoutMs === undefined
-        ? {}
-        : { timeoutMs: cliArguments.timeoutMs }),
-      ...(cliArguments.screenshot === undefined
-        ? {}
-        : { screenshot: cliArguments.screenshot }),
-    }),
-    {
-      projectId: context.projectId,
-      threadId: context.threadId,
-      signal: context.signal ?? new AbortController().signal,
-    },
-  );
-  return response.ok
-    ? parseOpenPageState(browserScriptText(response.result))
-    : null;
 }
 
 async function runActivityCli(
@@ -2044,9 +1998,9 @@ function registerCli(bb: BbPluginApi, browser: BrowserService) {
     commands: [
       {
         name: "open",
-        summary: "Open an authorized URL or report the current tab",
+        summary: "Open an authorized URL",
         usage:
-          "bb browser open [url] [--profile <id>] [--timeout <ms>] [--screenshot] [--json]",
+          "bb browser open <url> [--profile <id>] [--timeout <ms>] [--screenshot] [--json]",
       },
       {
         name: "trust",

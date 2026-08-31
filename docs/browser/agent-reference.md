@@ -101,8 +101,9 @@ The `error` is one of:
    idle or starting; they do not fail `browser_script`. The instance wakes on
    demand.
 2. **Origin denied** (`state: "origin-denied"`, `code: "origin_denied"`) —
-   includes the denied `origin` and a non-blocking `grantRequest` for the owner
-   to approve.
+   a denied web navigation includes its `origin` and a non-blocking
+   `grantRequest` for the owner to approve. A denied non-web navigation has a
+   null `origin` and no request.
 3. **Runtime error** (`state: "runtime-error"`) — a `code` from:
 
    | code                | meaning                                                            |
@@ -155,8 +156,9 @@ Every script holds one atomic **Control Lease** for its host and profile.
 
 ## Grants and explicit retry after denial
 
-1. Without a matching grant, the call returns `origin_denied` with a non-blocking
-   Grant Request. **Stop and surface the denial to the owner**; do not loop.
+1. Without a matching web-origin grant, the call returns `origin_denied` with a
+   non-blocking Grant Request. Non-web navigation returns the typed denial
+   without a request. **Stop and surface the denial to the owner**; do not loop.
 2. The owner approves in authenticated Browser Settings: next retry, one hour,
    or persistent. The **default is one retry**.
 3. After approval, **retry explicitly**. The failed script never resumes

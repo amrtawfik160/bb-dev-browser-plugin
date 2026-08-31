@@ -16,6 +16,44 @@ async function capturedLogs(code: string) {
   return logs;
 }
 
+async function preparedLogs(code: string) {
+  const logs: string[] = [];
+  class FakeContext {
+    browser() {
+      return {
+        newContext: async () => "unrestricted-context",
+      };
+    }
+  }
+  const context = new FakeContext();
+  const page = {
+    context: () => context,
+    bringToFront: async () => undefined,
+    evaluate: async () => "visible",
+    setDefaultNavigationTimeout: () => undefined,
+    setDefaultTimeout: () => undefined,
+  };
+  const extraPage = {
+    ...page,
+  };
+  const fakeBrowser = {
+    listPages: async () => [{ id: "tab-1", url: "about:blank" }],
+    getPage: async () => page,
+    newPage: async () => extraPage,
+  };
+  const prepared = prepareAgentExecution({ code });
+  const run = new Function(
+    "browser",
+    "console",
+    `return (async () => {\n${prepared}\n})();`,
+  ) as (
+    browser: typeof fakeBrowser,
+    console: { log: (value: unknown) => void },
+  ) => Promise<void>;
+  await run(fakeBrowser, { log: (value) => logs.push(String(value)) });
+  return logs;
+}
+
 describe("agent script convenience wrapping", () => {
   it("prints a returned string as the script result", async () => {
     expect(await capturedLogs('return "https://example.com/";')).toEqual([
@@ -59,6 +97,24 @@ describe("agent script convenience wrapping", () => {
       prepared.indexOf("return page.url()"),
     );
     expect(prepared).toContain("await page.bringToFront()");
+  });
+
+  // Recovery issue #64: the public Page → BrowserContext → Browser path must
+  // not expose a context-creating Browser root to agent code.
+  it("cuts the transitive Browser root before agent code can create a context", async () => {
+    await expect(
+      preparedLogs(
+        'const root = page.context().browser(); return root === null ? "blocked" : await root.newContext();',
+      ),
+    ).resolves.toEqual(["blocked"]);
+  });
+
+  it("keeps new pages in the guarded context available after cutting its Browser root", async () => {
+    await expect(
+      preparedLogs(
+        "const extraPage = await browser.newPage(); return extraPage.context().browser() === null;",
+      ),
+    ).resolves.toEqual(["true"]);
   });
 
   it("prefers a tab already on the granted origin", () => {

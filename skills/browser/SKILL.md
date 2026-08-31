@@ -12,13 +12,15 @@ stays signed in for later automation.
 ## Start here
 
 Use `browser_script` with the exact HTTP(S) origin you need. If it returns
-`origin_denied`, surface its Grant Request to the owner and pause until the
-owner makes a decision in authenticated Browser Settings.
+`origin_denied`, surface any Grant Request to the owner and pause until the
+owner makes a decision in authenticated Browser Settings. A non-web navigation
+is denied without a Grant Request.
 
 `bb browser open https://example.com` is the shell equivalent for opening an
 authorized URL: it runs as an agent operation under the same Profile Grant,
-Control Lease, and Activity attribution. With no argument it only reports the
-current tab, including a fresh `about:blank` tab. It does not accept search text.
+Control Lease, and Activity attribution. The URL is required; no-argument
+opens fail closed before reading host tab state. Use the Browser Panel for
+current-tab inspection and search text.
 
 ## Automating a page
 
@@ -95,15 +97,15 @@ await Promise.all([page.waitForURL(/\/search\?/), box.press("Enter")]);
 
 ## Failures and what to do
 
-| Code                | Meaning                           | Do                                                                 |
-| ------------------- | --------------------------------- | ------------------------------------------------------------------ |
-| `origin_denied`     | No grant covers that origin       | Surface the Grant Request to the owner; retry only after approval  |
-| `browser_busy`      | Someone else holds control        | Wait and retry once; queued work is not kept                       |
-| `browser_timeout`   | Script hit its deadline           | Split the work or wait on a condition instead of a timer           |
-| `script_failed`     | Playwright error                  | Read the call log at the end of the message — it names the reason  |
-| `tab_invalid`       | Tab belongs to a previous runtime | `browser.listPages()` again                                        |
-| `setup_required`    | Host is not provisioned           | Report it. Do not retry, install packages, or find another browser |
-| `safe_login_denied` | Owner-only Safe Login is active   | Wait for the owner; you cannot see or drive the browser            |
+| Code                | Meaning                                | Do                                                                 |
+| ------------------- | -------------------------------------- | ------------------------------------------------------------------ |
+| `origin_denied`     | Grant missing or navigation is non-web | Surface any Grant Request; retry web origins only after approval   |
+| `browser_busy`      | Someone else holds control             | Wait and retry once; queued work is not kept                       |
+| `browser_timeout`   | Script hit its deadline                | Split the work or wait on a condition instead of a timer           |
+| `script_failed`     | Playwright error                       | Read the call log at the end of the message — it names the reason  |
+| `tab_invalid`       | Tab belongs to a previous runtime      | `browser.listPages()` again                                        |
+| `setup_required`    | Host is not provisioned                | Report it. Do not retry, install packages, or find another browser |
+| `safe_login_denied` | Owner-only Safe Login is active        | Wait for the owner; you cannot see or drive the browser            |
 
 `bb browser status` reports host readiness and live control state; `bb browser
 diagnostics` adds repair detail.
@@ -124,8 +126,10 @@ owner. A grant change applies to the next call and never resumes a denied one.
 
 Origin Scope is enforced outside the QuickJS sandbox by a host-owned navigation
 guard. It blocks denied top-level pages, popups, redirects, and frames before
-commit and removes denied pages. An invalid-certificate elevation applies only
-to its explicitly approved origin.
+commit and removes denied pages. Exact `about:blank` is the only safe internal
+page exception; other non-web document navigations fail closed. A `blob:` page
+uses its embedded HTTP(S) origin when the browser exposes one. An
+invalid-certificate elevation applies only to its explicitly approved origin.
 
 ## Control, profiles, and records
 

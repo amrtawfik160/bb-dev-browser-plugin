@@ -30,6 +30,42 @@ export function preferredTabOrigin(originScope?: string): string | undefined {
 const NAVIGATION_TIMEOUT_HEADROOM_MS = 5_000;
 
 /**
+ * Remove the Playwright Browser root from every page context reachable through
+ * the sandbox's page API. `browser.newPage()` remains the supported same-context
+ * capability, while `page.context().browser()` cannot create another context.
+ */
+function cutAgentBrowserRoots(pageListVariable: string): string {
+  return `const __bbBrowserRootPrototypes = new Set();
+const __bbBrowserRootContexts = new Set();
+const __bbCutBrowserRoot = (candidatePage) => {
+  const __bbPageContext = candidatePage.context();
+  const __bbContextPrototype = Object.getPrototypeOf(__bbPageContext);
+  if (
+    __bbContextPrototype !== null &&
+    typeof __bbContextPrototype.browser === "function" &&
+    !__bbBrowserRootPrototypes.has(__bbContextPrototype)
+  ) {
+    Object.defineProperty(__bbContextPrototype, "browser", {
+      configurable: false,
+      value: () => null,
+    });
+    __bbBrowserRootPrototypes.add(__bbContextPrototype);
+  }
+  if (!__bbBrowserRootContexts.has(__bbPageContext)) {
+    Object.defineProperty(__bbPageContext, "browser", {
+      configurable: false,
+      value: () => null,
+    });
+    __bbBrowserRootContexts.add(__bbPageContext);
+  }
+};
+for (const __bbEntry of ${pageListVariable}) {
+  await __bbCutBrowserRoot(await browser.getPage(__bbEntry.id));
+}
+__bbCutBrowserRoot(page);`;
+}
+
+/**
  * Bound both navigation and ordinary locator actions below the script
  * deadline.
  *
@@ -62,7 +98,8 @@ if (!__bbTargetPages.some((entry) => entry.id === ${JSON.stringify(tabId)})) thr
       TAB_INVALID_MESSAGE,
     )});
 const page = await browser.getPage(${JSON.stringify(tabId)});
-await page.bringToFront();`;
+await page.bringToFront();
+${cutAgentBrowserRoots("__bbTargetPages")}`;
   }
   return `const __bbPages = await browser.listPages();
 let page = await browser.getPage(__bbPages.length === 0 ? "main" : __bbPages[0].id);
@@ -86,7 +123,8 @@ if (__bbPreferred !== null) {
     }
   }
 }
-await page.bringToFront();`;
+await page.bringToFront();
+${cutAgentBrowserRoots("__bbPages")}`;
 }
 
 export function wrapAgentScriptResult(code: string): string {

@@ -2337,7 +2337,44 @@ describe("Browser public plugin contract", () => {
     }
   });
 
-  it("reports a fresh about:blank tab when CLI open omits a URL", async () => {
+  // Recovery issue #64: no-URL open must not inspect or return owner tab state.
+  it("does not disclose an owner tab when no-URL open lacks a Profile Grant", async () => {
+    const ownerUrl = "https://owner.example.test/private?token=secret";
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+      browserRuntime: {
+        ...publicRuntime(async () => "seeded"),
+        listPages: async () => [
+          {
+            id: "owner-tab",
+            url: ownerUrl,
+            title: "Owner private page",
+            openerTabId: null,
+          },
+        ],
+      },
+    });
+
+    try {
+      await browser.createBrowserProfile({
+        hostId: "host-browser-test",
+        name: "Untrusted owner tab target",
+      });
+      await browser.runBrowserNavigation(ownerUrl);
+
+      const opened = await browser.runBrowserCli(["open", "--json"]);
+
+      expect(opened.exitCode).toBe(1);
+      const serialized = JSON.stringify(opened);
+      expect(serialized).not.toContain(ownerUrl);
+      expect(serialized).not.toContain("owner-tab");
+      expect(serialized).not.toContain("Owner private page");
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("fails closed for no-URL open even when the current tab is about:blank", async () => {
     let executions = 0;
     const runtime: BrowserInstanceRuntime = {
       ...publicRuntime(async () => {
@@ -2359,25 +2396,17 @@ describe("Browser public plugin contract", () => {
     });
 
     try {
-      await grantDefaultProfileOrigin(browser, "https://example.com");
-      await browser.runBrowserScriptWithProfile(undefined, {
-        purpose: "Initialize the fresh browser tab",
-        code: "return page.url()",
-        destinationOrigin: "https://example.com",
+      await browser.createBrowserProfile({
+        hostId: "host-browser-test",
+        name: "Fresh internal page target",
       });
 
       const opened = await browser.runBrowserCli(["open", "--json"]);
 
-      expect(opened.exitCode).toBe(0);
-      expect(JSON.parse(opened.stdout)).toEqual({
-        url: "about:blank",
-        title: null,
-        tabId: "fresh-tab",
-        profileId: DEFAULT_PROFILE_ID,
-        hostId: "host-browser-test",
-        trusted: false,
-      });
-      expect(executions).toBe(1);
+      expect(opened.exitCode).toBe(1);
+      expect(JSON.stringify(opened)).not.toContain("about:blank");
+      expect(JSON.stringify(opened)).not.toContain("fresh-tab");
+      expect(executions).toBe(0);
     } finally {
       await browser.dispose();
     }

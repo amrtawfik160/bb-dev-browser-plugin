@@ -12,6 +12,7 @@ export type BrowserOriginScopePolicy = {
 };
 
 export type HostOriginScopeGuard = {
+  deniedError(): BrowserOriginScopeDeniedError | null;
   deniedOrigin(): string | null;
   dispose(): Promise<void>;
 };
@@ -31,9 +32,11 @@ const ORIGIN_SCOPE_ROUTE_PATTERN = "**/*";
 const requireFromPlugin = createRequire(import.meta.url);
 
 export class BrowserOriginScopeDeniedError extends Error {
-  constructor(public readonly origin: string) {
+  constructor(public readonly origin: string | null) {
     super(
-      `Browser navigation to ${origin} was denied by the active Profile Grant.`,
+      origin === null
+        ? "Browser navigation to a non-web URL was denied by the active Profile Grant."
+        : `Browser navigation to ${origin} was denied by the active Profile Grant.`,
     );
     this.name = "BrowserOriginScopeDeniedError";
   }
@@ -43,43 +46,72 @@ export function preferOriginScopeDenial<T>(
   guard: HostOriginScopeGuard | null,
   fallback: T,
 ): BrowserOriginScopeDeniedError | T {
-  const deniedOrigin = guard?.deniedOrigin();
-  return deniedOrigin === undefined || deniedOrigin === null
-    ? fallback
-    : new BrowserOriginScopeDeniedError(deniedOrigin);
+  return guard?.deniedError() ?? fallback;
 }
 
-function webOrigin(address: string): string | null {
+type NavigationClassification =
+  | { kind: "web"; origin: string }
+  | { kind: "safe-internal" }
+  | { kind: "non-web" };
+
+/**
+ * Classify document navigations before matching a web Origin Scope. Exact
+ * about:blank is the only internal page that does not carry host browsing
+ * data; every other non-web location is denied, while blob URLs inherit an
+ * exposed HTTP(S) origin.
+ */
+function classifyNavigation(address: string): NavigationClassification {
   let url: URL;
   try {
     url = new URL(address);
   } catch {
-    return null;
+    return { kind: "non-web" };
   }
-  return url.protocol === "http:" || url.protocol === "https:"
-    ? url.origin
-    : null;
+  if (url.protocol === "http:" || url.protocol === "https:") {
+    return { kind: "web", origin: url.origin };
+  }
+  if (url.protocol === "blob:" && isWebOrigin(url.origin)) {
+    return { kind: "web", origin: url.origin };
+  }
+  if (url.href === "about:blank") return { kind: "safe-internal" };
+  return { kind: "non-web" };
+}
+
+function isWebOrigin(origin: string): boolean {
+  return origin.startsWith("http://") || origin.startsWith("https://");
+}
+
+function webOrigin(address: string): string | null {
+  const classification = classifyNavigation(address);
+  return classification.kind === "web" ? classification.origin : null;
 }
 
 function deniedExistingPages(
   contexts: readonly BrowserContext[],
   matcher: OriginScopeMatcher,
-): { origin: string; page: Page }[] {
-  const denied: { origin: string; page: Page }[] = [];
+): { denial: BrowserOriginScopeDeniedError; page: Page }[] {
+  const denied: { denial: BrowserOriginScopeDeniedError; page: Page }[] = [];
   for (const context of contexts) {
     for (const page of context.pages()) {
-      const origin = webOrigin(page.url());
-      if (origin !== null && !matcherPermitsOrigin(matcher, origin)) {
-        denied.push({ origin, page });
+      const classification = classifyNavigation(page.url());
+      if (
+        classification.kind === "non-web" ||
+        (classification.kind === "web" &&
+          !matcherPermitsOrigin(matcher, classification.origin))
+      ) {
+        denied.push({
+          denial: new BrowserOriginScopeDeniedError(
+            classification.kind === "web" ? classification.origin : null,
+          ),
+          page,
+        });
       }
     }
   }
   return denied;
 }
 
-async function closeDeniedExistingPages(
-  denied: readonly { origin: string; page: Page }[],
-) {
+async function closeDeniedExistingPages(denied: readonly { page: Page }[]) {
   const results = await Promise.allSettled(
     denied.map(({ page }) => page.close()),
   );
@@ -109,10 +141,10 @@ async function closeDeniedPopup(request: Request) {
 async function denyNavigation(
   route: Route,
   request: Request,
-  origin: string,
-  recordDenial: (origin: string) => void,
+  denial: BrowserOriginScopeDeniedError,
+  recordDenial: (denial: BrowserOriginScopeDeniedError) => void,
 ) {
-  recordDenial(origin);
+  recordDenial(denial);
   await route.abort("blockedbyclient");
   await closeDeniedPopup(request);
 }
@@ -134,19 +166,34 @@ async function fulfillCertificateBypass(
 function originScopeRouteHandler(
   context: BrowserContext,
   policy: BrowserOriginScopePolicy,
-  recordDenial: (origin: string) => void,
+  recordDenial: (denial: BrowserOriginScopeDeniedError) => void,
 ) {
   return async (route: Route) => {
     const request = route.request();
-    const origin = request.isNavigationRequest()
-      ? webOrigin(request.url())
+    const classification = request.isNavigationRequest()
+      ? classifyNavigation(request.url())
       : null;
-    if (origin === null) {
+    if (classification === null || classification.kind === "safe-internal") {
       await route.continue();
-    } else if (!matcherPermitsOrigin(policy.matcher, origin)) {
-      await denyNavigation(route, request, origin, recordDenial);
+    } else if (classification.kind === "non-web") {
+      await denyNavigation(
+        route,
+        request,
+        new BrowserOriginScopeDeniedError(null),
+        recordDenial,
+      );
+    } else if (!matcherPermitsOrigin(policy.matcher, classification.origin)) {
+      await denyNavigation(
+        route,
+        request,
+        new BrowserOriginScopeDeniedError(classification.origin),
+        recordDenial,
+      );
     } else if (
-      originRequiresCertificateBypass(origin, policy.invalidCertificateOrigins)
+      originRequiresCertificateBypass(
+        classification.origin,
+        policy.invalidCertificateOrigins,
+      )
     ) {
       await fulfillCertificateBypass(route, request, context, policy.timeoutMs);
     } else {
@@ -219,22 +266,22 @@ export async function installHostOriginScopeGuard(
 ): Promise<HostOriginScopeGuard> {
   const browser = await connect(endpoint, policy.timeoutMs);
   const contexts = browser.contexts();
-  let deniedOrigin: string | null = null;
+  let denial: BrowserOriginScopeDeniedError | null = null;
   const registrations = contexts.map((context) =>
     routeRegistration(
       context,
-      originScopeRouteHandler(context, policy, (origin) => {
-        deniedOrigin ??= origin;
+      originScopeRouteHandler(context, policy, (candidate) => {
+        denial ??= candidate;
       }),
     ),
   );
   try {
     await installRoutes(registrations);
     const existingDenials = deniedExistingPages(contexts, policy.matcher);
-    const installationDenial = deniedOrigin ?? existingDenials[0]?.origin;
-    if (installationDenial !== undefined && installationDenial !== null) {
+    const installationDenial = denial ?? existingDenials[0]?.denial ?? null;
+    if (installationDenial !== null) {
       await closeDeniedExistingPages(existingDenials);
-      throw new BrowserOriginScopeDeniedError(installationDenial);
+      throw installationDenial;
     }
   } catch (error) {
     await settlePendingRoutes(registrations);
@@ -242,7 +289,8 @@ export async function installHostOriginScopeGuard(
     throw error;
   }
   return {
-    deniedOrigin: () => deniedOrigin,
+    deniedError: () => denial,
+    deniedOrigin: () => denial?.origin ?? null,
     dispose: async () => {
       try {
         try {

@@ -290,6 +290,131 @@ describe("host-owned Origin Scope guard", () => {
     expect(boundary.close).toHaveBeenCalledOnce();
   });
 
+  // Recovery issue #64: non-web locations must not disappear into the old
+  // null-origin allow path or be surfaced as host-derived identifiers.
+  it.each([
+    "about:srcdoc",
+    "data:text/html,<h1>private</h1>",
+    "file:///tmp/private.txt",
+    "chrome://settings",
+    "javascript:document.body.innerHTML='private'",
+    "not a URL",
+  ])("fails closed for an existing non-web page: %s", async (url) => {
+    const page = new SimulatedPage("non-web", url);
+    const boundary = simulatedBrowser([page]);
+
+    await expect(
+      installHostOriginScopeGuard(
+        "ws://127.0.0.1/devtools/browser/test",
+        policy(),
+        boundary.connect,
+      ),
+    ).rejects.toEqual(new BrowserOriginScopeDeniedError(null));
+    expect(boundary.context.page("non-web")).toBeUndefined();
+    expect(boundary.close).toHaveBeenCalledOnce();
+  });
+
+  it("allows an existing safe internal blank page without a denial", async () => {
+    const page = new SimulatedPage("blank", "about:blank");
+    const boundary = simulatedBrowser([page]);
+
+    const guard = await installHostOriginScopeGuard(
+      "ws://127.0.0.1/devtools/browser/test",
+      policy(),
+      boundary.connect,
+    );
+
+    expect(guard.deniedOrigin()).toBeNull();
+    await guard.dispose();
+  });
+
+  it("allows an exact about:blank navigation as the safe internal exception", async () => {
+    const page = new SimulatedPage("main", "https://app.example.test/");
+    const boundary = simulatedBrowser([page]);
+    const guard = await installHostOriginScopeGuard(
+      "ws://127.0.0.1/devtools/browser/test",
+      policy(),
+      boundary.connect,
+    );
+
+    expect(await boundary.context.navigate(page, "about:blank")).toBe(
+      "continued",
+    );
+    expect(guard.deniedError()).toBeNull();
+    await guard.dispose();
+  });
+
+  it("matches an existing blob page by its embedded HTTP(S) origin", async () => {
+    const page = new SimulatedPage(
+      "blob-page",
+      "blob:https://outside.example.test/blob-id",
+    );
+    const boundary = simulatedBrowser([page]);
+
+    await expect(
+      installHostOriginScopeGuard(
+        "ws://127.0.0.1/devtools/browser/test",
+        policy(),
+        boundary.connect,
+      ),
+    ).rejects.toEqual(
+      new BrowserOriginScopeDeniedError("https://outside.example.test"),
+    );
+    expect(boundary.context.page("blob-page")).toBeUndefined();
+    expect(boundary.close).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    "about:srcdoc",
+    "data:text/html,<h1>private</h1>",
+    "file:///tmp/private.txt",
+    "chrome://settings",
+    "javascript:document.body.innerHTML='private'",
+    "not a URL",
+  ])("aborts a non-web navigation: %s", async (url) => {
+    const page = new SimulatedPage("main", "https://app.example.test/");
+    const boundary = simulatedBrowser([page]);
+    const guard = await installHostOriginScopeGuard(
+      "ws://127.0.0.1/devtools/browser/test",
+      policy(),
+      boundary.connect,
+    );
+
+    expect(await boundary.context.navigate(page, url)).toBe("aborted");
+    expect(guard.deniedError()).toEqual(
+      new BrowserOriginScopeDeniedError(null),
+    );
+    expect(preferOriginScopeDenial(guard, new Error("fallback"))).toEqual(
+      new BrowserOriginScopeDeniedError(null),
+    );
+    await guard.dispose();
+  });
+
+  it("matches a blob navigation by its embedded HTTP(S) origin", async () => {
+    const page = new SimulatedPage("main", "https://app.example.test/");
+    const boundary = simulatedBrowser([page]);
+    const guard = await installHostOriginScopeGuard(
+      "ws://127.0.0.1/devtools/browser/test",
+      policy(),
+      boundary.connect,
+    );
+
+    expect(
+      await boundary.context.navigate(
+        page,
+        "blob:https://app.example.test/blob-id",
+      ),
+    ).toBe("continued");
+    expect(
+      await boundary.context.navigate(
+        page,
+        "blob:https://outside.example.test/blob-id",
+      ),
+    ).toBe("aborted");
+    expect(guard.deniedOrigin()).toBe("https://outside.example.test");
+    await guard.dispose();
+  });
+
   it("denies a page that escapes while the host route is being installed", async () => {
     const page = new SimulatedPage("main", "https://app.example.test/");
     const boundary = simulatedBrowser([page]);

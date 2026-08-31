@@ -90,17 +90,24 @@ Profile Grant**.
 Origin Scope uses exact `scheme://host:port` origins and optional explicit
 subdomain patterns (ADR 0004, ADR 0013). URL paths do not narrow a grant; each
 localhost port is separate; `*` is a distinct whole-web permission. Cross-origin
-subresources may render normally. A denied origin produces a typed
-`origin_denied` result and a non-blocking Grant Request.
+subresources may render normally. A denied web origin produces a typed
+`origin_denied` result and a non-blocking Grant Request. A denied non-web
+navigation produces the same typed error with a null origin and no Grant
+Request.
 
 Enforcement is host-owned request interception. Before the QuickJS helper starts,
 the host connects independently to the profile's Playwright context, rejects
-and closes any existing out-of-scope web page, and installs a navigation route.
-The agent sandbox supplies no callback and cannot remove the route.
+and closes any existing out-of-scope web or non-web document, and installs a
+navigation route. Exact `about:blank` is the only safe internal exception;
+`blob:` navigation is classified by its embedded HTTP(S) origin when exposed.
+The agent sandbox supplies no callback and cannot remove the route. Its
+transitive `page.context().browser()` capability is cut before agent code runs,
+so an agent cannot create a later unguarded browser context; `browser.newPage()`
+continues to create pages in the guarded context.
 
 - Out-of-scope top-level pages, redirects, popups, and frame documents are
   aborted before commit. Ordinary cross-origin subresources continue normally.
-- The first denied origin is sticky for the operation. Navigating back into
+- The first denied navigation is sticky for the operation. Navigating back into
   scope, closing a popup, or throwing a later exception cannot erase it.
 - Denied popups and pre-existing denied tabs are closed, so a later call cannot
   recover their page objects or content.
