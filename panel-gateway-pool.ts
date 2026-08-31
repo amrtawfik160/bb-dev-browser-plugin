@@ -3,7 +3,11 @@ import type {
   PanelCapabilityStore,
   PanelCapabilityIssue,
 } from "./panel-capability.js";
-import { createPanelGateway, type PanelGateway } from "./panel-gateway.js";
+import {
+  createPanelGateway,
+  type PanelGateway,
+  type PanelGatewayClock,
+} from "./panel-gateway.js";
 
 /**
  * The Panel Capability is single-use: it is redeemed in the first WebSocket
@@ -18,11 +22,13 @@ import { createPanelGateway, type PanelGateway } from "./panel-gateway.js";
 export type PanelGatewayPoolOptions = {
   capabilities: PanelCapabilityStore;
   bindHost?: string;
+  clock?: PanelGatewayClock;
   gatewayFactory?: (options: {
     capabilities: PanelCapabilityStore;
     hostId: string;
     profileId: string;
     bindHost: string;
+    clock?: PanelGatewayClock;
   }) => PanelGateway;
 };
 
@@ -57,6 +63,7 @@ export function createPanelGatewayPool(options: PanelGatewayPoolOptions) {
         hostId: factoryOptions.hostId,
         profileId: factoryOptions.profileId,
         bindHost: factoryOptions.bindHost,
+        clock: factoryOptions.clock ?? options.clock,
       }));
   const gateways = new Map<string, PanelGateway>();
 
@@ -78,6 +85,7 @@ export function createPanelGatewayPool(options: PanelGatewayPoolOptions) {
       hostId: binding.hostId,
       profileId: binding.profileId,
       bindHost,
+      clock: options.clock,
     });
     gateways.set(key, gateway);
     const issued = capabilities.issue({

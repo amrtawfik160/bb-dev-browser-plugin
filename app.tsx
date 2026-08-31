@@ -68,6 +68,7 @@ import {
   type BrowserPanelOption,
 } from "./panel-browser.js";
 import { ownerSessionIdFromContext } from "./panel-owner-session.js";
+import { isTestLoopbackPanelTransport } from "./panel-test-loopback.js";
 import { SAFE_LOGIN_LIMITATIONS_NOTICE } from "./safe-login-notice.js";
 import {
   createAutomationStreamAdapter,
@@ -77,6 +78,19 @@ import {
 const panelParams = { profileId: DEFAULT_PROFILE_ID } as const;
 const GRANT_REQUEST_REFRESH_INTERVAL_MS = 1_000;
 let nextBrowserPanelId = 1;
+
+function shouldOpenAuthenticatedPanelStream() {
+  if (!isTestEnvironment()) return true;
+  return isTestLoopbackPanelTransport();
+}
+
+function isTestEnvironment() {
+  return (
+    typeof import.meta !== "undefined" &&
+    typeof (import.meta as { env?: { MODE?: string } }).env === "object" &&
+    (import.meta as { env?: { MODE?: string } }).env?.MODE === "test"
+  );
+}
 
 function ReadinessChecklist({ status }: { status: BrowserStatus }) {
   return (
@@ -322,14 +336,6 @@ function PanelStreamSurface({
     string | null
   >(null);
   const [exportError, setExportError] = useState<string | null>(null);
-  // The deterministic test environment has no real BB Connect tunnel; opening a
-  // WebSocket there would attempt a real network call. The stream is exercised
-  // against the provisioned host through the real-browser integration suite.
-  const isTestEnvironment =
-    typeof import.meta !== "undefined" &&
-    typeof (import.meta as { env?: { MODE?: string } }).env === "object" &&
-    (import.meta as { env?: { MODE?: string } }).env?.MODE === "test";
-
   useEffect(() => {
     if (status.state !== "healthy" || status.hostId === null) {
       // A sleeping or waking instance keeps the frame it last painted: those
@@ -362,7 +368,9 @@ function PanelStreamSurface({
         // The capability is redeemed in the first WebSocket message rather than
         // placed in a URL. The panel never opens the loopback gateway directly;
         // BB Connect's owner-session gate carries the opaque single-use secret.
-        setStreamState("streaming");
+        // The public lifecycle seam keeps connecting until that redeem produces
+        // a ready state over the real loopback transport.
+        if (!isTestLoopbackPanelTransport()) setStreamState("streaming");
       })
       .catch((error: unknown) => {
         if (disposed) return;
@@ -388,7 +396,11 @@ function PanelStreamSurface({
   // canvas, and reconnect with bounded backoff on disconnect. Input freezes
   // immediately on disconnect; the same panel has a 10-second reclaim window.
   useEffect(() => {
-    if (capability?.outcome !== "issued" || isTestEnvironment) return;
+    if (
+      capability?.outcome !== "issued" ||
+      !shouldOpenAuthenticatedPanelStream()
+    )
+      return;
     let disposed = false;
     let socket: WebSocket | null = null;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -435,9 +447,12 @@ function PanelStreamSurface({
       if (disposed) return;
       const issued = capability;
       if (issued?.outcome !== "issued") return;
-      // The tunnel URL is constructed from the BB Connect identity the host
-      // declared; it is never rendered into the DOM or exposed to agents.
-      const url = `wss://${issued.tunnel.label}.${issued.tunnel.baseDomain}`;
+      // Production reaches the loopback gateway through BB Connect. The public
+      // lifecycle seam substitutes that tunnel with the declared loopback port
+      // so tests redeem a real Panel Capability without a Connect daemon.
+      const url = isTestLoopbackPanelTransport()
+        ? `ws://127.0.0.1:${issued.gatewayPort}`
+        : `wss://${issued.tunnel.label}.${issued.tunnel.baseDomain}`;
       try {
         socket = new WebSocket(url);
       } catch {
@@ -588,7 +603,7 @@ function PanelStreamSurface({
         socket = null;
       }
     };
-  }, [capability, ownerSessionId, panelId, isTestEnvironment]);
+  }, [capability, ownerSessionId, panelId]);
 
   // Render the stream surface whenever the panel is authorized to stream. The
   // region always carries the Automation Mode policy text so spectators see the

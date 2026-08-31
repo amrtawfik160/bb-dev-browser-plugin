@@ -80,7 +80,10 @@ import {
 } from "./contracts.js";
 import { createPanelCapabilityStore } from "./panel-capability.js";
 import { createPanelGatewayPool } from "./panel-gateway-pool.js";
-import { createPanelTransportServer } from "./panel-transport.js";
+import {
+  createPanelTransportServer,
+  type ScreencastSource,
+} from "./panel-transport.js";
 import { createCdpScreencastSource } from "./browser-screencast.js";
 import { createAutomationStreamAdapter } from "./panel-stream.js";
 import {
@@ -160,6 +163,15 @@ type TransferStagingSource =
   TransferStagingManager | ((dataDir: string) => TransferStagingManager);
 type HostDownloadsSource =
   HostDownloadsManager | ((dataDir: string) => HostDownloadsManager);
+
+export type BrowserHostPanelStreamOptions = {
+  clock?: { now(): number };
+  frameSource?: (binding: {
+    hostId: string;
+    profileId: string;
+    panelId: string;
+  }) => ScreencastSource;
+};
 
 type ScriptSignalContext = { signal: AbortSignal };
 type ScriptActivityOutcome = "succeeded" | "failed" | "interrupted";
@@ -657,6 +669,7 @@ export function createBrowserHostEntry(
   safeLoginSource?: SafeLoginModeSource,
   transferStagingSource?: TransferStagingSource,
   hostDownloadsSource?: HostDownloadsSource,
+  panelStream?: BrowserHostPanelStreamOptions,
 ) {
   let workerLease: { dispose(): Promise<void> } | undefined;
   let retainedBoundary: HostAdministrationBoundary | undefined;
@@ -674,9 +687,11 @@ export function createBrowserHostEntry(
   let retainedRuntime: BrowserRuntimeHost | undefined =
     typeof runtimeSource === "object" ? runtimeSource : undefined;
   const controlLeases = createControlLeaseManager();
-  const panelCapabilities = createPanelCapabilityStore();
+  const panelClock = panelStream?.clock ?? { now: () => Date.now() };
+  const panelCapabilities = createPanelCapabilityStore({ clock: panelClock });
   const panelGateways = createPanelGatewayPool({
     capabilities: panelCapabilities,
+    clock: panelClock,
   });
   const panelTransports = new Map<
     string,
@@ -1280,6 +1295,119 @@ export function createBrowserHostEntry(
     }
     return runtimeBrowserStatus(readiness, browserRuntime, controlLeases);
   }
+  async function startBoundPanelTransport(
+    request: BrowserPanelTransportRequest,
+    dataDir: string,
+    panel: ReturnType<typeof panelGateways.openPanel>,
+    source: ScreencastSource,
+  ) {
+    const { gateway, issued } = panel;
+    const stream = createAutomationStreamAdapter({
+      clock: panelClock,
+      capabilities: panelCapabilities,
+    });
+    const controlTarget = {
+      hostId: request.hostId,
+      profileId: request.profileId,
+    };
+    const control = panelControlSession(controlTarget);
+    const strip = browserTabStrip(controlTarget);
+    const applyControllerViewport = () => {
+      const controllerViewport = control.controllerViewport;
+      if (controllerViewport === null) return;
+      stream.setViewport(controllerViewport);
+      source.setViewport?.(controllerViewport);
+    };
+    applyControllerViewport();
+    control.connectPanel(request.panelId, request.ownerSessionId);
+    applyControllerViewport();
+    const clipboardExchange = createClipboardExchange({
+      effects: {
+        readSelectionBytes: async (actor) => source.copyClipboard?.(actor) ?? 0,
+        writeClipboardToPage: async (actor, bytes) =>
+          source.pasteClipboard?.(actor, bytes) ?? 0,
+      },
+    });
+    const transport = createPanelTransportServer({
+      gateway,
+      stream,
+      source,
+      clock: panelClock,
+      canInput: () => control.canInput(request.panelId),
+      onDisconnect: () => control.disconnectPanel(request.panelId),
+      clipboardExchange,
+      onTransferCancel: async (transferId) => {
+        // Route panel transfer cancellation to the host staging manager so
+        // the one-use staged copy is removed at the controller's request.
+        const manager = transferStaging(dataDir);
+        await manager?.cancel(transferId).catch(() => undefined);
+      },
+      onDownloadCancel: async (downloadId) => {
+        // Owner cancels a quarantined download through the panel; route to
+        // the Host Downloads manager so the quarantine file is removed.
+        const manager = hostDownloads(dataDir);
+        await manager
+          ?.cancelDownload({ hostId: request.hostId, downloadId })
+          .catch(() => undefined);
+      },
+      subscribeDownloads: (onUpdate) => {
+        // Push the live quarantine listing so the panel observes progress,
+        // state, limits, expiry, and errors (issue #20). Time-expired
+        // downloads are reaped on each emit while a panel is observing.
+        const manager = hostDownloads(dataDir);
+        if (manager === null) return () => undefined;
+        const emit = () => {
+          void manager
+            .expire()
+            .then(() =>
+              manager.listDownloads({
+                hostId: request.hostId,
+                profileId: request.profileId,
+              }),
+            )
+            .then(onUpdate)
+            .catch(() => undefined);
+        };
+        const interval = setInterval(emit, 1000);
+        emit();
+        return () => clearInterval(interval);
+      },
+    });
+    const pushControlState = () => {
+      applyControllerViewport();
+      transport.broadcastControl(
+        control.state() as BrowserPanelControlState,
+        strip.snapshot() as BrowserTabStrip,
+      );
+    };
+    const unsubscribeControl = control.subscribe(pushControlState);
+    const unsubscribeTabs = strip.subscribe(pushControlState);
+    const port = await transport.start();
+    const transportKey = `${request.hostId}\u0000${request.profileId}\u0000${request.panelId}`;
+    const previous = panelTransports.get(transportKey);
+    if (previous !== undefined) {
+      await previous.stop().catch(() => undefined);
+      panelTransports.delete(transportKey);
+    }
+    panelTransports.set(transportKey, {
+      ...transport,
+      async stop() {
+        unsubscribeControl();
+        unsubscribeTabs();
+        await transport.stop();
+      },
+    });
+    return {
+      gatewayPort: port,
+      bindHost: gateway.declaredBindHost(),
+      capabilityId: issued.capabilityId,
+      secret: issued.secret,
+      expiresAt: new Date(issued.expiresAt).toISOString(),
+      rotatesAt: new Date(
+        issued.issuedAt + panelCapabilities.rotationMs,
+      ).toISOString(),
+    };
+  }
   async function openPanelTransport(
     request: BrowserPanelTransportRequest,
     dataDir: string,
@@ -1291,22 +1419,46 @@ export function createBrowserHostEntry(
     if (readiness.state !== "healthy" || readiness.hostId === null) {
       throw new Error(readiness.message);
     }
+    if (request.profileId !== DEFAULT_PROFILE_ID) {
+      const inventory = await profiles(dataDir).listProfiles(request.hostId);
+      if (
+        !inventory.profiles.some(
+          (profile) =>
+            profile.profileId === request.profileId &&
+            profile.state === "active",
+        )
+      ) {
+        throw new Error(
+          `Unknown Browser Profile ${request.profileId} on host ${request.hostId}.`,
+        );
+      }
+    }
     // A remount issues a fresh single-use Panel Capability. The pool retires
     // any prior gateway for this panel (revoking its redeemed capability) so
     // the fresh redeem is never blocked by a stale redeemed capability.
-    const { gateway, issued } = panelGateways.openPanel({
+    const opened = panelGateways.openPanel({
       ownerSessionId: request.ownerSessionId,
       panelId: request.panelId,
       hostId: request.hostId,
       profileId: request.profileId,
     });
+    const injectedSource = panelStream?.frameSource?.({
+      hostId: request.hostId,
+      profileId: request.profileId,
+      panelId: request.panelId,
+    });
+    if (injectedSource !== undefined) {
+      return startBoundPanelTransport(request, dataDir, opened, injectedSource);
+    }
+    const { gateway, issued } = opened;
     const browserRuntime = runtime(dataDir);
     if (browserRuntime !== undefined) {
       // Bind the gateway port (net.Server + WebSocket) and drive CDP screencast
       // through the browser runtime so Automation Mode frames stream over the
       // authenticated transport. The real-browser integration suite exercises
       // this path against a provisioned host; the deterministic suite has no
-      // real browser and keeps the declared-port fallback below.
+      // real browser and keeps the declared-port fallback below unless a
+      // lifecycle seam supplies a frame source.
       const profile = await resolveActiveProfile(
         dataDir,
         request.hostId,
@@ -1318,15 +1470,14 @@ export function createBrowserHostEntry(
         locale: profile?.locale ?? "en-US",
         timezone: profile?.timezone ?? "UTC",
       };
-      const stream = createAutomationStreamAdapter({
-        capabilities: panelCapabilities,
-      });
-      const controlTarget = {
+      const control = panelControlSession({
         hostId: request.hostId,
         profileId: request.profileId,
-      };
-      const control = panelControlSession(controlTarget);
-      const strip = browserTabStrip(controlTarget);
+      });
+      const strip = browserTabStrip({
+        hostId: request.hostId,
+        profileId: request.profileId,
+      });
       const source = createCdpScreencastSource({
         resolveEndpoint: async () =>
           (await browserRuntime.start(target)).automationEndpoint,
@@ -1334,7 +1485,7 @@ export function createBrowserHostEntry(
         // spectators scale and letterbox it rather than resizing it.
         viewport: control.controllerViewport ?? undefined,
         // Enroll a created target (open-link/open-image-new-tab) as a
-        // BrowserTab in the shared strip so it is normalized into the
+        // Browser Tab in the shared strip so it is normalized into the
         // profile's ordered tab set rather than spawning an untracked window.
         onTargetCreated: async (created) => {
           await browserRuntime.checkRendererProcessLimit?.(target);
@@ -1344,128 +1495,7 @@ export function createBrowserHostEntry(
             await browserRuntime.closePages(target, evicted);
         },
       });
-      // Apply the controller's viewport to the stream policy so the ready frame
-      // carries the controller viewport, and keep it in sync when control moves.
-      const applyControllerViewport = () => {
-        const controllerViewport = control.controllerViewport;
-        if (controllerViewport === null) return;
-        stream.setViewport(controllerViewport);
-        source.setViewport?.(controllerViewport);
-      };
-      applyControllerViewport();
-      // The panel joins the shared control session for its profile: the first
-      // panel becomes the controller and owns the viewport; later panels are
-      // view-only spectators. Input through the transport is gated so only the
-      // connected controller can send browser input.
-      control.connectPanel(request.panelId, request.ownerSessionId);
-      applyControllerViewport();
-      // Build the explicit clipboard exchange (issue #19) and route its effects
-      // to the CDP source's clipboard capabilities. The exchange is the policy
-      // (controller-only, no ambient sync); the source supplies the OS-clipboard
-      // read/write so clipboard text moves only through an explicit owner action.
-      const clipboardExchange = createClipboardExchange({
-        effects: {
-          readSelectionBytes: async (actor) =>
-            source.copyClipboard?.(actor) ?? 0,
-          writeClipboardToPage: async (actor, bytes) =>
-            source.pasteClipboard?.(actor, bytes) ?? 0,
-        },
-      });
-      const transferTarget = {
-        hostId: request.hostId,
-        profileId: request.profileId,
-      };
-      const transport = createPanelTransportServer({
-        gateway,
-        stream,
-        source,
-        canInput: () => control.canInput(request.panelId),
-        onDisconnect: () => control.disconnectPanel(request.panelId),
-        clipboardExchange,
-        onTransferCancel: async (transferId) => {
-          // Route panel transfer cancellation to the host staging manager so
-          // the one-use staged copy is removed at the controller's request.
-          const manager = transferStaging(dataDir);
-          await manager?.cancel(transferId).catch(() => undefined);
-          void transferTarget;
-        },
-        onDownloadCancel: async (downloadId) => {
-          // Owner cancels a quarantined download through the panel; route to
-          // the Host Downloads manager so the quarantine file is removed.
-          const manager = hostDownloads(dataDir);
-          await manager
-            ?.cancelDownload({ hostId: request.hostId, downloadId })
-            .catch(() => undefined);
-        },
-        subscribeDownloads: (onUpdate) => {
-          // Push the live quarantine listing to the panel so it observes
-          // progress, state, limits, expiry, and errors (issue #20).
-          //
-          // S7 (issue #20 findings): the listing is refreshed by polling on a
-          // one-second interval rather than by event-driven emission on every
-          // manager state change. The manager has no internal pub/sub and is
-          // shared across panels; wiring per-change emissions (start/append/
-          // complete/fail/cancel/expire/purge/export) would add cross-cutting
-          // state-change hooks for a bounded, low-frequency listing, so the
-          // cheaper polling approach is kept here. P1 (issue #20 findings):
-          // each emit first reaps time-expired downloads so time-based expiry
-          // of a live quarantined download actually fires while a panel is
-          // observing — without waiting for a profile lifecycle event.
-          const manager = hostDownloads(dataDir);
-          if (manager === null) return () => undefined;
-          const emit = () => {
-            void manager
-              .expire()
-              .then(() =>
-                manager.listDownloads({
-                  hostId: request.hostId,
-                  profileId: request.profileId,
-                }),
-              )
-              .then(onUpdate)
-              .catch(() => undefined);
-          };
-          const interval = setInterval(emit, 1000);
-          emit();
-          return () => clearInterval(interval);
-        },
-      });
-      // Push live control transfers and tab changes to this panel so every
-      // panel observes the shared state without re-fetching (ADR 0012).
-      const pushControlState = () => {
-        applyControllerViewport();
-        transport.broadcastControl(
-          control.state() as BrowserPanelControlState,
-          strip.snapshot() as BrowserTabStrip,
-        );
-      };
-      const unsubscribeControl = control.subscribe(pushControlState);
-      const unsubscribeTabs = strip.subscribe(pushControlState);
-      const port = await transport.start();
-      const transportKey = `${request.hostId}\u0000${request.profileId}\u0000${request.panelId}`;
-      const previous = panelTransports.get(transportKey);
-      if (previous !== undefined) {
-        await previous.stop().catch(() => undefined);
-        panelTransports.delete(transportKey);
-      }
-      panelTransports.set(transportKey, {
-        ...transport,
-        async stop() {
-          unsubscribeControl();
-          unsubscribeTabs();
-          await transport.stop();
-        },
-      });
-      return {
-        gatewayPort: port,
-        bindHost: gateway.declaredBindHost(),
-        capabilityId: issued.capabilityId,
-        secret: issued.secret,
-        expiresAt: new Date(issued.expiresAt).toISOString(),
-        rotatesAt: new Date(
-          issued.issuedAt + panelCapabilities.rotationMs,
-        ).toISOString(),
-      };
+      return startBoundPanelTransport(request, dataDir, opened, source);
     }
     return {
       gatewayPort: gateway.choosePort(),

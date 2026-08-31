@@ -116,6 +116,7 @@ import {
   type BrowserScriptResponse,
 } from "../contracts.js";
 import { createBrowserHostEntry, type HostSetupBoundary } from "../host.js";
+import type { ScreencastSource } from "../panel-transport.js";
 import type {
   BrowserInstanceRuntime,
   RuntimeBrowserPage,
@@ -395,6 +396,13 @@ export async function createPublicPluginHarness(options?: {
     requests: BrowserGrantRequest[],
     callIndex: number,
   ) => Promise<BrowserGrantRequest[]>;
+  panelContext?: { projectId?: string | null; threadId?: string | null };
+  clock?: { now(): number };
+  panelFrameSource?: (binding: {
+    hostId: string;
+    profileId: string;
+    panelId: string;
+  }) => ScreencastSource;
 }) {
   const configuredHostId = options?.hostId ?? HOST_ID;
   const configuredProjectHostIds = options?.projectHostIds ?? [
@@ -552,6 +560,12 @@ export async function createPublicPluginHarness(options?: {
       profileRecovery,
       options?.browserRuntime,
       options?.safeLoginMode,
+      undefined,
+      undefined,
+      {
+        clock: options?.clock,
+        frameSource: options?.panelFrameSource,
+      },
     ),
     {
       experimental_paths: {
@@ -955,6 +969,15 @@ export async function createPublicPluginHarness(options?: {
     panelId: string;
     ownerSessionId: string;
   }[] = [];
+  const panelCapabilityExchanges: {
+    request: {
+      hostId: string;
+      profileId: string;
+      panelId: string;
+      ownerSessionId: string;
+    };
+    response: BrowserPanelCapabilityResponse;
+  }[] = [];
 
   const rpc = {
     browser_status: (input: BrowserStatusInput) =>
@@ -980,17 +1003,19 @@ export async function createPublicPluginHarness(options?: {
         "browser_panel_visibility",
         input,
       ) as Promise<BrowserStatus>,
-    browser_panel_capability: (input: {
+    browser_panel_capability: async (input: {
       hostId: string;
       profileId: string;
       panelId: string;
       ownerSessionId: string;
     }) => {
       panelCapabilityRequests.push(input);
-      return backend.harness.behavior.callRpc(
+      const response = (await backend.harness.behavior.callRpc(
         "browser_panel_capability",
         input,
-      ) as Promise<BrowserPanelCapabilityResponse>;
+      )) as BrowserPanelCapabilityResponse;
+      panelCapabilityExchanges.push({ request: input, response });
+      return response;
     },
     browser_tabs: (input: { hostId: string; profileId: string }) =>
       backend.harness.behavior.callRpc("browser_tabs", input) as Promise<
@@ -1520,7 +1545,12 @@ export async function createPublicPluginHarness(options?: {
     return renderSlot<PluginThreadPanelProps, typeof rpcContract>(
       app.threadPanelActions[0]!,
       { threadId: THREAD_ID, params },
-      { rpc },
+      {
+        rpc,
+        ...(options?.panelContext === undefined
+          ? {}
+          : { context: options.panelContext }),
+      },
     );
   }
 
@@ -1528,7 +1558,12 @@ export async function createPublicPluginHarness(options?: {
     return renderSlot<PluginNewThreadPanelProps, typeof rpcContract>(
       app.newThreadPanelActions[0]!,
       { projectId: PROJECT_ID, params },
-      { rpc },
+      {
+        rpc,
+        ...(options?.panelContext === undefined
+          ? {}
+          : { context: options.panelContext }),
+      },
     );
   }
 
@@ -2192,6 +2227,10 @@ export async function createPublicPluginHarness(options?: {
     get panelCapabilityRequests() {
       return [...panelCapabilityRequests];
     },
+    get panelCapabilityExchanges() {
+      return [...panelCapabilityExchanges];
+    },
+    rpc,
     get threadLookups() {
       return [...threadLookups];
     },
