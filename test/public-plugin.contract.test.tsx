@@ -4974,6 +4974,10 @@ describe("Browser public plugin contract", () => {
         label: "ci-gate",
         baseDomain: "ci.getbb.app",
       });
+      // A capability request names its host and has no thread or project, so
+      // host resolution must use the host inventory rather than inventing a
+      // placeholder thread and asking BB for it.
+      expect(browser.threadLookups).toEqual([]);
       // The dynamic loopback gateway port is declared to BB Connect for
       // owner-session-gated tunneling; raw listeners stay loopback-only.
       expect(browser.sharedPortDeclarations).toEqual([
@@ -4982,6 +4986,47 @@ describe("Browser public plugin contract", () => {
       // The capability is redeemed in the first WebSocket message, never a URL.
       expect(JSON.stringify(response)).not.toContain("ws://");
       expect(JSON.stringify(response)).not.toContain("127.0.0.1");
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("rejects an unknown Panel Capability host through host validation instead of a missing-thread 404", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: { ...preparedSnapshot, connect: { enrolled: true } },
+    });
+    try {
+      const response = await browser.runBrowserPanelCapability({
+        hostId: "host-unknown",
+        profileId: DEFAULT_PROFILE_ID,
+        panelId: "panel-capability-unknown-host",
+      });
+      expect(response.outcome).toBe("unavailable");
+      if (response.outcome === "unavailable") {
+        expect(response.reason).toBe("host-offline");
+        expect(response.message).not.toMatch(/404|Thread not found/i);
+      }
+      expect(browser.threadLookups).toEqual([]);
+      expect(browser.sharedPortDeclarations).toEqual([]);
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("does not silently resolve an impossible thread identifier", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+    });
+    try {
+      await expect(
+        browser.runBrowserStatus({
+          surface: "thread",
+          threadId: "panel-capability",
+          profileId: DEFAULT_PROFILE_ID,
+          hostId: "host-browser-test",
+        }),
+      ).rejects.toThrow("HTTP 404: Thread not found");
+      expect(browser.threadLookups).toEqual(["panel-capability"]);
     } finally {
       await browser.dispose();
     }
