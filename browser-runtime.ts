@@ -35,6 +35,7 @@ import {
 } from "./origin-scope.js";
 export { BrowserOriginScopeDeniedError } from "./origin-scope.js";
 import {
+  ACTIVE_TAB_MARKER_FIELD,
   NON_WEB_NAVIGATION_DENIED_MESSAGE,
   prepareAgentExecution,
   preferredTabOrigin,
@@ -142,6 +143,12 @@ export interface BrowserLaunchBoundary {
     automationEndpoint: string | null,
   ): Promise<RunningBrowserProcess | null>;
   processIdentity(pid: number): Promise<BrowserProcessIdentity>;
+  /**
+   * Verify the renderer process ceiling for a browser owned by this boundary.
+   * Production uses the browser process tree; injected test boundaries may
+   * omit this optional capability.
+   */
+  assertRendererProcessLimit?(pid: number): Promise<void>;
   execute(request: BrowserExecutionRequest): Promise<unknown>;
   configuredSearchUrl(request: {
     profileDirectory: string;
@@ -184,6 +191,7 @@ export class BrowserInstanceError extends Error {
       | "host-offline"
       | "profile-in-use"
       | "repair-required"
+      | "renderer-limit"
       | "unsafe-launch",
     message: string,
     public readonly diagnostics?: BrowserRepairDiagnostics,
@@ -364,16 +372,14 @@ function runtimeKey(
 }
 
 /**
- * Memory ceiling for one Browser Instance.
+ * Renderer safety settings for one Browser Instance.
  *
- * The browser is spawned by the host worker, so it lives in whatever cgroup
- * the BB host daemon runs in and spends the same memory budget as every agent
- * on the machine. Chromium left to itself will grow a renderer per page with
- * no bound, so one heavy page could exhaust that shared budget and take the
- * agent service down with it. Capping renderer processes and each renderer's
- * V8 old space bounds the worst case to roughly
- * RENDERER_PROCESS_LIMIT × (RENDERER_HEAP_LIMIT_MB + native overhead), which
- * is ample for an 800×600 automation browser.
+ * Chromium treats `--renderer-process-limit` as a process-reuse hint rather
+ * than a hard ceiling. The production process boundary therefore checks the
+ * live browser process tree and fails closed when the configured ceiling is
+ * exceeded. The V8 old-space flag remains a per-renderer heap setting; it is
+ * not a total-browser memory limit. Browser Tab retention is enforced
+ * separately by closing pages evicted from the shared tab strip.
  */
 export const RENDERER_PROCESS_LIMIT = 8;
 export const RENDERER_HEAP_LIMIT_MB = 512;
@@ -864,6 +870,19 @@ function executionRequest(
   };
 }
 
+async function readActiveTabId(
+  boundary: BrowserLaunchBoundary,
+  held: HeldBrowserInstance,
+  profileId: string,
+) {
+  const raw = assertBrowserScriptResultWithinBounds(
+    await boundary.execute(
+      executionRequest(held, profileId, activeBrowserTabScript(), 30_000),
+    ),
+  );
+  return parseActiveTabId(browserResultOutput(raw));
+}
+
 /**
  * Classifies a worker-execution error from a typed signal this runtime owns.
  * Typed {@link BrowserScriptExecutionError} instances (timeout, result bounds)
@@ -913,7 +932,26 @@ function linkedOperationSignal(options: BrowserOperationOptions) {
   };
 }
 
-function activeTabId(activeTabOutput: unknown) {
+function browserResultText(browserResult: unknown) {
+  if (typeof browserResult === "string") return browserResult;
+  if (
+    typeof browserResult === "object" &&
+    browserResult !== null &&
+    "output" in browserResult &&
+    typeof browserResult.output === "string"
+  ) {
+    return browserResult.output;
+  }
+  return null;
+}
+
+function browserResultOutput(browserResult: unknown) {
+  const output = browserResultText(browserResult);
+  if (output !== null) return output;
+  throw new Error("Automation Mode returned invalid Browser Result output.");
+}
+
+function parseActiveTabId(activeTabOutput: unknown) {
   if (typeof activeTabOutput !== "string") {
     throw new Error("Automation Mode returned an invalid active Browser Tab.");
   }
@@ -928,6 +966,84 @@ function activeTabId(activeTabOutput: unknown) {
     throw new Error("Automation Mode returned an invalid active Browser Tab.");
   }
   return active.id;
+}
+
+function isRendererLimitFailure(error: unknown): boolean {
+  if (error instanceof BrowserInstanceError) {
+    return error.code === "renderer-limit";
+  }
+  return (
+    error instanceof AggregateError &&
+    [...error.errors].some(isRendererLimitFailure)
+  );
+}
+
+function rendererLimitCleanupFailure(error: unknown, cleanupError: unknown) {
+  return new AggregateError(
+    [error, cleanupError],
+    "Browser Instance renderer limit enforcement failed.",
+    { cause: cleanupError },
+  );
+}
+
+function parseActiveTabMarkerLine(line: string, marker: string) {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line) as unknown;
+  } catch {
+    return undefined;
+  }
+  if (
+    typeof parsed !== "object" ||
+    parsed === null ||
+    !(ACTIVE_TAB_MARKER_FIELD in parsed) ||
+    parsed[ACTIVE_TAB_MARKER_FIELD] !== marker
+  ) {
+    return undefined;
+  }
+  if (!(
+    "id" in parsed &&
+    typeof parsed.id === "string" &&
+    parsed.id.length > 0
+  )) {
+    throw new Error("Automation Mode returned an invalid active Browser Tab.");
+  }
+  return parsed.id;
+}
+
+function splitActiveTabMarker(output: string, marker: string) {
+  let activeTabId: string | undefined;
+  const retainedLines: string[] = [];
+  for (const line of output.split("\n")) {
+    const markerTabId = parseActiveTabMarkerLine(line, marker);
+    if (markerTabId === undefined) {
+      retainedLines.push(line);
+      continue;
+    }
+    if (activeTabId !== undefined) {
+      throw new Error(
+        "Automation Mode returned duplicate active Browser Tabs.",
+      );
+    }
+    activeTabId = markerTabId;
+  }
+  return { activeTabId, output: retainedLines.join("\n") };
+}
+
+function extractActiveTabMarker(browserResult: unknown, marker: string) {
+  const output = browserResultText(browserResult);
+  if (output === null) return { result: browserResult };
+  const splitOutput = splitActiveTabMarker(output, marker);
+  if (splitOutput.activeTabId === undefined) return { result: browserResult };
+
+  const structuredResult = browserResult as Record<string, unknown>;
+  return {
+    result:
+      typeof browserResult === "string"
+        ? splitOutput.output
+        : { ...structuredResult, output: splitOutput.output },
+    activeTabId: splitOutput.activeTabId,
+  };
 }
 
 const pageInventoryScript = `console.log(JSON.stringify(await browser.listPages()));`;
@@ -1192,6 +1308,9 @@ async function launchBrowserInstance(
       paths.runtimeManifestPath,
     );
     assertLoopbackEndpoint(browserProcess.automationEndpoint);
+    await options.launchBoundary.assertRendererProcessLimit?.(
+      browserProcess.pid,
+    );
     const publicState = browserInstanceState(
       target,
       launch.browser,
@@ -1347,7 +1466,10 @@ export function createBrowserInstanceRuntime(
   }
 
   function watchBrowserExit(key: string, held: HeldBrowserInstance) {
-    const beginRetirement = () => {
+    const beginRetirement = (error?: unknown) => {
+      if (isRendererLimitFailure(error)) {
+        held.stopRequested = true;
+      }
       const retirement = retireExitedBrowser(key, held);
       trackRetirement(key, retirement);
       if (held.stopRequested) return;
@@ -1477,6 +1599,24 @@ export function createBrowserInstanceRuntime(
     }
   }
 
+  async function enforceRendererProcessLimit(
+    key: string,
+    held: HeldBrowserInstance,
+  ) {
+    const check = options.launchBoundary.assertRendererProcessLimit;
+    if (check === undefined) return;
+    try {
+      await check(held.process.pid);
+    } catch (error) {
+      try {
+        await stopHeld(key, held);
+      } catch (cleanupError) {
+        throw rendererLimitCleanupFailure(error, cleanupError);
+      }
+      throw error;
+    }
+  }
+
   async function quarantineOriginScopeFailure(
     key: string,
     held: HeldBrowserInstance,
@@ -1577,6 +1717,39 @@ export function createBrowserInstanceRuntime(
       held.panelIds.delete(panelId);
       noteActivity(key, held);
     },
+    async activeTabId(
+      target: Pick<BrowserRuntimeTarget, "hostId" | "profileId">,
+    ) {
+      const key = runtimeKey(target);
+      const held = await heldInstance({
+        hostId: target.hostId,
+        profileId: target.profileId,
+        locale: "en-US",
+        timezone: "UTC",
+      });
+      noteActivity(key, held);
+      await enforceRendererProcessLimit(key, held);
+      const active = await readActiveTabId(
+        options.launchBoundary,
+        held,
+        target.profileId,
+      );
+      await enforceRendererProcessLimit(key, held);
+      activeTabs.set(key, active);
+      return active;
+    },
+    async checkRendererProcessLimit(
+      target: Pick<BrowserRuntimeTarget, "hostId" | "profileId">,
+    ) {
+      const key = runtimeKey(target);
+      const held = await heldInstance({
+        hostId: target.hostId,
+        profileId: target.profileId,
+        locale: "en-US",
+        timezone: "UTC",
+      });
+      await enforceRendererProcessLimit(key, held);
+    },
     async execute(
       target: BrowserRuntimeTarget,
       code: string,
@@ -1607,31 +1780,44 @@ export function createBrowserInstanceRuntime(
                 operationOptions.invalidCertificateOrigins ?? [],
               timeoutMs,
             };
+      const activeTabMarker = randomUUID();
       const executionCode = prepareAgentExecution({
         code,
         tabId: target.tabId,
         preferredOrigin: preferredTabOrigin(operationOptions.originScope),
         timeoutMs,
         enforceNonWebNavigation: originPolicy !== undefined,
+        activeTabMarker,
         screenshot,
       });
       const operationSignal = linkedOperationSignal(operationOptions);
       try {
         try {
-          const browserResult = assertBrowserScriptResultWithinBounds(
-            await options.launchBoundary.execute(
-              executionRequest(
-                held,
-                target.profileId,
-                executionCode,
-                timeoutMs,
-                operationSignal.signal,
-                screenshot,
-                originPolicy,
-              ),
+          await enforceRendererProcessLimit(key, held);
+          const rawBrowserResult = await options.launchBoundary.execute(
+            executionRequest(
+              held,
+              target.profileId,
+              executionCode,
+              timeoutMs,
+              operationSignal.signal,
+              screenshot,
+              originPolicy,
             ),
           );
-          if (target.tabId !== undefined) activeTabs.set(key, target.tabId);
+          await enforceRendererProcessLimit(key, held);
+          const activeTab = extractActiveTabMarker(
+            rawBrowserResult,
+            activeTabMarker,
+          );
+          const browserResult = assertBrowserScriptResultWithinBounds(
+            activeTab.result,
+          );
+          if (activeTab.activeTabId !== undefined) {
+            activeTabs.set(key, activeTab.activeTabId);
+          } else if (target.tabId !== undefined) {
+            activeTabs.set(key, target.tabId);
+          }
           return browserResult;
         } catch (error) {
           const classified = classifyExecutionError(
@@ -1680,6 +1866,7 @@ export function createBrowserInstanceRuntime(
       const operationSignal = linkedOperationSignal(operationOptions);
       let tabId = target.tabId ?? activeTabs.get(key);
       try {
+        await enforceRendererProcessLimit(key, held);
         if (tabId === undefined) {
           const discovered = await options.launchBoundary.execute(
             executionRequest(
@@ -1690,7 +1877,7 @@ export function createBrowserInstanceRuntime(
               operationSignal.signal,
             ),
           );
-          tabId = activeTabId(discovered);
+          tabId = parseActiveTabId(browserResultOutput(discovered));
         }
         const location = await options.launchBoundary.execute(
           executionRequest(
@@ -1701,6 +1888,7 @@ export function createBrowserInstanceRuntime(
             operationSignal.signal,
           ),
         );
+        await enforceRendererProcessLimit(key, held);
         activeTabs.set(key, tabId);
         noteActivity(key, held);
         return { address, location, tabId };
@@ -1718,6 +1906,7 @@ export function createBrowserInstanceRuntime(
       const operationSignal = linkedOperationSignal(operationOptions);
       let tabId = target.tabId ?? activeTabs.get(key);
       try {
+        await enforceRendererProcessLimit(key, held);
         if (tabId === undefined) {
           const discovered = await options.launchBoundary.execute(
             executionRequest(
@@ -1728,7 +1917,7 @@ export function createBrowserInstanceRuntime(
               operationSignal.signal,
             ),
           );
-          tabId = activeTabId(discovered);
+          tabId = parseActiveTabId(browserResultOutput(discovered));
         }
         const location = await options.launchBoundary.execute(
           executionRequest(
@@ -1739,6 +1928,7 @@ export function createBrowserInstanceRuntime(
             operationSignal.signal,
           ),
         );
+        await enforceRendererProcessLimit(key, held);
         activeTabs.set(key, tabId);
         noteActivity(key, held);
         const address = {
@@ -1774,11 +1964,13 @@ export function createBrowserInstanceRuntime(
       });
       const key = runtimeKey(target);
       noteActivity(key, held);
+      await enforceRendererProcessLimit(key, held);
       const raw = assertBrowserScriptResultWithinBounds(
         await options.launchBoundary.execute(
           executionRequest(held, target.profileId, pageInventoryScript, 30_000),
         ),
       );
+      await enforceRendererProcessLimit(key, held);
       const parsed = parsePageInventory(raw);
       return parsed.map((page) => ({
         id: String(page.id),
@@ -1806,6 +1998,7 @@ export function createBrowserInstanceRuntime(
       });
       const key = runtimeKey(target);
       noteActivity(key, held);
+      await enforceRendererProcessLimit(key, held);
       const raw = assertBrowserScriptResultWithinBounds(
         await options.launchBoundary.execute(
           executionRequest(
@@ -1816,6 +2009,7 @@ export function createBrowserInstanceRuntime(
           ),
         ),
       );
+      await enforceRendererProcessLimit(key, held);
       const closed = Number.parseInt(String(raw).trim(), 10);
       return Number.isSafeInteger(closed) && closed >= 0 ? closed : 0;
     },

@@ -175,10 +175,11 @@ export function createBrowserTabStrip(options: BrowserTabStripOptions = {}) {
    * Sync the strip from a runtime page inventory. Pages not present are
    * dropped; new pages are added (preserving popup origin and opener when the
    * runtime reports them). A supplied active tab is protected while trimming;
-   * otherwise the current active tab is preserved when possible, and the last
-   * reported page becomes active when no active tab remains. Runtime tab ids
-   * are preserved unchanged so they stay consistent for the life of the
-   * instance.
+   * otherwise the current active tab is preserved when possible. An inventory
+   * larger than the retention cap cannot be trimmed without a known active
+   * tab, so it fails closed instead of selecting an arbitrary reported page.
+   * Runtime tab ids are preserved unchanged so they stay consistent for the
+   * life of the instance.
    */
   function syncPages(
     pages: ReadonlyArray<{
@@ -206,14 +207,22 @@ export function createBrowserTabStrip(options: BrowserTabStripOptions = {}) {
       next.set(page.id, tab);
       nextOrder.push(page.id);
     }
+    const nextActiveTabId =
+      preferredActiveTabId !== undefined && next.has(preferredActiveTabId)
+        ? preferredActiveTabId
+        : activeTabId !== null && next.has(activeTabId)
+          ? activeTabId
+          : nextOrder.length === 1
+            ? nextOrder[0]!
+            : null;
+    if (nextOrder.length > maxTabs && nextActiveTabId === null) {
+      throw new Error(
+        "Cannot trim the Browser Tab inventory without a known active Browser Tab.",
+      );
+    }
     tabs = next;
     order = nextOrder;
-    activeTabId =
-      preferredActiveTabId !== undefined && tabs.has(preferredActiveTabId)
-        ? preferredActiveTabId
-        : activeTabId !== null && tabs.has(activeTabId)
-          ? activeTabId
-          : (order[order.length - 1] ?? null);
+    activeTabId = nextActiveTabId;
     trimToMax();
     emit();
   }

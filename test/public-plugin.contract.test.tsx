@@ -173,6 +173,8 @@ function publicRuntime(
       automationEndpoint: "http://127.0.0.1:9222",
     }),
     unpinPanel: async () => undefined,
+    activeTabId: async () => "public-tab",
+    checkRendererProcessLimit: async () => undefined,
     hostDisconnected: () => undefined,
     hostReconnected: async () => undefined,
     dispose: async () => undefined,

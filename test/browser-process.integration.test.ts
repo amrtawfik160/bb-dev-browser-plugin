@@ -6,11 +6,15 @@ import {
   rm,
   writeFile,
 } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createConnection } from "node:net";
+import { chromium } from "playwright";
 import { describe, expect, it } from "vitest";
 import { createProductionBrowserProcessBoundary } from "../browser-process.js";
+import { RENDERER_PROCESS_LIMIT } from "../browser-runtime.js";
 
 /**
  * Real-browser-subprocess integration gate.
@@ -73,7 +77,144 @@ function connectToEndpoint(endpoint: string) {
   });
 }
 
+async function connectPinnedChromium(endpoint: string) {
+  let lastError: unknown;
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    try {
+      return await chromium.connectOverCDP(endpoint);
+    } catch (error) {
+      lastError = error;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
+  throw lastError ?? new Error("Pinned Chromium CDP connection timed out.");
+}
+
 describe("production browser process boundary", () => {
+  it.runIf(integrationEnabled)(
+    "issue #66 fails closed when pinned Chromium exceeds the renderer ceiling",
+    async () => {
+      // This is intentionally test-only: root cannot launch Chromium's sandbox
+      // in this unprivileged test runner. Production launch policy still rejects
+      // --no-sandbox and never adds it to its Chrome command.
+      const rootDirectory = await mkdtemp(join(tmpdir(), "renderer-limit-"));
+      const profileDirectory = join(rootDirectory, "profile");
+      const server = createServer((_request, response) => {
+        response.end("<!doctype html><title>renderer fixture</title>");
+      });
+      await new Promise<void>((resolve) =>
+        server.listen(0, "127.0.0.1", resolve),
+      );
+      const address = server.address();
+      if (address === null || typeof address === "string") {
+        throw new Error("Renderer fixture server did not bind.");
+      }
+      const browserProcess = spawn(
+        chromium.executablePath(),
+        [
+          "--headless=new",
+          "--no-sandbox",
+          "--site-per-process",
+          `--user-data-dir=${profileDirectory}`,
+          "--remote-debugging-address=127.0.0.1",
+          "--remote-debugging-port=0",
+          `--renderer-process-limit=${RENDERER_PROCESS_LIMIT}`,
+          "about:blank",
+        ],
+        { stdio: ["ignore", "ignore", "pipe"] },
+      );
+      let browser:
+        Awaited<ReturnType<typeof chromium.connectOverCDP>> | undefined;
+      try {
+        const endpointDeadline = Date.now() + 10_000;
+        let endpoint: string | undefined;
+        while (endpoint === undefined && Date.now() < endpointDeadline) {
+          try {
+            const portFile = await readFile(
+              join(profileDirectory, "DevToolsActivePort"),
+              "utf8",
+            );
+            const [port, path] = portFile.trim().split("\n");
+            if (port !== undefined && path?.startsWith("/devtools/browser/")) {
+              endpoint = `http://127.0.0.1:${port}`;
+            }
+          } catch (error) {
+            if (!(
+              error instanceof Error &&
+              "code" in error &&
+              error.code === "ENOENT"
+            )) {
+              throw error;
+            }
+          }
+          if (endpoint === undefined) {
+            await new Promise((resolve) => setTimeout(resolve, 50));
+          }
+        }
+        if (endpoint === undefined) {
+          throw new Error("Pinned Chromium did not expose CDP readiness.");
+        }
+        browser = await connectPinnedChromium(endpoint);
+        const context = browser.contexts()[0];
+        if (context === undefined) throw new Error("Chromium context missing.");
+        for (let index = 0; index < RENDERER_PROCESS_LIMIT * 2; index += 1) {
+          const page = await context.newPage();
+          await page.goto(
+            `http://site-${index}.localhost:${address.port}/?page=${index}`,
+            { waitUntil: "domcontentloaded" },
+          );
+        }
+        const cdp = await browser.newBrowserCDPSession();
+        const processInfo = await cdp.send("SystemInfo.getProcessInfo");
+        const rendererCount = processInfo.processInfo.filter(
+          (process_) => process_.type === "renderer",
+        ).length;
+        expect(rendererCount).toBeGreaterThan(RENDERER_PROCESS_LIMIT);
+
+        const boundary = createProductionBrowserProcessBoundary({
+          devBrowserExecutable: "/bin/true",
+        });
+        await expect(
+          boundary.assertRendererProcessLimit!(browserProcess.pid!),
+        ).rejects.toMatchObject({ code: "renderer-limit" });
+      } finally {
+        await browser?.close().catch(() => undefined);
+        if (
+          browserProcess.exitCode === null &&
+          browserProcess.signalCode === null
+        ) {
+          browserProcess.kill("SIGKILL");
+        }
+        await new Promise<void>((resolve) => {
+          if (
+            browserProcess.exitCode !== null ||
+            browserProcess.signalCode !== null
+          ) {
+            resolve();
+            return;
+          }
+          browserProcess.once("exit", () => resolve());
+        });
+        server.closeAllConnections();
+        await new Promise<void>((resolve) => {
+          if (!server.listening) {
+            resolve();
+            return;
+          }
+          server.close(() => resolve());
+        });
+        await rm(rootDirectory, {
+          recursive: true,
+          force: true,
+          maxRetries: 5,
+          retryDelay: 50,
+        });
+      }
+    },
+    20_000,
+  );
+
   it("resolves search text through the Browser Profile configured engine", async () => {
     const rootDirectory = await mkdtemp(join(tmpdir(), "browser-search-"));
     const profileDirectory = join(rootDirectory, "profile");

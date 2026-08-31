@@ -145,13 +145,30 @@ describe("Browser Tab strip", () => {
 
   it("evicts pages past the cap when syncing a runtime inventory", () => {
     const strip = createBrowserTabStrip({ maxTabs: 2 });
-    strip.syncPages([
-      { id: "tab-a", url: "https://example.test/a" },
-      { id: "tab-b", url: "https://example.test/b" },
-      { id: "tab-c", url: "https://example.test/c" },
-    ]);
+    strip.syncPages(
+      [
+        { id: "tab-a", url: "https://example.test/a" },
+        { id: "tab-b", url: "https://example.test/b" },
+        { id: "tab-c", url: "https://example.test/c" },
+      ],
+      "tab-c",
+    );
     expect(strip.takeEvictedTabIds()).toEqual(["tab-a"]);
     expect(stripIds(strip.snapshot())).toEqual(["tab-b", "tab-c"]);
+    strip.dispose();
+  });
+
+  it("refuses to trim an inventory when the foreground tab is unknown", () => {
+    const strip = createBrowserTabStrip({ maxTabs: 2 });
+
+    expect(() =>
+      strip.syncPages([
+        { id: "tab-a", url: "https://example.test/a" },
+        { id: "tab-b", url: "https://example.test/b" },
+        { id: "tab-c", url: "https://example.test/c" },
+      ]),
+    ).toThrow("active Browser Tab");
+    expect(strip.snapshot()).toEqual({ tabs: [], activeTabId: null });
     strip.dispose();
   });
 

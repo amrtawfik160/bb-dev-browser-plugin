@@ -230,7 +230,8 @@ describe("agent script convenience wrapping", () => {
   it("binds page to the visible tab when tabId is omitted", () => {
     const prepared = prepareAgentExecution({ code: "return page.url()" });
     expect(prepared).toContain("browser.listPages()");
-    expect(prepared).toContain('? "main"');
+    expect(prepared).not.toContain('? "main"');
+    expect(prepared).toContain("page === undefined");
     expect(prepared.indexOf("visibilityState")).toBeLessThan(
       prepared.indexOf("return page.url()"),
     );

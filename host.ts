@@ -97,7 +97,7 @@ import {
   BrowserScriptExecutionError,
   createBrowserInstanceRuntime,
   type BrowserInstanceRuntime,
-  type RuntimeBrowserPage,
+  type BrowserRuntimeTarget,
 } from "./browser-runtime.js";
 import { createProductionBrowserProcessBoundary } from "./browser-process.js";
 import {
@@ -138,8 +138,21 @@ type ProfileStoreSource =
     ) => BrowserProfileStore);
 type ProfileRecoverySource =
   BrowserProfileRecovery | ((dataDir: string) => BrowserProfileRecovery);
+type BrowserRuntimeHost = Omit<
+  BrowserInstanceRuntime,
+  "activeTabId" | "checkRendererProcessLimit"
+> & {
+  /** Optional for small injected host test doubles. */
+  activeTabId?: (
+    target: Pick<BrowserRuntimeTarget, "hostId" | "profileId">,
+  ) => Promise<string | undefined>;
+  /** Optional for small injected host test doubles. */
+  checkRendererProcessLimit?: (
+    target: Pick<BrowserRuntimeTarget, "hostId" | "profileId">,
+  ) => Promise<void>;
+};
 type BrowserRuntimeSource =
-  BrowserInstanceRuntime | ((dataDir: string) => BrowserInstanceRuntime);
+  BrowserRuntimeHost | ((dataDir: string) => BrowserRuntimeHost);
 type SafeLoginModeSource =
   SafeLoginModeManager | ((dataDir: string) => SafeLoginModeManager);
 type TransferStagingSource =
@@ -575,7 +588,7 @@ async function recordDownloadExport(
 
 async function runtimeBrowserStatus(
   readiness: BrowserStatus,
-  browserRuntime: BrowserInstanceRuntime | undefined,
+  browserRuntime: BrowserRuntimeHost | undefined,
   controlLeases?: ControlLeaseManager,
 ) {
   const visibleReadiness = statusWithControlLease(readiness, controlLeases);
@@ -657,7 +670,7 @@ export function createBrowserHostEntry(
       : undefined;
   let retainedHostDownloads: HostDownloadsManager | undefined =
     typeof hostDownloadsSource === "object" ? hostDownloadsSource : undefined;
-  let retainedRuntime: BrowserInstanceRuntime | undefined =
+  let retainedRuntime: BrowserRuntimeHost | undefined =
     typeof runtimeSource === "object" ? runtimeSource : undefined;
   const controlLeases = createControlLeaseManager();
   const panelCapabilities = createPanelCapabilityStore();
@@ -704,6 +717,27 @@ export function createBrowserHostEntry(
     return strip;
   }
 
+  async function synchronizeRuntimeTabStrip(
+    browserRuntime: BrowserRuntimeHost,
+    strip: ReturnType<typeof browserTabStrip>,
+    target: { hostId: string; profileId: string },
+    requestedActiveTabId?: string,
+  ) {
+    const pages = await browserRuntime.listPages(target);
+    const protectedTabId =
+      requestedActiveTabId ?? (await browserRuntime.activeTabId?.(target));
+    strip.syncPages(
+      pages.map((page) => ({
+        id: page.id,
+        url: page.url,
+        title: page.title,
+        origin: page.openerTabId === null ? "page" : "popup",
+        openerTabId: page.openerTabId,
+      })),
+      protectedTabId,
+    );
+  }
+
   /**
    * Dismiss every still-open agent dialog for a profile when the agent's
    * Control Lease ends (revoked or owner takes control), so an unresolved
@@ -743,25 +777,18 @@ export function createBrowserHostEntry(
     const browserRuntime = runtime(dataDir);
     if (browserRuntime === undefined) return;
     const strip = browserTabStrip(target);
-    let pages: RuntimeBrowserPage[];
     try {
-      pages = await browserRuntime.listPages(target);
+      await synchronizeRuntimeTabStrip(
+        browserRuntime,
+        strip,
+        target,
+        activeTabId,
+      );
     } catch {
-      // Feeding the strip is best-effort: if the runtime inventory cannot be
-      // read (for example a host blip), leave the prior strip intact until the
-      // next operation reconciles, rather than dropping tabs the user sees.
+      // Without a readable inventory and verified foreground, leave the prior
+      // strip intact until the next operation can reconcile it safely.
       return;
     }
-    strip.syncPages(
-      pages.map((page) => ({
-        id: page.id,
-        url: page.url,
-        title: page.title,
-        origin: page.openerTabId === null ? "page" : "popup",
-        openerTabId: page.openerTabId,
-      })),
-      activeTabId,
-    );
     // Tabs past the retention cap are dropped from the strip; close their
     // pages too, or the browser keeps every renderer alive for the life of the
     // profile and the cap bounds nothing.
@@ -858,7 +885,7 @@ export function createBrowserHostEntry(
     return previousGeneration === undefined || generation > previousGeneration;
   }
   async function applyRuntimeHostConnection(
-    browserRuntime: BrowserInstanceRuntime,
+    browserRuntime: BrowserRuntimeHost,
     request: {
       hostId: string;
       state: "connected" | "disconnected";
@@ -1136,9 +1163,9 @@ export function createBrowserHostEntry(
   }
   async function pinVisiblePanel(
     request: BrowserPanelVisibilityRequest,
-    target: Parameters<BrowserInstanceRuntime["pinPanel"]>[0],
+    target: Parameters<BrowserRuntimeHost["pinPanel"]>[0],
     readiness: BrowserStatus,
-    browserRuntime: BrowserInstanceRuntime,
+    browserRuntime: BrowserRuntimeHost,
   ) {
     try {
       await browserRuntime.pinPanel(target, request.panelId);
@@ -1210,6 +1237,7 @@ export function createBrowserHostEntry(
         // BrowserTab in the shared strip so it is normalized into the
         // profile's ordered tab set rather than spawning an untracked window.
         onTargetCreated: async (created) => {
+          await browserRuntime.checkRendererProcessLimit?.(target);
           strip.openTab(created.url, "", created.targetId);
           const evicted = strip.takeEvictedTabIds();
           if (evicted.length > 0)

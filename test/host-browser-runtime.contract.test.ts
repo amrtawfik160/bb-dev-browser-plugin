@@ -1361,3 +1361,143 @@ it("closes the pages it evicts past the tab cap so renderer memory is reclaimed"
     await rm(rootDirectory, { recursive: true, force: true });
   }
 });
+
+it("issue #66 preserves an untargeted agent foreground through trim and recovery", async () => {
+  const rootDirectory = await mkdtemp(join(tmpdir(), "host-active-recovery-"));
+  const profiles = createFileBrowserProfileStore({
+    rootDirectory,
+    installationId: "installation-active-recovery",
+  });
+  await profiles.initialize(HOST_ID);
+  const listedPages = Array.from(
+    { length: TAB_STRIP_DEFAULT_MAX_TABS + 1 },
+    (_unused, index) => ({
+      id: `page-${index}`,
+      url: `https://site-${index}.example.test/`,
+      title: `Page ${index}`,
+      openerTabId: null,
+    }),
+  );
+  const closed: string[][] = [];
+  let agentForeground = "page-64";
+  const runtime = {
+    start: async () => {
+      throw new Error("not used");
+    },
+    stop: async () => {},
+    execute: async () => {
+      // Model the untargeted agent's page.bringToFront() side effect.
+      agentForeground = "page-0";
+      return "agent-output";
+    },
+    activeTabId: async () => agentForeground,
+    navigate: async (target: { tabId?: string }, input: string) => ({
+      address: { kind: "address" as const, url: input },
+      location: { url: input },
+      tabId: target.tabId ?? agentForeground,
+    }),
+    history: async () => {
+      throw new Error("not used");
+    },
+    closePages: async (
+      _target: { hostId: string; profileId: string },
+      tabIds: readonly string[],
+    ) => {
+      closed.push([...tabIds]);
+      for (const id of tabIds) {
+        const index = listedPages.findIndex((page) => page.id === id);
+        if (index !== -1) listedPages.splice(index, 1);
+      }
+      return tabIds.length;
+    },
+    listPages: async () => [...listedPages],
+    status: async ({
+      hostId,
+      profileId,
+    }: {
+      hostId: string;
+      profileId: string;
+    }) => ({ state: "running" as const, hostId, profileId }),
+    pinPanel: async () => {
+      throw new Error("not used");
+    },
+    unpinPanel: async () => {},
+    hostDisconnected: () => {},
+    hostReconnected: async () => {},
+    dispose: async () => {},
+  };
+  const readiness = {
+    inspect: healthyStatus,
+    diagnostics: () => {
+      throw new Error("diagnostics not used");
+    },
+  };
+  const host = experimental_createHostEntryHarness(
+    createBrowserHostEntry(readiness, profiles, undefined, runtime),
+    {
+      experimental_paths: {
+        dataDir: rootDirectory,
+        tempDir: join(rootDirectory, "tmp"),
+      },
+    },
+  );
+  const scriptRequest = {
+    purpose: "Inspect the selected foreground",
+    code: "return page.url()",
+    hostId: HOST_ID,
+    projectId: "project-active-recovery",
+    threadId: "thread-active-recovery",
+    activityEventId: "active-recovery-event",
+    activityOccurredAt: "2026-08-31T00:00:00.000Z",
+    profileId: DEFAULT_PROFILE_ID,
+    timeoutMs: 5_000,
+  };
+  try {
+    await expect(
+      host.experimental_call("browserScript", scriptRequest),
+    ).resolves.toEqual({ ok: true, result: "agent-output" });
+
+    // The agent selected page-0 without a tabId. The first trim must close a
+    // different live page, and the selected page must remain in the strip.
+    expect(closed).toEqual([["page-1"]]);
+    let strip = (await host.experimental_call("tabs", {
+      hostId: HOST_ID,
+      profileId: DEFAULT_PROFILE_ID,
+    })) as { tabs: Array<{ tabId: string }>; activeTabId: string | null };
+    expect(strip.tabs).toHaveLength(TAB_STRIP_DEFAULT_MAX_TABS);
+    expect(strip.tabs.some((tab) => tab.tabId === "page-0")).toBe(true);
+    expect(strip.activeTabId).toBe("page-0");
+
+    // Reconciliation after a worker/instance refresh starts from the live
+    // pages, not from arbitrary inventory order. The closed page stays gone.
+    await host.experimental_call("hostConnection", {
+      hostId: HOST_ID,
+      generation: 1,
+      state: "disconnected",
+    });
+    await host.experimental_call("hostConnection", {
+      hostId: HOST_ID,
+      generation: 2,
+      state: "connected",
+    });
+    agentForeground = "page-0";
+    await expect(
+      host.experimental_call("browserScript", {
+        ...scriptRequest,
+        activityEventId: "active-recovery-event-2",
+      }),
+    ).resolves.toEqual({ ok: true, result: "agent-output" });
+    expect(closed).toEqual([["page-1"]]);
+    strip = (await host.experimental_call("tabs", {
+      hostId: HOST_ID,
+      profileId: DEFAULT_PROFILE_ID,
+    })) as { tabs: Array<{ tabId: string }>; activeTabId: string | null };
+    expect(strip.tabs).toHaveLength(TAB_STRIP_DEFAULT_MAX_TABS);
+    expect(strip.tabs.some((tab) => tab.tabId === "page-0")).toBe(true);
+    expect(strip.tabs.some((tab) => tab.tabId === "page-1")).toBe(false);
+    expect(strip.activeTabId).toBe("page-0");
+  } finally {
+    await host.experimental_dispose();
+    await rm(rootDirectory, { recursive: true, force: true });
+  }
+});

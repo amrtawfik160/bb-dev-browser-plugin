@@ -109,5 +109,6 @@ for (const entry of pages) {
     break;
   }
 }
-console.log(JSON.stringify(active ?? pages[0]));`;
+if (active === null) throw new Error("The Browser Profile has no visible active tab.");
+console.log(JSON.stringify(active));`;
 }

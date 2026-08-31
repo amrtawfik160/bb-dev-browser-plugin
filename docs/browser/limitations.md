@@ -81,12 +81,18 @@ each.
   the BB host daemon runs in** and spends the same memory budget as every
   agent on the machine. The plugin cannot place it in a slice of its own
   without privileged cgroup setup.
-- What the plugin does bound: each Browser Instance launches Chromium with
-  `--renderer-process-limit=8` and
-  `--js-flags=--max-old-space-size=512`, limiting renderer count and V8 old
-  space per renderer. Pages evicted past the shared tab strip's retention cap
-  are closed rather than left resident. Worst-case renderer memory is roughly
-  `8 × (512 MiB + native overhead)`.
+- Each Browser Instance still launches Chromium with
+  `--renderer-process-limit=8`, but Chromium treats that switch as a soft
+  process-reuse hint rather than a ceiling. The production process boundary
+  counts live `--type=renderer` descendants of the Browser Instance and fails
+  closed by stopping it when the count exceeds eight or cannot be verified.
+  This is renderer-process enforcement, not a total memory guarantee or a
+  promise that the Chromium switch itself is hard.
+- Each Browser Instance also keeps
+  `--js-flags=--max-old-space-size=512`. That is a V8 old-space setting for
+  each renderer, not a total-browser memory limit. The shared tab strip's
+  64-tab retention cap is separate: pages evicted past it are closed rather
+  than left resident.
 - These settings do **not** cap the browser process's native, GPU, or other
   non-renderer memory, and they do not reserve an isolated budget for the
   Workspace Browser. Shared cgroup pressure can still terminate the browser or
