@@ -2493,13 +2493,16 @@ export function createBrowserService(
     request: BrowserPanelCapabilityRequest,
     signal?: AbortSignal,
   ): Promise<BrowserPanelCapabilityResponse> {
-    const identity = panelIdentity({
-      surface: "thread",
-      threadId: "panel-capability",
-      hostId: request.hostId,
-      profileId: request.profileId,
-    });
-    const hostId = await resolvedHostId(bb, identity);
+    // A capability request names its host outright and carries no thread or
+    // project, so there is no context to resolve one from. Passing a literal
+    // in place of a thread id made every request ask BB for a thread called
+    // "panel-capability", which has never existed: the lookup threw
+    // `404 thread_not_found` before any of the checks below ran, and the panel
+    // reported its stream offline for the life of the plugin. With no thread
+    // and no project, host resolution falls through to validating the named
+    // host against the real host list, which is the only check this request
+    // needs.
+    const hostId = await resolvedHostId(bb, { hostId: request.hostId });
     if (hostId === null || hostId !== request.hostId) {
       return {
         outcome: "unavailable",
