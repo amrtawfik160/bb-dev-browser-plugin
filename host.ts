@@ -1203,6 +1203,9 @@ export function createBrowserHostEntry(
           operationOptions,
         );
         strip.openTab(opened.url, opened.title, opened.id);
+        const evicted = strip.takeEvictedTabIds();
+        if (evicted.length > 0)
+          await browserRuntime.closePages(target, evicted);
         return strip.snapshot() as BrowserTabStrip;
       }
       const tabId = request.tabId;

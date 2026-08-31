@@ -1567,3 +1567,175 @@ it("issue #66 preserves an untargeted agent foreground through trim and recovery
     await rm(rootDirectory, { recursive: true, force: true });
   }
 });
+
+it("issue #50 closes the live page a panel tab-open evicts at the retention cap", async () => {
+  const rootDirectory = await mkdtemp(join(tmpdir(), "host-tab-open-evict-"));
+  const profiles = createFileBrowserProfileStore({
+    rootDirectory,
+    installationId: "installation-tab-open-evict",
+  });
+  await profiles.initialize(HOST_ID);
+  // A panel session that only opens tabs never hits navigate / script /
+  // onTargetCreated, so those drain paths cannot hide this leak.
+  const listedPages: Array<{
+    id: string;
+    url: string;
+    title: string;
+    openerTabId: null;
+  }> = [];
+  const closed: string[][] = [];
+  let opened = 0;
+  const runtime = {
+    start: async () => {
+      throw new Error("not used");
+    },
+    stop: async () => {},
+    execute: async () => {
+      throw new Error("not used");
+    },
+    navigate: async (target: { tabId?: string }, input: string) => ({
+      address: { kind: "address" as const, url: input },
+      location: { url: input },
+      tabId: target.tabId ?? listedPages[0]?.id ?? "page-0",
+    }),
+    history: async () => {
+      throw new Error("not used");
+    },
+    openPage: async () => {
+      const page = {
+        id: `page-${opened}`,
+        url: `https://app.example.test/${opened}`,
+        title: `Page ${opened}`,
+        openerTabId: null,
+      };
+      opened += 1;
+      listedPages.push(page);
+      return page;
+    },
+    focusPage: async () => {
+      throw new Error("not used");
+    },
+    closePages: async (
+      _target: { hostId: string; profileId: string },
+      tabIds: readonly string[],
+    ) => {
+      closed.push([...tabIds]);
+      for (const id of tabIds) {
+        const index = listedPages.findIndex((page) => page.id === id);
+        if (index !== -1) listedPages.splice(index, 1);
+      }
+      return tabIds.length;
+    },
+    listPages: async () => [...listedPages],
+    status: async ({
+      hostId,
+      profileId,
+    }: {
+      hostId: string;
+      profileId: string;
+    }) => ({ state: "running" as const, hostId, profileId }),
+    pinPanel: async () => {
+      throw new Error("not used");
+    },
+    unpinPanel: async () => {},
+    hostDisconnected: () => {},
+    hostReconnected: async () => {},
+    dispose: async () => {},
+  };
+  const readiness = {
+    inspect: healthyStatus,
+    diagnostics: () => {
+      throw new Error("diagnostics not used");
+    },
+  };
+  const host = experimental_createHostEntryHarness(
+    createBrowserHostEntry(readiness, profiles, undefined, runtime),
+    {
+      experimental_paths: {
+        dataDir: rootDirectory,
+        tempDir: join(rootDirectory, "tmp"),
+      },
+    },
+  );
+  const openFromPanel = () =>
+    host.experimental_call("tabAction", {
+      hostId: HOST_ID,
+      profileId: DEFAULT_PROFILE_ID,
+      projectId: "project-tab-open-evict",
+      action: "open" as const,
+    });
+  try {
+    for (let index = 0; index < TAB_STRIP_DEFAULT_MAX_TABS; index += 1) {
+      await openFromPanel();
+    }
+    expect(closed).toEqual([]);
+
+    const overflow = (await openFromPanel()) as {
+      tabs: Array<{ tabId: string }>;
+      activeTabId: string | null;
+    };
+    const openedTabId = `page-${TAB_STRIP_DEFAULT_MAX_TABS}`;
+    const evictedTabId = "page-0";
+
+    // Forgetting the oldest tab without closing its Chromium page left the
+    // renderer resident for the profile lifetime; --restore-last-session
+    // brought it back on the next launch.
+    expect(closed).toEqual([[evictedTabId]]);
+    expect(overflow.tabs).toHaveLength(TAB_STRIP_DEFAULT_MAX_TABS);
+    expect(overflow.tabs.some((tab) => tab.tabId === evictedTabId)).toBe(false);
+    expect(overflow.tabs.some((tab) => tab.tabId === openedTabId)).toBe(true);
+    expect(overflow.activeTabId).toBe(openedTabId);
+    expect(closed.flat()).not.toContain(openedTabId);
+
+    // A later inventory must not resurrect the page this path already closed.
+    await host.experimental_call("navigate", {
+      hostId: HOST_ID,
+      profileId: DEFAULT_PROFILE_ID,
+      projectId: "project-tab-open-evict",
+      input: "https://app.example.test/kept",
+      rawLocalhost: false,
+    });
+    expect(closed).toEqual([[evictedTabId]]);
+    let strip = (await host.experimental_call("tabs", {
+      hostId: HOST_ID,
+      profileId: DEFAULT_PROFILE_ID,
+    })) as {
+      tabs: Array<{ tabId: string }>;
+      activeTabId: string | null;
+    };
+    expect(strip.tabs).toHaveLength(TAB_STRIP_DEFAULT_MAX_TABS);
+    expect(strip.tabs.some((tab) => tab.tabId === evictedTabId)).toBe(false);
+
+    // Reset the local tab model as a Browser Instance restart would, then
+    // reconcile once more against the live pages.
+    await host.experimental_call("hostConnection", {
+      hostId: HOST_ID,
+      generation: 1,
+      state: "disconnected",
+    });
+    await host.experimental_call("hostConnection", {
+      hostId: HOST_ID,
+      generation: 2,
+      state: "connected",
+    });
+    await host.experimental_call("navigate", {
+      hostId: HOST_ID,
+      profileId: DEFAULT_PROFILE_ID,
+      projectId: "project-tab-open-evict",
+      input: "https://app.example.test/kept",
+      rawLocalhost: false,
+    });
+    expect(closed).toEqual([[evictedTabId]]);
+    strip = (await host.experimental_call("tabs", {
+      hostId: HOST_ID,
+      profileId: DEFAULT_PROFILE_ID,
+    })) as {
+      tabs: Array<{ tabId: string }>;
+      activeTabId: string | null;
+    };
+    expect(strip.tabs.some((tab) => tab.tabId === evictedTabId)).toBe(false);
+  } finally {
+    await host.experimental_dispose();
+    await rm(rootDirectory, { recursive: true, force: true });
+  }
+});
