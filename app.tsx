@@ -68,7 +68,11 @@ import {
   type BrowserPanelOption,
 } from "./panel-browser.js";
 import { ownerSessionIdFromContext } from "./panel-owner-session.js";
-import { isTestLoopbackPanelTransport } from "./panel-test-loopback.js";
+import {
+  clearPanelTimeout,
+  isTestLoopbackPanelTransport,
+  schedulePanelTimeout,
+} from "./panel-test-loopback.js";
 import { SAFE_LOGIN_LIMITATIONS_NOTICE } from "./safe-login-notice.js";
 import {
   createAutomationStreamAdapter,
@@ -403,14 +407,14 @@ function PanelStreamSurface({
       return;
     let disposed = false;
     let socket: WebSocket | null = null;
-    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let reconnectTimer: ReturnType<typeof schedulePanelTimeout> | null = null;
     const stream = createAutomationStreamAdapter();
     streamRef.current = stream;
     stream.start();
 
     function clearReconnect() {
       if (reconnectTimer !== null) {
-        clearTimeout(reconnectTimer);
+        clearPanelTimeout(reconnectTimer);
         reconnectTimer = null;
       }
     }
@@ -437,7 +441,7 @@ function PanelStreamSurface({
       }
       setStreamState("reconnecting");
       clearReconnect();
-      reconnectTimer = setTimeout(() => {
+      reconnectTimer = schedulePanelTimeout(() => {
         reconnectTimer = null;
         if (!disposed) connect();
       }, delay);

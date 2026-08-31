@@ -3,7 +3,10 @@ import type { RenderedSlot } from "@get-bb/plugin-sdk/testing/app";
 import { expect } from "vitest";
 import { WebSocket as NodeWebSocket } from "ws";
 import type { ScreencastFrame, ScreencastSource } from "../panel-transport.js";
-import { setTestLoopbackPanelTransport } from "../panel-test-loopback.js";
+import {
+  setTestLoopbackPanelTransport,
+  setTestPanelLifecycleClock,
+} from "../panel-test-loopback.js";
 import { ownerSessionIdFromContext } from "../panel-owner-session.js";
 import type { HostProbeSnapshot } from "../readiness.js";
 import { createPublicPluginHarness } from "./public-plugin-harness.js";
@@ -97,14 +100,21 @@ export type LifecyclePanel = ReturnType<typeof within> &
     gatewayPort: number;
     get redeemed(): boolean;
     get framesReceived(): number;
+    get connectionAttempts(): number;
   };
 
 export async function createPublicPanelLifecycleHarness() {
   let now = Date.parse("2026-08-31T12:00:00.000Z");
   const clock = { now: () => now };
   const sockets = new Set<TrackedSocket>();
+  const connectionAttemptsByPort = new Map<string, number>();
   const messagesByPort = new Map<string, string[]>();
   const previousWebSocket = globalThis.WebSocket;
+  const reconnectTimers = new Map<
+    number,
+    { callback: () => void; due: number }
+  >();
+  let nextReconnectTimerId = 1;
 
   function recordSocketMessage(socket: TrackedSocket, data: unknown) {
     const port = socketPort(socket);
@@ -120,6 +130,10 @@ export async function createPublicPanelLifecycleHarness() {
       Object.defineProperty(socket, "url", { value: href });
       sockets.add(socket);
       const port = new URL(href).port;
+      connectionAttemptsByPort.set(
+        port,
+        (connectionAttemptsByPort.get(port) ?? 0) + 1,
+      );
       if (!messagesByPort.has(port)) messagesByPort.set(port, []);
       this.on("message", (data) => {
         recordSocketMessage(socket, data);
@@ -168,6 +182,17 @@ export async function createPublicPanelLifecycleHarness() {
     (window as { WebSocket: typeof WebSocket }).WebSocket = WebSocketCtor;
   }
   setTestLoopbackPanelTransport(true);
+  setTestPanelLifecycleClock({
+    setTimeout(callback, milliseconds) {
+      const id = nextReconnectTimerId;
+      nextReconnectTimerId += 1;
+      reconnectTimers.set(id, { callback, due: now + milliseconds });
+      return id;
+    },
+    clearTimeout(handle) {
+      if (typeof handle === "number") reconnectTimers.delete(handle);
+    },
+  });
 
   const browser = await createPublicPluginHarness({
     snapshot: HEALTHY_SNAPSHOT,
@@ -217,7 +242,7 @@ export async function createPublicPanelLifecycleHarness() {
     if (issued === undefined || issued.outcome !== "issued") {
       throw new Error("Browser Panel did not obtain a Panel Capability.");
     }
-    return Object.assign(panel, {
+    const assigned = Object.assign(panel, {
       panelId: request.panelId,
       ownerSessionId: request.ownerSessionId,
       hostId: request.hostId,
@@ -244,6 +269,15 @@ export async function createPublicPanelLifecycleHarness() {
         }, 0);
       },
     });
+    // Object.assign copies getter values; reconnect must be observed live.
+    Object.defineProperty(assigned, "connectionAttempts", {
+      configurable: true,
+      enumerable: true,
+      get() {
+        return connectionAttemptsByPort.get(String(issued.gatewayPort)) ?? 0;
+      },
+    });
+    return assigned as LifecyclePanel;
   }
 
   function panelHasReady(panelId: string) {
@@ -314,7 +348,13 @@ export async function createPublicPanelLifecycleHarness() {
 
   async function advanceTime(milliseconds: number) {
     now += milliseconds;
-    await act(async () => undefined);
+    const due = [...reconnectTimers.entries()]
+      .filter(([, timer]) => timer.due <= now)
+      .sort((left, right) => left[1].due - right[1].due || left[0] - right[0]);
+    for (const [id] of due) reconnectTimers.delete(id);
+    await act(async () => {
+      for (const [, timer] of due) timer.callback();
+    });
   }
 
   async function closePanel(panel: LifecyclePanel) {
@@ -341,6 +381,8 @@ export async function createPublicPanelLifecycleHarness() {
 
   async function dispose() {
     setTestLoopbackPanelTransport(false);
+    setTestPanelLifecycleClock(undefined);
+    reconnectTimers.clear();
     (globalThis as { WebSocket: typeof WebSocket }).WebSocket =
       previousWebSocket;
     if (typeof window !== "undefined") {

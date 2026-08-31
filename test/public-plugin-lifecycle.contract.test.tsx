@@ -50,10 +50,6 @@ describe("public Browser Panel lifecycle seam", () => {
       await first.findByText("The page is live.");
       await second.findByText("The page is live.");
 
-      await browser.forcePhysicalSocketLoss(first);
-      await first.findByText("Reconnecting to the browser…");
-      await second.findByText("The page is live.");
-
       const issuedBefore = await browser.issuePanelCapability({
         hostId: browser.hostId,
         profileId: DEFAULT_PROFILE_ID,
@@ -63,8 +59,17 @@ describe("public Browser Panel lifecycle seam", () => {
       if (issuedBefore.outcome !== "issued") {
         throw new Error("expected an issued Panel Capability");
       }
-      await browser.advanceTime(PANEL_CAPABILITY_TTL_MS + 1);
+      expect(issuedBefore.expiresAt).toBe("2026-08-31T12:01:00.000Z");
+
+      await browser.forcePhysicalSocketLoss(first);
+      await first.findByText("Reconnecting to the browser…");
+      await second.findByText("The page is live.");
+      const attemptsAfterLoss = first.connectionAttempts;
+
       await browser.advanceTime(PANEL_RECONNECT_INITIAL_BACKOFF_MS);
+      expect(first.connectionAttempts).toBeGreaterThan(attemptsAfterLoss);
+
+      await browser.advanceTime(PANEL_CAPABILITY_TTL_MS + 1);
       const issuedAfter = await browser.issuePanelCapability({
         hostId: browser.hostId,
         profileId: DEFAULT_PROFILE_ID,
@@ -76,9 +81,7 @@ describe("public Browser Panel lifecycle seam", () => {
           "expected an issued Panel Capability after advancing time",
         );
       }
-      expect(Date.parse(issuedAfter.expiresAt)).toBeGreaterThan(
-        Date.parse(issuedBefore.expiresAt),
-      );
+      expect(issuedAfter.expiresAt).toBe("2026-08-31T12:02:00.501Z");
 
       await browser.closePanel(second);
       expect(second.container.innerHTML).toBe("");
