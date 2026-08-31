@@ -305,6 +305,57 @@ describe("Browser Profile Grant public authorization contract", () => {
     },
   );
 
+  it.each([
+    ["nested-before-parent", ["nested", "parent"]],
+    ["parent-before-nested", ["parent", "nested"]],
+  ] as const)(
+    "issue #65 selects the broader nested wildcard scope regardless of record order: %s",
+    async (_scenario, insertionOrder) => {
+      const { backend, store } = createStore();
+
+      try {
+        const grantsByScope = {
+          nested: grant({
+            grantId: "grant-nested-wildcard",
+            originScope: "https://*.internal.example.test",
+          }),
+          parent: grant({
+            grantId: "grant-parent-wildcard",
+            originScope: "https://*.example.test",
+          }),
+        } as const;
+        for (const [index, scopeKind] of insertionOrder.entries()) {
+          const createdAt = new Date(
+            NOW.getTime() + index * 1000,
+          ).toISOString();
+          store.create({
+            ...grantsByScope[scopeKind],
+            createdAt,
+            updatedAt: createdAt,
+          });
+        }
+
+        const decision = store.authorize({
+          projectId: "project-a",
+          hostId: "host-a",
+          installationId: "installation-a",
+          profileId: "profile-a",
+          origin: "https://x.internal.example.test",
+        });
+
+        expect(decision).toMatchObject({
+          allowed: true,
+          grant: {
+            grantId: "grant-parent-wildcard",
+            originScope: "https://*.example.test",
+          },
+        });
+      } finally {
+        await backend.harness.lifecycle.dispose();
+      }
+    },
+  );
+
   it("requires file transfer and invalid certificates to be explicitly scoped", async () => {
     const { backend, store } = createStore();
 

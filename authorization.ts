@@ -714,10 +714,26 @@ function normalizedAuthorizationOrigin(request: BrowserAuthorizationRequest) {
   }
 }
 
-/** Broader scopes rank first, so the widest grant covering an origin wins. */
-function scopeBreadth(originScope: string) {
-  if (originScope === "*") return 0;
-  return originScope.includes("://*.") ? 1 : 2;
+/**
+ * Orders normalized scopes that match one origin from broadest to narrowest.
+ * A wildcard with fewer base-host labels covers more of the DNS tree.
+ */
+function compareScopeBreadth(leftScope: string, rightScope: string) {
+  const leftMatcher = originScopeMatcher(leftScope);
+  const rightMatcher = originScopeMatcher(rightScope);
+  if (leftMatcher.kind === "whole-web") {
+    return rightMatcher.kind === "whole-web" ? 0 : -1;
+  }
+  if (rightMatcher.kind === "whole-web") return 1;
+  if (leftMatcher.kind === "subdomain" && rightMatcher.kind === "subdomain") {
+    return (
+      leftMatcher.baseHost.split(".").length -
+      rightMatcher.baseHost.split(".").length
+    );
+  }
+  if (leftMatcher.kind === "subdomain") return -1;
+  if (rightMatcher.kind === "subdomain") return 1;
+  return 0;
 }
 
 /**
@@ -735,9 +751,8 @@ function grantsForOrigin(
 ) {
   return grants
     .filter((grant) => scopeMatchesOrigin(grant.originScope, origin))
-    .sort(
-      (left, right) =>
-        scopeBreadth(left.originScope) - scopeBreadth(right.originScope),
+    .sort((left, right) =>
+      compareScopeBreadth(left.originScope, right.originScope),
     );
 }
 
