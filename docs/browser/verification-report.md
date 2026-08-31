@@ -94,7 +94,7 @@ Baseline at the issue #21 head (`41ad3be`): **637 passed, 13 skipped** across
 | CLI has no owner authority; grant administration fails closed to authenticated Settings; URL open is agent-attributed; no-URL open discloses no tab state                                               | Automated: `test/public-plugin.contract.test.tsx` (privilege escalation, Activity attribution, no-URL disclosure, expired file-transfer elevation).                                                                              |
 | `browser_script` native tool + `bb browser` CLI + bundled skill; boundaries enforce policy                                                                                                              | Automated: `test/public-plugin.contract.test.tsx` (tool registration, skill config); `server.ts` `registerCli`/`registerAgentTool`.                                                                                              |
 | `browser_script` statically registered; derives host/project from context; optional profile/tab; required purpose; QuickJS sandbox; 30 s cap; page-to-browser root cut; purpose shown only during lease | Automated: `test/browser-runtime.contract.test.ts`, `test/agent-script.contract.test.ts`, `test/evidence/security.evidence.test.ts` (QuickJS isolation), `test/evidence/sensitive-data.evidence.test.ts` (purpose not retained). |
-| Accepted script timeouts are 1–30 s; nested Playwright deadlines retain host headroom                                                                                                                   | Automated: `test/agent-script.contract.test.ts`, `test/public-plugin.contract.test.tsx` (999 ms rejection and 1,000 ms boundary).                                                                                                |
+| Accepted script timeouts are 1–30 s; shared-context Playwright deadlines retain host headroom for existing and future supported pages                                                                   | Automated: `test/agent-script.contract.test.ts`, `test/agent-script.playwright.integration.test.ts`, `test/public-plugin.contract.test.tsx` (999 ms rejection and 1,000 ms boundary).                                            |
 | Browser Results ≤ 256 KiB + explicit screenshots; ordinary thread content; no plugin copy                                                                                                               | Automated: `BROWSER_SCRIPT_RESULT_LIMIT_BYTES`, `browserScriptResultSchema`; `test/evidence/sensitive-data.evidence.test.ts`.                                                                                                    |
 | Tab IDs opaque, runtime-only; omit = active tab; list again after restart                                                                                                                               | Automated: `test/browser-tabs.contract.test.ts`; SKILL guidance.                                                                                                                                                                 |
 
@@ -234,6 +234,9 @@ From `test/evidence/security.evidence.test.ts` and
   registered by the Origin Scope guard, while same-context `browser.newPage()`
   remains available (`test/agent-script.contract.test.ts`,
   `test/origin-scope-host.contract.test.ts`).
+- The shared Playwright context applies action and navigation deadlines to the
+  initial page, existing pages, and future `browser.getPage`/`browser.newPage`
+  pages, with useful call-log tails (`test/agent-script.playwright.integration.test.ts`).
 - (Provisioned-host) unprivileged execution and loopback-only socket boundaries.
 - Sensitive-data scans across Activity Records, database, durable outbox, logs,
   diagnostics, and manifests prove exclusion of cookies, full URLs, scripts,
@@ -315,5 +318,5 @@ the repository gates:
 - `npm run typecheck` — passes.
 - `npm run lint` — passes.
 - `npx prettier --check .` — passes (new Markdown is Prettier-clean).
-- `npm run test` — 656 passed, 38 skipped (provisioned-host tests).
+- `npm run test` — 678 passed, 38 skipped across 67 test files (provisioned-host tests).
 - `npm run build` — production build of plugin source.

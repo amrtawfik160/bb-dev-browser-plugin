@@ -33,11 +33,14 @@ Parameters are defined by `browserScriptParametersSchema` (`.strict()`):
 The script runs with Playwright `page` bound to the active tab (or `tabId`).
 `return` values become the tool result. There is no `document` global.
 
-`page.setDefaultTimeout` and `page.setDefaultNavigationTimeout` reserve 25% of
-the script timeout, capped at five seconds, for the host to return the result.
-At the minimum accepted 1,000 ms timeout, Playwright helpers receive 750 ms.
-A locator action that never becomes possible therefore returns its useful call
-log before the host deadline.
+The host applies `BrowserContext.setDefaultTimeout` and
+`BrowserContext.setDefaultNavigationTimeout` to the shared context, reserving
+25% of the script timeout, capped at five seconds, for the host to return the
+result. This covers pages already in the context and later pages obtained
+through the supported `browser.getPage` and `browser.newPage` paths. At the
+minimum accepted 1,000 ms timeout, Playwright helpers receive 750 ms. A locator
+action that never becomes possible therefore returns its useful call log before
+the host deadline.
 
 ```javascript
 return await page.title();

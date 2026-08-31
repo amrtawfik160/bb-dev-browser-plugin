@@ -5,6 +5,24 @@ import {
 } from "../agent-script.js";
 import { browserScriptParametersSchema } from "../contracts.js";
 
+type BrowserApi<Page> = {
+  getPage: (nameOrId: string) => Promise<Page>;
+  newPage: () => Promise<Page>;
+  listPages: () => Promise<ReadonlyArray<{ id: string; url: string }>>;
+  closePage: (name: string) => Promise<void>;
+};
+
+function createPinnedBrowserApi<Page>(callbacks: BrowserApi<Page>) {
+  const browserApi = Object.create(null) as BrowserApi<Page>;
+  Object.defineProperties(browserApi, {
+    getPage: { value: callbacks.getPage, enumerable: true },
+    newPage: { value: callbacks.newPage, enumerable: true },
+    listPages: { value: callbacks.listPages, enumerable: true },
+    closePage: { value: callbacks.closePage, enumerable: true },
+  });
+  return Object.freeze(browserApi);
+}
+
 async function capturedLogs(code: string) {
   const logs: string[] = [];
   const wrapped = wrapAgentScriptResult(code);
@@ -89,6 +107,8 @@ async function preparedLogs(
   class FakeContext {
     readonly _type = "BrowserContext";
     _browser: FakeBrowser;
+    defaultNavigationTimeout: number | null = null;
+    defaultTimeout: number | null = null;
 
     constructor(
       readonly _parent: FakeBrowser,
@@ -100,13 +120,19 @@ async function preparedLogs(
     browser() {
       return this._browser;
     }
+
+    setDefaultNavigationTimeout(timeoutMs: number) {
+      this.defaultNavigationTimeout = timeoutMs;
+    }
+
+    setDefaultTimeout(timeoutMs: number) {
+      this.defaultTimeout = timeoutMs;
+    }
   }
 
   class FakePage {
     readonly _type = "Page";
     readonly _browserContext: FakeContext;
-    navigationTimeout: number | null = null;
-    actionTimeout: number | null = null;
 
     constructor(
       readonly _parent: FakeContext,
@@ -121,12 +147,6 @@ async function preparedLogs(
 
     bringToFront = async () => undefined;
     evaluate = async () => "visible";
-    setDefaultNavigationTimeout = (timeout: number) => {
-      this.navigationTimeout = timeout;
-    };
-    setDefaultTimeout = (timeout: number) => {
-      this.actionTimeout = timeout;
-    };
   }
 
   const connection = new FakeConnection();
@@ -145,11 +165,12 @@ async function preparedLogs(
     connection._objects.set(guid, object);
   }
 
-  const fakeBrowser = {
+  const fakeBrowser = createPinnedBrowserApi<FakePage>({
     listPages: async () => [{ id: "tab-1", url: "about:blank" }],
     getPage: async (id: string) => (id === "tab-2" ? extraPage : page),
     newPage: async () => extraPage,
-  };
+    closePage: async () => undefined,
+  });
   const prepared = prepareAgentExecution({
     code,
     enforceNonWebNavigation,
@@ -214,6 +235,16 @@ describe("agent script convenience wrapping", () => {
       prepared.indexOf("return page.url()"),
     );
     expect(prepared).toContain("await page.bringToFront()");
+  });
+
+  it("issue #64 runs user code with the pinned frozen dev-browser API", async () => {
+    const logs = await preparedLogs(
+      'console.log("user-code-reached"); return "completed";',
+      false,
+      true,
+    );
+
+    expect(logs).toEqual(["user-code-reached", "completed"]);
   });
 
   // Recovery issue #64: the public Page → BrowserContext → Browser path must
@@ -339,47 +370,13 @@ throw new Error("later script failure");`,
     expect(prepared).toContain("new URL(__bbEntry.url).origin");
   });
 
-  it("keeps Playwright navigation inside the host deadline", () => {
-    const prepared = prepareAgentExecution({
-      code: "return page.url()",
-      timeoutMs: 30_000,
-    });
-    expect(prepared).toContain("page.setDefaultNavigationTimeout(25000)");
-  });
-
-  it("keeps locator actions inside the host deadline", () => {
-    const prepared = prepareAgentExecution({
-      code: "return page.locator('button').click()",
-      timeoutMs: 30_000,
-    });
-    expect(prepared).toContain("page.setDefaultTimeout(25000)");
-  });
-
-  it.each([
-    [
-      "browser.getPage",
-      'const acquired = await browser.getPage("tab-2"); return JSON.stringify({ navigation: acquired.navigationTimeout, action: acquired.actionTimeout });',
-    ],
-    [
-      "browser.newPage",
-      "const acquired = await browser.newPage(); return JSON.stringify({ navigation: acquired.navigationTimeout, action: acquired.actionTimeout });",
-    ],
-  ])(
-    "applies host deadline headroom to pages returned by %s",
-    async (_acquisition, code) => {
-      expect(await preparedLogs(code)).toEqual([
-        '{"navigation":25000,"action":25000}',
-      ]);
-    },
-  );
-
   it("leaves helper headroom at the minimum accepted host timeout", () => {
     const prepared = prepareAgentExecution({
       code: "return page.url()",
       timeoutMs: 1_000,
     });
-    expect(prepared).toContain("page.setDefaultTimeout(750)");
-    expect(prepared).toContain("page.setDefaultNavigationTimeout(750)");
+    expect(prepared).toContain("context.setDefaultTimeout(750)");
+    expect(prepared).toContain("context.setDefaultNavigationTimeout(750)");
   });
 
   it("rejects subsecond host timeouts at the public schema boundary", () => {

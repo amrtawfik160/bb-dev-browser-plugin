@@ -111,8 +111,8 @@ the single owner of grant matching. The boundary handles boxed method and URL
 values from the pinned Playwright client. The host also hardens the pinned
 client's reachable Browser, BrowserType, BrowserContext, and connection paths,
 including enumerable `_browser`/`_parent` aliases and channel creation calls.
-An agent cannot create a later unguarded browser context; the plugin wrapper's
-`browser.newPage()` continues to create pages in the guarded context. Every
+An agent cannot create a later unguarded browser context; `browser.newPage()`
+continues to create pages in the guarded context. Every
 BrowserContext emitted after the initial connection snapshot is registered.
 
 - Out-of-scope HTTP(S) requests are aborted by the route before commit. Direct

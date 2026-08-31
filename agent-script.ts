@@ -34,8 +34,8 @@ const NAVIGATION_TIMEOUT_HEADROOM_MS = 5_000;
 /**
  * Remove every context-creating Playwright capability reachable through the
  * sandbox's page API. The pinned client exposes Browser, BrowserType, private
- * aliases, and its connection as enumerable objects; the plugin wrapper's
- * `browser.newPage()` remains the supported same-context capability.
+ * aliases, and its connection as enumerable objects; `browser.newPage()`
+ * remains the supported same-context capability.
  */
 function cutAgentBrowserRoots(
   pageListVariable: string,
@@ -265,41 +265,27 @@ const __bbAgentBrowserBoundary = (() => {
       __bbHardenConnection(candidatePage._connection ?? context._connection);
       __bbHardenContext(context);
     },
-    define: __bbDefineImmutable,
   };
 })();
 const __bbInstallAgentBrowserBoundary = __bbAgentBrowserBoundary.install;
-const __bbConfigureAgentPage = (candidatePage) => {
-  candidatePage.setDefaultNavigationTimeout(${operationTimeoutMs});
-  candidatePage.setDefaultTimeout(${operationTimeoutMs});
-  return candidatePage;
+const __bbConfigureAgentContext = (context) => {
+  context.setDefaultNavigationTimeout(${operationTimeoutMs});
+  context.setDefaultTimeout(${operationTimeoutMs});
 };
-const __bbSupportedPageApi = (() => {
-  const __bbGetPage = browser.getPage.bind(browser);
-  const __bbNewPage = browser.newPage.bind(browser);
-  const __bbConfigureSupportedPage = async (candidatePage) => {
-    __bbInstallAgentBrowserBoundary(candidatePage);
-    return __bbConfigureAgentPage(candidatePage);
-  };
-  return Object.freeze({
-    getPage: async (...args) =>
-      __bbConfigureSupportedPage(await __bbGetPage(...args)),
-    newPage: async (...args) =>
-      __bbConfigureSupportedPage(await __bbNewPage(...args)),
-  });
-})();
-__bbAgentBrowserBoundary.define(browser, "getPage", __bbSupportedPageApi.getPage);
-__bbAgentBrowserBoundary.define(browser, "newPage", __bbSupportedPageApi.newPage);
 for (const __bbEntry of ${pageListVariable}) {
-  await __bbSupportedPageApi.getPage(__bbEntry.id);
+  const __bbExistingPage = await browser.getPage(__bbEntry.id);
+  const __bbExistingContext = __bbExistingPage.context();
+  __bbConfigureAgentContext(__bbExistingContext);
+  await __bbInstallAgentBrowserBoundary(__bbExistingPage);
 }
+__bbConfigureAgentContext(page.context());
 await __bbInstallAgentBrowserBoundary(page);
 `;
 }
 
 /**
  * Bound both navigation and ordinary locator actions below the script
- * deadline.
+ * deadline through the shared BrowserContext.
  *
  * Playwright defaults an action such as `click` to 30 seconds, which is also
  * the maximum script timeout, so an element that never becomes actionable
@@ -403,16 +389,13 @@ export function prepareAgentExecution(input: {
     operationTimeoutMs,
   );
   const wrappedUser = wrapAgentScriptResult(input.code);
-  const prefix = `${pagePreamble}
-page.setDefaultNavigationTimeout(${operationTimeoutMs});
-page.setDefaultTimeout(${operationTimeoutMs});`;
   if (input.screenshot === undefined) {
-    return `${prefix}${wrappedUser}`;
+    return `${pagePreamble}${wrappedUser}`;
   }
   const markerLine = JSON.stringify({
     __bbScreenshot: input.screenshot.marker,
   });
-  return `${prefix}try {
+  return `${pagePreamble}try {
 ${wrappedUser}
 } finally {
 await saveScreenshot(await page.screenshot({ type: "png" }), ${JSON.stringify(input.screenshot.fileName)});

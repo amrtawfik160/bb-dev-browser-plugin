@@ -177,7 +177,7 @@ profile-storage.ts   Browser Profile storage, backup, restore, import
 profile-recovery.ts  Profile lifecycle recovery
 readiness.ts         Host readiness capabilities (disk, identity, browser)
 docs/browser/        Handoff documentation (16 guides)
-test/                58 test files: contract, evidence, integration, release
+test/                67 test files: contract, evidence, integration, release
 scripts/             release-gate.sh + owner wizards
 skills/browser/      Bundled agent skill
 ```

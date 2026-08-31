@@ -62,9 +62,11 @@ workspace access.
   runtime-only and change when the browser restarts.
 - Tab state persists between scripts. If a tab is already on your granted
   origin, `page` binds to it — read it instead of navigating again.
-- `page.setDefaultTimeout` and `page.setDefaultNavigationTimeout` leave 25%
-  headroom (capped at 5 seconds) inside the host deadline, so a stuck action
-  fails with a Playwright call log instead of an opaque transport error.
+- The host applies Playwright `BrowserContext` action and navigation defaults
+  with 25% headroom (capped at 5 seconds) inside the host deadline. The defaults
+  cover existing pages and later pages from `browser.getPage` or
+  `browser.newPage`, so a stuck action fails with a Playwright call log instead
+  of an opaque transport error.
 
 ## Things that actually bite
 
@@ -143,8 +145,8 @@ invalid-certificate elevation applies only to its explicitly approved origin.
 
 The host also hardens the pinned Playwright object graph before agent code runs:
 Browser, BrowserType, BrowserContext, enumerable private aliases, and channel
-creation calls cannot create another BrowserContext. The plugin wrapper's
-`browser.newPage()` still creates a page in the guarded context.
+creation calls cannot create another BrowserContext. `browser.newPage()` still
+creates a page in the guarded context.
 
 ## Control, profiles, and records
 
