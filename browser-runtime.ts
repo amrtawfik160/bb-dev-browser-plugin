@@ -1437,6 +1437,23 @@ export function createBrowserInstanceRuntime(
     }
   }
 
+  async function quarantineOriginScopeFailure(
+    key: string,
+    held: HeldBrowserInstance,
+    denial: BrowserOriginScopeDeniedError,
+  ) {
+    try {
+      await stopHeld(key, held);
+    } catch (error) {
+      throw new BrowserOriginScopeDeniedError(denial.origin, {
+        cause: new AggregateError(
+          [denial.cause, error],
+          "Browser Instance quarantine failed.",
+        ),
+      });
+    }
+  }
+
   async function repairLifecycleStatus(
     target: Pick<BrowserRuntimeTarget, "hostId" | "profileId">,
   ) {
@@ -1577,7 +1594,17 @@ export function createBrowserInstanceRuntime(
           if (target.tabId !== undefined) activeTabs.set(key, target.tabId);
           return browserResult;
         } catch (error) {
-          throw classifyExecutionError(error, originPolicy !== undefined);
+          const classified = classifyExecutionError(
+            error,
+            originPolicy !== undefined,
+          );
+          if (
+            classified instanceof BrowserOriginScopeDeniedError &&
+            classified.cause !== undefined
+          ) {
+            await quarantineOriginScopeFailure(key, held, classified);
+          }
+          throw classified;
         }
       } finally {
         operationSignal.dispose();

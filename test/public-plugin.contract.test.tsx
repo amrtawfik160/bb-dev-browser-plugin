@@ -2337,6 +2337,48 @@ describe("Browser public plugin contract", () => {
     }
   });
 
+  // Recovery issue #64 / ADR 0008: an agent CLI must derive the host from BB
+  // context even when another project host has a matching Profile Grant.
+  it("rejects --host for CLI open in a multi-host project", async () => {
+    const browser = await createPublicPluginHarness({
+      hostId: "host-a",
+      hostIds: ["host-a", "host-b"],
+      projectHostIds: ["host-a", "host-b"],
+      environmentlessThread: true,
+      snapshot: preparedSnapshot,
+    });
+
+    try {
+      await browser.createBrowserProfile({
+        hostId: "host-b",
+        name: "Other host target",
+      });
+      await browser.createBrowserGrant({
+        projectId: "project-browser-test",
+        hostId: "host-b",
+        profileId: DEFAULT_PROFILE_ID,
+        originScope: "https://example.com",
+        wholeWeb: false,
+        fileTransfer: false,
+        invalidCertificateOrigins: [],
+      });
+
+      const opened = await browser.runBrowserCli([
+        "open",
+        "https://example.com/path",
+        "--host",
+        "host-b",
+      ]);
+
+      expect(opened.exitCode).toBe(1);
+      expect(opened.stderr).toContain(
+        "open derives the host from BB context; --host is not valid.",
+      );
+    } finally {
+      await browser.dispose();
+    }
+  });
+
   // Recovery issue #64: no-URL open must not inspect or return owner tab state.
   it("does not disclose an owner tab when no-URL open lacks a Profile Grant", async () => {
     const ownerUrl = "https://owner.example.test/private?token=secret";

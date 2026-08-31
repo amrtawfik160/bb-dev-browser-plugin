@@ -404,12 +404,16 @@ function scriptRuntimeFailure(
 
 function originScopeDeniedFailure(
   request: BrowserScriptRequest,
-  origin: string | null,
+  denial: BrowserOriginScopeDeniedError,
 ): BrowserScriptResponse {
+  const cleanupNotice =
+    denial.cause === undefined
+      ? ""
+      : " Origin Scope cleanup failed; the Browser Instance must be restarted before retrying.";
   const message =
-    origin === null
-      ? "Browser navigation to a non-web URL was denied by the active Profile Grant. The denied script will not resume automatically; after an owner decision, explicitly retry against current page state."
-      : `Browser navigation to ${origin} was denied by the active Profile Grant. The denied script will not resume automatically; after an owner decision, explicitly retry against current page state.`;
+    denial.origin === null
+      ? `Browser navigation to a non-web URL was denied by the active Profile Grant.${cleanupNotice} The denied script will not resume automatically; after an owner decision, explicitly retry against current page state.`
+      : `Browser navigation to ${denial.origin} was denied by the active Profile Grant.${cleanupNotice} The denied script will not resume automatically; after an owner decision, explicitly retry against current page state.`;
   return {
     ok: false,
     error: {
@@ -419,7 +423,7 @@ function originScopeDeniedFailure(
       hostId: request.hostId,
       profileId: request.profileId,
       message,
-      origin,
+      origin: denial.origin,
       grantRequest: null,
     },
   };
@@ -1520,7 +1524,7 @@ export function createBrowserHostEntry(
               return response;
             } catch (error) {
               if (error instanceof BrowserOriginScopeDeniedError) {
-                response = originScopeDeniedFailure(request, error.origin);
+                response = originScopeDeniedFailure(request, error);
                 return response;
               }
               if (

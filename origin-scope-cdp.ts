@@ -30,32 +30,82 @@ type PageNavigationGuardOptions = {
 
 function trackOperation(
   operations: Set<Promise<void>>,
+  failures: unknown[],
   operation: Promise<void>,
 ) {
   operations.add(operation);
   void operation.then(
     () => operations.delete(operation),
-    () => operations.delete(operation),
+    (error: unknown) => {
+      operations.delete(operation);
+      failures.push(error);
+    },
   );
+}
+
+function cleanupFailure(message: string, failures: readonly unknown[]) {
+  const causes = failures.flatMap((failure) =>
+    failure instanceof AggregateError ? [...failure.errors] : [failure],
+  );
+  if (causes.length === 1) {
+    const [cause] = causes;
+    return cause instanceof Error ? cause : new Error(message, { cause });
+  }
+  return new AggregateError(causes, message);
 }
 
 async function closePage(page: Page, session: CDPSession) {
   if (page.isClosed()) return;
-  // Send close first. Chromium can otherwise commit a non-web document while
-  // a stop or replacement navigation is still in flight.
-  const closeAttempt = await Promise.allSettled([session.send("Page.close")]);
-  if (closeAttempt[0]?.status === "fulfilled" || page.isClosed()) return;
-  await Promise.allSettled([session.send("Page.stopLoading")]);
-  if (!page.isClosed()) {
-    await Promise.allSettled([page.close()]);
+  const failures: unknown[] = [];
+  try {
+    // Send close first. Chromium can otherwise commit a non-web document while
+    // a stop or replacement navigation is still in flight.
+    await session.send("Page.close");
+  } catch (error) {
+    failures.push(error);
   }
+  if (page.isClosed()) return;
+  try {
+    await session.send("Page.stopLoading");
+  } catch (error) {
+    failures.push(error);
+  }
+  if (page.isClosed()) return;
+  try {
+    await page.close();
+  } catch (error) {
+    failures.push(error);
+  }
+  if (page.isClosed()) return;
+  throw cleanupFailure(
+    "Denied Browser Tab cleanup failed.",
+    failures.length === 0
+      ? [new Error("Denied Browser Tab remained open after cleanup.")]
+      : failures,
+  );
 }
 
 async function stopNavigation(page: Page, session: CDPSession) {
-  const stopping = session.send("Page.stopLoading");
-  const result = await Promise.allSettled([stopping]);
-  if (result[0]?.status === "rejected" && !page.isClosed()) {
-    await Promise.allSettled([page.close()]);
+  let stopFailure: unknown;
+  try {
+    await session.send("Page.stopLoading");
+  } catch (error) {
+    stopFailure = error;
+  }
+  if (page.isClosed() || stopFailure === undefined) return;
+  try {
+    await page.close();
+  } catch (error) {
+    throw cleanupFailure("Denied Browser navigation cleanup failed.", [
+      stopFailure,
+      error,
+    ]);
+  }
+  if (!page.isClosed()) {
+    throw cleanupFailure("Denied Browser navigation cleanup failed.", [
+      stopFailure,
+      new Error("Denied Browser Tab remained open after cleanup."),
+    ]);
   }
 }
 
@@ -65,6 +115,7 @@ export async function installPageNavigationGuard(
 ): Promise<PageNavigationGuard> {
   const session = await page.context().newCDPSession(page);
   const operations = new Set<Promise<void>>();
+  const cleanupFailures: unknown[] = [];
   let deniedPageCleanupStarted = false;
 
   const deny = (event: FrameNavigationEvent) => {
@@ -76,7 +127,7 @@ export async function installPageNavigationGuard(
     const cleanup = options.closeDeniedPage(event.url)
       ? closePage(page, session)
       : stopNavigation(page, session);
-    trackOperation(operations, cleanup);
+    trackOperation(operations, cleanupFailures, cleanup);
   };
   const onFrameStarted = (event: FrameNavigationEvent) => deny(event);
   const onFrameRequested = (event: FrameNavigationEvent) => deny(event);
@@ -94,11 +145,11 @@ export async function installPageNavigationGuard(
     options.recordDenial(denial);
     if (page.isClosed()) return;
     if (deniedPageCleanupStarted) {
-      trackOperation(operations, closePage(page, session));
+      trackOperation(operations, cleanupFailures, closePage(page, session));
       return;
     }
     deniedPageCleanupStarted = true;
-    trackOperation(operations, closePage(page, session));
+    trackOperation(operations, cleanupFailures, closePage(page, session));
   };
 
   session.on("Page.frameStartedNavigating", onFrameStarted);
@@ -114,7 +165,15 @@ export async function installPageNavigationGuard(
     session.off("Page.frameScheduledNavigation", onFrameScheduled);
     session.off("Page.frameNavigated", onFrameCommitted);
     session.off("Page.windowOpen", onWindowOpen);
-    await Promise.allSettled([session.detach()]);
+    try {
+      await session.detach();
+    } catch (detachError) {
+      throw new AggregateError(
+        [error, detachError],
+        "Origin Scope page guard setup failed.",
+        { cause: detachError },
+      );
+    }
     throw error;
   }
 
@@ -126,7 +185,17 @@ export async function installPageNavigationGuard(
       session.off("Page.frameNavigated", onFrameCommitted);
       session.off("Page.windowOpen", onWindowOpen);
       await Promise.allSettled([...operations]);
-      await Promise.allSettled([session.detach()]);
+      try {
+        await session.detach();
+      } catch (error) {
+        if (!page.isClosed()) cleanupFailures.push(error);
+      }
+      if (cleanupFailures.length > 0) {
+        throw cleanupFailure(
+          "Origin Scope page guard cleanup failed.",
+          cleanupFailures,
+        );
+      }
     },
   };
 }

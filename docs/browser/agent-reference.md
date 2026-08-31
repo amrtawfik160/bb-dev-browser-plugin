@@ -51,11 +51,12 @@ bb browser script --purpose "Read the page title" --code "return await page.titl
 ```
 
 The CLI derives project and host from BB context and does **not** accept
-`--host` for `script`. Without `--json`, text results print directly; with
+`--host` for the agent `script` or `open` commands. Without `--json`, text results print directly; with
 `--json`, you get the JSON result or the screenshot envelope.
 
 > The `script` subcommand rejects `--host`, `--confirm`, and any script-only
-> option when used with another command (verified in `validateCliCommandOptions`).
+> option when used with another command; `open` also rejects `--host` (verified
+> in `validateCliCommandOptions`).
 
 ## The bundled skill
 

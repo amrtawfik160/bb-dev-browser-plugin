@@ -264,6 +264,7 @@ export async function createPublicPluginHarness(options?: {
   };
   hostIds?: readonly string[];
   projectHostIds?: readonly string[];
+  environmentlessThread?: boolean;
   probeFailure?: boolean;
   /** Fail this many readiness probes, then answer normally. */
   probeFailuresBeforeReady?: number;
@@ -480,7 +481,8 @@ export async function createPublicPluginHarness(options?: {
               threadId === "thread-foreign-project"
                 ? "project-foreign"
                 : PROJECT_ID,
-            environmentId: ENVIRONMENT_ID,
+            environmentId:
+              options?.environmentlessThread === true ? null : ENVIRONMENT_ID,
           }),
       },
       environments: {

@@ -118,11 +118,13 @@ BrowserContext emitted after the initial connection snapshot is registered.
 - Out-of-scope HTTP(S) requests are aborted by the route before commit. Direct
   agent non-web `Frame.goto` calls are rejected before the Playwright navigation
   command; renderer-initiated location changes and frame documents use the CDP
-  guard, which fails closed and removes the denied page. Pinned Chromium can
-  expose a diagnostic precommit event for a raw direct `data:` loader without
-  offering a cancellable loader command, so the public guarantee there is
-  typed denial plus page cleanup rather than a universal no-commit claim.
-  Ordinary cross-origin subresources continue normally.
+  guard, which fails closed and removes the denied page. If cleanup fails, the
+  typed denial reports that failure and the Browser Instance is retired before
+  another call can reuse it. Pinned Chromium can expose a diagnostic precommit
+  event for a raw direct `data:` loader without offering a cancellable loader
+  command, so the public guarantee there is typed denial plus page cleanup rather
+  than a universal no-commit claim. Ordinary cross-origin subresources continue
+  normally.
 - The first denied navigation is sticky for the operation. Navigating back into
   scope, closing a popup, or throwing a later exception cannot erase it.
 - Denied popup targets and pre-existing denied tabs are closed when they exist;

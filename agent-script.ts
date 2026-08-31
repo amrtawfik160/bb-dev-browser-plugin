@@ -40,6 +40,7 @@ const NAVIGATION_TIMEOUT_HEADROOM_MS = 5_000;
 function cutAgentBrowserRoots(
   pageListVariable: string,
   enforceNonWebNavigation: boolean,
+  operationTimeoutMs: number,
 ): string {
   return `const __bbNonWebNavigationBoundary = (() => {
   let denied = false;
@@ -50,7 +51,7 @@ function cutAgentBrowserRoots(
     wasDenied: () => denied,
   });
 })();
-const __bbInstallAgentBrowserBoundary = (() => {
+const __bbAgentBrowserBoundary = (() => {
   const __bbEnforceNonWebNavigation = ${String(enforceNonWebNavigation)};
   const __bbDenied = async () => {
     throw new Error("Agent-created BrowserContexts are unavailable.");
@@ -258,16 +259,42 @@ const __bbInstallAgentBrowserBoundary = (() => {
     }
   };
 
-  return (candidatePage) => {
-    const context = candidatePage.context();
-    __bbHardenConnection(candidatePage._connection ?? context._connection);
-    __bbHardenContext(context);
+  return {
+    install: (candidatePage) => {
+      const context = candidatePage.context();
+      __bbHardenConnection(candidatePage._connection ?? context._connection);
+      __bbHardenContext(context);
+    },
+    define: __bbDefineImmutable,
   };
 })();
+const __bbInstallAgentBrowserBoundary = __bbAgentBrowserBoundary.install;
+const __bbConfigureAgentPage = (candidatePage) => {
+  candidatePage.setDefaultNavigationTimeout(${operationTimeoutMs});
+  candidatePage.setDefaultTimeout(${operationTimeoutMs});
+  return candidatePage;
+};
+const __bbSupportedPageApi = (() => {
+  const __bbGetPage = browser.getPage.bind(browser);
+  const __bbNewPage = browser.newPage.bind(browser);
+  const __bbConfigureSupportedPage = async (candidatePage) => {
+    __bbInstallAgentBrowserBoundary(candidatePage);
+    return __bbConfigureAgentPage(candidatePage);
+  };
+  return Object.freeze({
+    getPage: async (...args) =>
+      __bbConfigureSupportedPage(await __bbGetPage(...args)),
+    newPage: async (...args) =>
+      __bbConfigureSupportedPage(await __bbNewPage(...args)),
+  });
+})();
+__bbAgentBrowserBoundary.define(browser, "getPage", __bbSupportedPageApi.getPage);
+__bbAgentBrowserBoundary.define(browser, "newPage", __bbSupportedPageApi.newPage);
 for (const __bbEntry of ${pageListVariable}) {
-  await __bbInstallAgentBrowserBoundary(await browser.getPage(__bbEntry.id));
+  await __bbSupportedPageApi.getPage(__bbEntry.id);
 }
-await __bbInstallAgentBrowserBoundary(page);`;
+await __bbInstallAgentBrowserBoundary(page);
+`;
 }
 
 /**
@@ -297,6 +324,7 @@ export function agentPagePreamble(
   tabId?: string,
   preferredOrigin?: string,
   enforceNonWebNavigation = false,
+  operationTimeoutMs = boundedOperationTimeoutMs(BROWSER_SCRIPT_MAX_TIMEOUT_MS),
 ): string {
   if (tabId !== undefined) {
     return `const __bbTargetPages = await browser.listPages();
@@ -305,7 +333,7 @@ if (!__bbTargetPages.some((entry) => entry.id === ${JSON.stringify(tabId)})) thr
     )});
 const page = await browser.getPage(${JSON.stringify(tabId)});
 await page.bringToFront();
-${cutAgentBrowserRoots("__bbTargetPages", enforceNonWebNavigation)}`;
+${cutAgentBrowserRoots("__bbTargetPages", enforceNonWebNavigation, operationTimeoutMs)}`;
   }
   return `const __bbPages = await browser.listPages();
 let page = await browser.getPage(__bbPages.length === 0 ? "main" : __bbPages[0].id);
@@ -330,7 +358,7 @@ if (__bbPreferred !== null) {
   }
 }
 await page.bringToFront();
-${cutAgentBrowserRoots("__bbPages", enforceNonWebNavigation)}`;
+${cutAgentBrowserRoots("__bbPages", enforceNonWebNavigation, operationTimeoutMs)}`;
 }
 
 export function wrapAgentScriptResult(code: string): string {
@@ -365,15 +393,16 @@ export function prepareAgentExecution(input: {
   enforceNonWebNavigation?: boolean;
   screenshot?: { fileName: string; marker: string };
 }): string {
+  const operationTimeoutMs = boundedOperationTimeoutMs(
+    input.timeoutMs ?? BROWSER_SCRIPT_MAX_TIMEOUT_MS,
+  );
   const pagePreamble = agentPagePreamble(
     input.tabId,
     input.preferredOrigin,
     input.enforceNonWebNavigation ?? false,
+    operationTimeoutMs,
   );
   const wrappedUser = wrapAgentScriptResult(input.code);
-  const operationTimeoutMs = boundedOperationTimeoutMs(
-    input.timeoutMs ?? BROWSER_SCRIPT_MAX_TIMEOUT_MS,
-  );
   const prefix = `${pagePreamble}
 page.setDefaultNavigationTimeout(${operationTimeoutMs});
 page.setDefaultTimeout(${operationTimeoutMs});`;

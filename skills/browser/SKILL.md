@@ -20,7 +20,8 @@ is denied without a Grant Request.
 authorized URL: it runs as an agent operation under the same Profile Grant,
 Control Lease, and Activity attribution. The URL is required; no-argument
 opens fail closed before reading host tab state. Use the Browser Panel for
-current-tab inspection and search text.
+current-tab inspection and search text. The agent `open` command derives its
+host from BB context and rejects `--host`.
 
 ## Automating a page
 
@@ -130,9 +131,11 @@ agent call, the pinned Playwright connection adapter rejects direct non-web
 `Frame.goto` before forwarding its `goto` command; it allows exact
 `about:blank`, HTTP(S), and HTTP(S)-backed `blob:` only for the host to classify
 and match. Renderer-initiated location changes, redirects, popups, and frames
-use the CDP guard and fail closed by removing denied pages. Pinned Chromium may
-report a precommit event for a raw direct `data:` loader that cannot be canceled;
-the public result is still a typed denial and the denied page is cleaned up.
+use the CDP guard and fail closed by removing denied pages. If cleanup fails, the
+typed denial reports it and the Browser Instance is retired before another call
+can reuse it. Pinned Chromium may report a precommit event for a raw direct
+`data:` loader that cannot be canceled; the public result is still a typed denial
+and the denied page is cleaned up.
 The guard registers contexts emitted after its initial browser snapshot as
 well. Exact `about:blank` is the only safe internal page exception. A `blob:`
 page uses its embedded HTTP(S) origin when the browser exposes one. An

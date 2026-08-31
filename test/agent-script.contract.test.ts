@@ -105,6 +105,8 @@ async function preparedLogs(
   class FakePage {
     readonly _type = "Page";
     readonly _browserContext: FakeContext;
+    navigationTimeout: number | null = null;
+    actionTimeout: number | null = null;
 
     constructor(
       readonly _parent: FakeContext,
@@ -119,8 +121,12 @@ async function preparedLogs(
 
     bringToFront = async () => undefined;
     evaluate = async () => "visible";
-    setDefaultNavigationTimeout = () => undefined;
-    setDefaultTimeout = () => undefined;
+    setDefaultNavigationTimeout = (timeout: number) => {
+      this.navigationTimeout = timeout;
+    };
+    setDefaultTimeout = (timeout: number) => {
+      this.actionTimeout = timeout;
+    };
   }
 
   const connection = new FakeConnection();
@@ -141,7 +147,7 @@ async function preparedLogs(
 
   const fakeBrowser = {
     listPages: async () => [{ id: "tab-1", url: "about:blank" }],
-    getPage: async () => page,
+    getPage: async (id: string) => (id === "tab-2" ? extraPage : page),
     newPage: async () => extraPage,
   };
   const prepared = prepareAgentExecution({
@@ -348,6 +354,24 @@ throw new Error("later script failure");`,
     });
     expect(prepared).toContain("page.setDefaultTimeout(25000)");
   });
+
+  it.each([
+    [
+      "browser.getPage",
+      'const acquired = await browser.getPage("tab-2"); return JSON.stringify({ navigation: acquired.navigationTimeout, action: acquired.actionTimeout });',
+    ],
+    [
+      "browser.newPage",
+      "const acquired = await browser.newPage(); return JSON.stringify({ navigation: acquired.navigationTimeout, action: acquired.actionTimeout });",
+    ],
+  ])(
+    "applies host deadline headroom to pages returned by %s",
+    async (_acquisition, code) => {
+      expect(await preparedLogs(code)).toEqual([
+        '{"navigation":25000,"action":25000}',
+      ]);
+    },
+  );
 
   it("leaves helper headroom at the minimum accepted host timeout", () => {
     const prepared = prepareAgentExecution({

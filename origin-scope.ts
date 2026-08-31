@@ -63,6 +63,7 @@ type RouteRegistration = {
   context: BrowserContext;
   handler: (route: Route) => Promise<void>;
   pending: Set<Promise<void>>;
+  failures: unknown[];
 };
 
 type PageRegistration = {
@@ -74,14 +75,56 @@ const ORIGIN_SCOPE_ROUTE_PATTERN = "**/*";
 const requireFromPlugin = createRequire(import.meta.url);
 
 export class BrowserOriginScopeDeniedError extends Error {
-  constructor(public readonly origin: string | null) {
+  constructor(
+    public readonly origin: string | null,
+    options?: ErrorOptions,
+  ) {
     super(
       origin === null
         ? "Browser navigation to a non-web URL was denied by the active Profile Grant."
         : `Browser navigation to ${origin} was denied by the active Profile Grant.`,
+      options,
     );
     this.name = "BrowserOriginScopeDeniedError";
   }
+}
+
+function rejectedReasons(
+  results: readonly PromiseSettledResult<unknown>[],
+): unknown[] {
+  return results.flatMap((result) =>
+    result.status === "rejected" ? [result.reason] : [],
+  );
+}
+
+function cleanupFailure(message: string, failures: readonly unknown[]) {
+  const causes = failures.flatMap((failure) =>
+    failure instanceof AggregateError ? [...failure.errors] : [failure],
+  );
+  if (causes.length === 1) {
+    const [cause] = causes;
+    return cause instanceof Error ? cause : new Error(message, { cause });
+  }
+  return new AggregateError(causes, message);
+}
+
+function preservePrimaryFailure(primary: unknown, cleanup: Error) {
+  if (primary instanceof BrowserOriginScopeDeniedError) {
+    const cause =
+      primary.cause === undefined
+        ? cleanup
+        : new AggregateError(
+            [primary.cause, cleanup],
+            "Origin Scope setup and cleanup failed.",
+          );
+    return new BrowserOriginScopeDeniedError(primary.origin, {
+      cause,
+    });
+  }
+  return cleanupFailure("Origin Scope setup and cleanup failed.", [
+    primary,
+    cleanup,
+  ]);
 }
 
 export function preferOriginScopeDenial<T>(
@@ -157,13 +200,12 @@ async function closeDeniedExistingPages(denied: readonly { page: Page }[]) {
   const results = await Promise.allSettled(
     denied.map(({ page }) => page.close()),
   );
-  const failure = results.find(
-    (result): result is PromiseRejectedResult => result.status === "rejected",
-  );
-  if (failure !== undefined) {
-    throw new Error("An out-of-scope Browser Tab could not be closed.", {
-      cause: failure.reason,
-    });
+  const failures = rejectedReasons(results);
+  if (failures.length > 0) {
+    throw cleanupFailure(
+      "An out-of-scope Browser Tab could not be closed.",
+      failures,
+    );
   }
 }
 
@@ -298,9 +340,11 @@ async function connectOriginScopeBrowser(endpoint: string, timeoutMs: number) {
 }
 
 async function removeRoutes(registrations: readonly RouteRegistration[]) {
-  await Promise.all(
-    registrations.map(({ context, handler }) =>
-      context.unroute(ORIGIN_SCOPE_ROUTE_PATTERN, handler),
+  return rejectedReasons(
+    await Promise.allSettled(
+      registrations.map(({ context, handler }) =>
+        context.unroute(ORIGIN_SCOPE_ROUTE_PATTERN, handler),
+      ),
     ),
   );
 }
@@ -308,11 +352,10 @@ async function removeRoutes(registrations: readonly RouteRegistration[]) {
 async function settlePendingRoutes(
   registrations: readonly RouteRegistration[],
 ) {
-  // Handler errors already reach the navigation that initiated them. Cleanup
-  // only needs to wait until every page-close or fulfil action has settled.
   await Promise.allSettled(
     registrations.flatMap(({ pending }) => [...pending]),
   );
+  return registrations.flatMap(({ failures }) => failures.splice(0));
 }
 
 async function settlePendingInstallations(installations: Set<Promise<void>>) {
@@ -326,16 +369,20 @@ function routeRegistration(
   handler: (route: Route) => Promise<void>,
 ): RouteRegistration {
   const pending = new Set<Promise<void>>();
+  const failures: unknown[] = [];
   const trackedHandler = (route: Route) => {
     const execution = handler(route);
     pending.add(execution);
     void execution.then(
       () => pending.delete(execution),
-      () => pending.delete(execution),
+      (error: unknown) => {
+        pending.delete(execution);
+        failures.push(error);
+      },
     );
     return execution;
   };
-  return { context, handler: trackedHandler, pending };
+  return { context, handler: trackedHandler, pending, failures };
 }
 
 async function installRoutes(registrations: readonly RouteRegistration[]) {
@@ -359,6 +406,27 @@ export async function installHostOriginScopeGuard(
   const pageRegistrations: PageRegistration[] = [];
   const registeredPages = new Set<Page>();
   const pendingPageInstallations = new Set<Promise<void>>();
+  const installationFailures: unknown[] = [];
+  let browserCloseAttempt: Promise<void> | undefined;
+  let browserCloseObserved = false;
+  const browserCloseFailures: unknown[] = [];
+  const browserClose = () => {
+    browserCloseAttempt ??= Promise.resolve().then(() => browser.close());
+    return browserCloseAttempt;
+  };
+  const observeBrowserClose = () => {
+    if (browserCloseObserved) return;
+    browserCloseObserved = true;
+    void browserClose().then(
+      () => undefined,
+      (error: unknown) => browserCloseFailures.push(error),
+    );
+  };
+  const collectBrowserCloseFailures = async () => {
+    observeBrowserClose();
+    await Promise.allSettled([browserClose()]);
+    return browserCloseFailures.splice(0);
+  };
   const pageObservers = new Map<
     BrowserContext,
     (event: BrowserPageChannelEvent) => void | Promise<void>
@@ -373,14 +441,18 @@ export async function installHostOriginScopeGuard(
       recordDenial(new BrowserOriginScopeDeniedError(null));
     }
   };
+  const recordInstallationFailure = (error: unknown) => {
+    installationFailures.push(error);
+    observeBrowserClose();
+  };
   const trackPageInstallation = (installation: Promise<void>) => {
     pendingPageInstallations.add(installation);
     void installation.then(
       () => pendingPageInstallations.delete(installation),
-      () => {
+      (error: unknown) => {
         pendingPageInstallations.delete(installation);
         denial ??= new BrowserOriginScopeDeniedError(null);
-        void browser.close().catch(() => undefined);
+        recordInstallationFailure(error);
       },
     );
     return installation;
@@ -416,7 +488,7 @@ export async function installHostOriginScopeGuard(
         const page = event.page._object;
         if (page === undefined) {
           denial ??= new BrowserOriginScopeDeniedError(null);
-          void browser.close().catch(() => undefined);
+          observeBrowserClose();
           return;
         }
         trackPageInstallation(installPage(context, page));
@@ -444,10 +516,10 @@ export async function installHostOriginScopeGuard(
     pendingContextInstallations.add(installation);
     return installation.then(
       () => pendingContextInstallations.delete(installation),
-      () => {
+      (error: unknown) => {
         denial ??= new BrowserOriginScopeDeniedError(null);
         pendingContextInstallations.delete(installation);
-        void browser.close().catch(() => undefined);
+        recordInstallationFailure(error);
       },
     );
   };
@@ -458,10 +530,39 @@ export async function installHostOriginScopeGuard(
     const context = event.context._object;
     if (context === undefined) {
       denial ??= new BrowserOriginScopeDeniedError(null);
-      void browser.close().catch(() => undefined);
+      observeBrowserClose();
       return;
     }
     await observeContext(context);
+  };
+  const disposeResources = async () => {
+    const cleanupFailures: unknown[] = installationFailures.splice(0);
+    try {
+      contextEmitter.off("context", observeBrowserContext);
+    } catch (error) {
+      cleanupFailures.push(error);
+    }
+    for (const [context, observer] of pageObservers) {
+      try {
+        contextChannel(context)?.off("page", observer);
+      } catch (error) {
+        cleanupFailures.push(error);
+      }
+    }
+    await settlePendingInstallations(pendingContextInstallations);
+    await settlePendingInstallations(pendingPageInstallations);
+    cleanupFailures.push(...installationFailures.splice(0));
+    cleanupFailures.push(
+      ...rejectedReasons(
+        await Promise.allSettled(
+          pageRegistrations.map(({ guard }) => guard.dispose()),
+        ),
+      ),
+    );
+    cleanupFailures.push(...(await removeRoutes(registrations)));
+    cleanupFailures.push(...(await settlePendingRoutes(registrations)));
+    cleanupFailures.push(...(await collectBrowserCloseFailures()));
+    return cleanupFailures;
   };
   try {
     contextEmitter.prependListener("context", observeBrowserContext);
@@ -469,42 +570,44 @@ export async function installHostOriginScopeGuard(
     await Promise.all(contexts.map((context) => installContext(context)));
     await settlePendingInstallations(pendingContextInstallations);
     await settlePendingInstallations(pendingPageInstallations);
-    if (denial !== null) throw denial;
-  } catch (error) {
-    contextEmitter.off("context", observeBrowserContext);
-    for (const [context, observer] of pageObservers) {
-      contextChannel(context)?.off("page", observer);
+    const backgroundFailures = installationFailures.splice(0);
+    if (denial !== null) {
+      if (backgroundFailures.length > 0) {
+        throw preservePrimaryFailure(
+          denial,
+          cleanupFailure(
+            "Origin Scope installation failed.",
+            backgroundFailures,
+          ),
+        );
+      }
+      throw denial;
     }
-    await settlePendingInstallations(pendingContextInstallations);
-    await settlePendingInstallations(pendingPageInstallations);
-    await Promise.allSettled(
-      pageRegistrations.map(({ guard }) => guard.dispose()),
-    );
-    await settlePendingRoutes(registrations);
-    await browser.close();
-    throw error;
+    if (backgroundFailures.length > 0) {
+      throw cleanupFailure(
+        "Origin Scope installation failed.",
+        backgroundFailures,
+      );
+    }
+  } catch (error) {
+    const cleanupFailures = await disposeResources();
+    if (denial !== null && error !== denial) cleanupFailures.push(error);
+    if (cleanupFailures.length > 0) {
+      const primary = denial ?? error;
+      throw preservePrimaryFailure(
+        primary,
+        cleanupFailure("Origin Scope cleanup failed.", cleanupFailures),
+      );
+    }
+    throw denial ?? error;
   }
   return {
     deniedError: () => denial,
     deniedOrigin: () => denial?.origin ?? null,
     dispose: async () => {
-      try {
-        contextEmitter.off("context", observeBrowserContext);
-        for (const [context, observer] of pageObservers) {
-          contextChannel(context)?.off("page", observer);
-        }
-        await settlePendingInstallations(pendingContextInstallations);
-        await settlePendingInstallations(pendingPageInstallations);
-        await Promise.allSettled(
-          pageRegistrations.map(({ guard }) => guard.dispose()),
-        );
-        try {
-          await removeRoutes(registrations);
-        } finally {
-          await settlePendingRoutes(registrations);
-        }
-      } finally {
-        await browser.close();
+      const cleanupFailures = await disposeResources();
+      if (cleanupFailures.length > 0) {
+        throw cleanupFailure("Origin Scope cleanup failed.", cleanupFailures);
       }
     },
   };

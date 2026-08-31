@@ -482,6 +482,9 @@ function validateCliCommandOptions(
 ): string | null {
   const grantError = validateGrantCommandOptions(command, parseState);
   if (grantError !== null) return grantError;
+  if (command === "open" && parseState.hostId !== undefined) {
+    return `open derives the host from BB context; --host is not valid.\n${CLI_USAGE}`;
+  }
   const scriptOptions = [
     parseState.purpose,
     parseState.code,

@@ -60,10 +60,12 @@ each.
   denied HTTP(S) requests before commit. Direct agent `Frame.goto` calls to
   non-web addresses are rejected before the Playwright command reaches
   Chromium; renderer location changes, popups, redirects, and frame documents
-  use the CDP guard and fail closed by removing the denied page when needed.
-  Pinned Chromium can report a precommit event for a raw direct `data:` loader
-  without exposing a cancellable loader command, so this path guarantees typed
-  denial and cleanup rather than a universal no-commit event guarantee.
+  use the CDP guard and fail closed by removing the denied page when needed. If
+  cleanup fails, the typed denial is surfaced and the Browser Instance is retired
+  before another call can reuse it. Pinned Chromium can report a precommit event
+  for a raw direct `data:` loader without exposing a cancellable loader command,
+  so this path guarantees typed denial and cleanup rather than a universal
+  no-commit event guarantee.
   Ordinary cross-origin subresources may render. Cross-origin frame documents
   therefore need their own grant.
 - Exact `about:blank` is allowed as a safe internal page. Other `about:`,

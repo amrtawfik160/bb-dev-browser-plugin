@@ -9,8 +9,8 @@ Common conventions:
 
 - `--json` (where shown) returns structured output; without it, commands print
   human-readable text.
-- `--host <id>` (where shown) selects a host. The `script` command does not
-  accept `--host` — it derives the host from BB context.
+- `--host <id>` (where shown) selects a host. The agent `script` and `open`
+  commands do not accept `--host` — they derive the host from BB context.
 - `--profile <id>` (where shown) selects a Browser Profile; omit it to use the
   selected profile.
 

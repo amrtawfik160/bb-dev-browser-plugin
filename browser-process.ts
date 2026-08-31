@@ -25,6 +25,7 @@ import type {
 } from "./browser-runtime.js";
 import { BrowserScriptExecutionError } from "./browser-runtime.js";
 import {
+  BrowserOriginScopeDeniedError,
   installHostOriginScopeGuard,
   preferOriginScopeDenial,
   type HostOriginScopeGuard,
@@ -1043,7 +1044,7 @@ async function cleanupBrowserHelper(
   guard: HostOriginScopeGuard | null,
   screenshotPath: string | undefined,
 ) {
-  let cleanupError: unknown;
+  const cleanupErrors: unknown[] = [];
   for (const action of [
     () =>
       stopProcess(
@@ -1056,10 +1057,35 @@ async function cleanupBrowserHelper(
     try {
       await action();
     } catch (error) {
-      cleanupError ??= error;
+      cleanupErrors.push(error);
     }
   }
-  if (cleanupError !== undefined) throw cleanupError;
+  if (cleanupErrors.length === 1) throw cleanupErrors[0];
+  if (cleanupErrors.length > 1) {
+    throw new AggregateError(cleanupErrors, "Browser helper cleanup failed.");
+  }
+}
+
+function preserveExecutionFailure(
+  executionError: unknown,
+  cleanupError: unknown,
+) {
+  if (executionError instanceof BrowserOriginScopeDeniedError) {
+    const cause =
+      executionError.cause === undefined
+        ? cleanupError
+        : new AggregateError(
+            [executionError.cause, cleanupError],
+            "Browser execution and cleanup failed.",
+          );
+    return new BrowserOriginScopeDeniedError(executionError.origin, {
+      cause,
+    });
+  }
+  return new AggregateError(
+    [executionError, cleanupError],
+    "Browser execution and cleanup failed.",
+  );
 }
 
 async function executeBrowserHelper(
@@ -1110,9 +1136,8 @@ async function executeBrowserHelper(
       originGuard,
       screenshotPath,
     ).catch((error: unknown) => {
-      // Preserve the execution failure (especially an Origin Scope denial)
-      // after cleanup has still attempted every resource-release action.
       if (executionError === undefined) throw error;
+      throw preserveExecutionFailure(executionError, error);
     });
   }
 }

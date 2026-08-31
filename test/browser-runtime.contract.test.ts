@@ -1409,6 +1409,45 @@ describe("Browser Instance runtime Origin Scope enforcement", () => {
     }
   });
 
+  it("issue #64 quarantines an instance after Origin Scope cleanup fails", async () => {
+    const fixture = await runtimeFixture();
+    const deniedOrigin = "https://evil.example.test";
+    let firstExecution = true;
+    fixture.processFixture.boundary.execute = async () => {
+      if (firstExecution) {
+        firstExecution = false;
+        throw new BrowserOriginScopeDeniedError(deniedOrigin, {
+          cause: new Error("Origin Scope cleanup failed"),
+        });
+      }
+      return { output: "recovered" };
+    };
+
+    try {
+      await fixture.runtime.start(fixture.target);
+      await expect(
+        fixture.runtime.execute(fixture.target, "return page.url()", 5_000, {
+          originScope: "https://app.example.test",
+        }),
+      ).rejects.toMatchObject({
+        origin: deniedOrigin,
+        cause: expect.objectContaining({
+          message: "Origin Scope cleanup failed",
+        }),
+      });
+      expect(fixture.processFixture.stopped).toEqual([4100]);
+
+      await expect(
+        fixture.runtime.execute(fixture.target, "return page.url()", 5_000, {
+          originScope: "https://app.example.test",
+        }),
+      ).resolves.toEqual({ output: "recovered" });
+      expect(fixture.processFixture.launches).toHaveLength(2);
+    } finally {
+      await fixture.dispose();
+    }
+  });
+
   it("turns the direct non-web navigation boundary marker into a typed denial", async () => {
     const fixture = await runtimeFixture();
     fixture.processFixture.boundary.execute = async () => {
