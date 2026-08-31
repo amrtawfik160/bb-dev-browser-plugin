@@ -75,6 +75,27 @@ each.
 - Invalid-certificate access is an exact-origin elevation. It does not disable
   certificate validation globally or for another allowed origin.
 
+## Memory
+
+- The browser is spawned by the host worker, so it **runs in whatever cgroup
+  the BB host daemon runs in** and spends the same memory budget as every
+  agent on the machine. The plugin cannot place it in a slice of its own
+  without privileged cgroup setup.
+- What the plugin does bound: each Browser Instance launches Chromium with
+  `--renderer-process-limit=8` and
+  `--js-flags=--max-old-space-size=512`, limiting renderer count and V8 old
+  space per renderer. Pages evicted past the shared tab strip's retention cap
+  are closed rather than left resident. Worst-case renderer memory is roughly
+  `8 × (512 MiB + native overhead)`.
+- These settings do **not** cap the browser process's native, GPU, or other
+  non-renderer memory, and they do not reserve an isolated budget for the
+  Workspace Browser. Shared cgroup pressure can still terminate the browser or
+  another process according to the host kernel's policy.
+- Operators who want a hard ceiling should set `MemoryMax` on the BB host
+  daemon unit, and note that Chromium sets `oom_score_adj=300` on its
+  renderers — so under cgroup pressure the browser is the kernel's preferred
+  victim even when another process caused the pressure.
+
 ## Anti-automation defenses
 
 - Major search engines and other sites serve bot-detection challenges to an

@@ -10,6 +10,7 @@ import {
 } from "../contracts.js";
 import { createBrowserHostEntry } from "../host.js";
 import { createFileBrowserProfileStore } from "../profile-storage.js";
+import { TAB_STRIP_DEFAULT_MAX_TABS } from "../browser-tabs.js";
 import {
   BrowserOriginScopeDeniedError,
   createBrowserInstanceRuntime,
@@ -57,6 +58,7 @@ describe("Browser host runtime boundary", () => {
       history: async () => {
         throw new Error("not used");
       },
+      closePages: async () => 0,
       listPages: async () => [],
       status: async ({
         hostId,
@@ -283,6 +285,7 @@ describe("Browser host runtime boundary", () => {
         history: async () => {
           throw new Error("not used");
         },
+        closePages: async () => 0,
         listPages: async () => [],
         status: async ({
           hostId,
@@ -424,6 +427,7 @@ describe("Browser host runtime boundary", () => {
         location: { direction },
         tabId: target.tabId ?? "host-tab",
       }),
+      closePages: async () => 0,
       listPages: async () => [],
       status: async ({
         hostId,
@@ -546,6 +550,7 @@ it("issue #16 feeds the shared tab strip from real browser page events and norma
     history: async () => {
       throw new Error("not used");
     },
+    closePages: async () => 0,
     listPages: async () => [...listedPages],
     status: async ({
       hostId,
@@ -661,6 +666,7 @@ it("issue #16 interrupts an active agent Control Lease when the owner takes cont
     history: async () => {
       throw new Error("not used");
     },
+    closePages: async () => 0,
     listPages: async () => [
       {
         id: "page-1",
@@ -797,6 +803,7 @@ it("issue #16 reflects active-tab changes from navigation across the shared stri
     history: async () => {
       throw new Error("not used");
     },
+    closePages: async () => 0,
     listPages: async () => [...listedPages],
     status: async ({
       hostId,
@@ -897,6 +904,7 @@ it("issue #14 returns a typed origin_denied result when the runtime blocks a rea
     history: async () => {
       throw new Error("not used");
     },
+    closePages: async () => 0,
     listPages: async () => [],
     status: async ({
       hostId,
@@ -997,6 +1005,7 @@ it("issue #14 AC4 forwards per-origin invalid-certificate flags from the script 
     history: async () => {
       throw new Error("not used");
     },
+    closePages: async () => 0,
     listPages: async () => [],
     status: async ({
       hostId,
@@ -1066,6 +1075,7 @@ function safeLoginExecuteRuntime() {
     history: async () => {
       throw new Error("not used");
     },
+    closePages: async () => 0,
     listPages: async () => [],
     status: async ({
       hostId,
@@ -1195,6 +1205,159 @@ it("issue #18 denies browser_script DOM, screenshot, and control access while th
   } finally {
     await host.experimental_dispose();
     safeLoginMode.dispose();
+    await rm(rootDirectory, { recursive: true, force: true });
+  }
+});
+
+it("closes the pages it evicts past the tab cap so renderer memory is reclaimed", async () => {
+  const rootDirectory = await mkdtemp(join(tmpdir(), "host-tab-evict-"));
+  const profiles = createFileBrowserProfileStore({
+    rootDirectory,
+    installationId: "installation-tab-evict",
+  });
+  await profiles.initialize(HOST_ID);
+  // One page over the retained cap, as a profile accumulates over its life.
+  const listedPages = Array.from(
+    { length: TAB_STRIP_DEFAULT_MAX_TABS + 1 },
+    (_unused, index) => ({
+      id: `page-${index}`,
+      url: `https://app.example.test/${index}`,
+      title: `Page ${index}`,
+      openerTabId: null,
+    }),
+  );
+  const closed: string[][] = [];
+  const runtime = {
+    start: async () => {
+      throw new Error("not used");
+    },
+    stop: async () => {},
+    execute: async () => {
+      throw new Error("not used");
+    },
+    navigate: async (target: { tabId?: string }, input: string) => ({
+      address: { kind: "address" as const, url: input },
+      location: { url: input },
+      tabId: target.tabId ?? "page-0",
+    }),
+    history: async () => {
+      throw new Error("not used");
+    },
+    closePages: async (
+      _target: { hostId: string; profileId: string },
+      tabIds: readonly string[],
+    ) => {
+      closed.push([...tabIds]);
+      for (const id of tabIds) {
+        const index = listedPages.findIndex((page) => page.id === id);
+        if (index !== -1) listedPages.splice(index, 1);
+      }
+      return tabIds.length;
+    },
+    listPages: async () => [...listedPages],
+    status: async ({
+      hostId,
+      profileId,
+    }: {
+      hostId: string;
+      profileId: string;
+    }) => ({ state: "running" as const, hostId, profileId }),
+    pinPanel: async () => {
+      throw new Error("not used");
+    },
+    unpinPanel: async () => {},
+    hostDisconnected: () => {},
+    hostReconnected: async () => {},
+    dispose: async () => {},
+  };
+  const readiness = {
+    inspect: healthyStatus,
+    diagnostics: () => {
+      throw new Error("diagnostics not used");
+    },
+  };
+  const host = experimental_createHostEntryHarness(
+    createBrowserHostEntry(readiness, profiles, undefined, runtime),
+    {
+      experimental_paths: {
+        dataDir: rootDirectory,
+        tempDir: join(rootDirectory, "tmp"),
+      },
+    },
+  );
+  try {
+    await host.experimental_call("navigate", {
+      hostId: HOST_ID,
+      profileId: DEFAULT_PROFILE_ID,
+      projectId: "project-tab-evict",
+      input: "https://app.example.test/0",
+      rawLocalhost: false,
+    });
+
+    // Forgetting the tab without closing its page left every renderer
+    // resident for the life of the profile, and --restore-last-session
+    // brought them all back on the next launch.
+    expect(closed).toEqual([["page-1"]]);
+    let strip = (await host.experimental_call("tabs", {
+      hostId: HOST_ID,
+      profileId: DEFAULT_PROFILE_ID,
+    })) as {
+      tabs: Array<{ tabId: string }>;
+      activeTabId: string | null;
+    };
+    expect(strip.tabs).toHaveLength(TAB_STRIP_DEFAULT_MAX_TABS);
+    expect(strip.tabs.some((tab) => tab.tabId === "page-0")).toBe(true);
+    expect(strip.activeTabId).toBe("page-0");
+
+    // A later inventory must not resurrect the page the retention pass closed.
+    await host.experimental_call("navigate", {
+      hostId: HOST_ID,
+      profileId: DEFAULT_PROFILE_ID,
+      projectId: "project-tab-evict",
+      input: "https://app.example.test/0",
+      rawLocalhost: false,
+    });
+    expect(closed).toEqual([["page-1"]]);
+    strip = (await host.experimental_call("tabs", {
+      hostId: HOST_ID,
+      profileId: DEFAULT_PROFILE_ID,
+    })) as {
+      tabs: Array<{ tabId: string }>;
+      activeTabId: string | null;
+    };
+    expect(strip.tabs).toHaveLength(TAB_STRIP_DEFAULT_MAX_TABS);
+    expect(strip.tabs.some((tab) => tab.tabId === "page-1")).toBe(false);
+
+    // Reset the local tab model as a Browser Instance restart would, then
+    // reconcile once more against the live pages.
+    await host.experimental_call("hostConnection", {
+      hostId: HOST_ID,
+      generation: 1,
+      state: "disconnected",
+    });
+    await host.experimental_call("hostConnection", {
+      hostId: HOST_ID,
+      generation: 2,
+      state: "connected",
+    });
+    await host.experimental_call("navigate", {
+      hostId: HOST_ID,
+      profileId: DEFAULT_PROFILE_ID,
+      projectId: "project-tab-evict",
+      input: "https://app.example.test/0",
+      rawLocalhost: false,
+    });
+    expect(closed).toEqual([["page-1"]]);
+    strip = (await host.experimental_call("tabs", {
+      hostId: HOST_ID,
+      profileId: DEFAULT_PROFILE_ID,
+    })) as {
+      tabs: Array<{ tabId: string }>;
+      activeTabId: string | null;
+    };
+    expect(strip.tabs.some((tab) => tab.tabId === "page-1")).toBe(false);
+  } finally {
+    await host.experimental_dispose();
     await rm(rootDirectory, { recursive: true, force: true });
   }
 });

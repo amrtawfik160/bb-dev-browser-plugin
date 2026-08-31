@@ -731,11 +731,9 @@ export function createBrowserHostEntry(
     };
   }
   /**
-   * Feed the shared tab strip from real browser state. New pages the runtime
-   * reports are added through openTab (top-level) or normalizePopup (popup),
-   * then syncPages reconciles url/title changes, removals, and the active tab.
-   * Runtime tab ids stay authoritative so the strip and runtime stay consistent
-   * for the life of the instance.
+   * Feed the shared tab strip from real browser state. The runtime's page ids
+   * stay authoritative, and its active page is protected while the strip
+   * applies its retention cap.
    */
   async function reconcileRuntimeTabs(
     dataDir: string,
@@ -754,16 +752,21 @@ export function createBrowserHostEntry(
       // next operation reconciles, rather than dropping tabs the user sees.
       return;
     }
-    for (const page of pages) {
-      if (strip.tab(page.id) !== undefined) continue;
-      if (page.openerTabId !== null) {
-        strip.normalizePopup(page.url, page.title, page.openerTabId, page.id);
-      } else {
-        strip.openTab(page.url, page.title, page.id);
-      }
-    }
-    strip.syncPages(pages);
-    if (activeTabId !== undefined) strip.activateTab(activeTabId);
+    strip.syncPages(
+      pages.map((page) => ({
+        id: page.id,
+        url: page.url,
+        title: page.title,
+        origin: page.openerTabId === null ? "page" : "popup",
+        openerTabId: page.openerTabId,
+      })),
+      activeTabId,
+    );
+    // Tabs past the retention cap are dropped from the strip; close their
+    // pages too, or the browser keeps every renderer alive for the life of the
+    // profile and the cap bounds nothing.
+    const evicted = strip.takeEvictedTabIds();
+    if (evicted.length > 0) await browserRuntime.closePages(target, evicted);
   }
   const hostConnectionGenerations = new Map<string, number>();
   function administration(dataDir: string) {
@@ -1206,7 +1209,12 @@ export function createBrowserHostEntry(
         // Enroll a created target (open-link/open-image-new-tab) as a
         // BrowserTab in the shared strip so it is normalized into the
         // profile's ordered tab set rather than spawning an untracked window.
-        onTargetCreated: (created) => strip.openTab(created.url, ""),
+        onTargetCreated: async (created) => {
+          strip.openTab(created.url, "", created.targetId);
+          const evicted = strip.takeEvictedTabIds();
+          if (evicted.length > 0)
+            await browserRuntime.closePages(target, evicted);
+        },
       });
       // Apply the controller's viewport to the stream policy so the ready frame
       // carries the controller viewport, and keep it in sync when control moves.

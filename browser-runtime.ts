@@ -363,6 +363,21 @@ function runtimeKey(
   return `${target.hostId}\0${target.profileId}`;
 }
 
+/**
+ * Memory ceiling for one Browser Instance.
+ *
+ * The browser is spawned by the host worker, so it lives in whatever cgroup
+ * the BB host daemon runs in and spends the same memory budget as every agent
+ * on the machine. Chromium left to itself will grow a renderer per page with
+ * no bound, so one heavy page could exhaust that shared budget and take the
+ * agent service down with it. Capping renderer processes and each renderer's
+ * V8 old space bounds the worst case to roughly
+ * RENDERER_PROCESS_LIMIT × (RENDERER_HEAP_LIMIT_MB + native overhead), which
+ * is ample for an 800×600 automation browser.
+ */
+export const RENDERER_PROCESS_LIMIT = 8;
+export const RENDERER_HEAP_LIMIT_MB = 512;
+
 async function browserArguments(
   target: BrowserInstanceTarget,
   profileDirectory: string,
@@ -378,6 +393,8 @@ async function browserArguments(
     "--disable-notifications",
     "--disable-save-password-bubble",
     "--disable-features=PasswordManagerEnabled,AutofillAddressEnabled,AutofillCreditCardEnabled,AutofillServerCommunication",
+    `--renderer-process-limit=${RENDERER_PROCESS_LIMIT}`,
+    `--js-flags=--max-old-space-size=${RENDERER_HEAP_LIMIT_MB}`,
     `--lang=${target.locale}`,
     "--restore-last-session",
   ];
@@ -914,6 +931,29 @@ function activeTabId(activeTabOutput: unknown) {
 }
 
 const pageInventoryScript = `console.log(JSON.stringify(await browser.listPages()));`;
+
+/**
+ * Close pages the shared tab strip evicted past its retention cap.
+ *
+ * Ids absent from the initial inventory are skipped because the inventory is a
+ * moment old and the owner may have closed one first. A failure closing a live
+ * page propagates so retention is never silently treated as reclaimed.
+ */
+function pageCloseScript(tabIds: readonly string[]) {
+  return `const __bbTargets = ${JSON.stringify([...tabIds])};
+const __bbLive = new Set((await browser.listPages()).map(function (entry) { return entry.id; }));
+const __bbAttempts = __bbTargets
+  .filter(function (__bbId, __bbIndex, __bbAll) {
+    return __bbLive.has(__bbId) && __bbAll.indexOf(__bbId) === __bbIndex;
+  })
+  .map(async function (__bbId) {
+    const __bbPage = await browser.getPage(__bbId);
+    await __bbPage.close();
+    return __bbId;
+  });
+const __bbClosed = await Promise.all(__bbAttempts);
+console.log(String(__bbClosed.length));`;
+}
 
 /**
  * Parse the runtime's page inventory script output into a list of pages. Each
@@ -1747,6 +1787,37 @@ export function createBrowserInstanceRuntime(
         openerTabId:
           typeof page.openerTabId === "string" ? page.openerTabId : null,
       }));
+    },
+    /**
+     * Close pages in the running instance without taking an owner lease. It
+     * reclaims renderer memory for tabs already dropped from the shared strip
+     * and propagates failures instead of silently leaving them resident.
+     */
+    async closePages(
+      target: Pick<BrowserRuntimeTarget, "hostId" | "profileId">,
+      tabIds: readonly string[],
+    ): Promise<number> {
+      if (tabIds.length === 0) return 0;
+      const held = await heldInstance({
+        hostId: target.hostId,
+        profileId: target.profileId,
+        locale: "en-US",
+        timezone: "UTC",
+      });
+      const key = runtimeKey(target);
+      noteActivity(key, held);
+      const raw = assertBrowserScriptResultWithinBounds(
+        await options.launchBoundary.execute(
+          executionRequest(
+            held,
+            target.profileId,
+            pageCloseScript(tabIds),
+            30_000,
+          ),
+        ),
+      );
+      const closed = Number.parseInt(String(raw).trim(), 10);
+      return Number.isSafeInteger(closed) && closed >= 0 ? closed : 0;
     },
     async dispose() {
       disposed = true;

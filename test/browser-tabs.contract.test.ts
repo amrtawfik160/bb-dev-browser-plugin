@@ -118,4 +118,67 @@ describe("Browser Tab strip", () => {
     expect(stripIds(strip.snapshot())).toEqual([b, c]);
     strip.dispose();
   });
+
+  it("reports each evicted tab once until the queue is drained", () => {
+    // Forgetting a tab without closing its page bounded nothing: the next
+    // inventory reported the same page and the strip re-added it, while every
+    // renderer stayed resident for the life of the profile.
+    const strip = createBrowserTabStrip({ maxTabs: 2 });
+    const a = strip.openTab("https://example.test/a", "A");
+    strip.openTab("https://example.test/b", "B");
+    strip.openTab("https://example.test/c", "C");
+    expect(strip.takeEvictedTabIds()).toEqual([a]);
+    expect(strip.takeEvictedTabIds()).toEqual([]);
+    strip.dispose();
+  });
+
+  it("never evicts the tab the owner is looking at", () => {
+    const strip = createBrowserTabStrip({ maxTabs: 2 });
+    const a = strip.openTab("https://example.test/a", "A");
+    const b = strip.openTab("https://example.test/b", "B");
+    strip.activateTab(a);
+    const c = strip.openTab("https://example.test/c", "C");
+    expect(strip.takeEvictedTabIds()).toEqual([b]);
+    expect(stripIds(strip.snapshot())).toEqual([a, c]);
+    strip.dispose();
+  });
+
+  it("evicts pages past the cap when syncing a runtime inventory", () => {
+    const strip = createBrowserTabStrip({ maxTabs: 2 });
+    strip.syncPages([
+      { id: "tab-a", url: "https://example.test/a" },
+      { id: "tab-b", url: "https://example.test/b" },
+      { id: "tab-c", url: "https://example.test/c" },
+    ]);
+    expect(strip.takeEvictedTabIds()).toEqual(["tab-a"]);
+    expect(stripIds(strip.snapshot())).toEqual(["tab-b", "tab-c"]);
+    strip.dispose();
+  });
+
+  it("protects the runtime active tab while syncing a large inventory", () => {
+    const strip = createBrowserTabStrip({ maxTabs: 2 });
+    strip.syncPages(
+      [
+        { id: "tab-a", url: "https://example.test/a" },
+        { id: "tab-b", url: "https://example.test/b" },
+        { id: "tab-c", url: "https://example.test/c" },
+      ],
+      "tab-a",
+    );
+    expect(strip.takeEvictedTabIds()).toEqual(["tab-b"]);
+    expect(strip.snapshot().activeTabId).toBe("tab-a");
+    expect(stripIds(strip.snapshot())).toEqual(["tab-a", "tab-c"]);
+    strip.dispose();
+  });
+
+  it("forgets pending evictions when a new instance generation starts", () => {
+    const strip = createBrowserTabStrip({ maxTabs: 2 });
+    strip.openTab("https://example.test/a", "A");
+    strip.openTab("https://example.test/b", "B");
+    strip.openTab("https://example.test/c", "C");
+    strip.resetInstance();
+    // Those ids belong to a browser that no longer exists.
+    expect(strip.takeEvictedTabIds()).toEqual([]);
+    strip.dispose();
+  });
 });

@@ -157,6 +157,7 @@ function publicRuntime(
       location: { direction, tabId: target.tabId ?? "public-tab" },
       tabId: target.tabId ?? "public-tab",
     }),
+    closePages: async () => 0,
     listPages: async () => [],
     status: async (target) => ({
       state: "running",
