@@ -1,5 +1,5 @@
 import { experimental_createHostEntryHarness } from "@get-bb/plugin-sdk/testing/host";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -507,11 +507,16 @@ describe("Browser host administration contract", () => {
     ).resolves.toBeUndefined();
   });
 
-  it("production protected-storage copies the Playwright Chromium pack, not only chrome", async () => {
+  it("issue #64 never promotes mutable cache content into a setuid helper", async () => {
     const sourceDirectory = await mkdtemp(join(tmpdir(), "chromium-pack-"));
     const commands: { file: string; arguments: readonly string[] }[] = [];
     try {
       await writeFile(join(sourceDirectory, "chrome"), "chrome");
+      await writeFile(
+        join(sourceDirectory, "chrome_sandbox"),
+        "attacker-controlled sandbox payload",
+      );
+      await chmod(join(sourceDirectory, "chrome_sandbox"), 0o4755);
       const executor = createProductionPrivilegedExecutor({
         executeFile: async (file, arguments_) => {
           commands.push({ file, arguments: arguments_ });
@@ -536,7 +541,12 @@ describe("Browser host administration contract", () => {
         expect.arrayContaining([
           {
             file: "/usr/bin/cp",
-            arguments: ["-a", join(sourceDirectory, "."), fallback.directory],
+            arguments: [
+              "-a",
+              "--no-preserve=mode,ownership",
+              join(sourceDirectory, "."),
+              fallback.directory,
+            ],
           },
           {
             file: "/usr/bin/chown",
@@ -554,26 +564,20 @@ describe("Browser host administration contract", () => {
             file: "/usr/bin/chmod",
             arguments: ["0755", fallback.executablePath],
           },
-          {
-            file: "/usr/bin/install",
-            arguments: [
-              "-m",
-              "4755",
-              "-o",
-              "root",
-              "-g",
-              "root",
-              join(sourceDirectory, "chrome_sandbox"),
-              join(fallback.directory, "chrome-sandbox"),
-            ],
-          },
         ]),
       );
       expect(
         commands.some(
           (command) =>
             command.file === "/usr/bin/install" &&
-            command.arguments.includes(join(sourceDirectory, "chrome")),
+            command.arguments.includes("4755"),
+        ),
+      ).toBe(false);
+      expect(
+        commands.some(
+          (command) =>
+            command.file === "/usr/bin/install" &&
+            command.arguments.includes(join(sourceDirectory, "chrome_sandbox")),
         ),
       ).toBe(false);
     } finally {

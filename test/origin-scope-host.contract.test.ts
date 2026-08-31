@@ -107,6 +107,10 @@ class SimulatedContext {
     this.routeHandler = null;
   }
 
+  isRouted() {
+    return this.routeHandler !== null;
+  }
+
   popup(id: string, opener: SimulatedPage) {
     const popup = new SimulatedPage(id, "about:blank", opener);
     this.browserPages.push(popup);
@@ -143,13 +147,43 @@ function policy(
 
 function simulatedBrowser(initialPages: SimulatedPage[]) {
   const context = new SimulatedContext(initialPages);
+  const contexts = [context];
+  const contextListeners = new Set<
+    (event: { context: { _object?: BrowserContext } }) => void
+  >();
   const close = vi.fn(async () => undefined);
+  const channel = {
+    on: (
+      event: string,
+      listener: (event: { context: { _object?: BrowserContext } }) => void,
+    ) => {
+      if (event === "context") contextListeners.add(listener);
+    },
+    off: (
+      event: string,
+      listener: (event: { context: { _object?: BrowserContext } }) => void,
+    ) => {
+      if (event === "context") contextListeners.delete(listener);
+    },
+  };
   const browser = {
-    contexts: () => [context as unknown as BrowserContext],
+    contexts: () =>
+      contexts.map(
+        (currentContext) => currentContext as unknown as BrowserContext,
+      ),
+    _channel: channel,
     close,
   } as unknown as Browser;
   return {
     context,
+    addContext: (newContext: SimulatedContext) => {
+      contexts.push(newContext);
+      for (const listener of contextListeners) {
+        listener({
+          context: { _object: newContext as unknown as BrowserContext },
+        });
+      }
+    },
     close,
     connect: vi.fn(async () => browser),
   };
@@ -433,6 +467,27 @@ describe("host-owned Origin Scope guard", () => {
     );
     expect(boundary.context.page("main")).toBeUndefined();
     expect(boundary.close).toHaveBeenCalledOnce();
+  });
+
+  it("guards a BrowserContext created after the initial snapshot", async () => {
+    const page = new SimulatedPage("main", "https://app.example.test/");
+    const boundary = simulatedBrowser([page]);
+    const guard = await installHostOriginScopeGuard(
+      "ws://127.0.0.1/devtools/browser/test",
+      policy(),
+      boundary.connect,
+    );
+    const laterPage = new SimulatedPage("later", "https://app.example.test/");
+    const laterContext = new SimulatedContext([laterPage]);
+
+    boundary.addContext(laterContext);
+    await vi.waitFor(() => expect(laterContext.isRouted()).toBe(true));
+
+    expect(
+      await laterContext.navigate(laterPage, "https://outside.example.test/"),
+    ).toBe("aborted");
+    expect(guard.deniedOrigin()).toBe("https://outside.example.test");
+    await guard.dispose();
   });
 
   it("blocks an out-of-scope frame document before commit", async () => {

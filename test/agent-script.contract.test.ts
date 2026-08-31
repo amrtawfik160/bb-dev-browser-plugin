@@ -18,24 +18,115 @@ async function capturedLogs(code: string) {
 
 async function preparedLogs(code: string) {
   const logs: string[] = [];
-  class FakeContext {
-    browser() {
-      return {
-        newContext: async () => "unrestricted-context",
-      };
+  // These fields mirror the pinned dev-browser@0.2.9 Playwright client:
+  // BrowserContext._browser, ChannelOwner._parent/_connection, Page._browserContext,
+  // and Connection._objects are all enumerable escape paths in that client.
+  class FakeConnection {
+    readonly _objects = new Map<string, object>();
+    onmessage = () => undefined;
+
+    async sendMessageToServer(_owner: { _type?: string }, method: string) {
+      if (method === "newContext") return "unrestricted-context";
+      return undefined;
     }
   }
-  const context = new FakeContext();
-  const page = {
-    context: () => context,
-    bringToFront: async () => undefined,
-    evaluate: async () => "visible",
-    setDefaultNavigationTimeout: () => undefined,
-    setDefaultTimeout: () => undefined,
-  };
-  const extraPage = {
-    ...page,
-  };
+
+  class FakeBrowserType {
+    readonly _type = "BrowserType";
+    readonly _playwright = {};
+
+    constructor(readonly _connection: FakeConnection) {}
+
+    async launch() {
+      return "unrestricted-browser";
+    }
+  }
+
+  class FakeBrowser {
+    readonly _type = "Browser";
+    readonly _contexts = new Set<FakeContext>();
+    readonly _channel;
+
+    constructor(
+      readonly _connection: FakeConnection,
+      readonly _browserType: FakeBrowserType,
+    ) {
+      this._channel = {
+        newContext: async () =>
+          this._connection.sendMessageToServer(this, "newContext"),
+      };
+    }
+
+    browserType() {
+      return this._browserType;
+    }
+
+    async newContext() {
+      return "unrestricted-context";
+    }
+
+    async newPage() {
+      return "unrestricted-page";
+    }
+
+    contexts() {
+      return [...this._contexts];
+    }
+  }
+
+  class FakeContext {
+    readonly _type = "BrowserContext";
+    _browser: FakeBrowser;
+
+    constructor(
+      readonly _parent: FakeBrowser,
+      readonly _connection: FakeConnection,
+    ) {
+      this._browser = _parent;
+    }
+
+    browser() {
+      return this._browser;
+    }
+  }
+
+  class FakePage {
+    readonly _type = "Page";
+    readonly _browserContext: FakeContext;
+
+    constructor(
+      readonly _parent: FakeContext,
+      readonly _connection: FakeConnection,
+    ) {
+      this._browserContext = _parent;
+    }
+
+    context() {
+      return this._browserContext;
+    }
+
+    bringToFront = async () => undefined;
+    evaluate = async () => "visible";
+    setDefaultNavigationTimeout = () => undefined;
+    setDefaultTimeout = () => undefined;
+  }
+
+  const connection = new FakeConnection();
+  const browserType = new FakeBrowserType(connection);
+  const playwrightBrowser = new FakeBrowser(connection, browserType);
+  const context = new FakeContext(playwrightBrowser, connection);
+  const page = new FakePage(context, connection);
+  const extraPage = new FakePage(context, connection);
+  playwrightBrowser._contexts.add(context);
+  for (const [guid, object] of [
+    ["browser", playwrightBrowser],
+    ["browser-type", browserType],
+    ["context", context],
+    ["page", page],
+  ] as const) {
+    connection._objects.set(guid, object);
+  }
+
   const fakeBrowser = {
     listPages: async () => [{ id: "tab-1", url: "about:blank" }],
     getPage: async () => page,
@@ -101,12 +192,64 @@ describe("agent script convenience wrapping", () => {
 
   // Recovery issue #64: the public Page → BrowserContext → Browser path must
   // not expose a context-creating Browser root to agent code.
-  it("cuts the transitive Browser root before agent code can create a context", async () => {
-    await expect(
-      preparedLogs(
-        'const root = page.context().browser(); return root === null ? "blocked" : await root.newContext();',
-      ),
-    ).resolves.toEqual(["blocked"]);
+  it("blocks every pinned Browser alias from creating a later context", async () => {
+    const logs = await preparedLogs(`
+const context = page.context();
+const browserAliases = [
+  context.browser(),
+  context._browser,
+  context._parent,
+  page._browserContext._browser,
+  ...page._connection._objects.values(),
+].filter((candidate) => candidate && candidate._type === "Browser");
+const browserRoots = [...new Set(browserAliases)];
+const creationAttempts = await Promise.all(browserRoots.map(async (root) => {
+  try {
+    await root.newContext();
+    return "created";
+  } catch {
+    return "blocked";
+  }
+}));
+const channelAttempt = browserRoots.length === 0
+  ? "missing"
+  : await browserRoots[0]._channel.newContext({}).then(() => "created", () => "blocked");
+const connectionAttempt = browserRoots.length === 0
+  ? "missing"
+  : await page._connection.sendMessageToServer(browserRoots[0], "newContext", {}, {})
+      .then(() => "created", () => "blocked");
+const onmessageAttempt = await page._connection.onmessage({
+  guid: "browser",
+  method: "newContext",
+}).then(() => "created", () => "blocked");
+const browserType = browserRoots.length === 0 ? null : browserRoots[0].browserType();
+const browserTypeAttempt = browserType === null
+  ? "missing"
+  : await browserType.launch().then(() => "created", () => "blocked");
+return JSON.stringify({
+  contextBrowserIsNull: context.browser() === null,
+  ownBrowserIsNull: context._browser === null,
+  parentBrowserIsNull: context._parent === null,
+  browserAliasCount: browserRoots.length,
+  creationAttempts,
+  channelAttempt,
+  connectionAttempt,
+  onmessageAttempt,
+  browserTypeAttempt,
+});`);
+    const outcome = JSON.parse(logs[0] ?? "{}");
+
+    expect(outcome).toMatchObject({
+      contextBrowserIsNull: true,
+      ownBrowserIsNull: true,
+      parentBrowserIsNull: true,
+      creationAttempts: ["blocked"],
+      channelAttempt: "blocked",
+      connectionAttempt: "blocked",
+      onmessageAttempt: "blocked",
+      browserTypeAttempt: "missing",
+    });
+    expect(outcome.browserAliasCount).toBeGreaterThan(0);
   });
 
   it("keeps new pages in the guarded context available after cutting its Browser root", async () => {

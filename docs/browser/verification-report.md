@@ -4,8 +4,8 @@ This report maps every parent requirement from
 [`docs/browser-plugin-spec.md`](../browser-plugin-spec.md) (and the
 [`docs/verification-plan.md`](../verification-plan.md) decomposition) to
 automated evidence, planned human acceptance, or an explicit version-one
-limitation. It cross-references the test/evidence suites from issue #21 and the
-contract tests from issues #2–#20.
+limitation. It cross-references the test/evidence suites from issue #21, the
+contract tests from issues #2–#20, and the issue #64 boundary corrections.
 
 ## Evidence status legend
 
@@ -36,15 +36,15 @@ Baseline at the issue #21 head (`41ad3be`): **637 passed, 13 skipped** across
 
 ### Runtime architecture
 
-| Requirement                                                                                                                     | Evidence                                                                                                                                                                                                                  |
-| ------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Plugin host worker owns processes, profiles, stream, helpers                                                                    | Automated: `test/host-browser-runtime.contract.test.ts`, `test/browser-process.integration.test.ts`, `test/evidence/storage-failure.evidence.test.ts` (clean dispose).                                                    |
-| Web content and helpers run as `bb-browser` with Chrome sandbox                                                                 | Automated: `test/evidence/security.evidence.test.ts` (unprivileged execution + loopback-only sockets); `test/host-readiness.contract.test.ts` (setup plan enforces `runAsUser`, `sandbox: required`, `noSandbox: false`). |
-| Chrome Stable primary, pinned Playwright Chromium fallback                                                                      | Automated: `test/package-contract.test.ts`, `test/evidence/security.evidence.test.ts`; pinned in `dependency-inventory.ts`.                                                                                               |
-| `dev-browser` attaches to plugin-owned Automation Mode; `default` profile untouched; `bb-personal` initial                      | Automated: `test/browser-runtime.contract.test.ts`, `test/browser-auth.integration.test.ts`.                                                                                                                              |
-| Instance sleeps after 30 min; ≤ 3 awake; LRU sleep; lazy wake                                                                   | Automated: `test/evidence/restorable-session.evidence.test.ts` (idle sleep, visible pin prevents sleep); constants in `browser-runtime.ts` (`DEFAULT_IDLE_SLEEP_MS`, `DEFAULT_AWAKE_INSTANCE_LIMIT`).                     |
-| Three crashes in five minutes → repair diagnostics                                                                              | Automated: `browser-runtime.ts` (`CRASH_LIMIT = 3`, `CRASH_WINDOW_MS`); `test/browser-runtime.contract.test.ts`; `test/evidence/storage-failure.evidence.test.ts`.                                                        |
-| Server DB owns grants/requests/preferences/activity; host owns profiles/downloads/manifests/outbox; reconciliation on reconnect | Automated: `test/host-activity-outbox.contract.test.ts`, `test/evidence/storage-failure.evidence.test.ts` (host-offline → healthy reconciliation).                                                                        |
+| Requirement                                                                                                                     | Evidence                                                                                                                                                                                                                                                                                                                         |
+| ------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Plugin host worker owns processes, profiles, stream, helpers                                                                    | Automated: `test/host-browser-runtime.contract.test.ts`, `test/browser-process.integration.test.ts`, `test/evidence/storage-failure.evidence.test.ts` (clean dispose).                                                                                                                                                           |
+| Web content and helpers run as `bb-browser` with Chrome sandbox                                                                 | Automated: `test/evidence/security.evidence.test.ts` (unprivileged execution + loopback-only sockets); `test/host-readiness.contract.test.ts` (setup plan enforces `runAsUser`, `sandbox: required`, `noSandbox: false`); `test/host-operations.contract.test.ts` (mutable fallback cache is never promoted to a setuid helper). |
+| Chrome Stable primary, pinned Playwright Chromium fallback                                                                      | Automated: `test/package-contract.test.ts`, `test/evidence/security.evidence.test.ts`; pinned in `dependency-inventory.ts`.                                                                                                                                                                                                      |
+| `dev-browser` attaches to plugin-owned Automation Mode; `default` profile untouched; `bb-personal` initial                      | Automated: `test/browser-runtime.contract.test.ts`, `test/browser-auth.integration.test.ts`.                                                                                                                                                                                                                                     |
+| Instance sleeps after 30 min; ≤ 3 awake; LRU sleep; lazy wake                                                                   | Automated: `test/evidence/restorable-session.evidence.test.ts` (idle sleep, visible pin prevents sleep); constants in `browser-runtime.ts` (`DEFAULT_IDLE_SLEEP_MS`, `DEFAULT_AWAKE_INSTANCE_LIMIT`).                                                                                                                            |
+| Three crashes in five minutes → repair diagnostics                                                                              | Automated: `browser-runtime.ts` (`CRASH_LIMIT = 3`, `CRASH_WINDOW_MS`); `test/browser-runtime.contract.test.ts`; `test/evidence/storage-failure.evidence.test.ts`.                                                                                                                                                               |
+| Server DB owns grants/requests/preferences/activity; host owns profiles/downloads/manifests/outbox; reconciliation on reconnect | Automated: `test/host-activity-outbox.contract.test.ts`, `test/evidence/storage-failure.evidence.test.ts` (host-offline → healthy reconciliation).                                                                                                                                                                               |
 
 ### Profiles and sessions
 
@@ -220,8 +220,11 @@ From `test/evidence/security.evidence.test.ts` and
 
 - Origin-scope enforcement at the context level (new pages share interception).
 - QuickJS isolation: sandbox browser global frozen with no `newContext`.
-- Agent page contexts cannot reach a Browser root that creates an unguarded
-  context; same-context `browser.newPage()` remains available.
+- Agent-visible Playwright Browser, BrowserType, BrowserContext, and connection
+  aliases cannot create an unguarded context; future host BrowserContexts are
+  registered by the Origin Scope guard, while same-context `browser.newPage()`
+  remains available (`test/agent-script.contract.test.ts`,
+  `test/origin-scope-host.contract.test.ts`).
 - (Provisioned-host) unprivileged execution and loopback-only socket boundaries.
 - Sensitive-data scans across Activity Records, database, durable outbox, logs,
   diagnostics, and manifests prove exclusion of cookies, full URLs, scripts,
@@ -297,13 +300,11 @@ source and the public contracts:
 
 ### Validation run
 
-The documentation change adds Markdown files only and does not touch TypeScript
-source. The release gates that apply were run at the issue #21 head and remain
-green after these additions:
+The issue #64 boundary corrections and their documentation were validated with
+the repository gates:
 
 - `npm run typecheck` — passes.
 - `npm run lint` — passes.
 - `npx prettier --check .` — passes (new Markdown is Prettier-clean).
-- `npm run test` — 637 passed, 13 skipped (provisioned-host tests), unchanged
-  by documentation-only changes.
-- `npm run build` — production build of plugin source (unaffected by Markdown).
+- `npm run test` — 656 passed, 38 skipped (provisioned-host tests).
+- `npm run build` — production build of plugin source.

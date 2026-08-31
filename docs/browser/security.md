@@ -100,10 +100,13 @@ the host connects independently to the profile's Playwright context, rejects
 and closes any existing out-of-scope web or non-web document, and installs a
 navigation route. Exact `about:blank` is the only safe internal exception;
 `blob:` navigation is classified by its embedded HTTP(S) origin when exposed.
-The agent sandbox supplies no callback and cannot remove the route. Its
-transitive `page.context().browser()` capability is cut before agent code runs,
-so an agent cannot create a later unguarded browser context; `browser.newPage()`
-continues to create pages in the guarded context.
+The agent sandbox supplies no callback and cannot remove the route. Before agent
+code runs, the host hardens the pinned Playwright client's reachable Browser,
+BrowserType, BrowserContext, and connection paths, including enumerable
+`_browser`/`_parent` aliases and channel creation calls. An agent cannot create
+a later unguarded browser context; the plugin wrapper's `browser.newPage()`
+continues to create pages in the guarded context. The host also registers every
+BrowserContext emitted after the initial connection snapshot.
 
 - Out-of-scope top-level pages, redirects, popups, and frame documents are
   aborted before commit. Ordinary cross-origin subresources continue normally.

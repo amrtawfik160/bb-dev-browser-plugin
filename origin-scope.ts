@@ -22,6 +22,24 @@ export type ConnectOriginScopeBrowser = (
   timeoutMs: number,
 ) => Promise<Browser>;
 
+// Playwright emits Browser context creation on Browser._channel rather than
+// the public Browser event surface. The channel proxy exposes the object via
+// its _object back-reference.
+type BrowserContextChannelEvent = {
+  context: { _object?: BrowserContext };
+};
+
+type BrowserContextChannelEmitter = {
+  on(
+    event: "context",
+    listener: (event: BrowserContextChannelEvent) => void,
+  ): void;
+  off(
+    event: "context",
+    listener: (event: BrowserContextChannelEvent) => void,
+  ): void;
+};
+
 type RouteRegistration = {
   context: BrowserContext;
   handler: (route: Route) => Promise<void>;
@@ -234,6 +252,14 @@ async function settlePendingRoutes(
   );
 }
 
+async function settlePendingContextInstallations(
+  installations: Set<Promise<void>>,
+) {
+  while (installations.size > 0) {
+    await Promise.allSettled([...installations]);
+  }
+}
+
 function routeRegistration(
   context: BrowserContext,
   handler: (route: Route) => Promise<void>,
@@ -265,25 +291,61 @@ export async function installHostOriginScopeGuard(
   connect: ConnectOriginScopeBrowser = connectOriginScopeBrowser,
 ): Promise<HostOriginScopeGuard> {
   const browser = await connect(endpoint, policy.timeoutMs);
-  const contexts = browser.contexts();
   let denial: BrowserOriginScopeDeniedError | null = null;
-  const registrations = contexts.map((context) =>
-    routeRegistration(
+  const registrations: RouteRegistration[] = [];
+  const registeredContexts = new Set<BrowserContext>();
+  const pendingContextInstallations = new Set<Promise<void>>();
+  const recordDenial = (candidate: BrowserOriginScopeDeniedError) => {
+    denial ??= candidate;
+  };
+  const installContext = async (context: BrowserContext) => {
+    if (registeredContexts.has(context)) return;
+    registeredContexts.add(context);
+    const registration = routeRegistration(
       context,
-      originScopeRouteHandler(context, policy, (candidate) => {
-        denial ??= candidate;
-      }),
-    ),
-  );
-  try {
-    await installRoutes(registrations);
-    const existingDenials = deniedExistingPages(contexts, policy.matcher);
-    const installationDenial = denial ?? existingDenials[0]?.denial ?? null;
-    if (installationDenial !== null) {
+      originScopeRouteHandler(context, policy, recordDenial),
+    );
+    registrations.push(registration);
+    await installRoutes([registration]);
+    const existingDenials = deniedExistingPages([context], policy.matcher);
+    if (existingDenials.length > 0) {
+      recordDenial(existingDenials[0].denial);
       await closeDeniedExistingPages(existingDenials);
-      throw installationDenial;
     }
+  };
+  const observeContext = (context: BrowserContext) => {
+    const installation = installContext(context);
+    pendingContextInstallations.add(installation);
+    void installation.then(
+      () => pendingContextInstallations.delete(installation),
+      () => {
+        denial ??= new BrowserOriginScopeDeniedError(null);
+        pendingContextInstallations.delete(installation);
+        void browser.close().catch(() => undefined);
+      },
+    );
+  };
+  const contextEmitter = (
+    browser as unknown as { _channel: BrowserContextChannelEmitter }
+  )._channel;
+  const observeBrowserContext = (event: BrowserContextChannelEvent) => {
+    const context = event.context._object;
+    if (context === undefined) {
+      denial ??= new BrowserOriginScopeDeniedError(null);
+      void browser.close().catch(() => undefined);
+      return;
+    }
+    observeContext(context);
+  };
+  try {
+    contextEmitter.on("context", observeBrowserContext);
+    const contexts = browser.contexts();
+    await Promise.all(contexts.map((context) => installContext(context)));
+    await settlePendingContextInstallations(pendingContextInstallations);
+    if (denial !== null) throw denial;
   } catch (error) {
+    contextEmitter.off("context", observeBrowserContext);
+    await settlePendingContextInstallations(pendingContextInstallations);
     await settlePendingRoutes(registrations);
     await browser.close();
     throw error;
@@ -293,6 +355,8 @@ export async function installHostOriginScopeGuard(
     deniedOrigin: () => denial?.origin ?? null,
     dispose: async () => {
       try {
+        contextEmitter.off("context", observeBrowserContext);
+        await settlePendingContextInstallations(pendingContextInstallations);
         try {
           await removeRoutes(registrations);
         } finally {

@@ -15,6 +15,9 @@ summarizes the runtime and indexes them.
   `--no-sandbox` are unsupported.
 - **Official Chrome Stable** is the primary browser; a compatible pinned
   Playwright Chromium is the fallback for ordinary browsing.
+- The Playwright fallback is staged as ordinary `bb-browser`-owned files; setup
+  never promotes mutable cache content into a root-owned setuid sandbox helper.
+  Its sandbox requires user namespaces or a separately validated system helper.
 - `dev-browser` attaches to the plugin-owned Automation Mode endpoint. The
   plugin does not fork its daemon or expose raw automation endpoints. The
   existing `dev-browser` `default` profile remains untouched; the initial plugin

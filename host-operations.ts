@@ -305,8 +305,11 @@ async function installFallbackPack(
   >["fallback"],
 ) {
   const sourceDirectory = dirname(fallback.sourcePath);
+  // Playwright's cache is mutable. Keep its fallback entirely unprivileged;
+  // sandbox readiness comes from user namespaces or a validated system helper.
   await run("/usr/bin/cp", [
     "-a",
+    "--no-preserve=mode,ownership",
     join(sourceDirectory, "."),
     fallback.directory,
   ]);
@@ -317,16 +320,6 @@ async function installFallbackPack(
   ]);
   await run("/usr/bin/chmod", ["0700", fallback.directory]);
   await run("/usr/bin/chmod", ["0755", fallback.executablePath]);
-  await run("/usr/bin/install", [
-    "-m",
-    "4755",
-    "-o",
-    "root",
-    "-g",
-    "root",
-    join(dirname(fallback.sourcePath), "chrome_sandbox"),
-    join(fallback.directory, "chrome-sandbox"),
-  ]);
 }
 
 async function writeSetupEvidence(

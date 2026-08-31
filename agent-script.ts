@@ -30,39 +30,197 @@ export function preferredTabOrigin(originScope?: string): string | undefined {
 const NAVIGATION_TIMEOUT_HEADROOM_MS = 5_000;
 
 /**
- * Remove the Playwright Browser root from every page context reachable through
- * the sandbox's page API. `browser.newPage()` remains the supported same-context
- * capability, while `page.context().browser()` cannot create another context.
+ * Remove every context-creating Playwright capability reachable through the
+ * sandbox's page API. The pinned client exposes Browser, BrowserType, private
+ * aliases, and its connection as enumerable objects; the plugin wrapper's
+ * `browser.newPage()` remains the supported same-context capability.
  */
 function cutAgentBrowserRoots(pageListVariable: string): string {
-  return `const __bbBrowserRootPrototypes = new Set();
-const __bbBrowserRootContexts = new Set();
-const __bbCutBrowserRoot = (candidatePage) => {
-  const __bbPageContext = candidatePage.context();
-  const __bbContextPrototype = Object.getPrototypeOf(__bbPageContext);
-  if (
-    __bbContextPrototype !== null &&
-    typeof __bbContextPrototype.browser === "function" &&
-    !__bbBrowserRootPrototypes.has(__bbContextPrototype)
-  ) {
-    Object.defineProperty(__bbContextPrototype, "browser", {
+  return `const __bbInstallAgentBrowserBoundary = (() => {
+  const __bbDenied = async () => {
+    throw new Error("Agent-created BrowserContexts are unavailable.");
+  };
+  const __bbNullBrowser = () => null;
+  const __bbHardenedConnections = new Set();
+  const __bbHardenedBrowserTypes = new Set();
+  const __bbHardenedBrowsers = new Set();
+  const __bbHardenedContexts = new Set();
+  const __bbHardenedBrowserPrototypes = new Set();
+
+  const __bbDefineImmutable = (target, property, value) => {
+    const descriptor = Object.getOwnPropertyDescriptor(target, property);
+    if (descriptor?.configurable === false) {
+      if ("value" in descriptor && descriptor.value === value) return;
+      throw new Error("Playwright browser boundary could not be hardened.");
+    }
+    Object.defineProperty(target, property, {
       configurable: false,
-      value: () => null,
+      enumerable: descriptor?.enumerable ?? false,
+      writable: false,
+      value,
     });
-    __bbBrowserRootPrototypes.add(__bbContextPrototype);
-  }
-  if (!__bbBrowserRootContexts.has(__bbPageContext)) {
-    Object.defineProperty(__bbPageContext, "browser", {
-      configurable: false,
-      value: () => null,
-    });
-    __bbBrowserRootContexts.add(__bbPageContext);
-  }
-};
+  };
+
+  const __bbPatchPrototype = (target, property, value) => {
+    const prototype = Object.getPrototypeOf(target);
+    if (
+      prototype !== null &&
+      Object.getOwnPropertyDescriptor(prototype, property) !== undefined
+    ) {
+      __bbDefineImmutable(prototype, property, value);
+    }
+  };
+
+  const __bbPatchChannel = (channel, methods) => {
+    if (channel === null || typeof channel !== "object") return;
+    for (const method of methods) {
+      __bbDefineImmutable(channel, method, __bbDenied);
+    }
+  };
+
+  const __bbIsBlockedProtocolCall = (owner, method) => {
+    if (
+      method === "newContext" ||
+      method === "newContextForReuse" ||
+      method === "launchPersistentContext"
+    ) {
+      return true;
+    }
+    if (
+      method === "launch" ||
+      method === "launchServer" ||
+      method === "connect" ||
+      method === "connectOverCDP" ||
+      method === "connectOverCDPTransport"
+    ) {
+      return true;
+    }
+    const ownerType = owner?._type;
+    return (
+      ownerType === "Browser" &&
+      (method === "newPage" || method === "newBrowserCDPSession")
+    );
+  };
+
+  const __bbHardenContext = (context) => {
+    if (context === null || typeof context !== "object") return;
+    if (__bbHardenedContexts.has(context)) return;
+    __bbHardenedContexts.add(context);
+    __bbPatchPrototype(context, "browser", __bbNullBrowser);
+    __bbDefineImmutable(context, "browser", __bbNullBrowser);
+    __bbDefineImmutable(context, "_browser", null);
+    __bbDefineImmutable(context, "_parent", null);
+  };
+
+  const __bbHardenBrowserType = (browserType) => {
+    if (browserType === null || typeof browserType !== "object") return;
+    if (__bbHardenedBrowserTypes.has(browserType)) return;
+    __bbHardenedBrowserTypes.add(browserType);
+    const methods = [
+      "launch",
+      "launchServer",
+      "launchPersistentContext",
+      "connect",
+      "_connect",
+      "connectOverCDP",
+      "_connectOverCDP",
+      "connectOverCDPTransport",
+      "_connectOverCDPTransport",
+    ];
+    for (const method of methods) {
+      __bbPatchPrototype(browserType, method, __bbDenied);
+      __bbDefineImmutable(browserType, method, __bbDenied);
+    }
+    __bbPatchChannel(browserType._channel, methods);
+    __bbDefineImmutable(browserType, "_playwright", null);
+    __bbDefineImmutable(browserType, "_connection", null);
+  };
+
+  const __bbHardenBrowser = (browser) => {
+    if (browser === null || typeof browser !== "object") return;
+    if (__bbHardenedBrowsers.has(browser)) return;
+    __bbHardenedBrowsers.add(browser);
+    const methods = [
+      "newContext",
+      "newContextForReuse",
+      "_newContextForReuse",
+      "_innerNewContext",
+      "newPage",
+      "newBrowserCDPSession",
+    ];
+    for (const method of methods) {
+      __bbPatchPrototype(browser, method, __bbDenied);
+      __bbDefineImmutable(browser, method, __bbDenied);
+    }
+    const browserPrototype = Object.getPrototypeOf(browser);
+    if (!__bbHardenedBrowserPrototypes.has(browserPrototype)) {
+      const originalDidCreateContext = browserPrototype?._didCreateContext;
+      if (typeof originalDidCreateContext === "function") {
+        __bbDefineImmutable(
+          browserPrototype,
+          "_didCreateContext",
+          function (context) {
+            const result = Reflect.apply(originalDidCreateContext, this, [
+              context,
+            ]);
+            __bbHardenContext(context);
+            return result;
+          },
+        );
+      }
+      __bbHardenedBrowserPrototypes.add(browserPrototype);
+    }
+    __bbPatchPrototype(browser, "browserType", __bbNullBrowser);
+    __bbDefineImmutable(browser, "browserType", __bbNullBrowser);
+    __bbDefineImmutable(browser, "_browserType", null);
+    __bbPatchChannel(browser._channel, methods);
+    for (const context of browser.contexts?.() ?? []) {
+      __bbHardenContext(context);
+    }
+  };
+
+  const __bbHardenConnection = (connection) => {
+    if (connection === null || typeof connection !== "object") return;
+    if (__bbHardenedConnections.has(connection)) return;
+    __bbHardenedConnections.add(connection);
+    const prototype = Object.getPrototypeOf(connection);
+    const originalSend = prototype?.sendMessageToServer;
+    if (typeof originalSend === "function") {
+      const guardedSend = function (owner, method, params, options) {
+        if (__bbIsBlockedProtocolCall(owner, method)) return __bbDenied();
+        return Reflect.apply(originalSend, this, [owner, method, params, options]);
+      };
+      __bbDefineImmutable(prototype, "sendMessageToServer", guardedSend);
+      __bbDefineImmutable(connection, "sendMessageToServer", guardedSend);
+    }
+    const originalOnMessage = connection.onmessage;
+    if (typeof originalOnMessage === "function") {
+      const guardedOnMessage = (message) => {
+        const owner = connection._objects?.get(message?.guid);
+        if (__bbIsBlockedProtocolCall(owner, message?.method)) {
+          return __bbDenied();
+        }
+        return originalOnMessage(message);
+      };
+      __bbDefineImmutable(connection, "onmessage", guardedOnMessage);
+    }
+    for (const object of connection._objects?.values?.() ?? []) {
+      if (object?._type === "Browser") __bbHardenBrowser(object);
+      if (object?._type === "BrowserType") __bbHardenBrowserType(object);
+      if (object?._type === "BrowserContext") __bbHardenContext(object);
+    }
+  };
+
+  return (candidatePage) => {
+    const context = candidatePage.context();
+    __bbHardenConnection(candidatePage._connection ?? context._connection);
+    __bbHardenContext(context);
+  };
+})();
 for (const __bbEntry of ${pageListVariable}) {
-  await __bbCutBrowserRoot(await browser.getPage(__bbEntry.id));
+  await __bbInstallAgentBrowserBoundary(await browser.getPage(__bbEntry.id));
 }
-__bbCutBrowserRoot(page);`;
+await __bbInstallAgentBrowserBoundary(page);`;
 }
 
 /**

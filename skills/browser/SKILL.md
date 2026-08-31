@@ -126,10 +126,16 @@ owner. A grant change applies to the next call and never resumes a denied one.
 
 Origin Scope is enforced outside the QuickJS sandbox by a host-owned navigation
 guard. It blocks denied top-level pages, popups, redirects, and frames before
-commit and removes denied pages. Exact `about:blank` is the only safe internal
+commit and removes denied pages. The guard registers contexts emitted after its
+initial browser snapshot as well. Exact `about:blank` is the only safe internal
 page exception; other non-web document navigations fail closed. A `blob:` page
 uses its embedded HTTP(S) origin when the browser exposes one. An
 invalid-certificate elevation applies only to its explicitly approved origin.
+
+The host also hardens the pinned Playwright object graph before agent code runs:
+Browser, BrowserType, BrowserContext, enumerable private aliases, and channel
+creation calls cannot create another BrowserContext. The plugin wrapper's
+`browser.newPage()` still creates a page in the guarded context.
 
 ## Control, profiles, and records
 
