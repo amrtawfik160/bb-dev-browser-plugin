@@ -782,12 +782,15 @@ function stopRendererMonitoring(state: RendererProcessMonitorState) {
   state.timer = undefined;
 }
 
-async function reportRunningRendererViolation(
-  state: RendererProcessMonitorState,
+export async function deliverRendererMonitorFailure(
+  rejectFailure: (error: unknown) => void,
   error: unknown,
   onViolation: () => Promise<void>,
 ) {
-  state.rejectFailure(await reportRendererLimitFailure(error, onViolation));
+  // Reject before invoking stop. Awaiting stop first lets waitForExit win
+  // Promise.race, and the runtime ordinary-restarts a ceiling retirement.
+  rejectFailure(error);
+  await reportRendererLimitFailure(error, onViolation);
 }
 
 async function checkRendererProcessWhileRunning(
@@ -803,7 +806,7 @@ async function checkRendererProcessWhileRunning(
     if (state.disposed || state.violationReported) return;
     state.violationReported = true;
     stopRendererMonitoring(state);
-    void reportRunningRendererViolation(state, error, onViolation);
+    void deliverRendererMonitorFailure(state.rejectFailure, error, onViolation);
   } finally {
     state.checking = false;
   }
