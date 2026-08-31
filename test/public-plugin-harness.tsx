@@ -10,7 +10,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
-import { act } from "@testing-library/react";
+import { act, within } from "@testing-library/react";
 import {
   createFakePluginHost,
   makeThreadResponse,
@@ -42,6 +42,7 @@ import {
   browserScriptRequestSchema,
   browserSetupRequestSchema,
   browserHostTargetSchema,
+  browserTabActionRequestSchema,
   browserTabStripSchema,
   browserHostConnectionRequestSchema,
   browserPurgePlanSchema,
@@ -65,6 +66,7 @@ import {
   browserProfileGrantRevokeRequestSchema,
   type BrowserPanelNavigationInput,
   type BrowserPanelHistoryInput,
+  type BrowserPanelTabActionInput,
   type BrowserPanelCapabilityResponse,
   type BrowserPanelControlResponse,
   type BrowserNavigationRequest,
@@ -114,7 +116,10 @@ import {
   type BrowserScriptResponse,
 } from "../contracts.js";
 import { createBrowserHostEntry, type HostSetupBoundary } from "../host.js";
-import type { BrowserInstanceRuntime } from "../browser-runtime.js";
+import type {
+  BrowserInstanceRuntime,
+  RuntimeBrowserPage,
+} from "../browser-runtime.js";
 import {
   createHostAdministrationBoundary,
   type HostAdministrationStateStore,
@@ -247,6 +252,113 @@ function hostFixture(
 function panelKey(actionId: string, params: unknown) {
   return `${actionId}:${JSON.stringify(params)}`;
 }
+
+/**
+ * A runtime that keeps a page inventory, so tab actions can be asserted
+ * against what the instance actually holds rather than against a canned
+ * answer: opening adds a page, closing removes it, listing reports what is
+ * left, and pinning records the panels that woke the instance.
+ */
+export function createTabInventoryRuntime(): BrowserInstanceRuntime & {
+  readonly pinnedPanelIds: readonly string[];
+} {
+  const pages: RuntimeBrowserPage[] = [];
+  const pinnedPanelIds: string[] = [];
+  let opened = 0;
+  const instance = (target: { hostId: string; profileId: string }) => ({
+    state: "running" as const,
+    hostId: target.hostId,
+    profileId: target.profileId,
+    pid: 1,
+    browser: "chrome-stable" as const,
+    automationEndpoint: "http://127.0.0.1:9222",
+  });
+  return {
+    get pinnedPanelIds() {
+      return [...pinnedPanelIds];
+    },
+    start: async (target) => instance(target),
+    stop: async () => undefined,
+    execute: async () => "",
+    navigate: async (target, input) => ({
+      address: { kind: "address" as const, url: input },
+      location: { url: input },
+      tabId: target.tabId ?? pages[0]?.id ?? "inventory-tab",
+    }),
+    history: async (target, direction) => ({
+      address: { kind: "address" as const, url: "about:blank" },
+      location: { direction },
+      tabId: target.tabId ?? pages[0]?.id ?? "inventory-tab",
+    }),
+    openPage: async () => {
+      opened += 1;
+      const page: RuntimeBrowserPage = {
+        id: `tab-opened-${opened}`,
+        url: "about:blank",
+        title: "",
+        openerTabId: null,
+      };
+      pages.push(page);
+      return page;
+    },
+    focusPage: async () => undefined,
+    closePages: async (_target, tabIds) => {
+      const remaining = pages.filter((page) => !tabIds.includes(page.id));
+      const closed = pages.length - remaining.length;
+      pages.splice(0, pages.length, ...remaining);
+      return closed;
+    },
+    listPages: async () => [...pages],
+    status: async (target) => ({
+      state: "running" as const,
+      hostId: target.hostId,
+      profileId: target.profileId,
+    }),
+    pinPanel: async (target, panelId) => {
+      pinnedPanelIds.push(panelId);
+      return instance(target);
+    },
+    unpinPanel: async () => undefined,
+    activeTabId: async () => pages[0]?.id ?? "inventory-tab",
+    checkRendererProcessLimit: async () => undefined,
+    hostDisconnected: () => undefined,
+    hostReconnected: async () => undefined,
+    dispose: async () => undefined,
+  };
+}
+
+/**
+ * A host that passes every readiness capability, so the panel renders the
+ * browser rather than a setup surface. Shared by every suite that needs a
+ * healthy host: the readiness snapshot and this status must agree, and one
+ * definition keeps them from drifting apart.
+ */
+export const healthyBrowserStatus: BrowserStatus = {
+  hostId: HOST_ID,
+  profileId: DEFAULT_PROFILE_ID,
+  state: "healthy",
+  code: "healthy",
+  label: "Ready",
+  message: "Workspace Browser is ready on this host.",
+  capabilities: (
+    [
+      ["operating-system", "Operating system", "Ubuntu 24.04 is supported."],
+      ["architecture", "Architecture", "x86_64 is supported."],
+      ["bb-connect", "BB Connect", "The host is enrolled in BB Connect."],
+      ["browser", "Browser", "Google Chrome 140 is available."],
+      ["sandbox", "Browser sandbox", "The Chrome sandbox is available."],
+      ["dedicated-user", "Dedicated browser user", "bb-browser is configured."],
+      ["protected-storage", "Protected storage", "Storage is protected."],
+      ["disk-headroom", "Disk headroom", "At least 5 GiB is free."],
+      ["loopback", "Loopback networking", "Loopback is available."],
+    ] as const
+  ).map(([id, label, reason]) => ({
+    id: id as BrowserStatus["capabilities"][number]["id"],
+    label,
+    status: "ready" as const,
+    reason,
+  })),
+};
 
 export async function createPublicPluginHarness(options?: {
   hostId?: string;
@@ -652,6 +764,10 @@ export async function createPublicPluginHarness(options?: {
         }
         return host.experimental_call("history", request, { signal });
       }
+      if (method === "tabAction") {
+        const request = browserTabActionRequestSchema.parse(input);
+        return host.experimental_call("tabAction", request, { signal });
+      }
       if (method === "activityOutbox") {
         return host.experimental_call(
           "activityOutbox",
@@ -802,6 +918,19 @@ export async function createPublicPluginHarness(options?: {
           { signal },
         );
       }
+      if (
+        method === "downloadStart" ||
+        method === "downloadAppend" ||
+        method === "downloadComplete" ||
+        method === "downloadList" ||
+        method === "downloadExportClient"
+      ) {
+        // Host Downloads run against the real host boundary so quarantine,
+        // limits, and export behave the way they do on a workspace host.
+        return host.experimental_call(method, input as never, {
+          signal,
+        }) as Promise<unknown>;
+      }
       throw new Error(`Unexpected host method: ${method}`);
     },
   });
@@ -810,6 +939,7 @@ export async function createPublicPluginHarness(options?: {
   const threadPanels = new Map<string, RenderedSlot>();
   const newThreadPanels = new Map<string, RenderedSlot>();
   const settingsPanels: RenderedSlot[] = [];
+  const renderedPanels: RenderedSlot[] = [];
   let grantRequestRpcCallIndex = 0;
   const navigationRequests: BrowserNavigationRequest[] = [];
   const historyRequests: BrowserHistoryRequest[] = [];
@@ -858,6 +988,10 @@ export async function createPublicPluginHarness(options?: {
     },
     browser_tabs: (input: { hostId: string; profileId: string }) =>
       backend.harness.behavior.callRpc("browser_tabs", input) as Promise<
+        ReturnType<typeof browserTabStripSchema.parse>
+      >,
+    browser_tab_action: (input: BrowserPanelTabActionInput) =>
+      backend.harness.behavior.callRpc("browser_tab_action", input) as Promise<
         ReturnType<typeof browserTabStripSchema.parse>
       >,
     browser_panel_control: (input: {
@@ -1355,6 +1489,27 @@ export async function createPublicPluginHarness(options?: {
     return panel;
   }
 
+  /**
+   * Mount the Browser Panel the way the BB app mounts it, once per call. This
+   * is the panel counterpart to {@link renderSettings}: `openExistingThreadPanel`
+   * reuses one panel per params key the way BB reuses an open tab, while every
+   * `renderPanel` call is an independent client — which is what makes a
+   * controller and a view-only spectator observable through the assembled
+   * interface rather than through re-declared components.
+   */
+  function renderPanel(options: { surface?: "thread" | "new-thread" } = {}) {
+    const panel =
+      options.surface === "new-thread"
+        ? renderNewThreadPanel({ profileId: DEFAULT_PROFILE_ID })
+        : renderExistingPanel({ profileId: DEFAULT_PROFILE_ID });
+    renderedPanels.push(panel);
+    // Queries from a render are bound to the whole document, so with two
+    // panels mounted a query for "the omnibox" would answer with whichever
+    // panel rendered one first. Scoping them to this panel's own container is
+    // what makes a controller and a view-only spectator separable.
+    return { ...panel, ...within(panel.container) };
+  }
+
   function renderExistingPanel(params: JsonValue | null) {
     return renderSlot<PluginThreadPanelProps, typeof rpcContract>(
       app.threadPanelActions[0]!,
@@ -1449,7 +1604,7 @@ export async function createPublicPluginHarness(options?: {
 
   function runBrowserNavigation(
     input: string,
-    tabId?: string,
+    options?: { tabId?: string; panelId?: string },
   ): Promise<ReturnType<typeof browserNavigationResponseSchema.parse>> {
     return rpc.browser_navigate({
       surface: "thread",
@@ -1457,7 +1612,8 @@ export async function createPublicPluginHarness(options?: {
       profileId: DEFAULT_PROFILE_ID,
       hostId: configuredHostId,
       input,
-      ...(tabId === undefined ? {} : { tabId }),
+      ...(options?.tabId === undefined ? {} : { tabId: options.tabId }),
+      ...(options?.panelId === undefined ? {} : { panelId: options.panelId }),
       rawLocalhost: false,
     });
   }
@@ -1740,8 +1896,56 @@ export async function createPublicPluginHarness(options?: {
     return rpc.browser_panel_reclaim_control(input);
   }
 
+  /**
+   * Put a completed download in host quarantine through the same boundary the
+   * browser uses, so a test can assert what the owner does with a quarantined
+   * file rather than what a stubbed listing returns.
+   */
+  async function quarantineBrowserDownload(input: {
+    downloadId: string;
+    suggestedName: string;
+    contents: string;
+    profileId?: string;
+    contentType?: string | null;
+  }) {
+    const data = Buffer.from(input.contents, "utf8");
+    await rpc.browser_download_start({
+      hostId: configuredHostId,
+      downloadId: input.downloadId,
+      profileId: input.profileId ?? DEFAULT_PROFILE_ID,
+      suggestedName: input.suggestedName,
+      contentType: input.contentType ?? "text/plain",
+      totalBytes: data.byteLength,
+    });
+    await rpc.browser_download_append({
+      hostId: configuredHostId,
+      downloadId: input.downloadId,
+      data: data.toString("base64"),
+      chunkBytes: data.byteLength,
+    });
+    return rpc.browser_download_complete({
+      hostId: configuredHostId,
+      downloadId: input.downloadId,
+    });
+  }
+
   function runBrowserTabs(hostId: string, profileId = DEFAULT_PROFILE_ID) {
     return rpc.browser_tabs({ hostId, profileId });
+  }
+
+  function runBrowserTabAction(
+    action: BrowserPanelTabActionInput["action"],
+    options?: { tabId?: string; panelId?: string; profileId?: string },
+  ) {
+    return rpc.browser_tab_action({
+      surface: "thread",
+      threadId: THREAD_ID,
+      profileId: options?.profileId ?? DEFAULT_PROFILE_ID,
+      hostId: configuredHostId,
+      action,
+      ...(options?.tabId === undefined ? {} : { tabId: options.tabId }),
+      ...(options?.panelId === undefined ? {} : { panelId: options.panelId }),
+    });
   }
 
   function runBrowserStatus(input: BrowserStatusInput) {
@@ -1932,6 +2136,7 @@ export async function createPublicPluginHarness(options?: {
       for (const panel of threadPanels.values()) panel.lifecycle.unmount();
       for (const panel of newThreadPanels.values()) panel.lifecycle.unmount();
       for (const panel of settingsPanels) panel.lifecycle.unmount();
+      for (const panel of renderedPanels) panel.lifecycle.unmount();
       await act(async () => undefined);
       await backend.harness.lifecycle.dispose();
       await host.experimental_dispose();
@@ -1986,6 +2191,7 @@ export async function createPublicPluginHarness(options?: {
     },
     openExistingThreadPanel,
     openNewThreadPanel,
+    renderPanel,
     renderSettings,
     runBrowserStatus,
     runSettingsStatuses,
@@ -2050,6 +2256,8 @@ export async function createPublicPluginHarness(options?: {
     runBrowserReleaseControl,
     runBrowserReclaimControl,
     runBrowserTabs,
+    quarantineBrowserDownload,
+    runBrowserTabAction,
     runBrowserScript,
     runBrowserScriptWithProfile,
     privilegedExecutor: options?.privilegedExecutor ?? null,

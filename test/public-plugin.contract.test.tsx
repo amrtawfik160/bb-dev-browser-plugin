@@ -34,9 +34,12 @@ import {
   RESET_PROFILE_CONFIRMATION,
   setupRequiredStatus,
   type BrowserGrantRequest,
-  type BrowserStatus,
 } from "../contracts.js";
-import { createPublicPluginHarness } from "./public-plugin-harness.js";
+import {
+  createPublicPluginHarness,
+  createTabInventoryRuntime,
+  healthyBrowserStatus as healthyStatus,
+} from "./public-plugin-harness.js";
 import {
   projectLoopbackAlias,
   AGENT_EXACT_ORIGIN_REQUIRED,
@@ -79,31 +82,6 @@ const preparedSnapshot: HostProbeSnapshot = {
 };
 
 const profileImportCommand = ["imp", "ort"].join("");
-
-const healthyStatus: BrowserStatus = {
-  hostId: "host-browser-test",
-  profileId: DEFAULT_PROFILE_ID,
-  state: "healthy",
-  code: "healthy",
-  label: "Ready",
-  message: "Workspace Browser is ready on this host.",
-  capabilities: [
-    ["operating-system", "Operating system", "Ubuntu 24.04 is supported."],
-    ["architecture", "Architecture", "x86_64 is supported."],
-    ["bb-connect", "BB Connect", "The host is enrolled in BB Connect."],
-    ["browser", "Browser", "Google Chrome 140 is available."],
-    ["sandbox", "Browser sandbox", "The Chrome sandbox is available."],
-    ["dedicated-user", "Dedicated browser user", "bb-browser is configured."],
-    ["protected-storage", "Protected storage", "Storage is protected."],
-    ["disk-headroom", "Disk headroom", "At least 5 GiB is free."],
-    ["loopback", "Loopback networking", "Loopback is available."],
-  ].map(([id, label, reason]) => ({
-    id: id as BrowserStatus["capabilities"][number]["id"],
-    label,
-    status: "ready" as const,
-    reason,
-  })),
-};
 
 async function grantDefaultProfileOrigin(
   browser: Awaited<ReturnType<typeof createPublicPluginHarness>>,
@@ -157,6 +135,13 @@ function publicRuntime(
       location: { direction, tabId: target.tabId ?? "public-tab" },
       tabId: target.tabId ?? "public-tab",
     }),
+    openPage: async () => ({
+      id: "public-tab-opened",
+      url: "about:blank",
+      title: "",
+      openerTabId: null,
+    }),
+    focusPage: async () => undefined,
     closePages: async () => 0,
     listPages: async () => [],
     status: async (target) => ({
@@ -292,7 +277,7 @@ describe("Browser public plugin contract", () => {
     const opened = await browser.openExistingThreadPanel();
     const cli = await browser.runStatusCli();
 
-    await opened.panel.findByText("Ready");
+    await opened.panel.findByRole("button", { name: "Browser status: Ready" });
     const status = browserStatusSchema.parse(JSON.parse(cli.stdout));
     expect(status.state).toBe("healthy");
     expect(status.capabilities).toHaveLength(9);
@@ -480,7 +465,7 @@ describe("Browser public plugin contract", () => {
     const address = await panel.panel.findByLabelText("Address or search");
 
     fireEvent.change(address, { target: { value: "localhost:4173/account" } });
-    fireEvent.click(panel.panel.getByRole("button", { name: "Go" }));
+    fireEvent.submit(address);
 
     await waitFor(() => expect(browser.navigationRequests).toHaveLength(1));
     expect(browser.navigationRequests[0]).toMatchObject({
@@ -490,9 +475,13 @@ describe("Browser public plugin contract", () => {
       input: "localhost:4173/account",
       rawLocalhost: false,
     });
-    expect(
-      await panel.panel.findByText("http://p-project.localhost:4173/account"),
-    ).toBeTruthy();
+    // The omnibox then shows where the browser actually is, resolved through
+    // the Project Loopback Alias rather than the text the owner typed.
+    await waitFor(() =>
+      expect((address as HTMLInputElement).value).toBe(
+        "http://p-project.localhost:4173/account",
+      ),
+    );
     await browser.dispose();
   });
 
@@ -529,6 +518,120 @@ describe("Browser public plugin contract", () => {
         direction: "forward",
       });
       expect(browser.historyRequests[2]).toMatchObject({ direction: "reload" });
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("opens, switches, and closes a Browser Tab in the profile's shared strip", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+      browserRuntime: createTabInventoryRuntime(),
+    });
+    try {
+      // Creating a profile initializes this host's profile storage, so the
+      // default profile the panel opens is present and active.
+      await browser.createBrowserProfile({
+        hostId: "host-browser-test",
+        name: "Tab strip target",
+      });
+      const opened = await browser.runBrowserTabAction("open");
+      // Opening a tab activates it, the way opening a tab does in a browser.
+      expect(opened.tabs).toHaveLength(1);
+      const first = opened.tabs[0]!.tabId;
+      expect(opened.activeTabId).toBe(first);
+
+      const second = (await browser.runBrowserTabAction("open")).tabs[1]!.tabId;
+      expect(second).not.toBe(first);
+
+      const switched = await browser.runBrowserTabAction("activate", {
+        tabId: first,
+      });
+      expect(switched.activeTabId).toBe(first);
+
+      const closed = await browser.runBrowserTabAction("close", {
+        tabId: first,
+      });
+      expect(closed.tabs.map((tab) => tab.tabId)).toEqual([second]);
+      expect(closed.activeTabId).toBe(second);
+
+      // The strip belongs to the profile, so a panel that asks for it later
+      // sees the same tabs rather than a per-panel set.
+      const shared = await browser.runBrowserTabs("host-browser-test");
+      expect(shared).toEqual(closed);
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("refuses to switch or close a Browser Tab without naming one", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+      browserRuntime: createTabInventoryRuntime(),
+    });
+    try {
+      await expect(browser.runBrowserTabAction("activate")).rejects.toThrow();
+      await expect(browser.runBrowserTabAction("close")).rejects.toThrow();
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("refuses to drive the browser from a view-only panel, whatever its interface offers", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+      browserRuntime: createTabInventoryRuntime(),
+    });
+    try {
+      await browser.createBrowserProfile({
+        hostId: "host-browser-test",
+        name: "View-only target",
+      });
+      const controller = await browser.runBrowserPanelControl({
+        hostId: "host-browser-test",
+        profileId: DEFAULT_PROFILE_ID,
+        panelId: "panel-controller",
+        ownerSessionId: "session-controller",
+      });
+      const spectator = await browser.runBrowserPanelControl({
+        hostId: "host-browser-test",
+        profileId: DEFAULT_PROFILE_ID,
+        panelId: "panel-spectator",
+        ownerSessionId: "session-spectator",
+      });
+      expect(controller.role).toBe("controller");
+      expect(spectator.role).toBe("spectator");
+
+      // The guarantee is the boundary's, not the interface's: hiding the
+      // address bar is not what stops a second panel driving the browser.
+      await expect(
+        browser.runBrowserNavigation("https://example.com/spectator", {
+          panelId: "panel-spectator",
+        }),
+      ).rejects.toThrow(/view-only/iu);
+      await expect(
+        browser.runBrowserTabAction("open", { panelId: "panel-spectator" }),
+      ).rejects.toThrow(/view-only/iu);
+
+      // The panel that holds control drives it, and so does every path that is
+      // not a panel at all.
+      await expect(
+        browser.runBrowserNavigation("https://example.com/controller", {
+          panelId: "panel-controller",
+        }),
+      ).resolves.toMatchObject({
+        address: { url: "https://example.com/controller" },
+      });
+      await expect(
+        browser.runBrowserNavigation("https://example.com/cli"),
+      ).resolves.toMatchObject({
+        address: { url: "https://example.com/cli" },
+      });
+      await grantDefaultProfileOrigin(browser, "https://example.com");
+      const agent = await browser.runBrowserScriptWithProfile(undefined, {
+        destinationOrigin: "https://example.com",
+      });
+      expect(agent.isError).toBe(false);
     } finally {
       await browser.dispose();
     }
@@ -1444,8 +1547,16 @@ describe("Browser public plugin contract", () => {
       expect(failure.error.message).not.toContain("secret denied script");
 
       const panel = await browser.openExistingThreadPanel();
-      await panel.panel.findByText(requestId);
-      await panel.panel.findByText(/explicitly retry.*current page state/i);
+      // The panel asks about the site, not about an identifier, and says the
+      // agent will not carry on by itself (ADR 0014).
+      const question = await panel.panel.findByRole("region", {
+        name: "Site access requests",
+      });
+      expect(question.textContent).toContain(
+        "https://expired-request.example.test",
+      );
+      expect(question.textContent).toMatch(/has to try again/iu);
+      expect(panel.panel.container.textContent).not.toContain(requestId);
 
       vi.setSystemTime(new Date("2026-08-28T00:16:00.000Z"));
       const settings = browser.renderSettings();
@@ -1457,8 +1568,15 @@ describe("Browser public plugin contract", () => {
       const list = await settings.findByRole("list", {
         name: "Browser Grant Request list",
       });
+      // The full history, identifiers and all, stays in Settings.
       expect(list.textContent).toMatch(
         new RegExp(`${requestId}.*expired`, "i"),
+      );
+      // An expired question is not a question any more, so the panel drops it.
+      await waitFor(() =>
+        expect(panel.panel.container.textContent).not.toMatch(
+          /expired-request\.example\.test/u,
+        ),
       );
     } finally {
       await browser.dispose();
@@ -1483,7 +1601,12 @@ describe("Browser public plugin contract", () => {
         JSON.parse(denied.content[0]!.text),
       ).error.grantRequest!.requestId;
       const panel = await browser.openExistingThreadPanel();
-      await panel.panel.findByText(requestId);
+      const question = await panel.panel.findByRole("region", {
+        name: "Site access requests",
+      });
+      expect(question.textContent).toContain(
+        "https://live-request.example.test",
+      );
 
       await browser.decideBrowserGrantRequest({
         requestId,
@@ -1491,13 +1614,12 @@ describe("Browser public plugin contract", () => {
       });
       window.dispatchEvent(new Event("focus"));
 
-      const notices = await panel.panel.findByRole("region", {
-        name: "Browser Grant Request notices",
-      });
+      // A decision made elsewhere answers the question here too, so the panel
+      // stops asking it.
       await waitFor(() =>
-        expect(notices.textContent).toMatch(
-          new RegExp(`${requestId}.*approved`, "i"),
-        ),
+        expect(
+          panel.panel.queryByRole("region", { name: "Site access requests" }),
+        ).toBeNull(),
       );
     } finally {
       await browser.dispose();
@@ -1544,27 +1666,25 @@ describe("Browser public plugin contract", () => {
       window.dispatchEvent(new Event("focus"));
       await secondStarted.promise;
 
+      // The newer answer says the question was decided elsewhere, so the panel
+      // stops asking it.
       await act(async () => {
         secondResponse.resolve(snapshots[1]!);
         await secondResponse.promise;
       });
-      const notices = await panel.panel.findByRole("region", {
-        name: "Browser Grant Request notices",
-      });
-      expect(notices.textContent).toMatch(
-        new RegExp(`${requestId}.*approved`, "i"),
-      );
+      expect(
+        panel.panel.queryByRole("region", { name: "Site access requests" }),
+      ).toBeNull();
 
+      // The older answer, which still says pending, must not put the question
+      // back on screen when it finally lands.
       await act(async () => {
         firstResponse.resolve(snapshots[0]!);
         await firstResponse.promise;
       });
-      expect(notices.textContent).toMatch(
-        new RegExp(`${requestId}.*approved`, "i"),
-      );
-      expect(notices.textContent).not.toMatch(
-        new RegExp(`${requestId}.*pending`, "i"),
-      );
+      expect(
+        panel.panel.queryByRole("region", { name: "Site access requests" }),
+      ).toBeNull();
     } finally {
       await browser.dispose();
     }
@@ -4699,6 +4819,37 @@ describe("Browser public plugin contract", () => {
     await browser.dispose();
   });
 
+  it("manages quarantined Host Downloads from Settings", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+    });
+    try {
+      await browser.quarantineBrowserDownload({
+        downloadId: "download-settings-1",
+        suggestedName: "statement.pdf",
+        contents: "quarantined bytes",
+      });
+      const settings = browser.renderSettings();
+
+      fireEvent.click(
+        await settings.findByRole("button", {
+          name: "Inspect Host Downloads",
+        }),
+      );
+
+      // The file is named and its quarantine state is stated; leaving
+      // quarantine stays an explicit owner decision.
+      await settings.findByText("statement.pdf");
+      const listing = await settings.findByLabelText(
+        "Browser Host Downloads quarantine",
+      );
+      expect(listing.textContent).toContain("quarantined");
+      await settings.findByRole("button", { name: "Export to client" });
+    } finally {
+      await browser.dispose();
+    }
+  });
+
   it("shows destructive consequences, progress, recovery deadline, and final state in Settings", async () => {
     const browser = await createPublicPluginHarness({
       snapshot: preparedSnapshot,
@@ -4751,26 +4902,34 @@ describe("Browser public plugin contract", () => {
     }
   });
 
-  it("lets a panel choose a host-local Browser Profile", async () => {
+  it("browses the Browser Profile chosen in Settings", async () => {
+    // Choosing a profile is done once and then lived with, so it belongs in
+    // Settings rather than above the page the owner looks at constantly
+    // (issue #50). The panel follows that choice.
     const browser = await createPublicPluginHarness({
       snapshot: preparedSnapshot,
     });
-    const created = await browser.createBrowserProfile({
-      hostId: "host-browser-test",
-      name: "Panel profile",
-    });
-    const panel = await browser.openExistingThreadPanel();
-    const picker = await panel.panel.findByRole("combobox", {
-      name: "Browser Profile",
-    });
+    try {
+      const created = await browser.createBrowserProfile({
+        hostId: "host-browser-test",
+        name: "Panel profile",
+      });
+      const settings = browser.renderSettings();
+      fireEvent.click(
+        await settings.findByRole("button", { name: "Select Panel profile" }),
+      );
+      await settings.findByText(`Selected: ${created.profileId}`);
 
-    fireEvent.change(picker, { target: { value: created.profileId } });
-    await panel.panel.findByText(created.profileId, { selector: "p" });
-    expect(browser.setupInspectionTargets.at(-1)).toEqual({
-      hostId: "host-browser-test",
-      profileId: created.profileId,
-    });
-    await browser.dispose();
+      browser.renderPanel();
+      await waitFor(() =>
+        expect(browser.setupInspectionTargets.at(-1)).toEqual({
+          hostId: "host-browser-test",
+          profileId: created.profileId,
+        }),
+      );
+    } finally {
+      await browser.dispose();
+    }
   });
 
   it("shows the host picker in an ambiguous New thread panel", async () => {
@@ -4784,7 +4943,13 @@ describe("Browser public plugin contract", () => {
     });
 
     fireEvent.change(hostPicker, { target: { value: "host-b" } });
-    await panel.panel.findByRole("combobox", { name: "Browser Profile" });
+    await waitFor(() =>
+      expect(
+        browser.setupInspectionTargets.some(
+          (target) => target.hostId === "host-b",
+        ),
+      ).toBe(true),
+    );
     await browser.dispose();
   });
 
@@ -4874,9 +5039,7 @@ describe("Browser public plugin contract", () => {
     });
     try {
       const panel = await browser.openExistingThreadPanel();
-      await panel.panel.findByRole("region", {
-        name: "Browser Automation Mode stream",
-      });
+      await panel.panel.findByRole("region", { name: "Browser page" });
       await waitFor(() =>
         expect(browser.panelCapabilityRequests.length).toBeGreaterThan(0),
       );
@@ -4892,26 +5055,26 @@ describe("Browser public plugin contract", () => {
     }
   });
 
-  it("renders the Automation Mode stream surface in the healthy Browser Panel without exposing transport secrets", async () => {
+  it("renders the page in the healthy Browser Panel without exposing transport secrets", async () => {
     const browser = await createPublicPluginHarness({
       snapshot: preparedSnapshot,
     });
     try {
       const panel = await browser.openExistingThreadPanel();
-      const streamSection = await panel.panel.findByRole("region", {
-        name: "Browser Automation Mode stream",
+      const page = await panel.panel.findByRole("region", {
+        name: "Browser page",
       });
-      expect(streamSection.textContent).toContain("5 and 15");
-      expect(streamSection.textContent).toContain("1920");
-      // The panel clearly discloses that streamed webpage pixels are not fully
-      // screen-reader accessible in version one (issue #17).
-      expect(streamSection.textContent).toContain(
-        "not fully screen-reader accessible",
+      // The streaming policy and the version-one screen-reader limitation are
+      // still disclosed (issue #17) — to assistive technology, rather than as
+      // three paragraphs between the owner and the page (issue #50).
+      expect(page.textContent).toContain("5 and 15");
+      expect(page.textContent).toContain("1920");
+      expect(page.textContent).toContain("not fully screen-reader accessible");
+      // Automation Mode is the normal mode, so the panel stops announcing it
+      // (ADR 0014).
+      expect(panel.panel.container.textContent).not.toContain(
+        "Automation Mode",
       );
-      const modeIndicator = panel.panel.getByRole("img", {
-        name: "Browser mode indicator",
-      });
-      expect(modeIndicator.textContent).toContain("Automation Mode");
       // The rendered panel surface never exposes transport secrets.
       expect(panel.panel.container.innerHTML).not.toContain("ws://");
       const serialized = JSON.stringify(panel.panel.container.innerHTML);

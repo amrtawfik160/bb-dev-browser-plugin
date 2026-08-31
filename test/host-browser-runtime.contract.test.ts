@@ -58,6 +58,12 @@ describe("Browser host runtime boundary", () => {
       history: async () => {
         throw new Error("not used");
       },
+      openPage: async () => {
+        throw new Error("not used");
+      },
+      focusPage: async () => {
+        throw new Error("not used");
+      },
       closePages: async () => 0,
       listPages: async () => [],
       status: async ({
@@ -285,6 +291,12 @@ describe("Browser host runtime boundary", () => {
         history: async () => {
           throw new Error("not used");
         },
+        openPage: async () => {
+          throw new Error("not used");
+        },
+        focusPage: async () => {
+          throw new Error("not used");
+        },
         closePages: async () => 0,
         listPages: async () => [],
         status: async ({
@@ -427,6 +439,12 @@ describe("Browser host runtime boundary", () => {
         location: { direction },
         tabId: target.tabId ?? "host-tab",
       }),
+      openPage: async () => {
+        throw new Error("not used");
+      },
+      focusPage: async () => {
+        throw new Error("not used");
+      },
       closePages: async () => 0,
       listPages: async () => [],
       status: async ({
@@ -550,6 +568,12 @@ it("issue #16 feeds the shared tab strip from real browser page events and norma
     history: async () => {
       throw new Error("not used");
     },
+    openPage: async () => {
+      throw new Error("not used");
+    },
+    focusPage: async () => {
+      throw new Error("not used");
+    },
     closePages: async () => 0,
     listPages: async () => [...listedPages],
     status: async ({
@@ -664,6 +688,12 @@ it("issue #16 interrupts an active agent Control Lease when the owner takes cont
       tabId: target.tabId ?? "page-1",
     }),
     history: async () => {
+      throw new Error("not used");
+    },
+    openPage: async () => {
+      throw new Error("not used");
+    },
+    focusPage: async () => {
       throw new Error("not used");
     },
     closePages: async () => 0,
@@ -803,6 +833,12 @@ it("issue #16 reflects active-tab changes from navigation across the shared stri
     history: async () => {
       throw new Error("not used");
     },
+    openPage: async () => {
+      throw new Error("not used");
+    },
+    focusPage: async () => {
+      throw new Error("not used");
+    },
     closePages: async () => 0,
     listPages: async () => [...listedPages],
     status: async ({
@@ -902,6 +938,12 @@ it("issue #14 returns a typed origin_denied result when the runtime blocks a rea
       throw new Error("not used");
     },
     history: async () => {
+      throw new Error("not used");
+    },
+    openPage: async () => {
+      throw new Error("not used");
+    },
+    focusPage: async () => {
       throw new Error("not used");
     },
     closePages: async () => 0,
@@ -1005,6 +1047,12 @@ it("issue #14 AC4 forwards per-origin invalid-certificate flags from the script 
     history: async () => {
       throw new Error("not used");
     },
+    openPage: async () => {
+      throw new Error("not used");
+    },
+    focusPage: async () => {
+      throw new Error("not used");
+    },
     closePages: async () => 0,
     listPages: async () => [],
     status: async ({
@@ -1073,6 +1121,12 @@ function safeLoginExecuteRuntime() {
       throw new Error("not used");
     },
     history: async () => {
+      throw new Error("not used");
+    },
+    openPage: async () => {
+      throw new Error("not used");
+    },
+    focusPage: async () => {
       throw new Error("not used");
     },
     closePages: async () => 0,
@@ -1243,6 +1297,12 @@ it("closes the pages it evicts past the tab cap so renderer memory is reclaimed"
     history: async () => {
       throw new Error("not used");
     },
+    openPage: async () => {
+      throw new Error("not used");
+    },
+    focusPage: async () => {
+      throw new Error("not used");
+    },
     closePages: async (
       _target: { hostId: string; profileId: string },
       tabIds: readonly string[],
@@ -1397,6 +1457,12 @@ it("issue #66 preserves an untargeted agent foreground through trim and recovery
       tabId: target.tabId ?? agentForeground,
     }),
     history: async () => {
+      throw new Error("not used");
+    },
+    openPage: async () => {
+      throw new Error("not used");
+    },
+    focusPage: async () => {
       throw new Error("not used");
     },
     closePages: async (

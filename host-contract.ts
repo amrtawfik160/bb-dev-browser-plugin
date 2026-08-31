@@ -26,6 +26,7 @@ import {
   browserPanelTransportRequestSchema,
   browserPanelTransportResponseSchema,
   browserTabsRequestSchema,
+  browserTabActionRequestSchema,
   browserTabStripSchema,
   browserPanelControlRequestSchema,
   browserPanelControlResponseSchema,
@@ -142,6 +143,10 @@ export const browserHostContract = defineRpcContract({
   },
   tabs: {
     input: browserTabsRequestSchema,
+    output: browserTabStripSchema,
+  },
+  tabAction: {
+    input: browserTabActionRequestSchema,
     output: browserTabStripSchema,
   },
   panelControl: {

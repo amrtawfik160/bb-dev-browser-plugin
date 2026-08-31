@@ -85,6 +85,46 @@ describe("Panel Control State", () => {
     session.dispose();
   });
 
+  it("lets only the panel holding control drive the shared browser", async () => {
+    const { session } = setup();
+    session.connectPanel("panel-1", "session-1");
+    session.connectPanel("panel-2", "session-2");
+
+    // The interface hides the address bar from the second panel; the boundary
+    // gives the same answer, so a view-only panel is view-only in fact.
+    expect(session.canNavigate("panel-1")).toBe(true);
+    expect(session.canNavigate("panel-2")).toBe(false);
+    // A panel this session has never seen cannot drive a browser someone else
+    // is driving either.
+    expect(session.canNavigate("panel-unknown")).toBe(false);
+
+    await session.takeControl("panel-2");
+    expect(session.canNavigate("panel-2")).toBe(true);
+    expect(session.canNavigate("panel-1")).toBe(false);
+
+    // With control released, no panel drives until one takes it — and an
+    // identity this session does not know is refused with them, so a
+    // view-only panel cannot buy itself the address bar by inventing one.
+    session.releaseControl("panel-2");
+    expect(session.canNavigate("panel-1")).toBe(false);
+    expect(session.canNavigate("panel-2")).toBe(false);
+    expect(session.canNavigate("panel-unknown")).toBe(false);
+    session.dispose();
+  });
+
+  it("lets the first panel drive while its join is still in flight", () => {
+    const { session } = setup();
+
+    // No panel has joined yet, so there is no control to usurp and the panel
+    // asking is the one about to become the controller. Refusing it would
+    // fail the owner's first navigation for the length of a round trip.
+    expect(session.canNavigate("panel-joining")).toBe(true);
+
+    session.connectPanel("panel-1", "session-1");
+    expect(session.canNavigate("panel-joining")).toBe(false);
+    session.dispose();
+  });
+
   it("clamps the viewport to the supported maximum", () => {
     expect(clampPanelViewport({ width: 9999, height: 9999 })).toEqual(
       DEFAULT_PANEL_VIEWPORT,

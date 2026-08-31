@@ -84,6 +84,7 @@ import {
   type BrowserProfileGrantRevokeResponse,
   type BrowserPanelNavigationInput,
   type BrowserPanelHistoryInput,
+  type BrowserPanelTabActionInput,
   type BrowserPanelVisibilityRequest,
   type BrowserPanelCapabilityRequest,
   type BrowserPanelCapabilityResponse,
@@ -2403,6 +2404,7 @@ export function createBrowserService(
         projectId,
         input: request.input,
         ...(request.tabId === undefined ? {} : { tabId: request.tabId }),
+        ...(request.panelId === undefined ? {} : { panelId: request.panelId }),
         rawLocalhost: request.rawLocalhost ?? false,
       },
       { hostId, signal },
@@ -2428,6 +2430,38 @@ export function createBrowserService(
         projectId,
         direction: request.direction,
         ...(request.tabId === undefined ? {} : { tabId: request.tabId }),
+        ...(request.panelId === undefined ? {} : { panelId: request.panelId }),
+      },
+      { hostId, signal },
+    );
+  }
+
+  /**
+   * Open, switch, or close a Browser Tab on behalf of the owner. The tab set
+   * belongs to the Browser Profile (ADR 0005), so the response is the whole
+   * shared strip rather than the one tab that changed, and every panel using
+   * that profile renders the same result.
+   */
+  async function tabAction(
+    request: BrowserPanelTabActionInput,
+    signal?: AbortSignal,
+  ): Promise<BrowserTabStrip> {
+    const identity = panelIdentity(request);
+    const hostId = await resolvedHostId(bb, identity);
+    if (hostId === null || hostId !== request.hostId) {
+      throw new Error("The selected workspace host is unavailable.");
+    }
+    const projectId = await profileContextProjectId(bb, identity);
+    await requireConnectedHost(hostId, signal);
+    return host.call(
+      "tabAction",
+      {
+        hostId,
+        profileId: request.profileId,
+        projectId,
+        action: request.action,
+        ...(request.tabId === undefined ? {} : { tabId: request.tabId }),
+        ...(request.panelId === undefined ? {} : { panelId: request.panelId }),
       },
       { hostId, signal },
     );
@@ -2918,6 +2952,7 @@ export function createBrowserService(
     browserScript,
     navigate,
     history,
+    tabAction,
     panelVisibility,
     panelCapability,
     tabs,
