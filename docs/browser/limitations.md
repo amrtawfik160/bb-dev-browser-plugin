@@ -56,10 +56,16 @@ each.
 ## Origin Scope enforcement
 
 - Origin Scope applies to HTTP(S) document navigation and to `blob:` documents
-  when the browser exposes an embedded HTTP(S) origin. The host-owned guard
-  blocks denied top-level pages, popups, redirects, and frame documents before
-  commit, while ordinary cross-origin subresources may render. Cross-origin
-  frame documents therefore need their own grant.
+  when the browser exposes an embedded HTTP(S) origin. The host route blocks
+  denied HTTP(S) requests before commit. Direct agent `Frame.goto` calls to
+  non-web addresses are rejected before the Playwright command reaches
+  Chromium; renderer location changes, popups, redirects, and frame documents
+  use the CDP guard and fail closed by removing the denied page when needed.
+  Pinned Chromium can report a precommit event for a raw direct `data:` loader
+  without exposing a cancellable loader command, so this path guarantees typed
+  denial and cleanup rather than a universal no-commit event guarantee.
+  Ordinary cross-origin subresources may render. Cross-origin frame documents
+  therefore need their own grant.
 - Exact `about:blank` is allowed as a safe internal page. Other `about:`,
   `data:`, `file:`, `chrome:`, `javascript:`, malformed, and unknown non-web
   document navigations fail closed; they are never treated as an unscoped

@@ -15,6 +15,8 @@ import {
 
 export const TAB_INVALID_MESSAGE =
   "Browser Tab is invalid or belongs to a previous runtime";
+export const NON_WEB_NAVIGATION_DENIED_MESSAGE =
+  "Browser navigation to a non-web URL was denied by the active Profile Grant.";
 
 export function preferredTabOrigin(originScope?: string): string | undefined {
   if (
@@ -35,10 +37,27 @@ const NAVIGATION_TIMEOUT_HEADROOM_MS = 5_000;
  * aliases, and its connection as enumerable objects; the plugin wrapper's
  * `browser.newPage()` remains the supported same-context capability.
  */
-function cutAgentBrowserRoots(pageListVariable: string): string {
-  return `const __bbInstallAgentBrowserBoundary = (() => {
+function cutAgentBrowserRoots(
+  pageListVariable: string,
+  enforceNonWebNavigation: boolean,
+): string {
+  return `const __bbNonWebNavigationBoundary = (() => {
+  let denied = false;
+  return Object.freeze({
+    markDenied: () => {
+      denied = true;
+    },
+    wasDenied: () => denied,
+  });
+})();
+const __bbInstallAgentBrowserBoundary = (() => {
+  const __bbEnforceNonWebNavigation = ${String(enforceNonWebNavigation)};
   const __bbDenied = async () => {
     throw new Error("Agent-created BrowserContexts are unavailable.");
+  };
+  const __bbDeniedNonWebNavigation = async () => {
+    __bbNonWebNavigationBoundary.markDenied();
+    throw new Error(${JSON.stringify(NON_WEB_NAVIGATION_DENIED_MESSAGE)});
   };
   const __bbNullBrowser = () => null;
   const __bbHardenedConnections = new Set();
@@ -79,29 +98,54 @@ function cutAgentBrowserRoots(pageListVariable: string): string {
   };
 
   const __bbIsBlockedProtocolCall = (owner, method) => {
+    const methodName = String(method);
     if (
-      method === "newContext" ||
-      method === "newContextForReuse" ||
-      method === "launchPersistentContext"
+      methodName === "newContext" ||
+      methodName === "newContextForReuse" ||
+      methodName === "launchPersistentContext"
     ) {
       return true;
     }
     if (
-      method === "launch" ||
-      method === "launchServer" ||
-      method === "connect" ||
-      method === "connectOverCDP" ||
-      method === "connectOverCDPTransport"
+      methodName === "launch" ||
+      methodName === "launchServer" ||
+      methodName === "connect" ||
+      methodName === "connectOverCDP" ||
+      methodName === "connectOverCDPTransport"
     ) {
       return true;
     }
     const ownerType = owner?._type;
     return (
       ownerType === "Browser" &&
-      (method === "newPage" || method === "newBrowserCDPSession")
+      (methodName === "newPage" || methodName === "newBrowserCDPSession")
     );
   };
 
+  const __bbIsAllowedNavigationAddress = (address) => {
+    if (typeof address !== "string" && !(address instanceof String)) return false;
+    let url;
+    try {
+      url = new URL(String(address));
+    } catch {
+      return false;
+    }
+    if (url.href === "about:blank") return true;
+    if (url.protocol === "http:" || url.protocol === "https:") return true;
+    return (
+      url.protocol === "blob:" &&
+      (url.origin.indexOf("http://") === 0 || url.origin.indexOf("https://") === 0)
+    );
+  };
+
+  const __bbIsNonWebNavigation = (owner, method, params) =>
+    __bbEnforceNonWebNavigation &&
+    owner?._type === "Frame" &&
+    String(method) === "goto" &&
+    !__bbIsAllowedNavigationAddress(params?.url);
+
+  // This adapter only recognizes the navigation protocol family. The host
+  // Origin Scope guard remains the single owner of grant matching.
   const __bbHardenContext = (context) => {
     if (context === null || typeof context !== "object") return;
     if (__bbHardenedContexts.has(context)) return;
@@ -187,6 +231,9 @@ function cutAgentBrowserRoots(pageListVariable: string): string {
     const originalSend = prototype?.sendMessageToServer;
     if (typeof originalSend === "function") {
       const guardedSend = function (owner, method, params, options) {
+        if (__bbIsNonWebNavigation(owner, method, params)) {
+          return __bbDeniedNonWebNavigation();
+        }
         if (__bbIsBlockedProtocolCall(owner, method)) return __bbDenied();
         return Reflect.apply(originalSend, this, [owner, method, params, options]);
       };
@@ -249,6 +296,7 @@ function boundedOperationTimeoutMs(scriptTimeoutMs: number): number {
 export function agentPagePreamble(
   tabId?: string,
   preferredOrigin?: string,
+  enforceNonWebNavigation = false,
 ): string {
   if (tabId !== undefined) {
     return `const __bbTargetPages = await browser.listPages();
@@ -257,7 +305,7 @@ if (!__bbTargetPages.some((entry) => entry.id === ${JSON.stringify(tabId)})) thr
     )});
 const page = await browser.getPage(${JSON.stringify(tabId)});
 await page.bringToFront();
-${cutAgentBrowserRoots("__bbTargetPages")}`;
+${cutAgentBrowserRoots("__bbTargetPages", enforceNonWebNavigation)}`;
   }
   return `const __bbPages = await browser.listPages();
 let page = await browser.getPage(__bbPages.length === 0 ? "main" : __bbPages[0].id);
@@ -282,13 +330,28 @@ if (__bbPreferred !== null) {
   }
 }
 await page.bringToFront();
-${cutAgentBrowserRoots("__bbPages")}`;
+${cutAgentBrowserRoots("__bbPages", enforceNonWebNavigation)}`;
 }
 
 export function wrapAgentScriptResult(code: string): string {
-  return `const __bbResult = await (async () => {
+  return `let __bbResult;
+let __bbScriptError;
+let __bbScriptFailed = false;
+try {
+  __bbResult = await (async () => {
 ${code}
-})();
+  })();
+} catch (error) {
+  __bbScriptFailed = true;
+  __bbScriptError = error;
+}
+if (
+  typeof __bbNonWebNavigationBoundary !== "undefined" &&
+  __bbNonWebNavigationBoundary.wasDenied()
+) {
+  throw new Error(${JSON.stringify(NON_WEB_NAVIGATION_DENIED_MESSAGE)});
+}
+if (__bbScriptFailed) throw __bbScriptError;
 if (__bbResult !== undefined) {
   console.log(typeof __bbResult === "string" ? __bbResult : JSON.stringify(__bbResult));
 }`;
@@ -299,9 +362,14 @@ export function prepareAgentExecution(input: {
   tabId?: string;
   preferredOrigin?: string;
   timeoutMs?: number;
+  enforceNonWebNavigation?: boolean;
   screenshot?: { fileName: string; marker: string };
 }): string {
-  const pagePreamble = agentPagePreamble(input.tabId, input.preferredOrigin);
+  const pagePreamble = agentPagePreamble(
+    input.tabId,
+    input.preferredOrigin,
+    input.enforceNonWebNavigation ?? false,
+  );
   const wrappedUser = wrapAgentScriptResult(input.code);
   const operationTimeoutMs = boundedOperationTimeoutMs(
     input.timeoutMs ?? BROWSER_SCRIPT_MAX_TIMEOUT_MS,

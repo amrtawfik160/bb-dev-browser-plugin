@@ -32,11 +32,12 @@ Official **Chrome Stable** is the primary browser; a compatible pinned Playwrigh
 Chromium is the fallback for ordinary browsing. Chrome Stable updates through
 its signed system repository. Compatible `dev-browser` and Playwright fallback
 versions are pinned; health checks report incompatible drift but never silently
-upgrade system packages. The fallback is copied from the Playwright cache into
-protected storage as ordinary `bb-browser`-owned files with source modes and
-ownership discarded; setup never installs a cache-provided setuid helper. User
-namespaces or a separately validated system helper must satisfy the sandbox
-readiness check.
+upgrade system packages. The fallback is read from the Playwright cache through
+a private no-follow staging boundary that accepts only regular files and
+directories. Protected storage receives the normalized staging tree as
+ordinary `bb-browser`-owned files with safe modes; setup never follows cache
+symlinks or installs a cache-provided setuid helper. User namespaces or a
+separately validated system helper must satisfy the sandbox readiness check.
 
 ## BB Connect
 

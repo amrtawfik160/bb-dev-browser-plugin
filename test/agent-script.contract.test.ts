@@ -16,17 +16,29 @@ async function capturedLogs(code: string) {
   return logs;
 }
 
-async function preparedLogs(code: string) {
+async function preparedLogs(
+  code: string,
+  enforceNonWebNavigation = false,
+  allowError = false,
+) {
   const logs: string[] = [];
   // These fields mirror the pinned dev-browser@0.2.9 Playwright client:
   // BrowserContext._browser, ChannelOwner._parent/_connection, Page._browserContext,
   // and Connection._objects are all enumerable escape paths in that client.
   class FakeConnection {
     readonly _objects = new Map<string, object>();
-    onmessage = () => undefined;
+    readonly sentMethods: string[] = [];
+    onmessage = async (message: { method?: unknown }) => {
+      if (String(message.method) === "newContext") {
+        return "unrestricted-context";
+      }
+      return undefined;
+    };
 
-    async sendMessageToServer(_owner: { _type?: string }, method: string) {
-      if (method === "newContext") return "unrestricted-context";
+    async sendMessageToServer(_owner: { _type?: string }, method: unknown) {
+      this.sentMethods.push(String(method));
+      if (String(method) === "newContext") return "unrestricted-context";
+      if (String(method) === "goto") return "forwarded";
       return undefined;
     }
   }
@@ -132,7 +144,10 @@ async function preparedLogs(code: string) {
     getPage: async () => page,
     newPage: async () => extraPage,
   };
-  const prepared = prepareAgentExecution({ code });
+  const prepared = prepareAgentExecution({
+    code,
+    enforceNonWebNavigation,
+  });
   const run = new Function(
     "browser",
     "console",
@@ -141,7 +156,12 @@ async function preparedLogs(code: string) {
     browser: typeof fakeBrowser,
     console: { log: (value: unknown) => void },
   ) => Promise<void>;
-  await run(fakeBrowser, { log: (value) => logs.push(String(value)) });
+  try {
+    await run(fakeBrowser, { log: (value) => logs.push(String(value)) });
+  } catch (error) {
+    if (!allowError) throw error;
+    logs.push(String(error));
+  }
   return logs;
 }
 
@@ -216,11 +236,11 @@ const channelAttempt = browserRoots.length === 0
   : await browserRoots[0]._channel.newContext({}).then(() => "created", () => "blocked");
 const connectionAttempt = browserRoots.length === 0
   ? "missing"
-  : await page._connection.sendMessageToServer(browserRoots[0], "newContext", {}, {})
+  : await page._connection.sendMessageToServer(browserRoots[0], new String("newContext"), {}, {})
       .then(() => "created", () => "blocked");
 const onmessageAttempt = await page._connection.onmessage({
   guid: "browser",
-  method: "newContext",
+  method: new String("newContext"),
 }).then(() => "created", () => "blocked");
 const browserType = browserRoots.length === 0 ? null : browserRoots[0].browserType();
 const browserTypeAttempt = browserType === null
@@ -250,6 +270,50 @@ return JSON.stringify({
       browserTypeAttempt: "missing",
     });
     expect(outcome.browserAliasCount).toBeGreaterThan(0);
+  });
+
+  it("blocks direct non-web goto at the pinned Playwright protocol boundary", async () => {
+    const logs = await preparedLogs(
+      `const frame = { _type: "Frame" };
+const connection = page._connection;
+const attempts = await Promise.all([
+  connection.sendMessageToServer(frame, new String("goto"), { url: new String("data:text/html,private") }, {})
+    .then(() => "forwarded", (error) => String(error).includes("non-web URL") ? "blocked" : String(error)),
+  connection.sendMessageToServer(frame, new String("goto"), { url: new String("about:blank") }, {})
+    .then(() => "forwarded", () => "blocked"),
+  connection.sendMessageToServer(frame, new String("goto"), { url: new String("blob:https://app.example.test/blob-id") }, {})
+    .then(() => "forwarded", () => "blocked"),
+]);
+console.log(JSON.stringify({ attempts, sentMethods: connection.sentMethods }));
+return "completed";`,
+      true,
+      true,
+    );
+    expect(JSON.parse(logs[0] ?? "{}")).toEqual({
+      attempts: ["blocked", "forwarded", "forwarded"],
+      sentMethods: ["goto", "goto"],
+    });
+    expect(logs[1]).toContain("non-web URL");
+  });
+
+  it("keeps a caught protocol denial ahead of a later script error", async () => {
+    const logs = await preparedLogs(
+      `try {
+  await page._connection.sendMessageToServer(
+    { _type: "Frame" },
+    new String("goto"),
+    { url: new String("data:text/html,private") },
+    {},
+  );
+} catch {}
+throw new Error("later script failure");`,
+      true,
+      true,
+    );
+
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toContain("non-web URL");
+    expect(logs[0]).not.toContain("later script failure");
   });
 
   it("keeps new pages in the guarded context available after cutting its Browser root", async () => {

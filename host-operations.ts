@@ -9,7 +9,7 @@ import {
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { promisify } from "node:util";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { z } from "zod";
 import {
@@ -35,6 +35,10 @@ import {
 import type { HostReadinessBoundary } from "./readiness.js";
 import { fallbackBrowserPaths } from "./browser-fallback.js";
 import { PINNED_BROWSER_RUNTIME } from "./dependency-inventory.js";
+import {
+  stageFallbackPack,
+  type StagedFallbackPack,
+} from "./fallback-ingestion.js";
 
 export const BROWSER_USER = "bb-browser";
 export const BROWSER_USER_HOME = BROWSER_STORAGE_ROOT;
@@ -303,23 +307,23 @@ async function installFallbackPack(
     PrivilegedOperation,
     { kind: "configure-protected-storage" }
   >["fallback"],
+  stagedPack: StagedFallbackPack,
 ) {
-  const sourceDirectory = dirname(fallback.sourcePath);
-  // Playwright's cache is mutable. Keep its fallback entirely unprivileged;
-  // sandbox readiness comes from user namespaces or a validated system helper.
+  // Playwright's cache is mutable. Only the private, regular-file staging tree
+  // crosses into the privileged setup boundary.
   await run("/usr/bin/cp", [
     "-a",
-    "--no-preserve=mode,ownership",
-    join(sourceDirectory, "."),
+    "--no-preserve=ownership",
+    "--remove-destination",
+    `${stagedPack.packDirectory}/.`,
     fallback.directory,
   ]);
   await run("/usr/bin/chown", [
     "-R",
+    "--no-dereference",
     `${BROWSER_USER}:${BROWSER_USER}`,
     fallback.directory,
   ]);
-  await run("/usr/bin/chmod", ["0700", fallback.directory]);
-  await run("/usr/bin/chmod", ["0755", fallback.executablePath]);
 }
 
 async function writeSetupEvidence(
@@ -328,8 +332,9 @@ async function writeSetupEvidence(
     PrivilegedOperation,
     { kind: "configure-protected-storage" }
   >,
+  executablePath: string,
 ) {
-  const executable = await readFile(operation.fallback.sourcePath);
+  const executable = await readFile(executablePath);
   const hostStatePath = join(directory, "host-state.json");
   const manifestPath = join(directory, "version.json");
   await writeFile(
@@ -357,28 +362,36 @@ async function configureProtectedStorage(
     { kind: "configure-protected-storage" }
   >,
 ) {
-  for (const directory of [operation.path, operation.fallback.directory]) {
-    await installOwnedDirectory(run, directory);
-  }
-  await installFallbackPack(run, operation.fallback);
-  const temporaryDirectory = await mkdtemp(join(tmpdir(), "bb-browser-setup-"));
+  const stagedPack = await stageFallbackPack(operation.fallback.sourcePath);
   try {
-    const { hostStatePath, manifestPath } = await writeSetupEvidence(
-      temporaryDirectory,
-      operation,
+    for (const directory of [operation.path, operation.fallback.directory]) {
+      await installOwnedDirectory(run, directory);
+    }
+    await installFallbackPack(run, operation.fallback, stagedPack);
+    const temporaryDirectory = await mkdtemp(
+      join(tmpdir(), "bb-browser-setup-"),
     );
-    await installConfigurationFile(
-      run,
-      hostStatePath,
-      join(operation.path, "host-state.json"),
-    );
-    await installConfigurationFile(
-      run,
-      manifestPath,
-      operation.fallback.manifestPath,
-    );
+    try {
+      const { hostStatePath, manifestPath } = await writeSetupEvidence(
+        temporaryDirectory,
+        operation,
+        stagedPack.executablePath,
+      );
+      await installConfigurationFile(
+        run,
+        hostStatePath,
+        join(operation.path, "host-state.json"),
+      );
+      await installConfigurationFile(
+        run,
+        manifestPath,
+        operation.fallback.manifestPath,
+      );
+    } finally {
+      await rm(temporaryDirectory, { recursive: true, force: true });
+    }
   } finally {
-    await rm(temporaryDirectory, { recursive: true, force: true });
+    await rm(stagedPack.rootDirectory, { recursive: true, force: true });
   }
 }
 

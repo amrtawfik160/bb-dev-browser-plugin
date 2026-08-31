@@ -29,9 +29,13 @@ import {
   originScopeMatcher,
   type OriginScopeMatcher,
 } from "./authorization.js";
-import { type BrowserOriginScopePolicy } from "./origin-scope.js";
+import {
+  BrowserOriginScopeDeniedError,
+  type BrowserOriginScopePolicy,
+} from "./origin-scope.js";
 export { BrowserOriginScopeDeniedError } from "./origin-scope.js";
 import {
+  NON_WEB_NAVIGATION_DENIED_MESSAGE,
   prepareAgentExecution,
   preferredTabOrigin,
   TAB_INVALID_MESSAGE,
@@ -852,8 +856,18 @@ function executionRequest(
  * module. Unrecognized worker errors are left untouched so the host reports
  * them as `script_failed`.
  */
-function classifyExecutionError(error: unknown): unknown {
+function classifyExecutionError(
+  error: unknown,
+  enforceNonWebNavigation: boolean,
+): unknown {
   if (error instanceof BrowserScriptExecutionError) return error;
+  if (
+    enforceNonWebNavigation &&
+    error instanceof Error &&
+    error.message.includes(NON_WEB_NAVIGATION_DENIED_MESSAGE)
+  ) {
+    return new BrowserOriginScopeDeniedError(null);
+  }
   if (error instanceof Error && error.message.includes(TAB_INVALID_MESSAGE)) {
     return new BrowserScriptExecutionError("tab_invalid", error.message);
   }
@@ -1541,6 +1555,7 @@ export function createBrowserInstanceRuntime(
         tabId: target.tabId,
         preferredOrigin: preferredTabOrigin(operationOptions.originScope),
         timeoutMs,
+        enforceNonWebNavigation: originPolicy !== undefined,
         screenshot,
       });
       const operationSignal = linkedOperationSignal(operationOptions);
@@ -1562,7 +1577,7 @@ export function createBrowserInstanceRuntime(
           if (target.tabId !== undefined) activeTabs.set(key, target.tabId);
           return browserResult;
         } catch (error) {
-          throw classifyExecutionError(error);
+          throw classifyExecutionError(error, originPolicy !== undefined);
         }
       } finally {
         operationSignal.dispose();

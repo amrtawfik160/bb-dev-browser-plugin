@@ -95,25 +95,39 @@ subresources may render normally. A denied web origin produces a typed
 navigation produces the same typed error with a null origin and no Grant
 Request.
 
-Enforcement is host-owned request interception. Before the QuickJS helper starts,
-the host connects independently to the profile's Playwright context, rejects
-and closes any existing out-of-scope web or non-web document, and installs a
-navigation route. Exact `about:blank` is the only safe internal exception;
-`blob:` navigation is classified by its embedded HTTP(S) origin when exposed.
-The agent sandbox supplies no callback and cannot remove the route. Before agent
-code runs, the host hardens the pinned Playwright client's reachable Browser,
-BrowserType, BrowserContext, and connection paths, including enumerable
-`_browser`/`_parent` aliases and channel creation calls. An agent cannot create
-a later unguarded browser context; the plugin wrapper's `browser.newPage()`
-continues to create pages in the guarded context. The host also registers every
-BrowserContext emitted after the initial connection snapshot.
+Enforcement is host-owned and layered. Before the QuickJS helper starts, the
+host connects independently to the profile's Playwright context, rejects and
+closes any existing out-of-scope web or non-web document, installs the web
+grant-matching route, and attaches a CDP guard to each page. Exact
+`about:blank` is the only safe internal exception; `blob:` navigation is
+classified by its embedded HTTP(S) origin when exposed. The agent sandbox
+supplies no callback and cannot remove these controls.
 
-- Out-of-scope top-level pages, redirects, popups, and frame documents are
-  aborted before commit. Ordinary cross-origin subresources continue normally.
+For an active Origin Scope, the generated agent boundary also rejects a direct
+Playwright `Frame.goto` whose address is not exact `about:blank`, HTTP(S), or an
+HTTP(S)-backed `blob:` before `sendMessageToServer` forwards the command to
+Chromium. That adapter checks only the protocol family; the host route remains
+the single owner of grant matching. The boundary handles boxed method and URL
+values from the pinned Playwright client. The host also hardens the pinned
+client's reachable Browser, BrowserType, BrowserContext, and connection paths,
+including enumerable `_browser`/`_parent` aliases and channel creation calls.
+An agent cannot create a later unguarded browser context; the plugin wrapper's
+`browser.newPage()` continues to create pages in the guarded context. Every
+BrowserContext emitted after the initial connection snapshot is registered.
+
+- Out-of-scope HTTP(S) requests are aborted by the route before commit. Direct
+  agent non-web `Frame.goto` calls are rejected before the Playwright navigation
+  command; renderer-initiated location changes and frame documents use the CDP
+  guard, which fails closed and removes the denied page. Pinned Chromium can
+  expose a diagnostic precommit event for a raw direct `data:` loader without
+  offering a cancellable loader command, so the public guarantee there is
+  typed denial plus page cleanup rather than a universal no-commit claim.
+  Ordinary cross-origin subresources continue normally.
 - The first denied navigation is sticky for the operation. Navigating back into
   scope, closing a popup, or throwing a later exception cannot erase it.
-- Denied popups and pre-existing denied tabs are closed, so a later call cannot
-  recover their page objects or content.
+- Denied popup targets and pre-existing denied tabs are closed when they exist;
+  a popup opener remains available when Chromium rejects the popup before a
+  target page exists, so a later call cannot recover denied page content.
 - Every new sandbox page uses the one routed context, so `browser.newPage()`
   cannot create an unenforced context.
 

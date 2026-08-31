@@ -20,7 +20,9 @@ import {
 // route decisions, committed page URLs, popup lifecycle, and certificate
 // fetches. The provisioned-host suite remains the end-to-end browser check.
 
-type RouteAction = "aborted" | "continued" | "fulfilled";
+type RouteAction = "aborted" | "continued" | "fulfilled" | "unguarded";
+type ContextEvent = { context: { _object?: BrowserContext } };
+type ContextListener = (event: ContextEvent) => void;
 
 class SimulatedPage {
   closed = false;
@@ -123,14 +125,15 @@ class SimulatedContext {
 
   async navigate(page: SimulatedPage, url: string, navigationRequest = true) {
     if (this.routeHandler === null) {
-      throw new Error("Origin Scope route is not installed.");
+      page.currentUrl = url;
+      return "unguarded" as const;
     }
     const route = new SimulatedRoute(url, page, navigationRequest);
     await this.routeHandler(route as unknown as Route);
     if (route.action === "continued" || route.action === "fulfilled") {
       page.currentUrl = url;
     }
-    return route.action;
+    return route.action ?? "unguarded";
   }
 }
 
@@ -148,22 +151,20 @@ function policy(
 function simulatedBrowser(initialPages: SimulatedPage[]) {
   const context = new SimulatedContext(initialPages);
   const contexts = [context];
-  const contextListeners = new Set<
-    (event: { context: { _object?: BrowserContext } }) => void
-  >();
+  const contextListeners: ContextListener[] = [];
   const close = vi.fn(async () => undefined);
   const channel = {
-    on: (
-      event: string,
-      listener: (event: { context: { _object?: BrowserContext } }) => void,
-    ) => {
-      if (event === "context") contextListeners.add(listener);
+    on: (event: string, listener: ContextListener) => {
+      if (event === "context") contextListeners.push(listener);
     },
-    off: (
-      event: string,
-      listener: (event: { context: { _object?: BrowserContext } }) => void,
-    ) => {
-      if (event === "context") contextListeners.delete(listener);
+    prependListener: (event: string, listener: ContextListener) => {
+      if (event === "context") contextListeners.unshift(listener);
+    },
+    off: (event: string, listener: ContextListener) => {
+      if (event === "context") {
+        const index = contextListeners.indexOf(listener);
+        if (index >= 0) contextListeners.splice(index, 1);
+      }
     },
   };
   const browser = {
@@ -176,9 +177,12 @@ function simulatedBrowser(initialPages: SimulatedPage[]) {
   } as unknown as Browser;
   return {
     context,
+    addContextObserver: (listener: ContextListener) => {
+      contextListeners.push(listener);
+    },
     addContext: (newContext: SimulatedContext) => {
       contexts.push(newContext);
-      for (const listener of contextListeners) {
+      for (const listener of [...contextListeners]) {
         listener({
           context: { _object: newContext as unknown as BrowserContext },
         });
@@ -488,6 +492,35 @@ describe("host-owned Origin Scope guard", () => {
     ).toBe("aborted");
     expect(guard.deniedOrigin()).toBe("https://outside.example.test");
     await guard.dispose();
+  });
+
+  it("starts guarding a later context before a competing creation listener can navigate", async () => {
+    const page = new SimulatedPage("main", "https://app.example.test/");
+    const boundary = simulatedBrowser([page]);
+    const laterPage = new SimulatedPage("later", "https://app.example.test/");
+    const laterContext = new SimulatedContext([laterPage]);
+    let navigation!: Promise<RouteAction>;
+    boundary.addContextObserver(() => {
+      navigation = laterContext.navigate(
+        laterPage,
+        "https://outside.example.test/",
+      );
+    });
+    const guard = await installHostOriginScopeGuard(
+      "ws://127.0.0.1/devtools/browser/test",
+      policy(),
+      boundary.connect,
+    );
+
+    try {
+      boundary.addContext(laterContext);
+
+      await expect(navigation).resolves.toBe("aborted");
+      expect(laterPage.url()).toBe("https://app.example.test/");
+      expect(guard.deniedOrigin()).toBe("https://outside.example.test");
+    } finally {
+      await guard.dispose();
+    }
   });
 
   it("blocks an out-of-scope frame document before commit", async () => {

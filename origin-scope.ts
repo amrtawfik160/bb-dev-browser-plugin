@@ -4,6 +4,10 @@ import {
   matcherPermitsOrigin,
   type OriginScopeMatcher,
 } from "./authorization.js";
+import {
+  installPageNavigationGuard,
+  type PageNavigationGuard,
+} from "./origin-scope-cdp.js";
 
 export type BrowserOriginScopePolicy = {
   matcher: OriginScopeMatcher;
@@ -22,17 +26,21 @@ export type ConnectOriginScopeBrowser = (
   timeoutMs: number,
 ) => Promise<Browser>;
 
-// Playwright emits Browser context creation on Browser._channel rather than
-// the public Browser event surface. The channel proxy exposes the object via
-// its _object back-reference.
+// Playwright emits context/page creation on private channel proxies rather than
+// the public BrowserContext event surface. This narrow adapter is pinned to
+// Playwright's channel object and its _object back-reference.
 type BrowserContextChannelEvent = {
   context: { _object?: BrowserContext };
 };
 
-type BrowserContextChannelEmitter = {
-  on(
+type BrowserPageChannelEvent = {
+  page: { _object?: Page };
+};
+
+type BrowserChannelEmitter = {
+  prependListener(
     event: "context",
-    listener: (event: BrowserContextChannelEvent) => void,
+    listener: (event: BrowserContextChannelEvent) => void | Promise<void>,
   ): void;
   off(
     event: "context",
@@ -40,10 +48,26 @@ type BrowserContextChannelEmitter = {
   ): void;
 };
 
+type BrowserContextChannelEmitter = {
+  prependListener(
+    event: "page",
+    listener: (event: BrowserPageChannelEvent) => void | Promise<void>,
+  ): void;
+  off(
+    event: "page",
+    listener: (event: BrowserPageChannelEvent) => void | Promise<void>,
+  ): void;
+};
+
 type RouteRegistration = {
   context: BrowserContext;
   handler: (route: Route) => Promise<void>;
   pending: Set<Promise<void>>;
+};
+
+type PageRegistration = {
+  page: Page;
+  guard: PageNavigationGuard;
 };
 
 const ORIGIN_SCOPE_ROUTE_PATTERN = "**/*";
@@ -68,7 +92,7 @@ export function preferOriginScopeDenial<T>(
 }
 
 type NavigationClassification =
-  | { kind: "web"; origin: string }
+  | { kind: "web"; origin: string; protocol: "http:" | "https:" | "blob:" }
   | { kind: "safe-internal" }
   | { kind: "non-web" };
 
@@ -86,10 +110,10 @@ function classifyNavigation(address: string): NavigationClassification {
     return { kind: "non-web" };
   }
   if (url.protocol === "http:" || url.protocol === "https:") {
-    return { kind: "web", origin: url.origin };
+    return { kind: "web", origin: url.origin, protocol: url.protocol };
   }
   if (url.protocol === "blob:" && isWebOrigin(url.origin)) {
-    return { kind: "web", origin: url.origin };
+    return { kind: "web", origin: url.origin, protocol: url.protocol };
   }
   if (url.href === "about:blank") return { kind: "safe-internal" };
   return { kind: "non-web" };
@@ -152,7 +176,15 @@ export function originRequiresCertificateBypass(
 }
 
 async function closeDeniedPopup(request: Request) {
-  const page = request.frame().page();
+  let page: Page;
+  try {
+    page = request.frame().page();
+  } catch {
+    // Chromium can issue a popup's first navigation before Playwright creates
+    // its Frame object. The route is already aborted; the CDP window-open
+    // guard owns cleanup for non-web popups, so there is no page to close here.
+    return;
+  }
   if ((await page.opener()) !== null && !page.isClosed()) await page.close();
 }
 
@@ -220,6 +252,37 @@ function originScopeRouteHandler(
   };
 }
 
+function navigationDenial(
+  address: string,
+  policy: BrowserOriginScopePolicy,
+): BrowserOriginScopeDeniedError | null {
+  const classification = classifyNavigation(address);
+  if (classification.kind === "safe-internal") return null;
+  if (classification.kind === "non-web") {
+    return new BrowserOriginScopeDeniedError(null);
+  }
+  return matcherPermitsOrigin(policy.matcher, classification.origin)
+    ? null
+    : new BrowserOriginScopeDeniedError(classification.origin);
+}
+
+function shouldCloseDeniedPage(address: string): boolean {
+  const classification = classifyNavigation(address);
+  return (
+    classification.kind === "non-web" ||
+    (classification.kind === "web" && classification.protocol === "blob:")
+  );
+}
+
+function contextChannel(
+  context: BrowserContext,
+): BrowserContextChannelEmitter | null {
+  const channel = (
+    context as unknown as { _channel?: BrowserContextChannelEmitter }
+  )._channel;
+  return channel ?? null;
+}
+
 async function connectOriginScopeBrowser(endpoint: string, timeoutMs: number) {
   // Keep Playwright at the host runtime boundary. Bundling its server internals
   // pulls optional BiDi modules that a CDP-only attachment never executes.
@@ -252,9 +315,7 @@ async function settlePendingRoutes(
   );
 }
 
-async function settlePendingContextInstallations(
-  installations: Set<Promise<void>>,
-) {
+async function settlePendingInstallations(installations: Set<Promise<void>>) {
   while (installations.size > 0) {
     await Promise.allSettled([...installations]);
   }
@@ -295,18 +356,83 @@ export async function installHostOriginScopeGuard(
   const registrations: RouteRegistration[] = [];
   const registeredContexts = new Set<BrowserContext>();
   const pendingContextInstallations = new Set<Promise<void>>();
+  const pageRegistrations: PageRegistration[] = [];
+  const registeredPages = new Set<Page>();
+  const pendingPageInstallations = new Set<Promise<void>>();
+  const pageObservers = new Map<
+    BrowserContext,
+    (event: BrowserPageChannelEvent) => void | Promise<void>
+  >();
   const recordDenial = (candidate: BrowserOriginScopeDeniedError) => {
     denial ??= candidate;
+  };
+  const recordPageDenial = (candidate: Error) => {
+    if (candidate instanceof BrowserOriginScopeDeniedError) {
+      recordDenial(candidate);
+    } else {
+      recordDenial(new BrowserOriginScopeDeniedError(null));
+    }
+  };
+  const trackPageInstallation = (installation: Promise<void>) => {
+    pendingPageInstallations.add(installation);
+    void installation.then(
+      () => pendingPageInstallations.delete(installation),
+      () => {
+        pendingPageInstallations.delete(installation);
+        denial ??= new BrowserOriginScopeDeniedError(null);
+        void browser.close().catch(() => undefined);
+      },
+    );
+    return installation;
+  };
+  const installPage = async (context: BrowserContext, page: Page) => {
+    if (
+      registeredPages.has(page) ||
+      page.isClosed() ||
+      typeof (context as unknown as { newCDPSession?: unknown })
+        .newCDPSession !== "function"
+    ) {
+      return;
+    }
+    registeredPages.add(page);
+    try {
+      const guard = await installPageNavigationGuard(page, {
+        classify: (address) => navigationDenial(address, policy),
+        closeDeniedPage: shouldCloseDeniedPage,
+        recordDenial: recordPageDenial,
+      });
+      pageRegistrations.push({ page, guard });
+    } catch (error) {
+      registeredPages.delete(page);
+      throw error;
+    }
   };
   const installContext = async (context: BrowserContext) => {
     if (registeredContexts.has(context)) return;
     registeredContexts.add(context);
+    const pageChannel = contextChannel(context);
+    if (pageChannel !== null) {
+      const observePage = (event: BrowserPageChannelEvent) => {
+        const page = event.page._object;
+        if (page === undefined) {
+          denial ??= new BrowserOriginScopeDeniedError(null);
+          void browser.close().catch(() => undefined);
+          return;
+        }
+        trackPageInstallation(installPage(context, page));
+      };
+      pageObservers.set(context, observePage);
+      pageChannel.prependListener("page", observePage);
+    }
     const registration = routeRegistration(
       context,
       originScopeRouteHandler(context, policy, recordDenial),
     );
     registrations.push(registration);
-    await installRoutes([registration]);
+    const pageInstallations = context
+      .pages()
+      .map((page) => trackPageInstallation(installPage(context, page)));
+    await Promise.all([installRoutes([registration]), ...pageInstallations]);
     const existingDenials = deniedExistingPages([context], policy.matcher);
     if (existingDenials.length > 0) {
       recordDenial(existingDenials[0].denial);
@@ -316,7 +442,7 @@ export async function installHostOriginScopeGuard(
   const observeContext = (context: BrowserContext) => {
     const installation = installContext(context);
     pendingContextInstallations.add(installation);
-    void installation.then(
+    return installation.then(
       () => pendingContextInstallations.delete(installation),
       () => {
         denial ??= new BrowserOriginScopeDeniedError(null);
@@ -326,26 +452,34 @@ export async function installHostOriginScopeGuard(
     );
   };
   const contextEmitter = (
-    browser as unknown as { _channel: BrowserContextChannelEmitter }
+    browser as unknown as { _channel: BrowserChannelEmitter }
   )._channel;
-  const observeBrowserContext = (event: BrowserContextChannelEvent) => {
+  const observeBrowserContext = async (event: BrowserContextChannelEvent) => {
     const context = event.context._object;
     if (context === undefined) {
       denial ??= new BrowserOriginScopeDeniedError(null);
       void browser.close().catch(() => undefined);
       return;
     }
-    observeContext(context);
+    await observeContext(context);
   };
   try {
-    contextEmitter.on("context", observeBrowserContext);
+    contextEmitter.prependListener("context", observeBrowserContext);
     const contexts = browser.contexts();
     await Promise.all(contexts.map((context) => installContext(context)));
-    await settlePendingContextInstallations(pendingContextInstallations);
+    await settlePendingInstallations(pendingContextInstallations);
+    await settlePendingInstallations(pendingPageInstallations);
     if (denial !== null) throw denial;
   } catch (error) {
     contextEmitter.off("context", observeBrowserContext);
-    await settlePendingContextInstallations(pendingContextInstallations);
+    for (const [context, observer] of pageObservers) {
+      contextChannel(context)?.off("page", observer);
+    }
+    await settlePendingInstallations(pendingContextInstallations);
+    await settlePendingInstallations(pendingPageInstallations);
+    await Promise.allSettled(
+      pageRegistrations.map(({ guard }) => guard.dispose()),
+    );
     await settlePendingRoutes(registrations);
     await browser.close();
     throw error;
@@ -356,7 +490,14 @@ export async function installHostOriginScopeGuard(
     dispose: async () => {
       try {
         contextEmitter.off("context", observeBrowserContext);
-        await settlePendingContextInstallations(pendingContextInstallations);
+        for (const [context, observer] of pageObservers) {
+          contextChannel(context)?.off("page", observer);
+        }
+        await settlePendingInstallations(pendingContextInstallations);
+        await settlePendingInstallations(pendingPageInstallations);
+        await Promise.allSettled(
+          pageRegistrations.map(({ guard }) => guard.dispose()),
+        );
         try {
           await removeRoutes(registrations);
         } finally {

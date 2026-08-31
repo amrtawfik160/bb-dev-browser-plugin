@@ -46,10 +46,12 @@ exposes automation to agents only through explicit, revocable authorization.
   Grant Request the owner can approve for one retry, one hour, or persistent
   access; non-web navigation is denied without a request.
 - **Origin Scope enforcement** — exact `scheme://host:port` origins and
-  optional subdomain patterns. A host-owned guard blocks out-of-scope web and
-  non-web document navigations before commit, closes denied pages, and retains
-  denial even when a script navigates back or throws. Exact `about:blank` is
-  the only safe internal exception.
+  optional subdomain patterns. The host route matches web grants, the pinned
+  Playwright boundary rejects direct non-web `Frame.goto` calls before they
+  reach Chromium, and the CDP guard fails closed for renderer, popup, and
+  frame navigations. Denied pages are removed and denial remains sticky even
+  when a script navigates back or throws. Exact `about:blank` is the only safe
+  internal exception.
 - **Control Leases** — one owner client or agent controls input at a time. The
   owner has priority and can revoke an agent's lease; control transfers
   explicitly between owner clients.

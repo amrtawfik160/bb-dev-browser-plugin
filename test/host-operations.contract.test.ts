@@ -1,7 +1,19 @@
 import { experimental_createHostEntryHarness } from "@get-bb/plugin-sdk/testing/host";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import {
+  chmod,
+  copyFile,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 import {
   BROWSER_CONFIGURATION_ROOT,
@@ -29,6 +41,7 @@ import {
   type BrowserRuntimePolicy,
   type HostAdministrationBoundary,
   type HostAdministrationStateStore,
+  type PrivilegedOperation,
   validateBrowserRuntimePolicy,
 } from "../host-operations.js";
 import type { HostReadinessBoundary } from "../readiness.js";
@@ -38,6 +51,72 @@ const target: BrowserHostTarget = {
   profileId: DEFAULT_PROFILE_ID,
 };
 const installationId = "installation-operations-test";
+const runSystemCommand = promisify(execFile);
+
+type RecordedCommand = { file: string; arguments: readonly string[] };
+
+async function emulateInstallCommand(arguments_: readonly string[]) {
+  const modeFlag = arguments_.indexOf("-m");
+  const modeText = arguments_[modeFlag + 1];
+  const destination = arguments_.at(-1);
+  if (modeFlag < 0 || modeText === undefined || destination === undefined) {
+    throw new Error(
+      "The fallback fixture received an invalid install command.",
+    );
+  }
+  const mode = Number.parseInt(modeText, 8);
+  if (arguments_.includes("-d")) {
+    await mkdir(destination, { recursive: true });
+    await chmod(destination, mode);
+    return;
+  }
+  const source = arguments_.at(-2);
+  if (source === undefined) {
+    throw new Error(
+      "The fallback fixture received an incomplete install command.",
+    );
+  }
+  await copyFile(source, destination);
+  await chmod(destination, mode);
+}
+
+function realTempFallbackExecutor(commands: RecordedCommand[]) {
+  return createProductionPrivilegedExecutor({
+    executeFile: async (file, arguments_) => {
+      commands.push({ file, arguments: [...arguments_] });
+      if (file === "/usr/bin/cp" || file === "/usr/bin/chmod") {
+        await runSystemCommand(file, [...arguments_]);
+        return;
+      }
+      if (file === "/usr/bin/chown") return;
+      if (file === "/usr/bin/install") {
+        await emulateInstallCommand(arguments_);
+        return;
+      }
+      throw new Error(`The fallback fixture received ${file}.`);
+    },
+  });
+}
+
+function fallbackOperation(
+  fixtureRoot: string,
+  sourcePath: string,
+): Extract<PrivilegedOperation, { kind: "configure-protected-storage" }> {
+  const hostStoragePath = join(fixtureRoot, "protected-host");
+  return {
+    kind: "configure-protected-storage" as const,
+    path: hostStoragePath,
+    owner: BROWSER_USER,
+    mode: 0o700 as const,
+    installationId,
+    hostId: target.hostId,
+    confirmation: "Configure protected Browser storage",
+    fallback: {
+      sourcePath,
+      ...fallbackBrowserPaths(hostStoragePath),
+    },
+  };
+}
 
 function readinessBoundary(
   reportedStatus: BrowserStatus = setupRequiredStatus(target),
@@ -507,81 +586,145 @@ describe("Browser host administration contract", () => {
     ).resolves.toBeUndefined();
   });
 
-  it("issue #64 never promotes mutable cache content into a setuid helper", async () => {
-    const sourceDirectory = await mkdtemp(join(tmpdir(), "chromium-pack-"));
-    const commands: { file: string; arguments: readonly string[] }[] = [];
+  it.each([
+    {
+      kind: "absolute",
+      externalTarget: "outside-target",
+      linkTarget: "absolute",
+    },
+    {
+      kind: "relative",
+      externalTarget: "protected-host/outside-target",
+      linkTarget: "../protected-host/outside-target",
+    },
+  ])(
+    "issue #64 rejects a $kind cache link before privileged mode changes",
+    async ({ externalTarget: targetPath, linkTarget }) => {
+      const fixtureRoot = await mkdtemp(join(tmpdir(), "chromium-pack-"));
+      try {
+        const sourceDirectory = join(fixtureRoot, "mutable-cache");
+        const externalTarget = join(fixtureRoot, targetPath);
+        await mkdir(sourceDirectory);
+        await mkdir(dirname(externalTarget), { recursive: true });
+        await writeFile(externalTarget, "outside");
+        await chmod(externalTarget, 0o600);
+        await symlink(
+          linkTarget === "absolute" ? externalTarget : linkTarget,
+          join(sourceDirectory, "chrome"),
+        );
+        const commands: RecordedCommand[] = [];
+        const executor = realTempFallbackExecutor(commands);
+
+        await expect(
+          executor.execute(
+            fallbackOperation(fixtureRoot, join(sourceDirectory, "chrome")),
+          ),
+        ).rejects.toThrow("regular file");
+        expect((await stat(externalTarget)).mode & 0o7777).toBe(0o600);
+        expect(
+          commands.every(({ arguments: commandArguments }) =>
+            commandArguments.every(
+              (argument) => !argument.startsWith(sourceDirectory),
+            ),
+          ),
+        ).toBe(true);
+      } finally {
+        await rm(fixtureRoot, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("issue #64 rejects a special cache entry without privileged ingestion", async () => {
+    const fixtureRoot = await mkdtemp(join(tmpdir(), "chromium-pack-"));
     try {
+      const sourceDirectory = join(fixtureRoot, "mutable-cache");
+      const specialEntry = join(sourceDirectory, "chrome_sandbox");
+      await mkdir(sourceDirectory);
       await writeFile(join(sourceDirectory, "chrome"), "chrome");
-      await writeFile(
-        join(sourceDirectory, "chrome_sandbox"),
-        "attacker-controlled sandbox payload",
-      );
-      await chmod(join(sourceDirectory, "chrome_sandbox"), 0o4755);
-      const executor = createProductionPrivilegedExecutor({
-        executeFile: async (file, arguments_) => {
-          commands.push({ file, arguments: arguments_ });
-        },
-      });
-      const paths = browserInstallationPaths(installationId, target.hostId);
-      const fallback = fallbackBrowserPaths(paths.hostStoragePath);
-      await executor.execute({
-        kind: "configure-protected-storage",
-        path: paths.hostStoragePath,
-        owner: BROWSER_USER,
-        mode: 0o700,
-        installationId,
-        hostId: target.hostId,
-        confirmation: "Configure protected Browser storage",
-        fallback: {
-          sourcePath: join(sourceDirectory, "chrome"),
-          ...fallback,
-        },
-      });
-      expect(commands).toEqual(
-        expect.arrayContaining([
-          {
-            file: "/usr/bin/cp",
-            arguments: [
-              "-a",
-              "--no-preserve=mode,ownership",
-              join(sourceDirectory, "."),
-              fallback.directory,
-            ],
-          },
-          {
-            file: "/usr/bin/chown",
-            arguments: [
-              "-R",
-              `${BROWSER_USER}:${BROWSER_USER}`,
-              fallback.directory,
-            ],
-          },
-          {
-            file: "/usr/bin/chmod",
-            arguments: ["0700", fallback.directory],
-          },
-          {
-            file: "/usr/bin/chmod",
-            arguments: ["0755", fallback.executablePath],
-          },
-        ]),
-      );
-      expect(
-        commands.some(
-          (command) =>
-            command.file === "/usr/bin/install" &&
-            command.arguments.includes("4755"),
+      await runSystemCommand("/usr/bin/mkfifo", [specialEntry]);
+      const commands: RecordedCommand[] = [];
+      const executor = realTempFallbackExecutor(commands);
+
+      await expect(
+        executor.execute(
+          fallbackOperation(fixtureRoot, join(sourceDirectory, "chrome")),
         ),
-      ).toBe(false);
-      expect(
-        commands.some(
-          (command) =>
-            command.file === "/usr/bin/install" &&
-            command.arguments.includes(join(sourceDirectory, "chrome_sandbox")),
-        ),
-      ).toBe(false);
+      ).rejects.toThrow("regular file");
+      expect(commands.some(({ file }) => file === "/usr/bin/cp")).toBe(false);
     } finally {
-      await rm(sourceDirectory, { recursive: true, force: true });
+      await rm(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("copies a regular fallback pack with safe destination modes", async () => {
+    const fixtureRoot = await mkdtemp(join(tmpdir(), "chromium-pack-"));
+    try {
+      const sourceDirectory = join(fixtureRoot, "mutable-cache");
+      const sourceExecutable = join(sourceDirectory, "chrome");
+      const sourceSandbox = join(sourceDirectory, "chrome_sandbox");
+      await mkdir(sourceDirectory);
+      await writeFile(sourceExecutable, "chrome");
+      await writeFile(sourceSandbox, "sandbox");
+      await writeFile(join(sourceDirectory, "icudtl.dat"), "icu");
+      await chmod(sourceExecutable, 0o755);
+      await chmod(sourceSandbox, 0o4755);
+      const commands: RecordedCommand[] = [];
+      const executor = realTempFallbackExecutor(commands);
+      const operation = fallbackOperation(fixtureRoot, sourceExecutable);
+
+      await executor.execute(operation);
+
+      expect(await readFile(operation.fallback.executablePath, "utf8")).toBe(
+        "chrome",
+      );
+      expect(
+        (await stat(operation.fallback.executablePath)).mode & 0o7777,
+      ).toBe(0o755);
+      expect((await stat(sourceSandbox)).mode & 0o7777).toBe(0o4755);
+      expect(
+        (await stat(join(operation.fallback.directory, "chrome_sandbox")))
+          .mode & 0o7777,
+      ).toBe(0o600);
+      expect(
+        commands
+          .filter(({ file }) => file === "/usr/bin/cp")
+          .every(({ arguments: commandArguments }) =>
+            commandArguments.every(
+              (argument) => !argument.startsWith(sourceDirectory),
+            ),
+          ),
+      ).toBe(true);
+    } finally {
+      await rm(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("does not follow a stale protected fallback link while refreshing the pack", async () => {
+    const fixtureRoot = await mkdtemp(join(tmpdir(), "chromium-pack-"));
+    try {
+      const sourceDirectory = join(fixtureRoot, "mutable-cache");
+      const externalTarget = join(fixtureRoot, "outside-target");
+      const operation = fallbackOperation(
+        fixtureRoot,
+        join(sourceDirectory, "chrome"),
+      );
+      await mkdir(sourceDirectory);
+      await writeFile(join(sourceDirectory, "chrome"), "chrome");
+      await mkdir(operation.fallback.directory, { recursive: true });
+      await writeFile(externalTarget, "outside");
+      await chmod(externalTarget, 0o600);
+      await symlink(externalTarget, operation.fallback.executablePath);
+      const executor = realTempFallbackExecutor([]);
+
+      await executor.execute(operation);
+
+      expect(await readFile(externalTarget, "utf8")).toBe("outside");
+      expect((await stat(externalTarget)).mode & 0o7777).toBe(0o600);
+      expect(
+        (await stat(operation.fallback.executablePath)).mode & 0o7777,
+      ).toBe(0o755);
+    } finally {
+      await rm(fixtureRoot, { recursive: true, force: true });
     }
   });
 

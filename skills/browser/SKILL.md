@@ -124,12 +124,18 @@ Settings. CLI grant-administration names fail closed with Settings guidance
 because shell access, a TTY, or a confirmation flag does not authenticate an
 owner. A grant change applies to the next call and never resumes a denied one.
 
-Origin Scope is enforced outside the QuickJS sandbox by a host-owned navigation
-guard. It blocks denied top-level pages, popups, redirects, and frames before
-commit and removes denied pages. The guard registers contexts emitted after its
-initial browser snapshot as well. Exact `about:blank` is the only safe internal
-page exception; other non-web document navigations fail closed. A `blob:` page
-uses its embedded HTTP(S) origin when the browser exposes one. An
+Origin Scope is enforced outside the QuickJS sandbox by layered host controls.
+The host route matches HTTP(S) grants before commit. During an Origin Scope
+agent call, the pinned Playwright connection adapter rejects direct non-web
+`Frame.goto` before forwarding its `goto` command; it allows exact
+`about:blank`, HTTP(S), and HTTP(S)-backed `blob:` only for the host to classify
+and match. Renderer-initiated location changes, redirects, popups, and frames
+use the CDP guard and fail closed by removing denied pages. Pinned Chromium may
+report a precommit event for a raw direct `data:` loader that cannot be canceled;
+the public result is still a typed denial and the denied page is cleaned up.
+The guard registers contexts emitted after its initial browser snapshot as
+well. Exact `about:blank` is the only safe internal page exception. A `blob:`
+page uses its embedded HTTP(S) origin when the browser exposes one. An
 invalid-certificate elevation applies only to its explicitly approved origin.
 
 The host also hardens the pinned Playwright object graph before agent code runs:

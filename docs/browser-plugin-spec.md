@@ -69,12 +69,16 @@ The plugin must not claim universal login compatibility. Safe Login Mode improve
 - Agents are denied by default. A persistent Profile Grant authorizes one BB project to use one profile at explicit web origins; unrestricted origins require a separate owner opt-in.
 - Origin Scopes use exact `scheme://host:port` origins and optional explicit subdomain patterns. URL paths do not narrow a grant, each localhost port is separate, and `*` is a distinct whole-web permission.
 - Profile Grants confer full automation within their Origin Scope because arbitrary Playwright scripts cannot be reliably classified as read-only. File transfer remains a separate grant flag.
-- Disallowed HTTP(S) and embedded-origin `blob:` top-level navigation,
-  redirects, popups, and frame documents are blocked before commit and fail the
-  operation. Exact `about:blank` is the only safe internal exception; other
-  non-web document navigation fails closed. Cross-origin subresources may
-  render normally, while agents cannot target a cross-origin frame without a
-  matching grant.
+- Disallowed HTTP(S) and embedded-origin `blob:` requests are aborted before
+  commit by the host route. Direct agent non-web `Frame.goto` is rejected before
+  its Playwright navigation command reaches Chromium; renderer-initiated
+  location changes, redirects, popups, and frame documents use the CDP guard and
+  fail closed by removing denied pages. Exact `about:blank` is the only safe
+  internal exception; other non-web document navigation fails closed. Pinned
+  Chromium may expose a non-cancellable precommit event for a raw direct
+  `data:` loader, so the guarantee is typed denial plus cleanup on that path.
+  Cross-origin subresources may render normally, while agents cannot target a
+  cross-origin frame without a matching grant.
 - A denied web origin produces a typed `origin_denied` result and a non-blocking Grant Request containing the exact project, profile, origin, and requested elevated flags. Non-web navigation produces the typed denial with no origin or Grant Request. The owner may permit the next matching retry, one hour, or persistent access; the default is one retry, and the failed script never resumes automatically.
 - Grant Requests expire after 15 minutes. A one-retry authorization expires after five minutes or use; whole-web, file-transfer, and invalid-certificate access defaults to one hour and requires a second confirmation to persist.
 - Grants bind to the exact BB project identifier and cover its providers, threads, environments, and worktrees. They do not follow copied projects; deleting a project or revoking a grant interrupts active agent work without closing the owner's page.

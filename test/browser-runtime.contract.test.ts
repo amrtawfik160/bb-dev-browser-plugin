@@ -25,6 +25,7 @@ import { fallbackBrowserPaths } from "../browser-fallback.js";
 import { PINNED_BROWSER_RUNTIME } from "../dependency-inventory.js";
 import { profileStoragePaths } from "../profile-storage.js";
 import { BROWSER_SCRIPT_RESULT_LIMIT_BYTES } from "../contracts.js";
+import { NON_WEB_NAVIGATION_DENIED_MESSAGE } from "../agent-script.js";
 
 function launchFixture(
   options: {
@@ -1291,6 +1292,7 @@ describe("Browser Instance runtime Origin Scope enforcement", () => {
       const unenforced = fixture.processFixture.executions[0]!;
       expect(unenforced.originPolicy).toBeUndefined();
       expect(unenforced.code).toContain("return page.url()");
+      expect(unenforced.code).toContain("__bbEnforceNonWebNavigation = false");
 
       await fixture.runtime.execute(
         fixture.target,
@@ -1310,6 +1312,7 @@ describe("Browser Instance runtime Origin Scope enforcement", () => {
         timeoutMs: 5_000,
       });
       expect(enforced.code).not.toContain("__bbOriginPermitted");
+      expect(enforced.code).toContain("__bbEnforceNonWebNavigation = true");
       expect(enforced.code).toContain("return page.url()");
     } finally {
       await fixture.dispose();
@@ -1403,6 +1406,28 @@ describe("Browser Instance runtime Origin Scope enforcement", () => {
     } finally {
       await runtime.dispose();
       await rm(rootDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("turns the direct non-web navigation boundary marker into a typed denial", async () => {
+    const fixture = await runtimeFixture();
+    fixture.processFixture.boundary.execute = async () => {
+      throw new Error(NON_WEB_NAVIGATION_DENIED_MESSAGE);
+    };
+    try {
+      await fixture.runtime.start(fixture.target);
+      await expect(
+        fixture.runtime.execute(
+          fixture.target,
+          "await page.goto(data)",
+          5_000,
+          {
+            originScope: "https://app.example.test",
+          },
+        ),
+      ).rejects.toEqual(new BrowserOriginScopeDeniedError(null));
+    } finally {
+      await fixture.dispose();
     }
   });
 

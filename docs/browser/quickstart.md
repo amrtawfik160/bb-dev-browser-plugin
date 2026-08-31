@@ -106,9 +106,12 @@ managed in authenticated Browser Settings, not from a thread.
   threads, environments, and worktrees. It does **not** follow copied projects.
   Deleting a project or revoking a grant interrupts active agent work without
   closing your page.
-- Disallowed web and non-web top-level navigation, redirects, and popups are
-  blocked before commit and fail the operation. Exact `about:blank` is the only
-  safe internal exception; cross-origin subresources may render normally.
+- Disallowed HTTP(S) navigation is aborted before commit by the host route.
+  Direct agent non-web `Frame.goto` is rejected before its Playwright command
+  reaches Chromium; renderer-initiated navigation, redirects, popups, and
+  frames fail closed through the CDP guard. Exact `about:blank` is the only
+  safe internal exception; HTTP(S)-backed `blob:` uses its embedded origin, and
+  cross-origin subresources may render normally.
 
 ### Grant Requests (after a denial)
 
