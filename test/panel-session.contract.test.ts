@@ -1,17 +1,24 @@
 import { describe, expect, it } from "vitest";
 import { PANEL_RECLAIM_WINDOW_MS } from "../contracts.js";
+import { createControlLeaseManager } from "../control-lease.js";
 import { createPanelSessionRegistry } from "../panel-session.js";
 
 const HOST_ID = "host-session";
 const PROFILE_A = "profile-a";
 const PROFILE_B = "profile-b";
 
-function setup(options?: { reclaimWindowMs?: number }) {
+function setup(options?: {
+  reclaimWindowMs?: number;
+  controlLeases?: ReturnType<typeof createControlLeaseManager>;
+}) {
   let now = 0;
   const clock = { now: () => now };
   const sessions = createPanelSessionRegistry({
     clock,
     reclaimWindowMs: options?.reclaimWindowMs ?? PANEL_RECLAIM_WINDOW_MS,
+    ...(options?.controlLeases === undefined
+      ? {}
+      : { controlLeases: options.controlLeases }),
   });
   return {
     sessions,
@@ -167,5 +174,139 @@ describe("shared Panel session per Browser Profile", () => {
     expect(
       sessions.sessionFor({ hostId: HOST_ID, profileId: PROFILE_A }),
     ).not.toBe(session);
+  });
+
+  it("makes the first joined panel the controller and a later panel view-only", () => {
+    const { sessions } = setup();
+    const session = sessions.sessionFor({
+      hostId: HOST_ID,
+      profileId: PROFILE_A,
+    });
+    session.joinPanel("panel-1", "owner-session-1");
+    session.joinPanel("panel-2", "owner-session-2");
+
+    expect(session.role("panel-1")).toBe("controller");
+    expect(session.role("panel-2")).toBe("spectator");
+    expect(session.canInput("panel-1")).toBe(true);
+    expect(session.canInput("panel-2")).toBe(false);
+    expect(session.state().controllerPanelId).toBe("panel-1");
+    sessions.dispose();
+  });
+
+  it("broadcasts the same ordered Control Lease transition to every panel", async () => {
+    const { sessions } = setup();
+    const session = sessions.sessionFor({
+      hostId: HOST_ID,
+      profileId: PROFILE_A,
+    });
+    const seen: Array<string | null> = [];
+    session.subscribe((state) => seen.push(state.controllerPanelId));
+    session.joinPanel("panel-1", "owner-session-1");
+    session.joinPanel("panel-2", "owner-session-2");
+    await session.takeControl("panel-2");
+    session.releaseControl("panel-2");
+    await session.takeControl("panel-1");
+    session.disconnectPanel("panel-1");
+    session.connectPanel("panel-1", "owner-session-1");
+    session.reclaimControl("panel-1");
+
+    expect(seen).toEqual([
+      "panel-1",
+      "panel-1",
+      "panel-2",
+      null,
+      "panel-1",
+      null,
+      null,
+      "panel-1",
+    ]);
+    expect(session.state().controllerPanelId).toBe("panel-1");
+    expect(session.canInput("panel-1")).toBe(true);
+    expect(session.canInput("panel-2")).toBe(false);
+    sessions.dispose();
+  });
+
+  it("freezes input on controller disconnect and lets only the same panel reclaim within ten seconds", async () => {
+    const { sessions, advanceTime } = setup();
+    const session = sessions.sessionFor({
+      hostId: HOST_ID,
+      profileId: PROFILE_A,
+    });
+    session.joinPanel("panel-1", "owner-session-1");
+    session.joinPanel("panel-2", "owner-session-2");
+    session.disconnectPanel("panel-1");
+
+    expect(session.canInput("panel-1")).toBe(false);
+    expect(session.state().controllerPanelId).toBeNull();
+    await expect(session.takeControl("panel-2")).resolves.toBe(false);
+
+    session.connectPanel("panel-1", "owner-session-1");
+    expect(session.role("panel-1")).toBe("spectator");
+    expect(session.reclaimControl("panel-1")).toBe(true);
+    expect(session.canInput("panel-1")).toBe(true);
+
+    session.disconnectPanel("panel-1");
+    session.connectPanel("panel-1", "owner-session-1");
+    advanceTime(PANEL_RECLAIM_WINDOW_MS + 1);
+    expect(session.reclaimControl("panel-1")).toBe(false);
+    await session.takeControl("panel-2");
+    expect(session.state().controllerPanelId).toBe("panel-2");
+    sessions.dispose();
+  });
+
+  it("lets only the controller resize the shared viewport and clamps it to the streaming ceiling", () => {
+    const { sessions } = setup();
+    const session = sessions.sessionFor({
+      hostId: HOST_ID,
+      profileId: PROFILE_A,
+    });
+    session.connectPanel("panel-1", "owner-session-1", {
+      width: 1280,
+      height: 720,
+    });
+    session.connectPanel("panel-2", "owner-session-2", {
+      width: 800,
+      height: 600,
+    });
+
+    expect(session.state().controllerViewport).toEqual({
+      width: 1280,
+      height: 720,
+    });
+    session.setViewport("panel-2", { width: 400, height: 300 });
+    expect(session.state().controllerViewport).toEqual({
+      width: 1280,
+      height: 720,
+    });
+    session.setViewport("panel-1", { width: 5000, height: 4000 });
+    expect(session.state().controllerViewport).toEqual({
+      width: 1920,
+      height: 1080,
+    });
+    sessions.dispose();
+  });
+
+  it("shows agent-held control and owner interruption on the shared session state", async () => {
+    const controlLeases = createControlLeaseManager();
+    const { sessions } = setup({ controlLeases });
+    const session = sessions.sessionFor({
+      hostId: HOST_ID,
+      profileId: PROFILE_A,
+    });
+    session.connectPanel("panel-1", "owner-session-1");
+    const lease = await controlLeases.acquireAgent(
+      `${HOST_ID}\0${PROFILE_A}`,
+      "Inspect the fixture",
+    );
+    lease.signal.addEventListener("abort", () => lease.release(), {
+      once: true,
+    });
+
+    expect(session.state().agentPurpose).toBe("Inspect the fixture");
+    await session.takeControl("panel-1");
+    expect(lease.signal.aborted).toBe(true);
+    expect(session.state().agentPurpose).toBeNull();
+    controlLeases.dispose();
+    sessions.dispose();
   });
 });

@@ -6,6 +6,9 @@ import {
   DEFAULT_PROFILE_ID,
   PANEL_AUTH_ROTATION_MS,
   PANEL_CAPABILITY_TTL_MS,
+  PANEL_MAX_VIEWPORT_HEIGHT,
+  PANEL_MAX_VIEWPORT_WIDTH,
+  PANEL_RECLAIM_WINDOW_MS,
   PANEL_RECONNECT_INITIAL_BACKOFF_MS,
 } from "../contracts.js";
 import { waitForSettled } from "./wait.js";
@@ -935,6 +938,184 @@ describe("public Browser Panel lifecycle seam", () => {
       }
       expect(reissued.capabilityId).not.toBe(issued.capabilityId);
       expect(reissued.secret).not.toBe(issued.secret);
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("lets two panels observe one controller and the same ordered Control Lease transitions", async () => {
+    const browser = await createPublicPanelLifecycleHarness();
+    try {
+      const [first, second] = await browser.openTwoPanels();
+      await waitFor(() => {
+        expect(browser.latestControl(first)?.controllerPanelId).toBe(
+          first.panelId,
+        );
+        expect(browser.latestControl(second)?.controllerPanelId).toBe(
+          first.panelId,
+        );
+      });
+      expect(browser.latestControl(first)?.agentPurpose).toBeNull();
+      expect(browser.latestControl(second)?.agentPurpose).toBeNull();
+
+      await browser.takeControl(second);
+      await waitFor(() => {
+        expect(browser.latestControl(first)?.controllerPanelId).toBe(
+          second.panelId,
+        );
+        expect(browser.latestControl(second)?.controllerPanelId).toBe(
+          second.panelId,
+        );
+      });
+
+      await browser.releaseControl(second);
+      await waitFor(() => {
+        expect(browser.latestControl(first)?.controllerPanelId).toBeNull();
+        expect(browser.latestControl(second)?.controllerPanelId).toBeNull();
+      });
+
+      await browser.takeControl(first);
+      await waitFor(() => {
+        expect(browser.latestControl(first)?.controllerPanelId).toBe(
+          first.panelId,
+        );
+        expect(browser.latestControl(second)?.controllerPanelId).toBe(
+          first.panelId,
+        );
+      });
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("freezes a disconnected controller immediately and lets only that panel reclaim within ten seconds", async () => {
+    const browser = await createPublicPanelLifecycleHarness();
+    try {
+      const [first, second] = await browser.openTwoPanels();
+      await waitFor(() => {
+        expect(browser.latestControl(second)?.controllerPanelId).toBe(
+          first.panelId,
+        );
+      });
+      browser.sendAuthorizedInput(first, { kind: "click", generation: 1 });
+      await waitFor(() => {
+        expect(browser.receivedInputs).toEqual([
+          { kind: "click", generation: 1 },
+        ]);
+      });
+
+      await browser.forcePhysicalSocketLoss(first);
+      await waitFor(() => {
+        expect(
+          browser
+            .latestSessionPanels(second)
+            .find((panel) => panel.panelId === first.panelId),
+        ).toMatchObject({ connection: "disconnected", role: "spectator" });
+        expect(browser.latestControl(second)?.controllerPanelId).toBeNull();
+      });
+      await expect(browser.takeControl(second)).resolves.toMatchObject({
+        role: "spectator",
+        control: expect.objectContaining({ controllerPanelId: null }),
+      });
+
+      await browser.advanceTime(PANEL_RECONNECT_INITIAL_BACKOFF_MS);
+      await first.findByText("The page is live.");
+      await waitFor(() => {
+        expect(
+          browser
+            .latestSessionPanels(second)
+            .find((panel) => panel.panelId === first.panelId),
+        ).toMatchObject({ connection: "connected", role: "spectator" });
+      });
+
+      const reclaimed = await browser.reclaimControl(first);
+      expect(reclaimed.role).toBe("controller");
+      await waitFor(() => {
+        expect(browser.latestControl(first)?.controllerPanelId).toBe(
+          first.panelId,
+        );
+        expect(browser.latestControl(second)?.controllerPanelId).toBe(
+          first.panelId,
+        );
+      });
+      browser.sendLiveInput(first, { kind: "click", generation: 2 });
+      await waitFor(() => {
+        expect(browser.receivedInputs).toContainEqual({
+          kind: "click",
+          generation: 2,
+        });
+      });
+
+      await browser.forcePhysicalSocketLoss(first);
+      await waitFor(() => {
+        expect(browser.latestControl(second)?.controllerPanelId).toBeNull();
+      });
+      await browser.advanceTime(PANEL_RECLAIM_WINDOW_MS + 1);
+      const takeover = await browser.takeControl(second);
+      expect(takeover.role).toBe("controller");
+      await browser.advanceTime(PANEL_RECONNECT_INITIAL_BACKOFF_MS);
+      await first.findByText("The page is live.");
+      const expired = await browser.reclaimControl(first);
+      expect(expired.role).toBe("spectator");
+      await waitFor(() => {
+        expect(browser.latestControl(first)?.controllerPanelId).toBe(
+          second.panelId,
+        );
+        expect(browser.latestControl(second)?.controllerPanelId).toBe(
+          second.panelId,
+        );
+      });
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("keeps the controller viewport shared and clamped while spectators only letterbox", async () => {
+    const browser = await createPublicPanelLifecycleHarness();
+    try {
+      const [first, second] = await browser.openTwoPanels();
+      await waitFor(() => {
+        expect(browser.latestControl(second)?.controllerPanelId).toBe(
+          first.panelId,
+        );
+      });
+
+      await browser.reportViewport(first, { width: 1280, height: 720 });
+      await waitFor(() => {
+        expect(browser.latestControl(first)?.controllerViewport).toEqual({
+          width: 1280,
+          height: 720,
+        });
+        expect(browser.latestControl(second)?.controllerViewport).toEqual({
+          width: 1280,
+          height: 720,
+        });
+      });
+
+      await browser.reportViewport(second, { width: 400, height: 300 });
+      await waitForSettled(() => {
+        const firstViewport = browser.latestControl(first)?.controllerViewport;
+        const secondViewport =
+          browser.latestControl(second)?.controllerViewport;
+        return (
+          firstViewport?.width === 1280 &&
+          firstViewport.height === 720 &&
+          secondViewport?.width === 1280 &&
+          secondViewport.height === 720
+        );
+      });
+
+      await browser.reportViewport(first, { width: 5000, height: 4000 });
+      await waitFor(() => {
+        expect(browser.latestControl(first)?.controllerViewport).toEqual({
+          width: PANEL_MAX_VIEWPORT_WIDTH,
+          height: PANEL_MAX_VIEWPORT_HEIGHT,
+        });
+        expect(browser.latestControl(second)?.controllerViewport).toEqual({
+          width: PANEL_MAX_VIEWPORT_WIDTH,
+          height: PANEL_MAX_VIEWPORT_HEIGHT,
+        });
+      });
     } finally {
       await browser.dispose();
     }

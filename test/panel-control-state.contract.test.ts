@@ -6,6 +6,7 @@ import {
   type PanelControlState,
 } from "../panel-control-state.js";
 import { createControlLeaseManager } from "../control-lease.js";
+import { createPanelSession } from "../panel-session.js";
 
 function setup(options?: { reclaimWindowMs?: number }) {
   const clock = { now: () => 0 };
@@ -294,6 +295,25 @@ describe("Panel Control State", () => {
       const controllers = state.panels.filter((p) => p.role === "controller");
       expect(controllers.length).toBeLessThanOrEqual(1);
     }
+    session.dispose();
+  });
+
+  it("delegates Control Lease coordination to the shared Panel session", async () => {
+    const clock = { now: () => 0 };
+    const controlLeases = createControlLeaseManager();
+    const session = createPanelSession({ clock, controlLeases });
+    const adapter = createPanelControlState({
+      clock,
+      controlLeases,
+      session,
+    });
+
+    expect(adapter.connectPanel("panel-1", "session-1")).toBe("controller");
+    expect(session.state().controllerPanelId).toBe("panel-1");
+    adapter.connectPanel("panel-2", "session-2");
+    await adapter.takeControl("panel-2");
+    expect(session.role("panel-1")).toBe("spectator");
+    expect(session.state().controllerPanelId).toBe("panel-2");
     session.dispose();
   });
 });
