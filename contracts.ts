@@ -1710,7 +1710,24 @@ export type BrowserTabActionRequest = z.infer<
   typeof browserTabActionRequestSchema
 >;
 
-export const browserPanelVisibilityRequestSchema = z
+export const panelIdentityRejectionReasonSchema = z.enum([
+  "project-mismatch",
+  "thread-mismatch",
+  "owner-session-mismatch",
+  "panel-mismatch",
+  "host-mismatch",
+  "profile-mismatch",
+]);
+
+export const panelIdentityRejectionSchema = z
+  .object({
+    outcome: z.literal("rejected"),
+    reason: panelIdentityRejectionReasonSchema,
+    message: z.string().min(1),
+  })
+  .strict();
+
+export const browserHostPanelVisibilityRequestSchema = z
   .object({
     hostId: z.string().min(1),
     profileId: z.string().min(1),
@@ -1719,6 +1736,14 @@ export const browserPanelVisibilityRequestSchema = z
   })
   .strict();
 
+export const browserPanelVisibilityRequestSchema =
+  browserHostPanelVisibilityRequestSchema.extend({
+    ownerSessionId: z.string().min(1),
+  });
+
+export type BrowserHostPanelVisibilityRequest = z.infer<
+  typeof browserHostPanelVisibilityRequestSchema
+>;
 export type BrowserPanelVisibilityRequest = z.infer<
   typeof browserPanelVisibilityRequestSchema
 >;
@@ -1787,6 +1812,7 @@ export const browserPanelCapabilityResponseSchema = z.discriminatedUnion(
         message: z.string().min(1),
       })
       .strict(),
+    panelIdentityRejectionSchema,
   ],
 );
 
@@ -1831,22 +1857,78 @@ export const browserPanelTransportRequestSchema = z
   })
   .strict();
 
-export const browserPanelTransportResponseSchema = z
+export const browserPanelTransportResponseSchema = z.discriminatedUnion(
+  "outcome",
+  [
+    z
+      .object({
+        outcome: z.literal("opened"),
+        gatewayPort: z.number().int().positive().max(65535),
+        bindHost: z.string().min(1),
+        capabilityId: z.string().min(1),
+        secret: z.string().min(1),
+        expiresAt: z.string().datetime(),
+        rotatesAt: z.string().datetime(),
+      })
+      .strict(),
+    z
+      .object({
+        outcome: z.literal("unavailable"),
+        reason: z.enum([
+          "setup-required",
+          "host-offline",
+          "bb-connect-required",
+        ]),
+        message: z.string().min(1),
+      })
+      .strict(),
+    panelIdentityRejectionSchema,
+  ],
+);
+
+export const browserPanelReleaseRequestSchema = z
   .object({
-    gatewayPort: z.number().int().positive().max(65535),
-    bindHost: z.string().min(1),
-    capabilityId: z.string().min(1),
-    secret: z.string().min(1),
-    expiresAt: z.string().datetime(),
-    rotatesAt: z.string().datetime(),
+    hostId: z.string().min(1),
+    profileId: z.string().min(1),
+    panelId: z.string().min(1),
+    ownerSessionId: z.string().min(1),
   })
   .strict();
+
+export const browserPanelReleaseHostRequestSchema = z
+  .object({
+    hostId: z.string().min(1),
+    profileId: z.string().min(1),
+    panelId: z.string().min(1),
+  })
+  .strict();
+
+export const browserPanelReleaseHostResponseSchema = z
+  .object({ outcome: z.literal("released") })
+  .strict();
+
+export const browserPanelReleaseResponseSchema = z.discriminatedUnion(
+  "outcome",
+  [browserPanelReleaseHostResponseSchema, panelIdentityRejectionSchema],
+);
 
 export type BrowserPanelTransportRequest = z.infer<
   typeof browserPanelTransportRequestSchema
 >;
 export type BrowserPanelTransportResponse = z.infer<
   typeof browserPanelTransportResponseSchema
+>;
+export type BrowserPanelReleaseRequest = z.infer<
+  typeof browserPanelReleaseRequestSchema
+>;
+export type BrowserPanelReleaseHostRequest = z.infer<
+  typeof browserPanelReleaseHostRequestSchema
+>;
+export type BrowserPanelReleaseResponse = z.infer<
+  typeof browserPanelReleaseResponseSchema
+>;
+export type PanelIdentityRejection = z.infer<
+  typeof panelIdentityRejectionSchema
 >;
 
 /**
@@ -2973,6 +3055,10 @@ export const rpcContract = defineRpcContract({
   browser_panel_capability: {
     input: browserPanelCapabilityRequestSchema,
     output: browserPanelCapabilityResponseSchema,
+  },
+  browser_panel_release: {
+    input: browserPanelReleaseRequestSchema,
+    output: browserPanelReleaseResponseSchema,
   },
   browser_tabs: {
     input: browserTabsRequestSchema,

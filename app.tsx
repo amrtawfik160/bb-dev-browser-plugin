@@ -369,7 +369,7 @@ function PanelStreamSurface({
       })
       .then((response) => {
         if (disposed) return;
-        if (response.outcome === "unavailable") {
+        if (response.outcome !== "issued") {
           setStreamState("offline");
           setStreamError(response.message);
           return;
@@ -391,6 +391,15 @@ function PanelStreamSurface({
       });
     return () => {
       disposed = true;
+      if (status.hostId === null) return;
+      void rpc
+        .call("browser_panel_release", {
+          hostId: status.hostId,
+          profileId: status.profileId,
+          panelId,
+          ownerSessionId,
+        })
+        .catch(() => undefined);
     };
   }, [
     rpc,
@@ -1047,6 +1056,7 @@ function usePanelControlSession({
 
 function BrowserPanel({ request }: { request: BrowserStatusInput }) {
   const rpc = useRpc<typeof rpcContract>();
+  const ownerSessionId = ownerSessionIdFromContext(useBbContext());
   const [status, setStatus] = useState<BrowserStatus | null>(null);
   const [selectedHostId, setSelectedHostId] = useState(request.hostId);
   const [hostChoices, setHostChoices] = useState<BrowserHostChoice[]>([]);
@@ -1194,7 +1204,12 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
     if (hostId === null || browserStateReplacesPage(status.state)) {
       return;
     }
-    const target = { hostId, profileId: status.profileId, panelId };
+    const target = {
+      hostId,
+      profileId: status.profileId,
+      panelId,
+      ownerSessionId,
+    };
     let mounted = true;
     void rpc
       .call("browser_panel_visibility", { ...target, visibility: "visible" })
@@ -1215,7 +1230,14 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
           console.warn("Browser Panel visibility release failed.", error);
         });
     };
-  }, [panelId, rpc, status?.hostId, status?.profileId, status?.state]);
+  }, [
+    panelId,
+    rpc,
+    ownerSessionId,
+    status?.hostId,
+    status?.profileId,
+    status?.state,
+  ]);
 
   // The panel names the host it is browsing on — on the new-tab surface and in
   // the status detail — so the choices are read for a resolved host too, not
