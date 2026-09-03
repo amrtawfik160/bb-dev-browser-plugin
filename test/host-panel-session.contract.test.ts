@@ -6,7 +6,12 @@ import { describe, expect, it } from "vitest";
 import { WebSocket } from "ws";
 import { DEFAULT_PROFILE_ID, setupRequiredStatus } from "../contracts.js";
 import { createBrowserHostEntry } from "../host.js";
+import {
+  PANEL_PROTOCOL_VERSION,
+  encodePanelProtocolMessage,
+} from "../panel-protocol.js";
 import type { ScreencastSource } from "../panel-transport.js";
+import { waitFor, waitForSettled } from "./wait.js";
 
 const HOST_ID = "host-panel-session";
 
@@ -29,6 +34,10 @@ function healthyStatus() {
 }
 
 function idleFrameSource(): ScreencastSource {
+  return recordingFrameSource([]);
+}
+
+function recordingFrameSource(receivedInputs: unknown[]): ScreencastSource {
   return {
     async start(_onFrame, signal) {
       await new Promise<void>((resolve) => {
@@ -39,9 +48,97 @@ function idleFrameSource(): ScreencastSource {
         signal.addEventListener("abort", () => resolve(), { once: true });
       });
     },
-    input() {},
+    input(payload) {
+      receivedInputs.push(payload);
+    },
     async stop() {},
   };
+}
+
+type OpenedPanelTransport = {
+  outcome: "opened";
+  gatewayPort: number;
+  capabilityId: string;
+  secret: string;
+};
+
+function collectMessages(socket: WebSocket) {
+  const messages: string[] = [];
+  socket.on("message", (raw) => {
+    messages.push(raw.toString());
+  });
+  return {
+    messages,
+    waitFor: (predicate: (raw: string) => boolean, timeoutMs = 2_000) =>
+      waitFor(() => messages.find(predicate), { timeoutMs }),
+  };
+}
+
+function parsedMessage(raw: string) {
+  try {
+    return JSON.parse(raw) as { type?: string; category?: string };
+  } catch {
+    return undefined;
+  }
+}
+
+function latestSessionPanels(messages: readonly string[]) {
+  let latest: Array<{
+    panelId: string;
+    connection: "connected" | "disconnected";
+  }> = [];
+  for (const raw of messages) {
+    try {
+      const parsed = JSON.parse(raw) as {
+        type?: string;
+        control?: {
+          panels?: Array<{
+            panelId: string;
+            connection: "connected" | "disconnected";
+          }>;
+        };
+      };
+      if (parsed.type === "session" && parsed.control?.panels !== undefined) {
+        latest = parsed.control.panels;
+      }
+    } catch {
+      continue;
+    }
+  }
+  return latest;
+}
+
+function sendProtocol(
+  socket: WebSocket,
+  message: Parameters<typeof encodePanelProtocolMessage>[0],
+) {
+  const encoded = encodePanelProtocolMessage(message);
+  if (encoded.outcome !== "encoded") {
+    throw new Error("expected a protocol message to encode");
+  }
+  socket.send(encoded.raw);
+}
+
+async function connectAndRedeem(
+  opened: OpenedPanelTransport,
+  identities: { panelId: string; ownerSessionId: string },
+) {
+  const socket = new WebSocket(`ws://127.0.0.1:${opened.gatewayPort}`);
+  await new Promise<void>((resolve, reject) => {
+    socket.once("open", () => resolve());
+    socket.once("error", reject);
+  });
+  const inbox = collectMessages(socket);
+  sendProtocol(socket, {
+    protocolVersion: PANEL_PROTOCOL_VERSION,
+    type: "redeem",
+    capabilityId: opened.capabilityId,
+    secret: opened.secret,
+    ownerSessionId: identities.ownerSessionId,
+    panelId: identities.panelId,
+  });
+  await inbox.waitFor((raw) => parsedMessage(raw)?.type === "ready");
+  return { socket, inbox };
 }
 
 describe("host-owned Panel session", () => {
@@ -91,6 +188,134 @@ describe("host-owned Panel session", () => {
         socket.once("error", () => resolve());
       });
     } finally {
+      await host.experimental_dispose().catch(() => undefined);
+      await rm(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the newer redeemed generation connected and authoritative after the superseded transport stops", async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), "host-panel-handoff-"));
+    const receivedInputs: unknown[] = [];
+    const identities = {
+      panelId: "panel-session-handoff",
+      ownerSessionId: "owner-session-handoff",
+    };
+    const host = experimental_createHostEntryHarness(
+      createBrowserHostEntry(
+        {
+          inspect: healthyStatus,
+          diagnostics: () => {
+            throw new Error("not used");
+          },
+        },
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { frameSource: () => recordingFrameSource(receivedInputs) },
+      ),
+      {
+        experimental_paths: {
+          dataDir,
+          tempDir: join(dataDir, "tmp"),
+        },
+      },
+    );
+    let firstSocket: WebSocket | undefined;
+    let nextSocket: WebSocket | undefined;
+    try {
+      const firstOpened = await host.experimental_call("panelTransport", {
+        hostId: HOST_ID,
+        profileId: DEFAULT_PROFILE_ID,
+        ...identities,
+      });
+      expect(firstOpened).toMatchObject({ outcome: "opened" });
+      if (firstOpened.outcome !== "opened") return;
+      const first = await connectAndRedeem(firstOpened, identities);
+      firstSocket = first.socket;
+      sendProtocol(first.socket, {
+        protocolVersion: PANEL_PROTOCOL_VERSION,
+        type: "input",
+        sequence: 1,
+        payload: { kind: "click", generation: 1 },
+      });
+      await waitFor(() =>
+        receivedInputs.some(
+          (input) =>
+            input !== null &&
+            typeof input === "object" &&
+            "generation" in input &&
+            input.generation === 1,
+        ),
+      );
+
+      const replacement = await host.experimental_call("panelTransport", {
+        hostId: HOST_ID,
+        profileId: DEFAULT_PROFILE_ID,
+        ...identities,
+      });
+      expect(replacement).toMatchObject({ outcome: "opened" });
+      if (replacement.outcome !== "opened") return;
+      const next = await connectAndRedeem(replacement, identities);
+      nextSocket = next.socket;
+      try {
+        sendProtocol(first.socket, {
+          protocolVersion: PANEL_PROTOCOL_VERSION,
+          type: "input",
+          sequence: 2,
+          payload: { kind: "click", generation: "stale" },
+        });
+      } catch {
+        // The superseded generation may already have closed.
+      }
+      await waitFor(() => first.socket.readyState === WebSocket.CLOSED, {
+        timeoutMs: 4_000,
+      });
+      await waitForSettled(() => {
+        const live = latestSessionPanels(next.inbox.messages).find(
+          (panel) => panel.panelId === identities.panelId,
+        );
+        return (
+          live?.connection === "connected" &&
+          !next.inbox.messages.some(
+            (raw) => parsedMessage(raw)?.type === "protocol_error",
+          )
+        );
+      });
+      sendProtocol(next.socket, {
+        protocolVersion: PANEL_PROTOCOL_VERSION,
+        type: "input",
+        sequence: 3,
+        payload: { kind: "click", generation: 2 },
+      });
+      await waitFor(() =>
+        receivedInputs.some(
+          (input) =>
+            input !== null &&
+            typeof input === "object" &&
+            "generation" in input &&
+            input.generation === 2,
+        ),
+      );
+      expect(receivedInputs).toEqual([
+        { kind: "click", generation: 1 },
+        { kind: "click", generation: 2 },
+      ]);
+      expect(
+        latestSessionPanels(next.inbox.messages).find(
+          (panel) => panel.panelId === identities.panelId,
+        ),
+      ).toMatchObject({ connection: "connected" });
+      expect(
+        next.inbox.messages.some(
+          (raw) => parsedMessage(raw)?.category === "stale-generation",
+        ),
+      ).toBe(false);
+    } finally {
+      firstSocket?.close();
+      nextSocket?.close();
       await host.experimental_dispose().catch(() => undefined);
       await rm(dataDir, { recursive: true, force: true });
     }

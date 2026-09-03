@@ -126,6 +126,25 @@ describe("public Browser Panel lifecycle seam", () => {
       } catch {
         // The superseded generation may already have closed.
       }
+      await waitFor(() => {
+        expect(browser.portHasOpenSocket(first.gatewayPort)).toBe(false);
+      });
+      expect(browser.latestIssuedGeneration(first)).toBe(2);
+      await waitForSettled(() => {
+        const live = browser
+          .latestSessionPanels(first)
+          .find((panel) => panel.panelId === first.panelId);
+        return (
+          live?.connection === "connected" &&
+          !browser.receivedInputs.some(
+            (input) =>
+              input !== null &&
+              typeof input === "object" &&
+              "generation" in input &&
+              input.generation === "stale",
+          )
+        );
+      });
       browser.sendSocketInput(nextSocket, { kind: "click", generation: 2 });
       await waitFor(() => {
         expect(browser.receivedInputs).toContainEqual({
@@ -133,21 +152,14 @@ describe("public Browser Panel lifecycle seam", () => {
           generation: 2,
         });
       });
-      await waitForSettled(
-        () =>
-          !browser.receivedInputs.some(
-            (input) =>
-              input !== null &&
-              typeof input === "object" &&
-              "generation" in input &&
-              input.generation === "stale",
-          ),
-      );
       await waitFor(() => {
         const members = browser.latestSessionPanels(second);
         expect(
           members.filter((panel) => panel.panelId === first.panelId),
         ).toHaveLength(1);
+        expect(
+          members.find((panel) => panel.panelId === first.panelId),
+        ).toMatchObject({ connection: "connected" });
         expect(members.map((panel) => panel.panelId).sort()).toEqual(
           [first.panelId, second.panelId].sort(),
         );
@@ -204,10 +216,10 @@ describe("public Browser Panel lifecycle seam", () => {
 
   it("disposes every session generation and loopback listener on host-worker shutdown", async () => {
     const browser = await createPublicPanelLifecycleHarness();
-    let ports: number[] = [];
+    const ports: number[] = [];
     try {
       const [first, second] = await browser.openTwoPanels();
-      ports = [first.gatewayPort, second.gatewayPort];
+      ports.push(first.gatewayPort, second.gatewayPort);
     } finally {
       await browser.dispose();
     }

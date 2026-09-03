@@ -231,6 +231,18 @@ export async function createPublicPanelLifecycleHarness() {
     };
   };
 
+  function issuedGatewayPorts(panelId: string) {
+    return browser.panelCapabilityExchanges.flatMap((exchange) => {
+      if (
+        exchange.request.panelId !== panelId ||
+        exchange.response.outcome !== "issued"
+      ) {
+        return [];
+      }
+      return [exchange.response.gatewayPort];
+    });
+  }
+
   function parsedMessages(port: number) {
     return portMessages(port).flatMap((raw) => {
       try {
@@ -242,29 +254,28 @@ export async function createPublicPanelLifecycleHarness() {
   }
 
   function latestSessionPanels(panel: LifecyclePanel) {
-    const ports = new Set(
-      browser.panelCapabilityExchanges.flatMap((exchange) => {
-        if (
-          exchange.request.panelId !== panel.panelId ||
-          exchange.response.outcome !== "issued"
-        ) {
-          return [];
-        }
-        return [exchange.response.gatewayPort];
-      }),
-    );
+    const ports = issuedGatewayPorts(panel.panelId);
+    const latestPort = ports.at(-1);
+    if (latestPort === undefined) return [];
     let latest: NonNullable<ParsedPanelMessage["control"]>["panels"] = [];
-    for (const port of ports) {
-      for (const message of parsedMessages(port)) {
-        if (
-          message.type === "session" &&
-          message.control?.panels !== undefined
-        ) {
-          latest = message.control.panels;
-        }
+    for (const message of parsedMessages(latestPort)) {
+      if (message.type === "session" && message.control?.panels !== undefined) {
+        latest = message.control.panels;
       }
     }
     return latest ?? [];
+  }
+
+  function latestIssuedGeneration(panel: LifecyclePanel) {
+    return issuedGatewayPorts(panel.panelId).length;
+  }
+
+  function portHasOpenSocket(port: number) {
+    return [...sockets].some(
+      (socket) =>
+        socketPort(socket) === String(port) &&
+        socket.readyState === NodeWebSocket.OPEN,
+    );
   }
 
   function attachLifecycle(
@@ -553,6 +564,8 @@ export async function createPublicPanelLifecycleHarness() {
     sendAuthorizedInput,
     sendSocketInput,
     latestSessionPanels,
+    latestIssuedGeneration,
+    portHasOpenSocket,
     redeemIssuedCapability,
     forcePhysicalSocketLoss,
     advanceTime,

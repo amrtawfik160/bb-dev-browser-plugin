@@ -1471,6 +1471,10 @@ export function createBrowserHostEntry(
         );
       },
       onDisconnect: () => {
+        // A superseded generation's stop is not an abrupt panel disconnect.
+        if (!session.acceptsGeneration(request.panelId, joined.generation)) {
+          return;
+        }
         session.disconnectPanel(request.panelId);
         control.disconnectPanel(request.panelId);
       },
