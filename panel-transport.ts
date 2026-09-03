@@ -8,12 +8,21 @@ import type {
 } from "./clipboard-exchange.js";
 import {
   PANEL_GATEWAY_BIND_HOST,
+  PANEL_PROTOCOL_VERSION,
   PANEL_RECLAIM_WINDOW_MS,
   type BrowserDialogEvent,
   type BrowserContextAction,
   type BrowserPanelControlState,
   type BrowserTabStrip,
 } from "./contracts.js";
+import {
+  decodePanelProtocolMessage,
+  encodePanelProtocolMessage,
+  panelProtocolErrorMessage,
+  toBrowserPanelRedeemMessage,
+  type PanelProtocolError,
+  type PanelProtocolMessage,
+} from "./panel-protocol.js";
 
 /**
  * Automation Mode stream transport. The host binds a dynamic loopback gateway
@@ -216,6 +225,42 @@ export function createPanelTransportServer(
     socket.send(JSON.stringify(message));
   }
 
+  function sendProtocol(socket: WebSocket, message: PanelProtocolMessage) {
+    if (socket.readyState !== socket.OPEN) return;
+    const encoded = encodePanelProtocolMessage(message, {
+      maxBytes: gateway.messageMaxBytes,
+    });
+    if (encoded.outcome !== "encoded") return;
+    socket.send(encoded.raw);
+  }
+
+  function rejectProtocol(error: PanelProtocolError) {
+    stream.freezeInput();
+    if (connection !== undefined && connection.readyState === connection.OPEN) {
+      sendProtocol(connection, panelProtocolErrorMessage(error.category));
+      connection.close();
+    }
+  }
+
+  function gatewayRawForProtocol(
+    message: PanelProtocolMessage,
+  ): string | undefined {
+    if (message.type === "redeem") {
+      return JSON.stringify(toBrowserPanelRedeemMessage(message));
+    }
+    if (message.type === "input") {
+      return JSON.stringify({
+        type: "input",
+        sequence: message.sequence,
+        payload: message.payload,
+      });
+    }
+    if (message.type === "ack") {
+      return JSON.stringify({ type: "ack", sequence: message.sequence });
+    }
+    return undefined;
+  }
+
   function closeConnection(reason: string) {
     if (connection !== undefined && connection.readyState === connection.OPEN) {
       sendJson(connection, { type: "error", reason });
@@ -293,7 +338,8 @@ export function createPanelTransportServer(
   function startStreaming(socket: WebSocket) {
     authorized = true;
     stream.start();
-    sendJson(socket, {
+    sendProtocol(socket, {
+      protocolVersion: PANEL_PROTOCOL_VERSION,
       type: "ready",
       viewport: stream.viewport,
       fps: stream.fps,
@@ -344,7 +390,8 @@ export function createPanelTransportServer(
     const result = gateway.validate(envelope);
     if (result.outcome !== "accepted") return;
     if (result.message.kind !== "frame") return;
-    sendJson(socket, {
+    sendProtocol(socket, {
+      protocolVersion: PANEL_PROTOCOL_VERSION,
       type: "frame",
       sequence: frame.sequence,
       mimeType: frame.mimeType,
@@ -356,7 +403,24 @@ export function createPanelTransportServer(
     const socket = connection;
     if (socket === undefined) return;
     const text = typeof raw === "string" ? raw : String(raw);
-    const result = gateway.validate(text);
+    const decoded = decodePanelProtocolMessage(text, {
+      direction: "client-to-host",
+      phase: authorized ? "authenticated" : "pre-redemption",
+      maxBytes: gateway.messageMaxBytes,
+    });
+    if (decoded.outcome === "rejected") {
+      rejectProtocol(decoded.error);
+      return;
+    }
+    const gatewayRaw =
+      decoded.outcome === "legacy"
+        ? text
+        : gatewayRawForProtocol(decoded.message);
+    if (gatewayRaw === undefined) {
+      rejectProtocol(panelProtocolErrorMessage("invalid-direction"));
+      return;
+    }
+    const result = gateway.validate(gatewayRaw);
     if (result.outcome !== "accepted") {
       closeConnection(result.reason);
       return;
@@ -553,7 +617,12 @@ export function createPanelTransportServer(
     tabs: BrowserTabStrip,
   ) {
     if (disposed || connection === undefined || !authorized) return;
-    sendJson(connection, { type: "control", control, tabs });
+    sendProtocol(connection, {
+      protocolVersion: PANEL_PROTOCOL_VERSION,
+      type: "session",
+      control,
+      tabs,
+    });
   }
 
   function dismissOpenDialogs() {

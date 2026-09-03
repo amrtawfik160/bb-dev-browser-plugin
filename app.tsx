@@ -69,6 +69,11 @@ import {
 } from "./panel-browser.js";
 import { ownerSessionIdFromContext } from "./panel-owner-session.js";
 import {
+  PANEL_PROTOCOL_VERSION,
+  decodePanelProtocolMessage,
+  encodePanelProtocolMessage,
+} from "./panel-protocol.js";
+import {
   clearPanelTimeout,
   isTestLoopbackPanelTransport,
   schedulePanelTimeout,
@@ -467,109 +472,106 @@ function PanelStreamSurface({
       socket.binaryType = "arraybuffer";
       socket.addEventListener("open", () => {
         if (disposed || socket === null) return;
-        socket.send(
-          JSON.stringify({
-            type: "redeem",
-            capabilityId: issued.capabilityId,
-            secret: issued.secret,
-            ownerSessionId,
-            panelId,
-          }),
-        );
+        const encoded = encodePanelProtocolMessage({
+          protocolVersion: PANEL_PROTOCOL_VERSION,
+          type: "redeem",
+          capabilityId: issued.capabilityId,
+          secret: issued.secret,
+          ownerSessionId,
+          panelId,
+        });
+        if (encoded.outcome === "encoded") socket.send(encoded.raw);
       });
       socket.addEventListener("message", (event) => {
         if (disposed) return;
         if (typeof event.data !== "string") return;
-        let message: {
-          type?: string;
-          sequence?: number;
-          mimeType?: string;
-          data?: string;
-          dialog?: BrowserDialogEvent | null;
-          queryId?: string;
-          point?: { x: number; y: number };
-          actions?: BrowserContextAction[];
-        };
-        try {
-          message = JSON.parse(event.data);
-        } catch {
+        const decoded = decodePanelProtocolMessage(event.data, {
+          direction: "host-to-client",
+          phase: "authenticated",
+        });
+        if (decoded.outcome === "rejected") {
+          stream.freezeInput();
+          socket?.close();
           return;
         }
+        if (decoded.outcome === "legacy") {
+          const message = decoded.value as {
+            type?: string;
+            dialog?: BrowserDialogEvent | null;
+            queryId?: string;
+            point?: { x: number; y: number };
+            actions?: BrowserContextAction[];
+            update?: {
+              downloads?: BrowserDownloadListingEntry[];
+              limits?: BrowserDownloadLimits;
+            } | null;
+          };
+          if (message.type === "dialog") {
+            // A null dialog clears any open modal; a non-null dialog opens (or
+            // re-opens after a bounded reconnect) the actionable BB panel UI.
+            setDialog(message.dialog ?? null);
+            if (message.dialog === null) setContextMenu(null);
+            return;
+          }
+          if (message.type === "context_menu") {
+            if (message.queryId !== undefined && message.point !== undefined) {
+              setContextMenu({
+                queryId: message.queryId,
+                point: message.point,
+                actions: message.actions ?? [],
+              });
+            }
+            return;
+          }
+          if (message.type === "downloads_update") {
+            // The host pushed the live Host Downloads quarantine listing. Only
+            // metadata (id, safe name, size, state, limits, expiry, errors) is
+            // carried — never file contents or full URLs (issue #20).
+            const update = message.update ?? {};
+            if (Array.isArray(update.downloads)) {
+              setDownloads(update.downloads);
+            }
+            if (update.limits !== undefined) {
+              setDownloadsLimits(update.limits);
+            }
+          }
+          return;
+        }
+        const message = decoded.message;
         if (message.type === "ready") {
           if (stream.state === "reconnecting") stream.reconnectSucceeded();
           setStreamState("streaming");
           setLivePush(true);
           return;
         }
-        if (message.type === "dialog") {
-          // A null dialog clears any open modal; a non-null dialog opens (or
-          // re-opens after a bounded reconnect) the actionable BB panel UI.
-          setDialog(message.dialog ?? null);
-          if (message.dialog === null) setContextMenu(null);
-          return;
-        }
-        if (message.type === "context_menu") {
-          if (message.queryId !== undefined && message.point !== undefined) {
-            setContextMenu({
-              queryId: message.queryId,
-              point: message.point,
-              actions: message.actions ?? [],
-            });
-          }
-          return;
-        }
-        if (message.type === "downloads_update") {
-          // The host pushed the live Host Downloads quarantine listing. Only
-          // metadata (id, safe name, size, state, limits, expiry, errors) is
-          // carried — never file contents or full URLs (issue #20).
-          const payload = message as {
-            update?: {
-              downloads?: BrowserDownloadListingEntry[];
-              limits?: BrowserDownloadLimits;
-            } | null;
-          };
-          const update = payload.update ?? {};
-          if (Array.isArray(update.downloads)) {
-            setDownloads(update.downloads);
-          }
-          if (update.limits !== undefined) {
-            setDownloadsLimits(update.limits);
-          }
-          return;
-        }
-        if (message.type === "control") {
+        if (message.type === "session") {
           // The host pushed the live shared control state and tab strip; derive
           // this panel's own role from the panel list so the surface updates
           // without a re-fetch.
-          const payload = message as {
-            control?: BrowserPanelControlResponse["control"];
-            tabs?: BrowserPanelControlResponse["tabs"];
-          };
-          if (payload.control !== undefined && payload.tabs !== undefined) {
-            const own = payload.control.panels.find(
-              (panel) => panel.panelId === panelId,
-            );
-            onControlState?.({
-              role: own?.role ?? "spectator",
-              control: payload.control,
-              tabs: payload.tabs,
-            });
-            // The controller's viewport drives the capture size; spectators
-            // letterbox it. Size the canvas to that viewport so frames map 1:1
-            // and CSS scales/letterboxes for the panel.
-            const viewport = payload.control.controllerViewport;
-            if (viewport !== null) setControllerViewport(viewport);
-          }
+          const own = message.control.panels.find(
+            (panel) => panel.panelId === panelId,
+          );
+          onControlState?.({
+            role: own?.role ?? "spectator",
+            control: message.control,
+            tabs: message.tabs,
+          });
+          // The controller's viewport drives the capture size; spectators
+          // letterbox it. Size the canvas to that viewport so frames map 1:1
+          // and CSS scales/letterboxes for the panel.
+          const viewport = message.control.controllerViewport;
+          if (viewport !== null) setControllerViewport(viewport);
           return;
         }
-        if (message.type === "frame" && message.data !== undefined) {
+        if (message.type === "frame") {
           drawFrame({
-            mimeType: message.mimeType ?? "image/png",
+            mimeType: message.mimeType,
             data: message.data,
           });
           return;
         }
-        if (message.type === "error") {
+        if (message.type === "protocol_error") {
+          stream.freezeInput();
           socket?.close();
         }
       });

@@ -13,6 +13,11 @@ import { createPanelCapabilityStore } from "../panel-capability.js";
 import { createPanelGateway } from "../panel-gateway.js";
 import { createClipboardExchange } from "../clipboard-exchange.js";
 import {
+  PANEL_PROTOCOL_VERSION,
+  decodePanelProtocolMessage,
+  encodePanelProtocolMessage,
+} from "../panel-protocol.js";
+import {
   createAutomationStreamAdapter,
   frameIntervalMs,
 } from "../panel-stream.js";
@@ -393,14 +398,16 @@ describe("Panel transport server contract", () => {
         { tabs: [], activeTabId: null },
       );
       const raw = await onceMessage(socket);
-      const message = decode<{
-        type: string;
-        control: { controllerPanelId: string };
-        tabs: { tabs: unknown[]; activeTabId: null };
-      }>(raw);
-      expect(message.type).toBe("control");
-      expect(message.control.controllerPanelId).toBe("panel-other");
-      expect(message.tabs.activeTabId).toBeNull();
+      const decoded = decodePanelProtocolMessage(raw, {
+        direction: "host-to-client",
+        phase: "authenticated",
+      });
+      expect(decoded.outcome).toBe("accepted");
+      if (decoded.outcome !== "accepted") return;
+      expect(decoded.message.type).toBe("session");
+      if (decoded.message.type !== "session") return;
+      expect(decoded.message.control.controllerPanelId).toBe("panel-other");
+      expect(decoded.message.tabs.activeTabId).toBeNull();
       socket.close();
     } finally {
       await transport.stop();
@@ -641,4 +648,231 @@ describe("Panel transport server contract", () => {
       await transport.stop();
     }
   });
+
+  it("encodes ready, frame, and shared-session updates through the versioned protocol and accepts versioned input", async () => {
+    const clock = { now: () => 1_000_000 };
+    const capabilities = createPanelCapabilityStore({ clock });
+    const gateway = createPanelGateway({
+      capabilities,
+      hostId,
+      profileId,
+      clock,
+    });
+    const stream = createAutomationStreamAdapter({ clock, capabilities });
+    const source = createFakeScreencastSource({ frameCount: 1 });
+    const transport = createPanelTransportServer({
+      gateway,
+      stream,
+      source,
+      clock,
+    });
+    const port = await transport.start();
+    try {
+      const socket = await connect(port);
+      const issued = capabilities.issue({
+        ownerSessionId,
+        panelId,
+        hostId,
+        profileId,
+      });
+      const inbox = collectMessages(socket);
+      const encodedRedeem = encodePanelProtocolMessage({
+        protocolVersion: PANEL_PROTOCOL_VERSION,
+        type: "redeem",
+        capabilityId: issued.capabilityId,
+        secret: issued.secret,
+        ownerSessionId,
+        panelId,
+      });
+      expect(encodedRedeem.outcome).toBe("encoded");
+      if (encodedRedeem.outcome !== "encoded") return;
+      socket.send(encodedRedeem.raw);
+      const readyRaw = await inbox.waitFor((raw) => {
+        const decoded = decodePanelProtocolMessage(raw, {
+          direction: "host-to-client",
+          phase: "authenticated",
+        });
+        return (
+          decoded.outcome === "accepted" && decoded.message.type === "ready"
+        );
+      });
+      expect(JSON.parse(readyRaw).protocolVersion).toBe(PANEL_PROTOCOL_VERSION);
+      const frameRaw = await inbox.waitFor((raw) => {
+        const decoded = decodePanelProtocolMessage(raw, {
+          direction: "host-to-client",
+          phase: "authenticated",
+        });
+        return (
+          decoded.outcome === "accepted" && decoded.message.type === "frame"
+        );
+      });
+      expect(JSON.parse(frameRaw).protocolVersion).toBe(PANEL_PROTOCOL_VERSION);
+      const encodedInput = encodePanelProtocolMessage({
+        protocolVersion: PANEL_PROTOCOL_VERSION,
+        type: "input",
+        sequence: 1,
+        payload: { kind: "click" },
+      });
+      expect(encodedInput.outcome).toBe("encoded");
+      if (encodedInput.outcome !== "encoded") return;
+      socket.send(encodedInput.raw);
+      await waitFor(() =>
+        source.inputs.some(
+          (input) => (input as { kind?: string }).kind === "click",
+        ),
+      );
+      transport.broadcastControl(
+        {
+          controllerPanelId: panelId,
+          controllerViewport: { width: 1280, height: 720 },
+          agentPurpose: null,
+          panels: [
+            {
+              panelId,
+              ownerSessionId,
+              role: "controller",
+              connection: "connected",
+              viewport: { width: 1280, height: 720 },
+              reclaimUntil: null,
+            },
+          ],
+        },
+        { tabs: [], activeTabId: null },
+      );
+      const sessionRaw = await inbox.waitFor((raw) => {
+        const decoded = decodePanelProtocolMessage(raw, {
+          direction: "host-to-client",
+          phase: "authenticated",
+        });
+        return (
+          decoded.outcome === "accepted" && decoded.message.type === "session"
+        );
+      });
+      expect(JSON.parse(sessionRaw).type).toBe("session");
+      expect(JSON.parse(sessionRaw).protocolVersion).toBe(
+        PANEL_PROTOCOL_VERSION,
+      );
+      socket.close();
+    } finally {
+      await transport.stop();
+    }
+  });
+
+  it.each([
+    {
+      name: "malformed JSON",
+      redeemFirst: true,
+      raw: `{"type":"input","secret":"capability-secret-must-never-leak"`,
+      category: "malformed",
+    },
+    {
+      name: "unknown discriminators",
+      redeemFirst: true,
+      raw: JSON.stringify({
+        protocolVersion: PANEL_PROTOCOL_VERSION,
+        type: "frobnicate",
+        secret: "capability-secret-must-never-leak",
+        payload: { kind: "click", text: "typed-owner-input" },
+      }),
+      category: "unknown-type",
+    },
+    {
+      name: "incompatible protocol versions",
+      redeemFirst: true,
+      raw: JSON.stringify({
+        protocolVersion: 2,
+        type: "input",
+        sequence: 1,
+        payload: { kind: "click", text: "typed-owner-input" },
+      }),
+      category: "incompatible-version",
+    },
+    {
+      name: "pre-redemption input",
+      redeemFirst: false,
+      raw: JSON.stringify({
+        protocolVersion: PANEL_PROTOCOL_VERSION,
+        type: "input",
+        sequence: 1,
+        payload: { kind: "click", text: "typed-owner-input" },
+      }),
+      category: "invalid-phase",
+    },
+    {
+      name: "invalid input shape",
+      redeemFirst: true,
+      raw: JSON.stringify({
+        protocolVersion: PANEL_PROTOCOL_VERSION,
+        type: "input",
+        payload: { kind: "click", text: "typed-owner-input" },
+      }),
+      category: "invalid-shape",
+    },
+  ])(
+    "fails closed on $name without forwarding input or leaking payload bytes",
+    async ({ redeemFirst, raw, category }) => {
+      const clock = { now: () => 1_000_000 };
+      const capabilities = createPanelCapabilityStore({ clock });
+      const gateway = createPanelGateway({
+        capabilities,
+        hostId,
+        profileId,
+        clock,
+      });
+      const stream = createAutomationStreamAdapter({ clock, capabilities });
+      const source = createFakeScreencastSource({ frameCount: 0 });
+      const transport = createPanelTransportServer({
+        gateway,
+        stream,
+        source,
+        clock,
+      });
+      const port = await transport.start();
+      try {
+        const socket = await connect(port);
+        const issued = capabilities.issue({
+          ownerSessionId,
+          panelId,
+          hostId,
+          profileId,
+        });
+        const inbox = collectMessages(socket);
+        if (redeemFirst) {
+          send(socket, redeemMessage(issued));
+          await inbox.waitFor(
+            (message) => decode<{ type: string }>(message).type === "ready",
+          );
+        }
+        socket.send(raw);
+        const errorRaw = await inbox.waitFor((message) => {
+          const decoded = decodePanelProtocolMessage(message, {
+            direction: "host-to-client",
+            phase: redeemFirst ? "authenticated" : "pre-redemption",
+          });
+          return (
+            decoded.outcome === "accepted" &&
+            decoded.message.type === "protocol_error"
+          );
+        });
+        const decoded = decodePanelProtocolMessage(errorRaw, {
+          direction: "host-to-client",
+          phase: redeemFirst ? "authenticated" : "pre-redemption",
+        });
+        expect(decoded.outcome).toBe("accepted");
+        if (decoded.outcome !== "accepted") return;
+        expect(decoded.message.type).toBe("protocol_error");
+        if (decoded.message.type !== "protocol_error") return;
+        expect(decoded.message.category).toBe(category);
+        expect(decoded.message.message).not.toContain(
+          "capability-secret-must-never-leak",
+        );
+        expect(decoded.message.message).not.toContain("typed-owner-input");
+        expect(source.inputs).toEqual([]);
+        expect(stream.state).toBe("input-frozen");
+        socket.close();
+      } finally {
+        await transport.stop();
+      }
+    },
+  );
 });

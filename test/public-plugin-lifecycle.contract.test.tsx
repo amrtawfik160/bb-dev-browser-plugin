@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+import { waitFor } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import {
   DEFAULT_PROFILE_ID,
@@ -38,6 +39,22 @@ describe("public Browser Panel lifecycle seam", () => {
       await second.findByRole("img", { name: "Browser page view" });
       expect(first.framesReceived).toBeGreaterThan(0);
       expect(second.framesReceived).toBeGreaterThan(0);
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("accepts authorized input after a valid initial connection reaches a first frame", async () => {
+    const browser = await createPublicPanelLifecycleHarness();
+    try {
+      const [first] = await browser.openTwoPanels();
+      await first.findByRole("img", { name: "Browser page view" });
+      expect(first.framesReceived).toBeGreaterThan(0);
+
+      browser.sendAuthorizedInput(first, { kind: "click" });
+      await waitFor(() => {
+        expect(browser.receivedInputs).toEqual([{ kind: "click" }]);
+      });
     } finally {
       await browser.dispose();
     }
