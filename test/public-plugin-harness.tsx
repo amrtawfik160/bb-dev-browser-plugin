@@ -70,6 +70,7 @@ import {
   type BrowserPanelTabActionInput,
   type BrowserPanelCapabilityResponse,
   type BrowserPanelReleaseResponse,
+  type BrowserPanelVisibilityResponse,
   type BrowserPanelControlResponse,
   type BrowserNavigationRequest,
   type BrowserHistoryRequest,
@@ -1029,7 +1030,7 @@ export async function createPublicPluginHarness(options?: {
       backend.harness.behavior.callRpc(
         "browser_panel_visibility",
         input,
-      ) as Promise<BrowserStatus>,
+      ) as Promise<BrowserPanelVisibilityResponse>,
     browser_panel_capability: async (input: {
       hostId: string;
       profileId: string;

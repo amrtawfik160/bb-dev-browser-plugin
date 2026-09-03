@@ -6,14 +6,14 @@ import {
   browserPanelReleaseResponseSchema,
   browserPanelTransportRequestSchema,
   browserPanelTransportResponseSchema,
-  browserStatusSchema,
+  browserPanelVisibilityResponseSchema,
   type BrowserPanelCapabilityRequest,
   type BrowserPanelCapabilityResponse,
   type BrowserPanelReleaseRequest,
   type BrowserPanelReleaseResponse,
   type BrowserPanelTransportResponse,
   type BrowserPanelVisibilityRequest,
-  type BrowserStatus,
+  type BrowserPanelVisibilityResponse,
   type PanelIdentityRejection,
 } from "./contracts.js";
 import {
@@ -213,12 +213,15 @@ export function createPanelLifecycleDispatch(
   async function setVisibility(
     request: BrowserPanelVisibilityRequest,
     signal?: AbortSignal,
-  ): Promise<BrowserStatus> {
+  ): Promise<BrowserPanelVisibilityResponse> {
     const identity = await resolveTrustedHost(bb, request);
+    if (identity.outcome === "rejected") {
+      return browserPanelVisibilityResponseSchema.parse(identity);
+    }
     if (identity.outcome !== "resolved") {
       throw new Error(identity.message);
     }
-    return browserStatusSchema.parse(
+    return browserPanelVisibilityResponseSchema.parse(
       await host.call(
         "panelVisibility",
         browserHostPanelVisibilityRequestSchema.parse({

@@ -1741,11 +1741,19 @@ export const browserPanelVisibilityRequestSchema =
     ownerSessionId: z.string().min(1),
   });
 
+export const browserPanelVisibilityResponseSchema = z.union([
+  browserStatusSchema,
+  panelIdentityRejectionSchema,
+]);
+
 export type BrowserHostPanelVisibilityRequest = z.infer<
   typeof browserHostPanelVisibilityRequestSchema
 >;
 export type BrowserPanelVisibilityRequest = z.infer<
   typeof browserPanelVisibilityRequestSchema
+>;
+export type BrowserPanelVisibilityResponse = z.infer<
+  typeof browserPanelVisibilityResponseSchema
 >;
 
 /**
@@ -3050,7 +3058,7 @@ export const rpcContract = defineRpcContract({
   },
   browser_panel_visibility: {
     input: browserPanelVisibilityRequestSchema,
-    output: browserStatusSchema,
+    output: browserPanelVisibilityResponseSchema,
   },
   browser_panel_capability: {
     input: browserPanelCapabilityRequestSchema,

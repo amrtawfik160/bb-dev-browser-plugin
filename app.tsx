@@ -34,6 +34,8 @@ import {
   type BrowserGrantRequest,
   type BrowserPanelCapabilityResponse,
   type BrowserPanelControlResponse,
+  type BrowserPanelVisibilityResponse,
+  type PanelIdentityRejection,
   type BrowserProfile,
   type BrowserProfileGrant,
   type BrowserProfileInventory,
@@ -1213,8 +1215,13 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
     let mounted = true;
     void rpc
       .call("browser_panel_visibility", { ...target, visibility: "visible" })
-      .then((nextStatus) => {
-        if (mounted) setStatus(nextStatus);
+      .then((visibilityResponse) => {
+        if (!mounted) return;
+        if (isPanelIdentityRejection(visibilityResponse)) {
+          setProfileError(visibilityResponse.message);
+          return;
+        }
+        setStatus(visibilityResponse);
       })
       .catch((error: unknown) => {
         if (mounted) setProfileError(administrationErrorMessage(error));
@@ -1656,6 +1663,12 @@ function omniboxAddress(
     lastNavigation.tabId !== null &&
     lastNavigation.tabId !== activeTab.tabId;
   return belongsToAnotherTab ? "" : lastNavigation.url;
+}
+
+function isPanelIdentityRejection(
+  value: BrowserPanelVisibilityResponse,
+): value is PanelIdentityRejection {
+  return "outcome" in value && value.outcome === "rejected";
 }
 
 function administrationErrorMessage(error: unknown) {

@@ -277,6 +277,59 @@ describe("public Browser Panel lifecycle seam", () => {
     }
   });
 
+  it.each([
+    {
+      reason: "host-mismatch" as const,
+      override: { hostId: "host-does-not-exist" },
+    },
+    {
+      reason: "owner-session-mismatch" as const,
+      override: { ownerSessionId: "owner-session-does-not-match" },
+    },
+    {
+      reason: "thread-mismatch" as const,
+      override: {
+        ownerSessionId: ownerSessionIdFromContext({
+          projectId: null,
+          threadId: "thread-does-not-exist",
+        }),
+      },
+    },
+  ])(
+    "returns a typed $reason identity rejection for visibility matching capability and release",
+    async ({ reason, override }) => {
+      const browser = await createPublicPanelLifecycleHarness();
+      try {
+        const request = {
+          hostId: browser.hostId,
+          profileId: DEFAULT_PROFILE_ID,
+          panelId: `panel-visibility-${reason}`,
+          ownerSessionId: browser.ownerSessionId,
+          ...override,
+        };
+        const expected = { outcome: "rejected" as const, reason };
+        const before = browser.hostRpcCalls.length;
+
+        const capability = await browser.issuePanelCapability(request);
+        expect(capability).toMatchObject(expected);
+
+        const released = await browser.releasePanel(request);
+        expect(released).toMatchObject(expected);
+
+        const visibility = await browser.setPanelVisibility({
+          ...request,
+          visibility: "hidden",
+        });
+        expect(visibility).toMatchObject(expected);
+        expect(
+          lifecycleHostCommands(browser.hostRpcCalls.slice(before)),
+        ).toEqual([]);
+      } finally {
+        await browser.dispose();
+      }
+    },
+  );
+
   it("resolves a valid public-plugin request to one host and one typed host command", async () => {
     const browser = await createPublicPanelLifecycleHarness();
     try {

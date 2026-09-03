@@ -86,6 +86,7 @@ import {
   type BrowserPanelHistoryInput,
   type BrowserPanelTabActionInput,
   type BrowserPanelVisibilityRequest,
+  type BrowserPanelVisibilityResponse,
   type BrowserPanelCapabilityRequest,
   type BrowserPanelCapabilityResponse,
   type BrowserPanelReleaseRequest,
@@ -2477,7 +2478,7 @@ export function createBrowserService(
   async function panelVisibility(
     request: BrowserPanelVisibilityRequest,
     signal?: AbortSignal,
-  ) {
+  ): Promise<BrowserPanelVisibilityResponse> {
     return panelLifecycle.setVisibility(request, signal);
   }
 
