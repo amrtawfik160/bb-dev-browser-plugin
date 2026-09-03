@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useId,
   useRef,
   useState,
   type FormEvent,
@@ -185,13 +186,14 @@ function PanelProfilePicker({
   inventory: BrowserProfileInventory;
   onChange: (profileId: string) => void;
 }) {
+  const selectionId = useId();
   return (
     <div className="mt-5 text-left">
-      <label className="block text-sm" htmlFor="browser-profile-selection">
+      <label className="block text-sm" htmlFor={selectionId}>
         Browser Profile
       </label>
       <select
-        id="browser-profile-selection"
+        id={selectionId}
         aria-label="Browser Profile"
         className="mt-2 w-full rounded border px-3 py-2 text-sm"
         value={inventory.selectedProfileId}
@@ -1666,6 +1668,14 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
         <p role="alert" className="px-2 py-1 text-xs">
           {profileError}
         </p>
+      )}
+      {profiles === null || status.hostId === null ? null : (
+        // Issue #50 keeps profile selection out of the visible chrome. The
+        // picker stays in the tree so a reconnecting panel can still run the
+        // in-panel switch path and stop the abandoned profile's reconnect.
+        <div hidden>
+          <PanelProfilePicker inventory={profiles} onChange={selectProfile} />
+        </div>
       )}
       <div ref={pageSurfaceRef} className="relative min-h-0 flex-1">
         <PanelStreamSurface

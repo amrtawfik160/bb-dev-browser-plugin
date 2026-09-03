@@ -1,4 +1,4 @@
-import { act, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, waitFor, within } from "@testing-library/react";
 import type { RenderedSlot } from "@get-bb/plugin-sdk/testing/app";
 import { expect } from "vitest";
 import { WebSocket as NodeWebSocket } from "ws";
@@ -286,8 +286,13 @@ export async function createPublicPanelLifecycleHarness() {
     return latest ?? [];
   }
 
-  function latestIssuedGeneration(panel: LifecyclePanel) {
-    return issuedGatewayPorts(panel.panelId).length;
+  function latestIssuedGeneration(panel: LifecyclePanel, profileId?: string) {
+    return browser.panelCapabilityExchanges.filter(
+      (exchange) =>
+        exchange.request.panelId === panel.panelId &&
+        (profileId === undefined || exchange.request.profileId === profileId) &&
+        exchange.response.outcome === "issued",
+    ).length;
   }
 
   function portHasOpenSocket(port: number) {
@@ -480,11 +485,79 @@ export async function createPublicPanelLifecycleHarness() {
     });
   }
 
-  async function switchBrowserProfile(profileId: string) {
-    return browser.selectBrowserProfile({
-      hostId: HOST_ID,
-      profileId,
+  function panelRequestedProfile(
+    panel: LifecyclePanel,
+    method: string,
+    requestedProfileId: string,
+  ) {
+    return panel.inspection.rpcCalls.some(
+      (call: { method: string; input: unknown }) =>
+        call.method === method &&
+        (call.input as { profileId?: string }).profileId === requestedProfileId,
+    );
+  }
+
+  async function switchMountedPanelProfile(
+    panel: LifecyclePanel,
+    nextProfileId: string,
+  ) {
+    const picker = await within(panel.container).findByRole("combobox", {
+      name: "Browser Profile",
+      hidden: true,
     });
+    await waitFor(() => {
+      expect(
+        within(picker)
+          .getAllByRole("option", { hidden: true })
+          .some(
+            (option) => (option as HTMLOptionElement).value === nextProfileId,
+          ),
+      ).toBe(true);
+    });
+    await act(async () => {
+      fireEvent.change(picker, { target: { value: nextProfileId } });
+    });
+    await waitFor(() => {
+      expect(
+        panelRequestedProfile(panel, "browser_profile_select", nextProfileId),
+      ).toBe(true);
+    });
+    await waitFor(() => {
+      expect(
+        panelRequestedProfile(panel, "browser_status", nextProfileId),
+      ).toBe(true);
+    });
+    await waitFor(() => {
+      expect(
+        browser.panelCapabilityRequests.some(
+          (request) =>
+            request.panelId === panel.panelId &&
+            request.profileId === nextProfileId,
+        ),
+      ).toBe(true);
+    });
+    return browser.runBrowserProfiles(HOST_ID, {
+      projectId: PROJECT_ID,
+      threadId: THREAD_ID,
+    });
+  }
+
+  async function switchBrowserProfile(
+    panelOrProfileId: LifecyclePanel | string,
+    profileId?: string,
+  ) {
+    if (typeof panelOrProfileId === "string") {
+      return browser.selectBrowserProfile({
+        hostId: HOST_ID,
+        profileId: panelOrProfileId,
+      });
+    }
+    if (profileId === undefined) {
+      throw new Error(
+        "A mounted panel switch requires the target Browser Profile id.",
+      );
+    }
+    return switchMountedPanelProfile(panelOrProfileId, profileId);
   }
 
   async function issuePanelCapability(input: {

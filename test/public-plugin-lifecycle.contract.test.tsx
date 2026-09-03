@@ -383,6 +383,10 @@ describe("public Browser Panel lifecycle seam", () => {
   it("does not start another reconnect after a closed or switched panel", async () => {
     const browser = await createPublicPanelLifecycleHarness();
     try {
+      const created = await browser.createBrowserProfile({
+        hostId: browser.hostId,
+        name: "Reconnect switch target",
+      });
       const [first, second] = await browser.openTwoPanels();
       await first.findByText("The page is live.");
       await browser.forcePhysicalSocketLoss(first);
@@ -398,17 +402,38 @@ describe("public Browser Panel lifecycle seam", () => {
 
       await browser.forcePhysicalSocketLoss(second);
       await second.findByText("Reconnecting to the browser…");
-      const created = await browser.createBrowserProfile({
-        hostId: browser.hostId,
-        name: "Reconnect switch target",
-      });
-      const issuedBeforeSwitch = browser.latestIssuedGeneration(second);
-      const switched = await browser.switchBrowserProfile(created.profileId);
+      const abandonedProfileId = second.profileId;
+      const issuedBeforeSwitch = browser.latestIssuedGeneration(
+        second,
+        abandonedProfileId,
+      );
+      const switched = await browser.switchBrowserProfile(
+        second,
+        created.profileId,
+      );
       expect(switched.selectedProfileId).toBe(created.profileId);
-      await browser.closePanel(second);
+      expect(second.container.innerHTML).not.toBe("");
+      expect(
+        second.inspection.rpcCalls.some(
+          (call: { method: string; input: unknown }) =>
+            call.method === "browser_profile_select" &&
+            (call.input as { profileId?: string }).profileId ===
+              created.profileId,
+        ),
+      ).toBe(true);
+      expect(
+        second.inspection.rpcCalls.some(
+          (call: { method: string; input: unknown }) =>
+            call.method === "browser_status" &&
+            (call.input as { profileId?: string }).profileId ===
+              created.profileId,
+        ),
+      ).toBe(true);
       await browser.advanceTime(PANEL_RECONNECT_INITIAL_BACKOFF_MS);
       await browser.advanceTime(PANEL_RECONNECT_INITIAL_BACKOFF_MS);
-      expect(browser.latestIssuedGeneration(second)).toBe(issuedBeforeSwitch);
+      expect(browser.latestIssuedGeneration(second, abandonedProfileId)).toBe(
+        issuedBeforeSwitch,
+      );
     } finally {
       await browser.dispose();
     }
