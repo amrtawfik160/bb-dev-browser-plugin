@@ -128,6 +128,17 @@ export type PanelTransportServerOptions = {
    */
   onDisconnect?: () => void;
   /**
+   * Whether this physical connection is the panel's authoritative generation.
+   * Older generations stay open only until the newer one is ready, then their
+   * messages fail closed.
+   */
+  acceptsGeneration?: () => boolean;
+  /**
+   * Called after a fresh Panel Capability is redeemed and the generation is
+   * ready, so the shared Panel session can make it authoritative atomically.
+   */
+  onAuthorized?: () => void;
+  /**
    * Explicit clipboard exchange (issue #19). When provided, `clipboard_copy`
    * and `clipboard_paste` messages dispatch to it so clipboard text moves only
    * through an explicit owner action. The exchange is the authoritative
@@ -192,6 +203,8 @@ export function createPanelTransportServer(
   const requestedPort = options.port ?? 0;
   const frameDeadlineMs = options.frameDeadlineMs ?? DEFAULT_FRAME_DEADLINE_MS;
   const canInput = options.canInput ?? (() => true);
+  const acceptsGeneration = options.acceptsGeneration ?? (() => true);
+  const onAuthorized = options.onAuthorized;
   const onDisconnect = options.onDisconnect;
   const clipboardExchange = options.clipboardExchange;
   const onTransferCancel = options.onTransferCancel;
@@ -393,6 +406,7 @@ export function createPanelTransportServer(
 
   function startStreaming(socket: WebSocket) {
     authorized = true;
+    onAuthorized?.();
     stream.start();
     sendProtocol(socket, {
       protocolVersion: PANEL_PROTOCOL_VERSION,
@@ -481,6 +495,10 @@ export function createPanelTransportServer(
     const message = result.message;
     if (message.kind === "redeem") {
       if (!authorized) startStreaming(socket);
+      return;
+    }
+    if (!acceptsGeneration()) {
+      rejectProtocol(panelProtocolErrorMessage("stale-generation"));
       return;
     }
     if (message.kind === "input") {

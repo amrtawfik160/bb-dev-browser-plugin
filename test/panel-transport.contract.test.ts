@@ -313,6 +313,67 @@ describe("Panel transport server contract", () => {
     }
   });
 
+  it("rejects input after the connection generation is superseded", async () => {
+    const clock = { now: () => 1_000_000 };
+    const capabilities = createPanelCapabilityStore({ clock });
+    const gateway = createPanelGateway({
+      capabilities,
+      hostId,
+      profileId,
+      clock,
+    });
+    const stream = createAutomationStreamAdapter({ clock, capabilities });
+    const source = createFakeScreencastSource({ frameCount: 0 });
+    let authoritative = true;
+    const transport = createPanelTransportServer({
+      gateway,
+      stream,
+      source,
+      clock,
+      acceptsGeneration: () => authoritative,
+    });
+    const port = await transport.start();
+    try {
+      const socket = await connect(port);
+      const issued = capabilities.issue({
+        ownerSessionId,
+        panelId,
+        hostId,
+        profileId,
+      });
+      const inbox = collectMessages(socket);
+      send(socket, redeemMessage(issued));
+      await inbox.waitFor(
+        (raw) => decode<{ type: string }>(raw).type === "ready",
+      );
+      send(socket, { type: "input", sequence: 1, payload: { kind: "click" } });
+      await waitFor(() => source.inputs.length === 1);
+      authoritative = false;
+      send(socket, {
+        type: "input",
+        sequence: 2,
+        payload: { kind: "click", stale: true },
+      });
+      const errorRaw = await inbox.waitFor(
+        (raw) => decode<{ type: string }>(raw).type === "protocol_error",
+      );
+      const decoded = decodePanelProtocolMessage(errorRaw, {
+        direction: "host-to-client",
+        phase: "authenticated",
+      });
+      expect(decoded.outcome).toBe("accepted");
+      if (decoded.outcome !== "accepted") return;
+      expect(decoded.message).toMatchObject({
+        type: "protocol_error",
+        category: "stale-generation",
+      });
+      await waitForSettled(() => source.inputs.length === 1);
+      expect(source.inputs).toEqual([{ kind: "click" }]);
+    } finally {
+      await transport.stop();
+    }
+  });
+
   it("freezes input on disconnect and reclaims within the 10-second window", async () => {
     let now = 1_000_000;
     const clock = { now: () => now };

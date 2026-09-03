@@ -96,6 +96,7 @@ import {
   type ControlLeaseManager,
 } from "./control-lease.js";
 import { createPanelControlState } from "./panel-control-state.js";
+import { createPanelSessionRegistry } from "./panel-session.js";
 import { createBrowserTabStrip } from "./browser-tabs.js";
 import {
   assertBrowserScriptResultWithinBounds,
@@ -696,10 +697,52 @@ export function createBrowserHostEntry(
     capabilities: panelCapabilities,
     clock: panelClock,
   });
-  const panelTransports = new Map<
-    string,
-    ReturnType<typeof createPanelTransportServer>
-  >();
+  type BoundPanelTransport = ReturnType<typeof createPanelTransportServer> & {
+    generation: number;
+  };
+  const panelTransports = new Map<string, BoundPanelTransport[]>();
+  const panelSessions = createPanelSessionRegistry({ clock: panelClock });
+
+  function panelTransportKey(target: {
+    hostId: string;
+    profileId: string;
+    panelId: string;
+  }) {
+    return `${target.hostId}\u0000${target.profileId}\u0000${target.panelId}`;
+  }
+
+  function boundPanelTransports() {
+    return [...panelTransports.values()].flat();
+  }
+
+  async function stopBoundPanelTransports(
+    key: string,
+    generations?: readonly number[],
+  ) {
+    const bound = panelTransports.get(key) ?? [];
+    const stopping =
+      generations === undefined
+        ? bound
+        : bound.filter((entry) => generations.includes(entry.generation));
+    await Promise.all(
+      stopping.map((entry) => entry.stop().catch(() => undefined)),
+    );
+    const remaining = bound.filter((entry) => !stopping.includes(entry));
+    if (remaining.length === 0) panelTransports.delete(key);
+    else panelTransports.set(key, remaining);
+  }
+
+  async function stopObsoletePendingGenerations(
+    key: string,
+    keep: readonly number[],
+  ) {
+    const bound = panelTransports.get(key) ?? [];
+    const obsolete = bound
+      .map((entry) => entry.generation)
+      .filter((generation) => !keep.includes(generation));
+    if (obsolete.length === 0) return;
+    await stopBoundPanelTransports(key, obsolete);
+  }
   /**
    * Per-profile shared Control Lease coordination (ADR 0005/0007/0012) and
    * shared ordered Browser Tab strip. Every Browser Panel for one profile
@@ -768,8 +811,9 @@ export function createBrowserHostEntry(
     profileId: string;
   }) {
     const profilePrefix = `${target.hostId}\u0000${target.profileId}\u0000`;
-    for (const [key, transport] of panelTransports) {
-      if (key.startsWith(profilePrefix)) transport.dismissOpenDialogs();
+    for (const [key, transports] of panelTransports) {
+      if (!key.startsWith(profilePrefix)) continue;
+      for (const transport of transports) transport.dismissOpenDialogs();
     }
   }
 
@@ -893,7 +937,7 @@ export function createBrowserHostEntry(
     controlLeases.revokeAll();
     // Disposing the runtime ends every agent Control Lease: dismiss open
     // dialogs across every profile so none strand.
-    for (const transport of panelTransports.values())
+    for (const transport of boundPanelTransports())
       transport.dismissOpenDialogs();
     const current = retainedRuntime;
     retainedRuntime = undefined;
@@ -1380,8 +1424,20 @@ export function createBrowserHostEntry(
       source.setViewport?.(controllerViewport);
     };
     applyControllerViewport();
+    const session = panelSessions.sessionFor(controlTarget);
+    const joined = session.joinPanel(request.panelId, request.ownerSessionId);
     control.connectPanel(request.panelId, request.ownerSessionId);
     applyControllerViewport();
+    const transportKey = panelTransportKey(request);
+    const authoritativeGeneration =
+      session
+        .snapshot()
+        .panels.find((panel) => panel.panelId === request.panelId)
+        ?.generation ?? 0;
+    const keepGenerations = [authoritativeGeneration, joined.generation].filter(
+      (generation) => generation > 0,
+    );
+    await stopObsoletePendingGenerations(transportKey, keepGenerations);
     const clipboardExchange = createClipboardExchange({
       effects: {
         readSelectionBytes: async (actor) => source.copyClipboard?.(actor) ?? 0,
@@ -1395,7 +1451,29 @@ export function createBrowserHostEntry(
       source,
       clock: panelClock,
       canInput: () => control.canInput(request.panelId),
-      onDisconnect: () => control.disconnectPanel(request.panelId),
+      acceptsGeneration: () =>
+        session.acceptsGeneration(request.panelId, joined.generation),
+      onAuthorized: () => {
+        const activated = session.activateGeneration(
+          request.panelId,
+          joined.generation,
+        );
+        if (activated.outcome === "activated") {
+          void stopBoundPanelTransports(
+            transportKey,
+            activated.supersededGenerations,
+          );
+        }
+        applyControllerViewport();
+        transport.broadcastControl(
+          control.state() as BrowserPanelControlState,
+          strip.snapshot() as BrowserTabStrip,
+        );
+      },
+      onDisconnect: () => {
+        session.disconnectPanel(request.panelId);
+        control.disconnectPanel(request.panelId);
+      },
       clipboardExchange,
       onTransferCancel: async (transferId) => {
         // Route panel transfer cancellation to the host staging manager so
@@ -1435,6 +1513,12 @@ export function createBrowserHostEntry(
       },
     });
     const pushControlState = () => {
+      const liveIds = new Set(
+        session.snapshot().panels.map((panel) => panel.panelId),
+      );
+      for (const member of control.state().panels) {
+        if (!liveIds.has(member.panelId)) control.closePanel(member.panelId);
+      }
       applyControllerViewport();
       transport.broadcastControl(
         control.state() as BrowserPanelControlState,
@@ -1444,20 +1528,19 @@ export function createBrowserHostEntry(
     const unsubscribeControl = control.subscribe(pushControlState);
     const unsubscribeTabs = strip.subscribe(pushControlState);
     const port = await transport.start();
-    const transportKey = `${request.hostId}\u0000${request.profileId}\u0000${request.panelId}`;
-    const previous = panelTransports.get(transportKey);
-    if (previous !== undefined) {
-      await previous.stop().catch(() => undefined);
-      panelTransports.delete(transportKey);
-    }
-    panelTransports.set(transportKey, {
-      ...transport,
-      async stop() {
-        unsubscribeControl();
-        unsubscribeTabs();
-        await transport.stop();
+    const boundGenerations = panelTransports.get(transportKey) ?? [];
+    panelTransports.set(transportKey, [
+      ...boundGenerations,
+      {
+        ...transport,
+        generation: joined.generation,
+        async stop() {
+          unsubscribeControl();
+          unsubscribeTabs();
+          await transport.stop();
+        },
       },
-    });
+    ]);
     return openedPanelTransport(issued, port, gateway.declaredBindHost());
   }
   async function openPanelTransport(
@@ -1486,9 +1569,9 @@ export function createBrowserHostEntry(
         };
       }
     }
-    // A remount issues a fresh single-use Panel Capability. The pool retires
-    // any prior gateway for this panel (revoking its redeemed capability) so
-    // the fresh redeem is never blocked by a stale redeemed capability.
+    // A remount issues a fresh single-use Panel Capability on a new gateway.
+    // The shared Panel session keeps the prior generation until the new one
+    // is redeemed and becomes authoritative.
     const opened = panelGateways.openPanel({
       ownerSessionId: request.ownerSessionId,
       panelId: request.panelId,
@@ -1560,12 +1643,16 @@ export function createBrowserHostEntry(
     request: BrowserPanelReleaseHostRequest,
     dataDir: string,
   ) {
-    const transportKey = `${request.hostId}\u0000${request.profileId}\u0000${request.panelId}`;
-    const previous = panelTransports.get(transportKey);
-    if (previous !== undefined) {
-      await previous.stop().catch(() => undefined);
-      panelTransports.delete(transportKey);
-    }
+    const session = panelSessions.sessionFor({
+      hostId: request.hostId,
+      profileId: request.profileId,
+    });
+    session.closePanel(request.panelId);
+    panelControlSession({
+      hostId: request.hostId,
+      profileId: request.profileId,
+    }).closePanel(request.panelId);
+    await stopBoundPanelTransports(panelTransportKey(request));
     panelGateways.closePanel(request);
     const browserRuntime = runtime(dataDir);
     if (browserRuntime !== undefined) {
@@ -2298,11 +2385,14 @@ export function createBrowserHostEntry(
         controlLeases.dispose();
         for (const session of panelControlSessions.values()) session.dispose();
         panelControlSessions.clear();
+        panelSessions.dispose();
         for (const strip of browserTabStrips.values()) strip.dispose();
         browserTabStrips.clear();
-        for (const transport of panelTransports.values()) {
-          await transport.stop().catch(() => undefined);
-        }
+        await Promise.all(
+          boundPanelTransports().map((transport) =>
+            transport.stop().catch(() => undefined),
+          ),
+        );
         panelTransports.clear();
         panelGateways.dispose();
         panelCapabilities.dispose();

@@ -383,6 +383,31 @@ describe("versioned Panel wire protocol", () => {
     expectPrivacySafe(decoded.error.message);
   });
 
+  it("encodes a stale-generation protocol error without leaking secrets", () => {
+    const encoded = encodePanelProtocolMessage({
+      protocolVersion: PANEL_PROTOCOL_VERSION,
+      type: "protocol_error",
+      category: "stale-generation",
+      message:
+        "The Browser Panel message belongs to a superseded connection generation.",
+    });
+    expect(encoded.outcome).toBe("encoded");
+    if (encoded.outcome !== "encoded") return;
+    const decoded = decodePanelProtocolMessage(encoded.raw, {
+      direction: "host-to-client",
+      phase: "authenticated",
+    });
+    expect(decoded.outcome).toBe("accepted");
+    if (decoded.outcome !== "accepted") return;
+    expect(decoded.message).toMatchObject({
+      type: "protocol_error",
+      category: "stale-generation",
+    });
+    expectPrivacySafe(
+      decoded.message.type === "protocol_error" ? decoded.message.message : "",
+    );
+  });
+
   it("rejects unknown discriminators with a stable privacy-safe outcome", () => {
     const decoded = decodePanelProtocolMessage(
       JSON.stringify({
