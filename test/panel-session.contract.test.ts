@@ -254,6 +254,39 @@ describe("shared Panel session per Browser Profile", () => {
     sessions.dispose();
   });
 
+  it.each(["joinPanel", "connectPanel"] as const)(
+    "keeps an expired former controller as a spectator after %s until it takes control",
+    async (rejoin) => {
+      const { sessions, advanceTime } = setup();
+      const session = sessions.sessionFor({
+        hostId: HOST_ID,
+        profileId: PROFILE_A,
+      });
+      session.joinPanel("panel-1", "owner-session-1");
+      session.disconnectPanel("panel-1");
+      advanceTime(PANEL_RECLAIM_WINDOW_MS + 1);
+
+      if (rejoin === "joinPanel") {
+        session.joinPanel("panel-1", "owner-session-1");
+      } else {
+        session.connectPanel("panel-1", "owner-session-1");
+      }
+
+      expect(session.role("panel-1")).toBe("spectator");
+      expect(session.canInput("panel-1")).toBe(false);
+      expect(session.state().controllerPanelId).toBeNull();
+      expect(session.reclaimControl("panel-1")).toBe(false);
+      expect(session.canInput("panel-1")).toBe(false);
+      expect(session.state().controllerPanelId).toBeNull();
+
+      await expect(session.takeControl("panel-1")).resolves.toBe(true);
+      expect(session.role("panel-1")).toBe("controller");
+      expect(session.canInput("panel-1")).toBe(true);
+      expect(session.state().controllerPanelId).toBe("panel-1");
+      sessions.dispose();
+    },
+  );
+
   it("lets only the controller resize the shared viewport and clamps it to the streaming ceiling", () => {
     const { sessions } = setup();
     const session = sessions.sessionFor({

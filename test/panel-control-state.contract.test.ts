@@ -220,9 +220,15 @@ describe("Panel Control State", () => {
     session.disconnectPanel("panel-1");
 
     clock.now = () => 15_000;
-    session.connectPanel("panel-1", "session-1");
-    // The window expired: the original controller cannot reclaim.
+    expect(session.connectPanel("panel-1", "session-1")).toBe("spectator");
+    expect(session.role("panel-1")).toBe("spectator");
+    expect(session.canInput("panel-1")).toBe(false);
+    expect(session.state().controllerPanelId).toBeNull();
+    // The window expired: the original controller cannot reclaim, and
+    // reconnecting does not silently restore input.
     expect(session.reclaimControl("panel-1")).toBe(false);
+    expect(session.canInput("panel-1")).toBe(false);
+    expect(session.state().controllerPanelId).toBeNull();
     // Control is now generally available to another panel.
     await session.takeControl("panel-2");
     expect(session.state().controllerPanelId).toBe("panel-2");

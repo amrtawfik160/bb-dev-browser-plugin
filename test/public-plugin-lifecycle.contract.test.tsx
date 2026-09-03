@@ -1051,10 +1051,25 @@ describe("public Browser Panel lifecycle seam", () => {
         expect(browser.latestControl(second)?.controllerPanelId).toBeNull();
       });
       await browser.advanceTime(PANEL_RECLAIM_WINDOW_MS + 1);
+      await first.findByText("The page is live.");
+      await waitFor(() => {
+        expect(
+          browser
+            .latestSessionPanels(second)
+            .find((panel) => panel.panelId === first.panelId),
+        ).toMatchObject({ connection: "connected", role: "spectator" });
+        expect(browser.latestControl(second)?.controllerPanelId).toBeNull();
+      });
+      const inputsAfterExpiry = browser.receivedInputs.length;
+      browser.sendLiveInput(first, { kind: "click", generation: 3 });
+      await waitForSettled(
+        () => browser.receivedInputs.length === inputsAfterExpiry,
+      );
+      const expiredReclaim = await browser.reclaimControl(first);
+      expect(expiredReclaim.role).toBe("spectator");
+      expect(expiredReclaim.control.controllerPanelId).toBeNull();
       const takeover = await browser.takeControl(second);
       expect(takeover.role).toBe("controller");
-      await browser.advanceTime(PANEL_RECONNECT_INITIAL_BACKOFF_MS);
-      await first.findByText("The page is live.");
       const expired = await browser.reclaimControl(first);
       expect(expired.role).toBe("spectator");
       await waitFor(() => {

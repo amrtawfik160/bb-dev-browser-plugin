@@ -108,6 +108,9 @@ export function createPanelSession(options: PanelSessionOptions = {}) {
   let controllerViewport: PanelViewport | null = null;
   let reclaimOwnerPanelId: string | null = null;
   let reclaimDeadline: number | null = null;
+  // Identities whose reclaim membership expired. A later join of the same
+  // panel restores observation only; vacant control is not granted again.
+  const expiredPanelIds = new Set<string>();
   const listeners = new Set<PanelControlStateListener>();
 
   function setLeaseKey(key: string) {
@@ -146,6 +149,7 @@ export function createPanelSession(options: PanelSessionOptions = {}) {
           controllerViewport = null;
         }
         if (reclaimOwnerPanelId === panelId) clearControlReclaim();
+        expiredPanelIds.add(panelId);
         panels.delete(panelId);
       }
     }
@@ -215,8 +219,9 @@ export function createPanelSession(options: PanelSessionOptions = {}) {
     viewport: PanelViewport = DEFAULT_PANEL_VIEWPORT,
   ) {
     const clamped = clampPanelViewport(viewport);
+    const expiredRejoin = expiredPanelIds.delete(panelId);
     const role: PanelRole =
-      controllerPanelId === null ? "controller" : "spectator";
+      !expiredRejoin && controllerPanelId === null ? "controller" : "spectator";
     const record: PanelSessionRecord = {
       ownerSessionId,
       connection: "connected",
@@ -466,6 +471,7 @@ export function createPanelSession(options: PanelSessionOptions = {}) {
   function dispose() {
     listeners.clear();
     panels.clear();
+    expiredPanelIds.clear();
     controllerPanelId = null;
     controllerViewport = null;
     clearControlReclaim();
