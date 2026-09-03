@@ -12,6 +12,7 @@ import {
   PANEL_RECLAIM_WINDOW_MS,
   type BrowserDialogEvent,
   type BrowserContextAction,
+  type BrowserDownloadListResult,
   type BrowserPanelControlState,
   type BrowserTabStrip,
 } from "./contracts.js";
@@ -151,7 +152,9 @@ export type PanelTransportServerOptions = {
    * transport pushes the current quarantine listing whenever the host updates
    * it so the panel observes progress, state, limits, and expiry.
    */
-  subscribeDownloads?: (onUpdate: (update: unknown) => void) => () => void;
+  subscribeDownloads?: (
+    onUpdate: (update: BrowserDownloadListResult) => void,
+  ) => () => void;
 };
 
 export type PanelTransportServer = {
@@ -258,6 +261,56 @@ export function createPanelTransportServer(
     if (message.type === "ack") {
       return JSON.stringify({ type: "ack", sequence: message.sequence });
     }
+    if (message.type === "dialog_response") {
+      return JSON.stringify({
+        type: "dialog_response",
+        dialogId: message.dialogId,
+        accept: message.accept,
+        ...(message.text === undefined ? {} : { text: message.text }),
+      });
+    }
+    if (message.type === "context_query") {
+      return JSON.stringify({
+        type: "context_query",
+        queryId: message.queryId,
+        x: message.x,
+        y: message.y,
+      });
+    }
+    if (message.type === "context_action") {
+      return JSON.stringify({
+        type: "context_action",
+        actionId: message.actionId,
+      });
+    }
+    if (message.type === "clipboard_copy") {
+      return JSON.stringify({
+        type: "clipboard_copy",
+        copyId: message.copyId,
+      });
+    }
+    if (message.type === "clipboard_paste") {
+      return JSON.stringify({
+        type: "clipboard_paste",
+        pasteId: message.pasteId,
+        bytes: message.bytes,
+      });
+    }
+    if (message.type === "transfer_cancel") {
+      return JSON.stringify({
+        type: "transfer_cancel",
+        transferId: message.transferId,
+      });
+    }
+    if (message.type === "download_cancel") {
+      return JSON.stringify({
+        type: "download_cancel",
+        downloadId: message.downloadId,
+      });
+    }
+    if (message.type === "ping") {
+      return JSON.stringify({ type: "ping" });
+    }
     return undefined;
   }
 
@@ -287,8 +340,11 @@ export function createPanelTransportServer(
   }
 
   function pushDialog(socket: WebSocket, event: BrowserDialogEvent) {
-    if (socket.readyState !== socket.OPEN) return;
-    sendJson(socket, { type: "dialog", dialog: event });
+    sendProtocol(socket, {
+      protocolVersion: PANEL_PROTOCOL_VERSION,
+      type: "dialog",
+      dialog: event,
+    });
   }
 
   function startFailClosedTimer() {
@@ -365,12 +421,12 @@ export function createPanelTransportServer(
       // Push the live Host Downloads quarantine state (progress, state,
       // limits, expiry, errors) to the panel as it changes (issue #20).
       unsubscribeDownloads = subscribeDownloads((update) => {
-        if (
-          connection !== undefined &&
-          authorized &&
-          connection.readyState === connection.OPEN
-        ) {
-          sendJson(connection, { type: "downloads_update", update });
+        if (connection !== undefined && authorized) {
+          sendProtocol(connection, {
+            protocolVersion: PANEL_PROTOCOL_VERSION,
+            type: "downloads_update",
+            update,
+          });
         }
       });
     }
@@ -412,10 +468,7 @@ export function createPanelTransportServer(
       rejectProtocol(decoded.error);
       return;
     }
-    const gatewayRaw =
-      decoded.outcome === "legacy"
-        ? text
-        : gatewayRawForProtocol(decoded.message);
+    const gatewayRaw = gatewayRawForProtocol(decoded.message);
     if (gatewayRaw === undefined) {
       rejectProtocol(panelProtocolErrorMessage("invalid-direction"));
       return;
@@ -464,7 +517,8 @@ export function createPanelTransportServer(
           pendingContextQueryId = null;
           const socketRef = connection;
           if (socketRef === undefined || !authorized) return;
-          sendJson(socketRef, {
+          sendProtocol(socketRef, {
+            protocolVersion: PANEL_PROTOCOL_VERSION,
             type: "context_menu",
             queryId,
             point: { x: message.x, y: message.y },
@@ -486,7 +540,11 @@ export function createPanelTransportServer(
       void clipboardExchange
         .copy("owner-controller", message.copyId)
         .then((outcome) =>
-          sendJson(socket, { type: "clipboard_outcome", outcome }),
+          sendProtocol(socket, {
+            protocolVersion: PANEL_PROTOCOL_VERSION,
+            type: "clipboard_outcome",
+            outcome,
+          }),
         )
         .catch(() => undefined);
       return;
@@ -496,7 +554,11 @@ export function createPanelTransportServer(
       void clipboardExchange
         .paste("owner-controller", message.bytes, message.pasteId)
         .then((outcome) =>
-          sendJson(socket, { type: "clipboard_outcome", outcome }),
+          sendProtocol(socket, {
+            protocolVersion: PANEL_PROTOCOL_VERSION,
+            type: "clipboard_outcome",
+            outcome,
+          }),
         )
         .catch(() => undefined);
       return;
@@ -507,7 +569,8 @@ export function createPanelTransportServer(
       if (!canInput() || onTransferCancel === undefined) return;
       void onTransferCancel(message.transferId)
         .then(() =>
-          sendJson(socket, {
+          sendProtocol(socket, {
+            protocolVersion: PANEL_PROTOCOL_VERSION,
             type: "transfer_cancel_ack",
             transferId: message.transferId,
           }),
@@ -521,7 +584,8 @@ export function createPanelTransportServer(
       if (!canInput() || onDownloadCancel === undefined) return;
       void onDownloadCancel(message.downloadId)
         .then(() =>
-          sendJson(socket, {
+          sendProtocol(socket, {
+            protocolVersion: PANEL_PROTOCOL_VERSION,
             type: "download_ack",
             downloadId: message.downloadId,
             action: "cancelled",
