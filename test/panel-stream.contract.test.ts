@@ -160,6 +160,18 @@ describe("Automation Mode stream policy contract", () => {
     expect(adapter.state).toBe("streaming");
   });
 
+  it("does not freeze input during an in-flight authorization rotation", () => {
+    const adapter = createAutomationStreamAdapter();
+    adapter.start();
+    expect(adapter.beginRotation()).toBe(true);
+    expect(adapter.freezeInput()).toBe(false);
+    expect(adapter.state).toBe("rotating");
+    expect(adapter.beginReconnect()).toBe(0);
+    expect(adapter.state).toBe("rotating");
+    expect(adapter.rotationSucceeded()).toBe(true);
+    expect(adapter.state).toBe("streaming");
+  });
+
   it("freezes input on a failed rotation so reconnect can begin", () => {
     const adapter = createAutomationStreamAdapter();
     adapter.start();

@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { waitFor } from "@testing-library/react";
+import { act, waitFor } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import { WebSocket } from "ws";
 import {
@@ -402,6 +402,11 @@ describe("public Browser Panel lifecycle seam", () => {
       });
       expect(browser.hostRpcCalls.length).toBe(hostCallsBeforeInput);
 
+      browser.holdNewSocketMessageEvents();
+      browser.armAuthorizedInputOnNextReady(first, {
+        kind: "click",
+        generation: "stale",
+      });
       await browser.advanceTime(PANEL_AUTH_ROTATION_MS);
       await waitFor(() => {
         expect(browser.issuedSecrets(first.panelId).length).toBeGreaterThan(1);
@@ -409,28 +414,18 @@ describe("public Browser Panel lifecycle seam", () => {
       const nextSecret = browser.issuedSecrets(first.panelId).at(-1);
       expect(nextSecret).toBeDefined();
       expect(nextSecret).not.toBe(originalSecret);
+      const replacementPort = browser.issuedGatewayPorts(first.panelId).at(-1);
+      expect(replacementPort).toBeDefined();
+      expect(replacementPort).not.toBe(originalPort);
       await waitFor(() => {
         expect(browser.redeemedSecrets(first.panelId)).toEqual([
           originalSecret,
           nextSecret,
         ]);
+        expect(browser.portHasReady(replacementPort!)).toBe(true);
+        expect(browser.overlapSend().sent).toBe(true);
       });
-      await first.findByText("The page is live.");
-      await first.findByRole("img", { name: "Browser page view" });
-      expect(first.queryByText("Reconnecting to the browser…")).toBeNull();
-      expect(first.framesReceived).toBeGreaterThanOrEqual(framesBeforeRotation);
-      await second.findByText("The page is live.");
-      await waitFor(() => {
-        expect(browser.portHasOpenSocket(originalPort)).toBe(false);
-      });
-      try {
-        browser.sendAuthorizedInput(first, {
-          kind: "click",
-          generation: "stale",
-        });
-      } catch {
-        // The superseded generation may already have closed.
-      }
+      expect(browser.overlapSend().error).toBeUndefined();
       await waitForSettled(() => {
         return !browser.receivedInputs.some(
           (input) =>
@@ -439,6 +434,16 @@ describe("public Browser Panel lifecycle seam", () => {
             "generation" in input &&
             input.generation === "stale",
         );
+      });
+      expect(first.queryByText("Reconnecting to the browser…")).toBeNull();
+      await browser.releaseHeldSocketEvents();
+      await first.findByText("The page is live.");
+      await first.findByRole("img", { name: "Browser page view" });
+      expect(first.queryByText("Reconnecting to the browser…")).toBeNull();
+      expect(first.framesReceived).toBeGreaterThanOrEqual(framesBeforeRotation);
+      await second.findByText("The page is live.");
+      await waitFor(() => {
+        expect(browser.portHasOpenSocket(originalPort)).toBe(false);
       });
       const hostCallsBeforeLiveInput = browser.hostRpcCalls.length;
       browser.sendLiveInput(first, { kind: "click", generation: 2 });
@@ -464,6 +469,37 @@ describe("public Browser Panel lifecycle seam", () => {
       expect(new Set(browser.issuedSecrets(first.panelId)).size).toBe(
         browser.issuedSecrets(first.panelId).length,
       );
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("closes an in-flight replacement connection when the panel unmounts during rotation", async () => {
+    const browser = await createPublicPanelLifecycleHarness();
+    try {
+      const [first, second] = await browser.openTwoPanels();
+      await first.findByText("The page is live.");
+      await second.findByText("The page is live.");
+      const originalSecret = browser.issuedSecrets(first.panelId)[0]!;
+
+      browser.holdNewSocketOpenEvents();
+      await browser.advanceTime(PANEL_AUTH_ROTATION_MS);
+      await waitFor(() => {
+        expect(browser.issuedSecrets(first.panelId).length).toBeGreaterThan(1);
+      });
+      const replacementPort = browser.issuedGatewayPorts(first.panelId).at(-1);
+      expect(replacementPort).toBeDefined();
+      await waitFor(() => {
+        expect(browser.portHasOpenSocket(replacementPort!)).toBe(true);
+      });
+      expect(browser.redeemedSecrets(first.panelId)).toEqual([originalSecret]);
+
+      act(() => {
+        first.lifecycle.unmount();
+      });
+      expect(browser.appClosedPort(replacementPort!)).toBe(true);
+      expect(browser.redeemedSecrets(first.panelId)).toEqual([originalSecret]);
+      await second.findByText("The page is live.");
     } finally {
       await browser.dispose();
     }

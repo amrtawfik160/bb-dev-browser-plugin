@@ -130,7 +130,7 @@ export function createAutomationStreamAdapter(
   }
 
   function freezeInput(): boolean {
-    if (state === "released") return false;
+    if (state === "released" || state === "rotating") return false;
     state = "input-frozen";
     disconnectedAt = clock.now();
     return true;

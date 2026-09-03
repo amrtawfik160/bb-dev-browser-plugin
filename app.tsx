@@ -433,6 +433,8 @@ function PanelStreamSurface({
     let reconnectTimer: ReturnType<typeof schedulePanelTimeout> | null = null;
     let rotationTimer: ReturnType<typeof schedulePanelTimeout> | null = null;
     let attemptAbort: AbortController | null = null;
+    let replacementAbort: AbortController | null = null;
+    let replacementSocket: WebSocket | null = null;
     const streamHostId = status.hostId;
     const streamProfileId = status.profileId;
     const stream = createAutomationStreamAdapter();
@@ -456,6 +458,15 @@ function PanelStreamSurface({
     function abortAttempt() {
       attemptAbort?.abort();
       attemptAbort = null;
+    }
+
+    function discardReplacement() {
+      const pendingAttempt = replacementAbort;
+      const pendingSocket = replacementSocket;
+      replacementAbort = null;
+      replacementSocket = null;
+      pendingAttempt?.abort();
+      if (pendingSocket !== null) pendingSocket.close();
     }
 
     function drawFrame(frame: { mimeType: string; data: string }) {
@@ -606,6 +617,7 @@ function PanelStreamSurface({
 
     function failRotation() {
       if (disposed) return;
+      discardReplacement();
       if (stream.state === "rotating") stream.rotationFailed();
       else stream.freezeInput();
       clearRotation();
@@ -705,6 +717,9 @@ function PanelStreamSurface({
           socketRef.current = null;
         }
         if (disposed || attempt.signal.aborted) return;
+        // A superseded generation may close while the replacement is still
+        // becoming ready; dropping here would throw that replacement away.
+        if (stream.state === "rotating") return;
         dropLiveAndReconnect();
       });
       nextSocket.addEventListener("error", () => {
@@ -717,6 +732,7 @@ function PanelStreamSurface({
       issued: Extract<BrowserPanelCapabilityResponse, { outcome: "issued" }>,
     ) {
       if (disposed) return;
+      discardReplacement();
       const attempt = new AbortController();
       let nextSocket: WebSocket;
       try {
@@ -725,14 +741,17 @@ function PanelStreamSurface({
         failRotation();
         return;
       }
+      replacementAbort = attempt;
+      replacementSocket = nextSocket;
       nextSocket.binaryType = "arraybuffer";
       redeemOnOpen(nextSocket, issued, attempt);
       listenForHostMessages(nextSocket, attempt, () => {
         if (stream.state !== "rotating") {
-          attempt.abort();
-          nextSocket.close();
+          discardReplacement();
           return;
         }
+        replacementAbort = null;
+        replacementSocket = null;
         const previousSocket = socket;
         const previousAttempt = attemptAbort;
         socket = nextSocket;
@@ -767,6 +786,7 @@ function PanelStreamSurface({
 
     return () => {
       disposed = true;
+      discardReplacement();
       abortAttempt();
       setLivePush(false);
       clearReconnect();

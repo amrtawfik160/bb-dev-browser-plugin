@@ -129,6 +129,21 @@ export async function createPublicPanelLifecycleHarness() {
   >();
   let nextReconnectTimerId = 1;
   const receivedInputs: unknown[] = [];
+  let holdNewSocketOpen = false;
+  let holdNewSocketMessages = false;
+  const heldOpenSockets = new Set<TrackedSocket>();
+  const heldMessageSockets = new Set<TrackedSocket>();
+  const deferredSocketEvents: Array<{
+    socket: TrackedSocket;
+    listener: EventListener;
+    event: Event;
+  }> = [];
+  const appClosedPorts = new Set<string>();
+  let pendingSupersededInput: {
+    panel: LifecyclePanel;
+    payload: unknown;
+  } | null = null;
+  let overlapSend: { sent: boolean; error?: unknown } = { sent: false };
 
   function recordSocketMessage(socket: TrackedSocket, data: unknown) {
     const port = socketPort(socket);
@@ -143,6 +158,8 @@ export async function createPublicPanelLifecycleHarness() {
       const socket = this as unknown as TrackedSocket;
       Object.defineProperty(socket, "url", { value: href });
       sockets.add(socket);
+      if (holdNewSocketOpen) heldOpenSockets.add(socket);
+      if (holdNewSocketMessages) heldMessageSockets.add(socket);
       const port = new URL(href).port;
       connectionAttemptsByPort.set(
         port,
@@ -151,10 +168,25 @@ export async function createPublicPanelLifecycleHarness() {
       if (!messagesByPort.has(port)) messagesByPort.set(port, []);
       this.on("message", (data) => {
         recordSocketMessage(socket, data);
+        sendArmedSupersededInput(data);
       });
       this.on("close", () => {
         sockets.delete(socket);
       });
+      const protoClose = NodeWebSocket.prototype.close;
+      this.close = function (
+        this: NodeWebSocket,
+        code?: number,
+        data?: string | Buffer,
+      ) {
+        // Peer hangup also ends in WebSocket.close; only panel cleanup
+        // from app.tsx counts as the Browser Panel owning the socket.
+        const stack = new Error().stack ?? "";
+        if (stack.includes("app.tsx")) {
+          appClosedPorts.add(socketPort(socket));
+        }
+        return protoClose.call(this, code, data);
+      } as NodeWebSocket["close"];
       const protoSend = NodeWebSocket.prototype.send;
       this.send = function (
         this: NodeWebSocket,
@@ -177,18 +209,47 @@ export async function createPublicPanelLifecycleHarness() {
           listener: EventListenerOrEventListenerObject,
           options?: unknown,
         ) => {
-          if (type === "message" && typeof listener === "function") {
-            protoAdd.call(
-              this,
-              type,
-              (event: unknown) => {
-                const data = messageText((event as { data?: unknown }).data);
-                recordSocketMessage(socket, data);
-                listener.call(this, { data } as unknown as Event);
-              },
-              options,
-            );
-            return;
+          if (typeof listener === "function") {
+            if (type === "message") {
+              protoAdd.call(
+                this,
+                type,
+                (event: unknown) => {
+                  const data = messageText((event as { data?: unknown }).data);
+                  recordSocketMessage(socket, data);
+                  if (heldMessageSockets.has(socket)) {
+                    deferredSocketEvents.push({
+                      socket,
+                      listener,
+                      event: { data } as unknown as Event,
+                    });
+                    return;
+                  }
+                  listener.call(this, { data } as unknown as Event);
+                },
+                options,
+              );
+              return;
+            }
+            if (type === "open") {
+              protoAdd.call(
+                this,
+                type,
+                (event: unknown) => {
+                  if (heldOpenSockets.has(socket)) {
+                    deferredSocketEvents.push({
+                      socket,
+                      listener,
+                      event: event as Event,
+                    });
+                    return;
+                  }
+                  listener.call(this, event as Event);
+                },
+                options,
+              );
+              return;
+            }
           }
           protoAdd.call(
             this,
@@ -301,6 +362,67 @@ export async function createPublicPanelLifecycleHarness() {
         socketPort(socket) === String(port) &&
         socket.readyState === NodeWebSocket.OPEN,
     );
+  }
+
+  function portHasReady(port: number) {
+    return parsedMessages(port).some((message) => message.type === "ready");
+  }
+
+  function appClosedPort(port: number) {
+    return appClosedPorts.has(String(port));
+  }
+
+  function armAuthorizedInputOnNextReady(
+    panel: LifecyclePanel,
+    payload: unknown,
+  ) {
+    pendingSupersededInput = { panel, payload };
+    overlapSend = { sent: false };
+  }
+
+  function sendArmedSupersededInput(data: unknown) {
+    if (pendingSupersededInput === null) return;
+    try {
+      const parsed = JSON.parse(messageText(data)) as { type?: string };
+      if (parsed.type !== "ready") return;
+    } catch {
+      return;
+    }
+    const pending = pendingSupersededInput;
+    pendingSupersededInput = null;
+    try {
+      sendAuthorizedInput(pending.panel, pending.payload);
+      overlapSend = { sent: true };
+    } catch (error) {
+      overlapSend = { sent: false, error };
+    }
+  }
+
+  function holdNewSocketOpenEvents() {
+    holdNewSocketOpen = true;
+  }
+
+  function holdNewSocketMessageEvents() {
+    holdNewSocketMessages = true;
+  }
+
+  async function releaseHeldSocketEvents() {
+    holdNewSocketOpen = false;
+    holdNewSocketMessages = false;
+    const queued = deferredSocketEvents.splice(0);
+    heldOpenSockets.clear();
+    heldMessageSockets.clear();
+    await act(async () => {
+      for (const pending of queued) {
+        if (
+          pending.socket.readyState !== NodeWebSocket.OPEN &&
+          pending.socket.readyState !== NodeWebSocket.CONNECTING
+        ) {
+          continue;
+        }
+        pending.listener.call(pending.socket, pending.event);
+      }
+    });
   }
 
   function attachLifecycle(
@@ -734,7 +856,15 @@ export async function createPublicPanelLifecycleHarness() {
         hostId: HOST_ID,
         profileId: DEFAULT_PROFILE_ID,
       }),
+    issuedGatewayPorts,
     portHasOpenSocket,
+    portHasReady,
+    appClosedPort,
+    armAuthorizedInputOnNextReady,
+    overlapSend: () => overlapSend,
+    holdNewSocketOpenEvents,
+    holdNewSocketMessageEvents,
+    releaseHeldSocketEvents,
     redeemIssuedCapability,
     forcePhysicalSocketLoss,
     advanceTime,
