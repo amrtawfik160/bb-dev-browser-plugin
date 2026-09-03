@@ -96,7 +96,6 @@ import {
   type ControlLeaseManager,
 } from "./control-lease.js";
 import { createPanelSessionRegistry } from "./panel-session.js";
-import { createBrowserTabStrip } from "./browser-tabs.js";
 import {
   assertBrowserScriptResultWithinBounds,
   BrowserInstanceError,
@@ -699,75 +698,48 @@ export function createBrowserHostEntry(
   type BoundPanelTransport = ReturnType<typeof createPanelTransportServer> & {
     generation: number;
   };
-  const panelTransports = new Map<string, BoundPanelTransport[]>();
   const panelSessions = createPanelSessionRegistry({
     clock: panelClock,
     controlLeases,
   });
 
-  function panelTransportKey(target: {
-    hostId: string;
-    profileId: string;
-    panelId: string;
-  }) {
-    return `${target.hostId}\u0000${target.profileId}\u0000${target.panelId}`;
-  }
-
   function boundPanelTransports() {
-    return [...panelTransports.values()].flat();
+    const bound: BoundPanelTransport[] = [];
+    panelSessions.forEach((session) => {
+      bound.push(...(session.boundTransports() as BoundPanelTransport[]));
+    });
+    return bound;
   }
 
   async function stopBoundPanelTransports(
-    key: string,
+    target: { hostId: string; profileId: string; panelId: string },
     generations?: readonly number[],
   ) {
-    const bound = panelTransports.get(key) ?? [];
-    const stopping =
-      generations === undefined
-        ? bound
-        : bound.filter((entry) => generations.includes(entry.generation));
-    await Promise.all(
-      stopping.map((entry) => entry.stop().catch(() => undefined)),
-    );
-    const remaining = bound.filter((entry) => !stopping.includes(entry));
-    if (remaining.length === 0) panelTransports.delete(key);
-    else panelTransports.set(key, remaining);
+    await panelSessions
+      .sessionFor(target)
+      .stopTransports(target.panelId, generations);
   }
 
   async function stopObsoletePendingGenerations(
-    key: string,
+    target: { hostId: string; profileId: string; panelId: string },
     keep: readonly number[],
   ) {
-    const bound = panelTransports.get(key) ?? [];
+    const bound = panelSessions
+      .sessionFor(target)
+      .transportsFor(target.panelId);
     const obsolete = bound
       .map((entry) => entry.generation)
       .filter((generation) => !keep.includes(generation));
     if (obsolete.length === 0) return;
-    await stopBoundPanelTransports(key, obsolete);
+    await stopBoundPanelTransports(target, obsolete);
   }
-  /**
-   * Shared ordered Browser Tab strip. Control Lease coordination lives on the
-   * profile-owned Panel session; every Browser Panel for one profile observes
-   * one ordered tab set and one active tab regardless of which BB thread or
-   * client opened it (ADR 0005/0007/0012).
-   */
-  const browserTabStrips = new Map<
-    string,
-    ReturnType<typeof createBrowserTabStrip>
-  >();
 
   function panelControlSession(target: { hostId: string; profileId: string }) {
     return panelSessions.sessionFor(target);
   }
 
   function browserTabStrip(target: { hostId: string; profileId: string }) {
-    const key = controlLeaseKey(target);
-    let strip = browserTabStrips.get(key);
-    if (strip === undefined) {
-      strip = createBrowserTabStrip();
-      browserTabStrips.set(key, strip);
-    }
-    return strip;
+    return panelControlSession(target).tabStrip();
   }
 
   async function synchronizeRuntimeTabStrip(
@@ -801,10 +773,10 @@ export function createBrowserHostEntry(
     hostId: string;
     profileId: string;
   }) {
-    const profilePrefix = `${target.hostId}\u0000${target.profileId}\u0000`;
-    for (const [key, transports] of panelTransports) {
-      if (!key.startsWith(profilePrefix)) continue;
-      for (const transport of transports) transport.dismissOpenDialogs();
+    for (const transport of panelSessions
+      .sessionFor(target)
+      .boundTransports()) {
+      transport.dismissOpenDialogs();
     }
   }
 
@@ -872,8 +844,9 @@ export function createBrowserHostEntry(
         dismissOpenDialogsForProfile({ hostId, profileId });
         // Stopping the profile releases every panel's control and invalidates
         // the shared tab strip so stale runtime tab ids fail closed.
-        panelSessions.sessionFor({ hostId, profileId }).revoke();
-        browserTabStrips.get(key)?.resetInstance();
+        const session = panelSessions.sessionFor({ hostId, profileId });
+        session.revoke();
+        session.tabStrip().resetInstance();
         try {
           await runtime(dataDir)?.stop({ hostId, profileId });
         } finally {
@@ -968,11 +941,9 @@ export function createBrowserHostEntry(
       panelSessions.forEach((session, target) => {
         if (target.hostId !== request.hostId) return;
         session.revoke();
+        session.tabStrip().resetInstance();
         dismissOpenDialogsForProfile(target);
       });
-      for (const [key, strip] of browserTabStrips) {
-        if (key.startsWith(`${request.hostId}\u0000`)) strip.resetInstance();
-      }
     }
     const browserRuntime = runtime(dataDir);
     if (browserRuntime === undefined) return { ...request, applied: false };
@@ -1285,9 +1256,17 @@ export function createBrowserHostEntry(
     }
     const target = await panelRuntimeTarget(request, dataDir);
     if (target === null) return browserProfileUnavailableStatus(request);
+    panelControlSession({
+      hostId: request.hostId,
+      profileId: request.profileId,
+    }).setVisibility(request.panelId, request.visibility);
     if (request.visibility === "visible")
       return pinVisiblePanel(request, target, readiness, browserRuntime);
     await browserRuntime.unpinPanel(target, request.panelId);
+    await panelSessions.releaseIfIdle({
+      hostId: request.hostId,
+      profileId: request.profileId,
+    });
     return runtimeBrowserStatus(readiness, browserRuntime, controlLeases);
   }
   async function panelRuntimeTarget(
@@ -1389,7 +1368,7 @@ export function createBrowserHostEntry(
     request: BrowserPanelTransportRequest,
     dataDir: string,
     panel: ReturnType<typeof panelGateways.openPanel>,
-    source: ScreencastSource,
+    createSource: () => ScreencastSource,
   ) {
     const { gateway, issued } = panel;
     const stream = createAutomationStreamAdapter({
@@ -1402,6 +1381,7 @@ export function createBrowserHostEntry(
     };
     const session = panelSessions.sessionFor(controlTarget);
     const strip = browserTabStrip(controlTarget);
+    const source = session.attachStreamSource(createSource);
     const applyControllerViewport = () => {
       const controllerViewport = session.controllerViewport;
       if (controllerViewport === null) return;
@@ -1411,16 +1391,15 @@ export function createBrowserHostEntry(
     applyControllerViewport();
     const joined = session.joinPanel(request.panelId, request.ownerSessionId);
     applyControllerViewport();
-    const transportKey = panelTransportKey(request);
     const authoritativeGeneration =
       session
         .snapshot()
-        .panels.find((panel) => panel.panelId === request.panelId)
+        .panels.find((member) => member.panelId === request.panelId)
         ?.generation ?? 0;
     const keepGenerations = [authoritativeGeneration, joined.generation].filter(
       (generation) => generation > 0,
     );
-    await stopObsoletePendingGenerations(transportKey, keepGenerations);
+    await stopObsoletePendingGenerations(request, keepGenerations);
     const clipboardExchange = createClipboardExchange({
       effects: {
         readSelectionBytes: async (actor) => source.copyClipboard?.(actor) ?? 0,
@@ -1443,7 +1422,7 @@ export function createBrowserHostEntry(
         );
         if (activated.outcome === "activated") {
           void stopBoundPanelTransports(
-            transportKey,
+            request,
             activated.supersededGenerations,
           );
         }
@@ -1459,6 +1438,7 @@ export function createBrowserHostEntry(
           return;
         }
         session.disconnectPanel(request.panelId);
+        void panelSessions.releaseIfIdle(controlTarget);
       },
       clipboardExchange,
       onTransferCancel: async (transferId) => {
@@ -1506,21 +1486,15 @@ export function createBrowserHostEntry(
       );
     };
     const unsubscribeControl = session.subscribe(pushControlState);
-    const unsubscribeTabs = strip.subscribe(pushControlState);
     const port = await transport.start();
-    const boundGenerations = panelTransports.get(transportKey) ?? [];
-    panelTransports.set(transportKey, [
-      ...boundGenerations,
-      {
-        ...transport,
-        generation: joined.generation,
-        async stop() {
-          unsubscribeControl();
-          unsubscribeTabs();
-          await transport.stop();
-        },
+    session.bindTransport(request.panelId, {
+      ...transport,
+      generation: joined.generation,
+      async stop() {
+        unsubscribeControl();
+        await transport.stop();
       },
-    ]);
+    });
     return openedPanelTransport(issued, port, gateway.declaredBindHost());
   }
   async function openPanelTransport(
@@ -1564,7 +1538,12 @@ export function createBrowserHostEntry(
       panelId: request.panelId,
     });
     if (injectedSource !== undefined) {
-      return startBoundPanelTransport(request, dataDir, opened, injectedSource);
+      return startBoundPanelTransport(
+        request,
+        dataDir,
+        opened,
+        () => injectedSource,
+      );
     }
     const { gateway, issued } = opened;
     const browserRuntime = runtime(dataDir);
@@ -1594,24 +1573,25 @@ export function createBrowserHostEntry(
         hostId: request.hostId,
         profileId: request.profileId,
       });
-      const source = createCdpScreencastSource({
-        resolveEndpoint: async () =>
-          (await browserRuntime.start(target)).automationEndpoint,
-        // The controller's logical viewport drives the screencast capture size;
-        // spectators scale and letterbox it rather than resizing it.
-        viewport: control.controllerViewport ?? undefined,
-        // Enroll a created target (open-link/open-image-new-tab) as a
-        // Browser Tab in the shared strip so it is normalized into the
-        // profile's ordered tab set rather than spawning an untracked window.
-        onTargetCreated: async (created) => {
-          await browserRuntime.checkRendererProcessLimit?.(target);
-          strip.openTab(created.url, "", created.targetId);
-          const evicted = strip.takeEvictedTabIds();
-          if (evicted.length > 0)
-            await browserRuntime.closePages(target, evicted);
-        },
-      });
-      return startBoundPanelTransport(request, dataDir, opened, source);
+      return startBoundPanelTransport(request, dataDir, opened, () =>
+        createCdpScreencastSource({
+          resolveEndpoint: async () =>
+            (await browserRuntime.start(target)).automationEndpoint,
+          // The controller's logical viewport drives the screencast capture size;
+          // spectators scale and letterbox it rather than resizing it.
+          viewport: control.controllerViewport ?? undefined,
+          // Enroll a created target (open-link/open-image-new-tab) as a
+          // Browser Tab in the shared strip so it is normalized into the
+          // profile's ordered tab set rather than spawning an untracked window.
+          onTargetCreated: async (created) => {
+            await browserRuntime.checkRendererProcessLimit?.(target);
+            strip.openTab(created.url, "", created.targetId);
+            const evicted = strip.takeEvictedTabIds();
+            if (evicted.length > 0)
+              await browserRuntime.closePages(target, evicted);
+          },
+        }),
+      );
     }
     return openedPanelTransport(
       issued,
@@ -1628,8 +1608,13 @@ export function createBrowserHostEntry(
       profileId: request.profileId,
     });
     session.closePanel(request.panelId);
-    await stopBoundPanelTransports(panelTransportKey(request));
+    session.setVisibility(request.panelId, "hidden");
+    await stopBoundPanelTransports(request);
     panelGateways.closePanel(request);
+    await panelSessions.releaseIfIdle({
+      hostId: request.hostId,
+      profileId: request.profileId,
+    });
     const browserRuntime = runtime(dataDir);
     if (browserRuntime !== undefined) {
       const target = await panelRuntimeTarget(request, dataDir);
@@ -2358,16 +2343,14 @@ export function createBrowserHostEntry(
     },
     dispose: async () => {
       try {
+        const remainingTransports = boundPanelTransports();
         controlLeases.dispose();
         panelSessions.dispose();
-        for (const strip of browserTabStrips.values()) strip.dispose();
-        browserTabStrips.clear();
         await Promise.all(
-          boundPanelTransports().map((transport) =>
+          remainingTransports.map((transport) =>
             transport.stop().catch(() => undefined),
           ),
         );
-        panelTransports.clear();
         panelGateways.dispose();
         panelCapabilities.dispose();
         await disposeRuntime();

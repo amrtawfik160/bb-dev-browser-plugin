@@ -14,6 +14,7 @@ import {
 import { DEFAULT_PROFILE_ID } from "../contracts.js";
 import { ownerSessionIdFromContext } from "../panel-owner-session.js";
 import type { HostProbeSnapshot } from "../readiness.js";
+import type { BrowserInstanceRuntime } from "../browser-runtime.js";
 import { createPublicPluginHarness } from "./public-plugin-harness.js";
 
 const HOST_ID = "host-browser-test";
@@ -116,7 +117,9 @@ export type LifecyclePanel = ReturnType<typeof within> &
     get connectionAttempts(): number;
   };
 
-export async function createPublicPanelLifecycleHarness() {
+export async function createPublicPanelLifecycleHarness(options?: {
+  browserRuntime?: BrowserInstanceRuntime;
+}) {
   let now = Date.parse("2026-08-31T12:00:00.000Z");
   const clock = { now: () => now };
   const sockets = new Set<TrackedSocket>();
@@ -284,6 +287,9 @@ export async function createPublicPanelLifecycleHarness() {
     snapshot: HEALTHY_SNAPSHOT,
     panelContext: { projectId: PROJECT_ID, threadId: THREAD_ID },
     clock,
+    ...(options?.browserRuntime === undefined
+      ? {}
+      : { browserRuntime: options.browserRuntime }),
     panelFrameSource: () => createDeterministicPanelFrameSource(receivedInputs),
   });
   const ownerSessionId = ownerSessionIdFromContext({
@@ -312,6 +318,10 @@ export async function createPublicPanelLifecycleHarness() {
         viewport?: { width: number; height: number };
         reclaimUntil: number | null;
       }>;
+    };
+    tabs?: {
+      tabs: Array<{ tabId: string; url: string; title: string }>;
+      activeTabId: string | null;
     };
   };
 
@@ -349,6 +359,19 @@ export async function createPublicPanelLifecycleHarness() {
     for (const message of parsedMessages(latestPort)) {
       if (message.type === "session" && message.control !== undefined) {
         latest = message.control;
+      }
+    }
+    return latest;
+  }
+
+  function latestTabs(panel: LifecyclePanel) {
+    const ports = issuedGatewayPorts(panel.panelId);
+    const latestPort = ports.at(-1);
+    if (latestPort === undefined) return null;
+    let latest: NonNullable<ParsedPanelMessage["tabs"]> | null = null;
+    for (const message of parsedMessages(latestPort)) {
+      if (message.type === "session" && message.tabs !== undefined) {
+        latest = message.tabs;
       }
     }
     return latest;
@@ -850,6 +873,19 @@ export async function createPublicPanelLifecycleHarness() {
       browser.setHostRpcFailure(method, message),
     latestSessionPanels,
     latestControl,
+    latestTabs,
+    openTab: (panel: LifecyclePanel) =>
+      browser.runBrowserTabAction("open", { panelId: panel.panelId }),
+    activateTab: (panel: LifecyclePanel, tabId: string) =>
+      browser.runBrowserTabAction("activate", {
+        panelId: panel.panelId,
+        tabId,
+      }),
+    closeTab: (panel: LifecyclePanel, tabId: string) =>
+      browser.runBrowserTabAction("close", {
+        panelId: panel.panelId,
+        tabId,
+      }),
     takeControl: (
       panel: LifecyclePanel,
       viewport?: { width: number; height: number },

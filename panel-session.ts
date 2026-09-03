@@ -8,13 +8,16 @@ import {
   ControlLeaseError,
   type ControlLeaseManager,
 } from "./control-lease.js";
+import { createBrowserTabStrip, type BrowserTabStrip } from "./browser-tabs.js";
+import type { ScreencastFrame, ScreencastSource } from "./panel-transport.js";
 
 /**
  * One host-owned Panel session per Browser Profile. It is the authority for
  * panel membership, connection generations, panel roles, Control Lease
- * coordination, reconnect reclaim, agent purpose, and the controller
- * viewport (ADR 0005/0007/0012). Browser Profile data stays on the workspace
- * host (ADR 0012).
+ * coordination, reconnect reclaim, agent purpose, the controller viewport,
+ * the shared Browser Tab snapshot, stream fan-out, and panel cleanup
+ * (ADR 0005/0007/0012). Browser Profile data stays on the workspace host
+ * (ADR 0012).
  */
 
 export type PanelSessionClock = { now(): number };
@@ -53,6 +56,15 @@ export type PanelSessionMember = {
 
 export type PanelSessionSnapshot = {
   panels: PanelSessionMember[];
+  tabs: BrowserTabStrip;
+};
+
+export type PanelVisibility = "visible" | "hidden";
+
+export type PanelSessionBoundTransport = {
+  generation: number;
+  stop(): Promise<void>;
+  dismissOpenDialogs(): void;
 };
 
 export type PanelSessionJoin = { generation: number };
@@ -98,11 +110,85 @@ function panelSessionKey(target: PanelSessionTarget) {
   return `${target.hostId}\u0000${target.profileId}`;
 }
 
+function createSessionStreamFanout() {
+  let source: ScreencastSource | undefined;
+  let sharedAbort: AbortController | undefined;
+  let started = false;
+  let lastFrame: ScreencastFrame | undefined;
+  const sinks = new Set<(frame: ScreencastFrame) => void>();
+
+  function attach(create: () => ScreencastSource): ScreencastSource {
+    source ??= create();
+    const real = source;
+    let sink: ((frame: ScreencastFrame) => void) | undefined;
+    return {
+      async start(onFrame, signal) {
+        sink = (frame) => onFrame(frame);
+        sinks.add(sink);
+        if (lastFrame !== undefined) onFrame(lastFrame);
+        if (!started) {
+          started = true;
+          sharedAbort = new AbortController();
+          void real.start((frame) => {
+            lastFrame = frame;
+            for (const next of sinks) next(frame);
+          }, sharedAbort.signal);
+        }
+        await new Promise<void>((resolve) => {
+          if (signal.aborted) {
+            resolve();
+            return;
+          }
+          signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+      },
+      input(payload) {
+        real.input(payload);
+      },
+      async stop() {
+        if (sink !== undefined) sinks.delete(sink);
+        sink = undefined;
+      },
+      setViewport: real.setViewport?.bind(real),
+      subscribeDialogs: real.subscribeDialogs?.bind(real),
+      respondToDialog: real.respondToDialog?.bind(real),
+      dismissOpenDialogs: real.dismissOpenDialogs?.bind(real),
+      resolveContextActions: real.resolveContextActions?.bind(real),
+      performContextAction: real.performContextAction?.bind(real),
+      copyClipboard: real.copyClipboard?.bind(real),
+      pasteClipboard: real.pasteClipboard?.bind(real),
+    };
+  }
+
+  async function release() {
+    sharedAbort?.abort();
+    sharedAbort = undefined;
+    started = false;
+    lastFrame = undefined;
+    sinks.clear();
+    const stopping = source;
+    source = undefined;
+    await stopping?.stop();
+  }
+
+  return {
+    attach,
+    release,
+    get live() {
+      return source !== undefined;
+    },
+  };
+}
+
 export function createPanelSession(options: PanelSessionOptions = {}) {
   const clock = options.clock ?? { now: () => Date.now() };
   const reclaimWindowMs = options.reclaimWindowMs ?? PANEL_RECLAIM_WINDOW_MS;
   const controlLeases = options.controlLeases;
   const panels = new Map<string, PanelSessionRecord>();
+  const visiblePanelIds = new Set<string>();
+  const boundTransports = new Map<string, PanelSessionBoundTransport[]>();
+  const tabStrip = createBrowserTabStrip();
+  const streamFanout = createSessionStreamFanout();
   let leaseKey: string | undefined;
   let controllerPanelId: string | null = null;
   let controllerViewport: PanelViewport | null = null;
@@ -172,6 +258,7 @@ export function createPanelSession(options: PanelSessionOptions = {}) {
         generation: member.authoritativeGeneration ?? 0,
         reclaimUntil: member.reclaimUntil,
       })),
+      tabs: tabStrip.snapshot(),
     };
   }
 
@@ -200,6 +287,8 @@ export function createPanelSession(options: PanelSessionOptions = {}) {
     const next = state();
     for (const listener of listeners) listener(next);
   }
+
+  tabStrip.subscribe(() => emit());
 
   function subscribe(listener: PanelControlStateListener) {
     listeners.add(listener);
@@ -468,13 +557,89 @@ export function createPanelSession(options: PanelSessionOptions = {}) {
     emit();
   }
 
+  function isIdle() {
+    expireReclaim();
+    return (
+      panels.size === 0 &&
+      visiblePanelIds.size === 0 &&
+      !reclaimActive() &&
+      leaseState() === undefined
+    );
+  }
+
+  function setVisibility(panelId: string, visibility: PanelVisibility) {
+    if (visibility === "visible") visiblePanelIds.add(panelId);
+    else visiblePanelIds.delete(panelId);
+    return true;
+  }
+
+  function attachStreamSource(create: () => ScreencastSource) {
+    return streamFanout.attach(create);
+  }
+
+  function hasLiveStream() {
+    return streamFanout.live;
+  }
+
+  async function releaseIfIdle() {
+    expireReclaim();
+    if (!isIdle()) return;
+    await streamFanout.release();
+    await stopAllTransports();
+  }
+
+  function bindTransport(
+    panelId: string,
+    transport: PanelSessionBoundTransport,
+  ) {
+    const bound = boundTransports.get(panelId) ?? [];
+    boundTransports.set(panelId, [...bound, transport]);
+  }
+
+  async function stopTransports(
+    panelId: string,
+    generations?: readonly number[],
+  ) {
+    const bound = boundTransports.get(panelId) ?? [];
+    const stopping =
+      generations === undefined
+        ? bound
+        : bound.filter((entry) => generations.includes(entry.generation));
+    await Promise.all(
+      stopping.map((entry) => entry.stop().catch(() => undefined)),
+    );
+    const remaining = bound.filter((entry) => !stopping.includes(entry));
+    if (remaining.length === 0) boundTransports.delete(panelId);
+    else boundTransports.set(panelId, remaining);
+  }
+
+  async function stopAllTransports() {
+    const stopping = [...boundTransports.values()].flat();
+    boundTransports.clear();
+    await Promise.all(
+      stopping.map((entry) => entry.stop().catch(() => undefined)),
+    );
+  }
+
+  function boundTransportList() {
+    return [...boundTransports.values()].flat();
+  }
+
+  function transportsFor(panelId: string) {
+    return boundTransports.get(panelId) ?? [];
+  }
+
   function dispose() {
     listeners.clear();
     panels.clear();
     expiredPanelIds.clear();
+    visiblePanelIds.clear();
     controllerPanelId = null;
     controllerViewport = null;
     clearControlReclaim();
+    tabStrip.dispose();
+    boundTransports.clear();
+    void streamFanout.release();
   }
 
   return {
@@ -496,6 +661,21 @@ export function createPanelSession(options: PanelSessionOptions = {}) {
     closePanel,
     revoke,
     snapshot,
+    tabStrip() {
+      return tabStrip;
+    },
+    attachStreamSource,
+    hasLiveStream,
+    releaseIfIdle,
+    isIdle,
+    setVisibility,
+    visiblePanelIds() {
+      return [...visiblePanelIds];
+    },
+    bindTransport,
+    stopTransports,
+    boundTransports: boundTransportList,
+    transportsFor,
     dispose,
     get reclaimWindowMs() {
       return reclaimWindowMs;
@@ -539,12 +719,27 @@ export function createPanelSessionRegistry(
     }
   }
 
+  function dropIdle(target: PanelSessionTarget) {
+    const key = panelSessionKey(target);
+    const session = sessions.get(key);
+    if (session === undefined || !session.isIdle()) return;
+    session.dispose();
+    sessions.delete(key);
+  }
+
+  async function releaseIfIdle(target: PanelSessionTarget) {
+    const session = sessions.get(panelSessionKey(target));
+    if (session === undefined) return;
+    await session.releaseIfIdle();
+    dropIdle(target);
+  }
+
   function dispose() {
     for (const session of sessions.values()) session.dispose();
     sessions.clear();
   }
 
-  return { sessionFor, forEach, dispose };
+  return { sessionFor, forEach, dropIdle, releaseIfIdle, dispose };
 }
 
 export type PanelSessionRegistry = ReturnType<

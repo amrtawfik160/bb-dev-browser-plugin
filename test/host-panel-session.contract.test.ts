@@ -320,4 +320,130 @@ describe("host-owned Panel session", () => {
       await rm(dataDir, { recursive: true, force: true });
     }
   });
+
+  it("fans one profile stream out so stopping one panel does not abort the other", async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), "host-panel-fanout-"));
+    const receivedInputs: unknown[] = [];
+    let starts = 0;
+    let stops = 0;
+    const stopWaiters: Array<() => void> = [];
+    const sharedSource: ScreencastSource = {
+      async start(onFrame, signal) {
+        starts += 1;
+        onFrame({
+          sequence: starts,
+          mimeType: "image/png",
+          data: Buffer.from("fanout"),
+        });
+        await new Promise<void>((resolve) => {
+          const finish = () => resolve();
+          stopWaiters.push(finish);
+          if (signal.aborted) {
+            finish();
+            return;
+          }
+          signal.addEventListener("abort", finish, { once: true });
+        });
+      },
+      input(payload) {
+        receivedInputs.push(payload);
+      },
+      async stop() {
+        stops += 1;
+        for (const finish of stopWaiters.splice(0)) finish();
+      },
+    };
+    const host = experimental_createHostEntryHarness(
+      createBrowserHostEntry(
+        {
+          inspect: healthyStatus,
+          diagnostics: () => {
+            throw new Error("not used");
+          },
+        },
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { frameSource: () => sharedSource },
+      ),
+      {
+        experimental_paths: {
+          dataDir,
+          tempDir: join(dataDir, "tmp"),
+        },
+      },
+    );
+    let firstSocket: WebSocket | undefined;
+    let secondSocket: WebSocket | undefined;
+    try {
+      const firstOpened = await host.experimental_call("panelTransport", {
+        hostId: HOST_ID,
+        profileId: DEFAULT_PROFILE_ID,
+        panelId: "panel-fanout-a",
+        ownerSessionId: "owner-session-a",
+      });
+      const secondOpened = await host.experimental_call("panelTransport", {
+        hostId: HOST_ID,
+        profileId: DEFAULT_PROFILE_ID,
+        panelId: "panel-fanout-b",
+        ownerSessionId: "owner-session-b",
+      });
+      expect(firstOpened).toMatchObject({ outcome: "opened" });
+      expect(secondOpened).toMatchObject({ outcome: "opened" });
+      if (
+        firstOpened.outcome !== "opened" ||
+        secondOpened.outcome !== "opened"
+      ) {
+        return;
+      }
+      const first = await connectAndRedeem(firstOpened, {
+        panelId: "panel-fanout-a",
+        ownerSessionId: "owner-session-a",
+      });
+      firstSocket = first.socket;
+      const second = await connectAndRedeem(secondOpened, {
+        panelId: "panel-fanout-b",
+        ownerSessionId: "owner-session-b",
+      });
+      secondSocket = second.socket;
+      expect(starts).toBe(1);
+
+      await host.experimental_call("takeControl", {
+        hostId: HOST_ID,
+        profileId: DEFAULT_PROFILE_ID,
+        panelId: "panel-fanout-b",
+        ownerSessionId: "owner-session-b",
+      });
+      await host.experimental_call("panelRelease", {
+        hostId: HOST_ID,
+        profileId: DEFAULT_PROFILE_ID,
+        panelId: "panel-fanout-a",
+      });
+      await waitFor(() => first.socket.readyState === WebSocket.CLOSED);
+      expect(stops).toBe(0);
+      sendProtocol(second.socket, {
+        protocolVersion: PANEL_PROTOCOL_VERSION,
+        type: "input",
+        sequence: 1,
+        payload: { kind: "click", generation: "survivor" },
+      });
+      await waitFor(() =>
+        receivedInputs.some(
+          (input) =>
+            input !== null &&
+            typeof input === "object" &&
+            "generation" in input &&
+            input.generation === "survivor",
+        ),
+      );
+    } finally {
+      firstSocket?.close();
+      secondSocket?.close();
+      await host.experimental_dispose().catch(() => undefined);
+      await rm(dataDir, { recursive: true, force: true });
+    }
+  });
 });
