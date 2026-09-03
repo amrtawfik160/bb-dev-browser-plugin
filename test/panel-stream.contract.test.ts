@@ -151,6 +151,33 @@ describe("Automation Mode stream policy contract", () => {
     expect(adapter.state).toBe("released");
   });
 
+  it("keeps the stream live through a successful authorization rotation", () => {
+    const adapter = createAutomationStreamAdapter();
+    adapter.start();
+    expect(adapter.beginRotation()).toBe(true);
+    expect(adapter.state).toBe("rotating");
+    expect(adapter.rotationSucceeded()).toBe(true);
+    expect(adapter.state).toBe("streaming");
+  });
+
+  it("freezes input on a failed rotation so reconnect can begin", () => {
+    const adapter = createAutomationStreamAdapter();
+    adapter.start();
+    expect(adapter.beginRotation()).toBe(true);
+    expect(adapter.rotationFailed()).toBe(true);
+    expect(adapter.state).toBe("input-frozen");
+    expect(adapter.beginReconnect()).toBe(PANEL_RECONNECT_INITIAL_BACKOFF_MS);
+    expect(adapter.state).toBe("reconnecting");
+  });
+
+  it("does not begin rotation after the stream is released", () => {
+    const adapter = createAutomationStreamAdapter();
+    adapter.start();
+    adapter.release();
+    expect(adapter.beginRotation()).toBe(false);
+    expect(adapter.state).toBe("released");
+  });
+
   it("never streams audio or exceeds the declared viewport after release", () => {
     const adapter = createAutomationStreamAdapter();
     adapter.start();

@@ -14,7 +14,9 @@ import type { PanelCapabilityStore } from "./panel-capability.js";
  * logical viewport within supported bounds (up to 1920x1080). Other panels
  * scale and letterbox it. The stream adapts between 5 and 15 frames per
  * second. Input freezes immediately on disconnect; the same panel has a
- * 10-second reclaim window and stream reconnect uses bounded backoff. v1
+ * 10-second reclaim window and stream reconnect uses bounded backoff.
+ * Scheduled authorization rotation replaces the live connection without
+ * blanking the stream; a failed rotation freezes input and reconnects. v1
  * streams no audio and makes no DRM or high-fidelity media promise.
  */
 export type PanelViewport = { width: number; height: number };
@@ -22,7 +24,12 @@ export type PanelViewport = { width: number; height: number };
 export type PanelStreamClock = { now(): number };
 
 export type PanelStreamState =
-  "idle" | "streaming" | "input-frozen" | "reconnecting" | "released";
+  | "idle"
+  | "streaming"
+  | "rotating"
+  | "input-frozen"
+  | "reconnecting"
+  | "released";
 
 export type PanelStreamAdapterOptions = {
   clock?: PanelStreamClock;
@@ -167,9 +174,34 @@ export function createAutomationStreamAdapter(
    * advances the backoff and {@link reconnectSucceeded} restores streaming.
    * Returns 0 when the stream is released and cannot reconnect.
    */
+  /**
+   * Begin scheduled authorization rotation. Observation continues on the
+   * current generation until a replacement connection is ready. Returns false
+   * when the stream cannot rotate.
+   */
+  function beginRotation(): boolean {
+    if (state !== "streaming") return false;
+    state = "rotating";
+    return true;
+  }
+
+  function rotationSucceeded(): boolean {
+    if (state !== "rotating") return false;
+    state = "streaming";
+    return true;
+  }
+
+  function rotationFailed(): boolean {
+    if (state !== "rotating") return false;
+    state = "input-frozen";
+    disconnectedAt = clock.now();
+    return true;
+  }
+
   function beginReconnect(): number {
     if (state === "released") return 0;
     if (state === "streaming") return 0;
+    if (state === "rotating") return 0;
     state = "reconnecting";
     reconnectAttempt = 0;
     return nextReconnectDelayMs();
@@ -203,6 +235,9 @@ export function createAutomationStreamAdapter(
     reclaim,
     reclaimWindowRemainingMs,
     nextReconnectDelayMs,
+    beginRotation,
+    rotationSucceeded,
+    rotationFailed,
     beginReconnect,
     reconnectFailed,
     reconnectSucceeded,

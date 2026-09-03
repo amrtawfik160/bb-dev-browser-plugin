@@ -596,8 +596,30 @@ export async function createPublicPanelLifecycleHarness() {
     );
   }
 
+  function latestLiveSocketFor(panel: LifecyclePanel) {
+    const ports = issuedGatewayPorts(panel.panelId);
+    for (let index = ports.length - 1; index >= 0; index -= 1) {
+      const port = ports[index];
+      const socket = [...sockets].find(
+        (candidate) =>
+          socketPort(candidate) === String(port) &&
+          candidate.readyState === NodeWebSocket.OPEN,
+      );
+      if (socket !== undefined) return socket;
+    }
+    return undefined;
+  }
+
   function sendAuthorizedInput(panel: LifecyclePanel, payload: unknown) {
     const socket = liveSocketFor(panel);
+    if (socket === undefined) {
+      throw new Error("Browser Panel has no live stream connection.");
+    }
+    sendSocketInput(socket, payload);
+  }
+
+  function sendLiveInput(panel: LifecyclePanel, payload: unknown) {
+    const socket = latestLiveSocketFor(panel);
     if (socket === undefined) {
       throw new Error("Browser Panel has no live stream connection.");
     }
@@ -693,7 +715,10 @@ export async function createPublicPanelLifecycleHarness() {
     },
     openTwoPanels,
     sendAuthorizedInput,
+    sendLiveInput,
     sendSocketInput,
+    setHostRpcFailure: (method: string, message?: string) =>
+      browser.setHostRpcFailure(method, message),
     latestSessionPanels,
     latestIssuedGeneration,
     issuedSecrets,
