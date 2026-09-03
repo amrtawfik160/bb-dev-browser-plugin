@@ -272,6 +272,148 @@ describe("public Browser Panel lifecycle seam", () => {
     }
   });
 
+  it("reconnects with a fresh Panel Capability after physical socket loss", async () => {
+    const browser = await createPublicPanelLifecycleHarness();
+    try {
+      const [first, second] = await browser.openTwoPanels();
+      await first.findByRole("img", { name: "Browser page view" });
+      await first.findByText("The page is live.");
+      const framesBeforeLoss = first.framesReceived;
+      const originalSecrets = browser.issuedSecrets(first.panelId);
+      expect(originalSecrets).toHaveLength(1);
+      const originalSecret = originalSecrets[0]!;
+      expect(browser.redeemedSecrets(first.panelId)).toEqual([originalSecret]);
+
+      browser.sendAuthorizedInput(first, { kind: "click", generation: 1 });
+      await waitFor(() => {
+        expect(browser.receivedInputs).toEqual([
+          { kind: "click", generation: 1 },
+        ]);
+      });
+
+      await browser.forcePhysicalSocketLoss(first);
+      await first.findByText("Reconnecting to the browser…");
+      await first.findByRole("img", { name: "Browser page view" });
+      await second.findByText("The page is live.");
+      expect(() =>
+        browser.sendAuthorizedInput(first, { kind: "click", queued: true }),
+      ).toThrow("Browser Panel has no live stream connection.");
+      expect(browser.receivedInputs).toEqual([
+        { kind: "click", generation: 1 },
+      ]);
+
+      await browser.advanceTime(PANEL_RECONNECT_INITIAL_BACKOFF_MS);
+      await waitFor(() => {
+        expect(browser.issuedSecrets(first.panelId).length).toBeGreaterThan(1);
+      });
+      const nextSecret = browser.issuedSecrets(first.panelId).at(-1);
+      expect(nextSecret).toBeDefined();
+      expect(nextSecret).not.toBe(originalSecret);
+      await waitFor(() => {
+        expect(browser.redeemedSecrets(first.panelId)).toEqual([
+          originalSecret,
+          nextSecret,
+        ]);
+      });
+      await first.findByText("The page is live.");
+      await first.findByRole("img", { name: "Browser page view" });
+      expect(first.framesReceived).toBeGreaterThan(framesBeforeLoss);
+      await waitFor(() => {
+        const member = browser
+          .latestSessionPanels(first)
+          .find((panel) => panel.panelId === first.panelId);
+        expect(member).toMatchObject({
+          connection: "connected",
+          role: "spectator",
+        });
+      });
+      await second.findByText("The page is live.");
+
+      const liveSocket = [...browser.socketUrls()].find((url) =>
+        url.includes("127.0.0.1"),
+      );
+      expect(liveSocket).toBeDefined();
+      for (const secret of browser.issuedSecrets(first.panelId)) {
+        expect(browser.socketUrls().join("\n")).not.toContain(secret);
+        expect(
+          browser.jsonContainsSecret(browser.diagnosticLogEntries(), secret),
+        ).toBe(false);
+        expect(
+          browser.jsonContainsSecret(await browser.activityRecords(), secret),
+        ).toBe(false);
+        expect(
+          browser.jsonContainsSecret(browser.persistedActivityRows(), secret),
+        ).toBe(false);
+        expect(
+          browser.jsonContainsSecret(await browser.runDiagnostics(), secret),
+        ).toBe(false);
+      }
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("does not let an aborted reconnect attempt poison the next live frame", async () => {
+    const browser = await createPublicPanelLifecycleHarness();
+    try {
+      const [first, second] = await browser.openTwoPanels();
+      await first.findByText("The page is live.");
+      const framesBeforeLoss = first.framesReceived;
+
+      await browser.forcePhysicalSocketLoss(first);
+      await first.findByText("Reconnecting to the browser…");
+      await browser.advanceTime(PANEL_RECONNECT_INITIAL_BACKOFF_MS);
+      await waitFor(() => {
+        expect(browser.latestIssuedGeneration(first)).toBeGreaterThan(1);
+      });
+      await browser.forcePhysicalSocketLoss(first);
+      await first.findByText("Reconnecting to the browser…");
+      await browser.advanceTime(PANEL_RECONNECT_INITIAL_BACKOFF_MS);
+      await first.findByText("The page is live.");
+      expect(first.framesReceived).toBeGreaterThan(framesBeforeLoss);
+      await second.findByText("The page is live.");
+      expect(new Set(browser.issuedSecrets(first.panelId)).size).toBe(
+        browser.issuedSecrets(first.panelId).length,
+      );
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("does not start another reconnect after a closed or switched panel", async () => {
+    const browser = await createPublicPanelLifecycleHarness();
+    try {
+      const [first, second] = await browser.openTwoPanels();
+      await first.findByText("The page is live.");
+      await browser.forcePhysicalSocketLoss(first);
+      await first.findByText("Reconnecting to the browser…");
+      const issuedBeforeClose = browser.latestIssuedGeneration(first);
+
+      await browser.closePanel(first);
+      expect(first.container.innerHTML).toBe("");
+      await browser.advanceTime(PANEL_RECONNECT_INITIAL_BACKOFF_MS);
+      await browser.advanceTime(PANEL_RECONNECT_INITIAL_BACKOFF_MS);
+      expect(browser.latestIssuedGeneration(first)).toBe(issuedBeforeClose);
+      await second.findByText("The page is live.");
+
+      await browser.forcePhysicalSocketLoss(second);
+      await second.findByText("Reconnecting to the browser…");
+      const created = await browser.createBrowserProfile({
+        hostId: browser.hostId,
+        name: "Reconnect switch target",
+      });
+      const issuedBeforeSwitch = browser.latestIssuedGeneration(second);
+      const switched = await browser.switchBrowserProfile(created.profileId);
+      expect(switched.selectedProfileId).toBe(created.profileId);
+      await browser.closePanel(second);
+      await browser.advanceTime(PANEL_RECONNECT_INITIAL_BACKOFF_MS);
+      await browser.advanceTime(PANEL_RECONNECT_INITIAL_BACKOFF_MS);
+      expect(browser.latestIssuedGeneration(second)).toBe(issuedBeforeSwitch);
+    } finally {
+      await browser.dispose();
+    }
+  });
+
   it("can force physical socket loss, advance reconnect and expiry time, close either panel, and switch a Browser Profile", async () => {
     const browser = await createPublicPanelLifecycleHarness();
     try {
@@ -296,7 +438,10 @@ describe("public Browser Panel lifecycle seam", () => {
       const attemptsAfterLoss = first.connectionAttempts;
 
       await browser.advanceTime(PANEL_RECONNECT_INITIAL_BACKOFF_MS);
-      expect(first.connectionAttempts).toBeGreaterThan(attemptsAfterLoss);
+      await waitFor(() => {
+        expect(first.connectionAttempts).toBeGreaterThan(attemptsAfterLoss);
+      });
+      await first.findByText("The page is live.");
 
       await browser.advanceTime(PANEL_CAPABILITY_TTL_MS + 1);
       const issuedAfter = await browser.issuePanelCapability({
@@ -317,7 +462,7 @@ describe("public Browser Panel lifecycle seam", () => {
       expect(lifecycleHostCommands(browser.hostRpcCalls)).toContain(
         "panelRelease",
       );
-      await first.findByText("Reconnecting to the browser…");
+      await first.findByText("The page is live.");
 
       const created = await browser.createBrowserProfile({
         hostId: browser.hostId,
