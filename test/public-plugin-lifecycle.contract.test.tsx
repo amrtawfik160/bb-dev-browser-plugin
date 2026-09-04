@@ -1,9 +1,10 @@
 // @vitest-environment jsdom
-import { waitFor } from "@testing-library/react";
+import { act, waitFor } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import { WebSocket } from "ws";
 import {
   DEFAULT_PROFILE_ID,
+  PANEL_AUTH_ROTATION_MS,
   PANEL_CAPABILITY_TTL_MS,
   PANEL_RECONNECT_INITIAL_BACKOFF_MS,
 } from "../contracts.js";
@@ -375,6 +376,180 @@ describe("public Browser Panel lifecycle seam", () => {
       expect(new Set(browser.issuedSecrets(first.panelId)).size).toBe(
         browser.issuedSecrets(first.panelId).length,
       );
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("replaces Panel authorization at the five-minute boundary without blanking the page", async () => {
+    const browser = await createPublicPanelLifecycleHarness();
+    try {
+      const [first, second] = await browser.openTwoPanels();
+      await first.findByRole("img", { name: "Browser page view" });
+      await first.findByText("The page is live.");
+      await second.findByText("The page is live.");
+      const framesBeforeRotation = first.framesReceived;
+      const originalSecrets = browser.issuedSecrets(first.panelId);
+      expect(originalSecrets).toHaveLength(1);
+      const originalSecret = originalSecrets[0]!;
+      const originalPort = first.gatewayPort;
+      const hostCallsBeforeInput = browser.hostRpcCalls.length;
+      browser.sendAuthorizedInput(first, { kind: "click", generation: 1 });
+      await waitFor(() => {
+        expect(browser.receivedInputs).toEqual([
+          { kind: "click", generation: 1 },
+        ]);
+      });
+      expect(browser.hostRpcCalls.length).toBe(hostCallsBeforeInput);
+
+      browser.holdNewSocketMessageEvents();
+      browser.armAuthorizedInputOnNextReady(first, {
+        kind: "click",
+        generation: "stale",
+      });
+      await browser.advanceTime(PANEL_AUTH_ROTATION_MS);
+      await waitFor(() => {
+        expect(browser.issuedSecrets(first.panelId).length).toBeGreaterThan(1);
+      });
+      const nextSecret = browser.issuedSecrets(first.panelId).at(-1);
+      expect(nextSecret).toBeDefined();
+      expect(nextSecret).not.toBe(originalSecret);
+      const replacementPort = browser.issuedGatewayPorts(first.panelId).at(-1);
+      expect(replacementPort).toBeDefined();
+      expect(replacementPort).not.toBe(originalPort);
+      await waitFor(() => {
+        expect(browser.redeemedSecrets(first.panelId)).toEqual([
+          originalSecret,
+          nextSecret,
+        ]);
+        expect(browser.portHasReady(replacementPort!)).toBe(true);
+        expect(browser.overlapSend().sent).toBe(true);
+      });
+      expect(browser.overlapSend().error).toBeUndefined();
+      await waitForSettled(() => {
+        return !browser.receivedInputs.some(
+          (input) =>
+            input !== null &&
+            typeof input === "object" &&
+            "generation" in input &&
+            input.generation === "stale",
+        );
+      });
+      expect(first.queryByText("Reconnecting to the browser…")).toBeNull();
+      await browser.releaseHeldSocketEvents();
+      await first.findByText("The page is live.");
+      await first.findByRole("img", { name: "Browser page view" });
+      expect(first.queryByText("Reconnecting to the browser…")).toBeNull();
+      expect(first.framesReceived).toBeGreaterThanOrEqual(framesBeforeRotation);
+      await second.findByText("The page is live.");
+      await waitFor(() => {
+        expect(browser.portHasOpenSocket(originalPort)).toBe(false);
+      });
+      const hostCallsBeforeLiveInput = browser.hostRpcCalls.length;
+      browser.sendLiveInput(first, { kind: "click", generation: 2 });
+      await waitFor(() => {
+        expect(browser.receivedInputs).toContainEqual({
+          kind: "click",
+          generation: 2,
+        });
+      });
+      expect(browser.hostRpcCalls.length).toBe(hostCallsBeforeLiveInput);
+      await waitFor(() => {
+        const members = browser.latestSessionPanels(second);
+        expect(
+          members.filter((panel) => panel.panelId === first.panelId),
+        ).toHaveLength(1);
+        expect(
+          members.find((panel) => panel.panelId === first.panelId),
+        ).toMatchObject({ connection: "connected" });
+        expect(members.map((panel) => panel.panelId).sort()).toEqual(
+          [first.panelId, second.panelId].sort(),
+        );
+      });
+      expect(new Set(browser.issuedSecrets(first.panelId)).size).toBe(
+        browser.issuedSecrets(first.panelId).length,
+      );
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("closes an in-flight replacement connection when the panel unmounts during rotation", async () => {
+    const browser = await createPublicPanelLifecycleHarness();
+    try {
+      const [first, second] = await browser.openTwoPanels();
+      await first.findByText("The page is live.");
+      await second.findByText("The page is live.");
+      const originalSecret = browser.issuedSecrets(first.panelId)[0]!;
+
+      browser.holdNewSocketOpenEvents();
+      await browser.advanceTime(PANEL_AUTH_ROTATION_MS);
+      await waitFor(() => {
+        expect(browser.issuedSecrets(first.panelId).length).toBeGreaterThan(1);
+      });
+      const replacementPort = browser.issuedGatewayPorts(first.panelId).at(-1);
+      expect(replacementPort).toBeDefined();
+      await waitFor(() => {
+        expect(browser.portHasOpenSocket(replacementPort!)).toBe(true);
+      });
+      expect(browser.redeemedSecrets(first.panelId)).toEqual([originalSecret]);
+
+      act(() => {
+        first.lifecycle.unmount();
+      });
+      expect(browser.appClosedPort(replacementPort!)).toBe(true);
+      expect(browser.redeemedSecrets(first.panelId)).toEqual([originalSecret]);
+      await second.findByText("The page is live.");
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("freezes input and reconnects when authorization rotation fails", async () => {
+    const browser = await createPublicPanelLifecycleHarness();
+    try {
+      const [first, second] = await browser.openTwoPanels();
+      await first.findByRole("img", { name: "Browser page view" });
+      await first.findByText("The page is live.");
+      const framesBeforeFailure = first.framesReceived;
+      const originalSecrets = browser.issuedSecrets(first.panelId);
+      expect(originalSecrets).toHaveLength(1);
+      const originalSecret = originalSecrets[0]!;
+      browser.sendAuthorizedInput(first, { kind: "click", generation: 1 });
+      await waitFor(() => {
+        expect(browser.receivedInputs).toEqual([
+          { kind: "click", generation: 1 },
+        ]);
+      });
+
+      browser.setHostRpcFailure(
+        "panelTransport",
+        "replacement Panel Capability unavailable",
+      );
+      await browser.advanceTime(PANEL_AUTH_ROTATION_MS);
+      await first.findByText("Reconnecting to the browser…");
+      await first.findByRole("img", { name: "Browser page view" });
+      expect(first.framesReceived).toBeGreaterThanOrEqual(framesBeforeFailure);
+      expect(() =>
+        browser.sendAuthorizedInput(first, { kind: "click", queued: true }),
+      ).toThrow("Browser Panel has no live stream connection.");
+      expect(browser.receivedInputs).toEqual([
+        { kind: "click", generation: 1 },
+      ]);
+      expect(browser.issuedSecrets(first.panelId)).toEqual([originalSecret]);
+      await second.findByRole("img", { name: "Browser page view" });
+
+      browser.setHostRpcFailure("panelTransport");
+      await browser.advanceTime(PANEL_RECONNECT_INITIAL_BACKOFF_MS);
+      await waitFor(() => {
+        expect(browser.issuedSecrets(first.panelId).length).toBeGreaterThan(1);
+      });
+      const recoveredSecret = browser.issuedSecrets(first.panelId).at(-1);
+      expect(recoveredSecret).toBeDefined();
+      expect(recoveredSecret).not.toBe(originalSecret);
+      await first.findByText("The page is live.");
+      await first.findByRole("img", { name: "Browser page view" });
+      expect(first.framesReceived).toBeGreaterThan(framesBeforeFailure);
     } finally {
       await browser.dispose();
     }

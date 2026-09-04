@@ -20,6 +20,7 @@ import {
   RESET_PROFILE_CONFIRMATION,
   STOP_BROWSER_CONFIRMATION,
   BROWSER_PANEL_STREAM_DISCLOSURE,
+  PANEL_AUTH_ROTATION_MS,
   PANEL_MAX_VIEWPORT_HEIGHT,
   PANEL_MAX_VIEWPORT_WIDTH,
   type BrowserContextAction,
@@ -417,8 +418,10 @@ function PanelStreamSurface({
 
   // Drive the authenticated stream: open a WebSocket through the BB Connect
   // tunnel, redeem the capability in the first message, render frames on the
-  // canvas, and reconnect with bounded backoff on disconnect. Input freezes
-  // immediately on disconnect; the same panel has a 10-second reclaim window.
+  // canvas, reconnect with bounded backoff on disconnect, and replace the
+  // physical connection at the five-minute authorization boundary. Input
+  // freezes immediately on disconnect; the same panel has a 10-second reclaim
+  // window.
   useEffect(() => {
     if (
       capability?.outcome !== "issued" ||
@@ -428,7 +431,10 @@ function PanelStreamSurface({
     let disposed = false;
     let socket: WebSocket | null = null;
     let reconnectTimer: ReturnType<typeof schedulePanelTimeout> | null = null;
+    let rotationTimer: ReturnType<typeof schedulePanelTimeout> | null = null;
     let attemptAbort: AbortController | null = null;
+    let replacementAbort: AbortController | null = null;
+    let replacementSocket: WebSocket | null = null;
     const streamHostId = status.hostId;
     const streamProfileId = status.profileId;
     const stream = createAutomationStreamAdapter();
@@ -442,9 +448,25 @@ function PanelStreamSurface({
       }
     }
 
+    function clearRotation() {
+      if (rotationTimer !== null) {
+        clearPanelTimeout(rotationTimer);
+        rotationTimer = null;
+      }
+    }
+
     function abortAttempt() {
       attemptAbort?.abort();
       attemptAbort = null;
+    }
+
+    function discardReplacement() {
+      const pendingAttempt = replacementAbort;
+      const pendingSocket = replacementSocket;
+      replacementAbort = null;
+      replacementSocket = null;
+      pendingAttempt?.abort();
+      if (pendingSocket !== null) pendingSocket.close();
     }
 
     function drawFrame(frame: { mimeType: string; data: string }) {
@@ -460,79 +482,24 @@ function PanelStreamSurface({
       image.src = `data:${frame.mimeType};base64,${frame.data}`;
     }
 
-    function scheduleReconnect() {
-      if (disposed) return;
-      const delay =
-        stream.state === "reconnecting"
-          ? stream.reconnectFailed()
-          : stream.beginReconnect();
-      if (delay === 0) {
-        setStreamState("offline");
-        return;
-      }
-      setStreamState("reconnecting");
-      clearReconnect();
-      reconnectTimer = schedulePanelTimeout(() => {
-        reconnectTimer = null;
-        if (!disposed) void requestFreshCapability();
-      }, delay);
-    }
-
-    async function requestFreshCapability() {
-      if (disposed || streamHostId === null) return;
-      abortAttempt();
-      const attempt = new AbortController();
-      attemptAbort = attempt;
-      try {
-        const response = await rpc.call("browser_panel_capability", {
-          hostId: streamHostId,
-          profileId: streamProfileId,
-          panelId,
-          ownerSessionId,
-        });
-        if (disposed || attempt.signal.aborted) return;
-        if (response.outcome !== "issued") {
-          scheduleReconnect();
-          return;
-        }
-        setCapability(response);
-        connect(response);
-      } catch {
-        if (!disposed && !attempt.signal.aborted) scheduleReconnect();
-      }
-    }
-
-    function connect(
+    function streamUrl(
       issued: Extract<BrowserPanelCapabilityResponse, { outcome: "issued" }>,
     ) {
-      if (disposed) return;
-      abortAttempt();
-      const attempt = new AbortController();
-      attemptAbort = attempt;
-      if (socket !== null) {
-        const previous = socket;
-        socket = null;
-        socketRef.current = null;
-        previous.close();
-      }
       // Production reaches the loopback gateway through BB Connect. The public
       // lifecycle seam substitutes that tunnel with the declared loopback port
       // so tests redeem a real Panel Capability without a Connect daemon.
-      const url = isTestLoopbackPanelTransport()
+      return isTestLoopbackPanelTransport()
         ? `ws://127.0.0.1:${issued.gatewayPort}`
         : `wss://${issued.tunnel.label}.${issued.tunnel.baseDomain}`;
-      let nextSocket: WebSocket;
-      try {
-        nextSocket = new WebSocket(url);
-      } catch {
-        if (!disposed && !attempt.signal.aborted) scheduleReconnect();
-        return;
-      }
-      socket = nextSocket;
-      socketRef.current = nextSocket;
-      nextSocket.binaryType = "arraybuffer";
+    }
+
+    function redeemOnOpen(
+      nextSocket: WebSocket,
+      issued: Extract<BrowserPanelCapabilityResponse, { outcome: "issued" }>,
+      attempt: AbortController,
+    ) {
       nextSocket.addEventListener("open", () => {
-        if (disposed || attempt.signal.aborted || socket !== nextSocket) return;
+        if (disposed || attempt.signal.aborted) return;
         const encoded = encodePanelProtocolMessage({
           protocolVersion: PANEL_PROTOCOL_VERSION,
           type: "redeem",
@@ -543,6 +510,13 @@ function PanelStreamSurface({
         });
         if (encoded.outcome === "encoded") nextSocket.send(encoded.raw);
       });
+    }
+
+    function listenForHostMessages(
+      nextSocket: WebSocket,
+      attempt: AbortController,
+      onReady: () => void,
+    ) {
       nextSocket.addEventListener("message", (event) => {
         if (disposed || attempt.signal.aborted) return;
         if (typeof event.data !== "string") return;
@@ -557,15 +531,10 @@ function PanelStreamSurface({
         }
         const message = decoded.message;
         if (message.type === "ready") {
-          if (stream.state === "reconnecting") stream.reconnectSucceeded();
-          setStreamState("streaming");
-          setLivePush(true);
+          onReady();
           return;
         }
         if (message.type === "session") {
-          // The host pushed the live shared control state and tab strip; derive
-          // this panel's own role from the panel list so the surface updates
-          // without a re-fetch.
           const own = message.control.panels.find(
             (panel) => panel.panelId === panelId,
           );
@@ -574,9 +543,6 @@ function PanelStreamSurface({
             control: message.control,
             tabs: message.tabs,
           });
-          // The controller's viewport drives the capture size; spectators
-          // letterbox it. Size the canvas to that viewport so frames map 1:1
-          // and CSS scales/letterboxes for the panel.
           const viewport = message.control.controllerViewport;
           if (viewport !== null) setControllerViewport(viewport);
           return;
@@ -610,23 +576,208 @@ function PanelStreamSurface({
           setDownloadsLimits(message.update.limits);
         }
       });
+    }
+
+    function dropLiveAndReconnect() {
+      setLivePush(false);
+      stream.freezeInput();
+      setDialog(null);
+      setContextMenu(null);
+      clearRotation();
+      scheduleReconnect();
+    }
+
+    function scheduleReconnect() {
+      if (disposed) return;
+      const delay =
+        stream.state === "reconnecting"
+          ? stream.reconnectFailed()
+          : stream.beginReconnect();
+      if (delay === 0) {
+        setStreamState("offline");
+        return;
+      }
+      setStreamState("reconnecting");
+      clearReconnect();
+      clearRotation();
+      reconnectTimer = schedulePanelTimeout(() => {
+        reconnectTimer = null;
+        if (!disposed) void requestFreshCapability();
+      }, delay);
+    }
+
+    function scheduleRotation() {
+      if (disposed) return;
+      clearRotation();
+      rotationTimer = schedulePanelTimeout(() => {
+        rotationTimer = null;
+        if (!disposed) void requestReplacementCapability();
+      }, PANEL_AUTH_ROTATION_MS);
+    }
+
+    function failRotation() {
+      if (disposed) return;
+      discardReplacement();
+      if (stream.state === "rotating") stream.rotationFailed();
+      else stream.freezeInput();
+      clearRotation();
+      setDialog(null);
+      setContextMenu(null);
+      setLivePush(false);
+      if (socket !== null) {
+        const previous = socket;
+        attemptAbort?.abort();
+        socket = null;
+        socketRef.current = null;
+        previous.close();
+      }
+      scheduleReconnect();
+    }
+
+    async function requestFreshCapability() {
+      if (disposed || streamHostId === null) return;
+      abortAttempt();
+      const attempt = new AbortController();
+      attemptAbort = attempt;
+      try {
+        const response = await rpc.call("browser_panel_capability", {
+          hostId: streamHostId,
+          profileId: streamProfileId,
+          panelId,
+          ownerSessionId,
+        });
+        if (disposed || attempt.signal.aborted) return;
+        if (response.outcome !== "issued") {
+          scheduleReconnect();
+          return;
+        }
+        setCapability(response);
+        connect(response);
+      } catch {
+        if (!disposed && !attempt.signal.aborted) scheduleReconnect();
+      }
+    }
+
+    async function requestReplacementCapability() {
+      if (disposed || streamHostId === null) return;
+      if (!stream.beginRotation()) return;
+      try {
+        const response = await rpc.call("browser_panel_capability", {
+          hostId: streamHostId,
+          profileId: streamProfileId,
+          panelId,
+          ownerSessionId,
+        });
+        if (disposed || stream.state !== "rotating") return;
+        if (response.outcome !== "issued") {
+          failRotation();
+          return;
+        }
+        setCapability(response);
+        connectReplacement(response);
+      } catch {
+        if (!disposed && stream.state === "rotating") failRotation();
+      }
+    }
+
+    function connect(
+      issued: Extract<BrowserPanelCapabilityResponse, { outcome: "issued" }>,
+    ) {
+      if (disposed) return;
+      abortAttempt();
+      const attempt = new AbortController();
+      attemptAbort = attempt;
+      if (socket !== null) {
+        const previous = socket;
+        socket = null;
+        socketRef.current = null;
+        previous.close();
+      }
+      let nextSocket: WebSocket;
+      try {
+        nextSocket = new WebSocket(streamUrl(issued));
+      } catch {
+        if (!disposed && !attempt.signal.aborted) scheduleReconnect();
+        return;
+      }
+      socket = nextSocket;
+      socketRef.current = nextSocket;
+      nextSocket.binaryType = "arraybuffer";
+      redeemOnOpen(nextSocket, issued, attempt);
+      listenForHostMessages(nextSocket, attempt, () => {
+        if (stream.state === "reconnecting") stream.reconnectSucceeded();
+        if (stream.state === "rotating") stream.rotationSucceeded();
+        setStreamState("streaming");
+        setLivePush(true);
+        scheduleRotation();
+      });
       nextSocket.addEventListener("close", () => {
         if (socket === nextSocket) {
           socket = null;
           socketRef.current = null;
         }
-        setLivePush(false);
         if (disposed || attempt.signal.aborted) return;
-        // Input freezes immediately on disconnect; reconnect uses bounded
-        // backoff driven by the stream adapter. Queued chrome gestures cannot
-        // ride the next generation: dialog and context-menu state is dropped.
-        stream.freezeInput();
-        setDialog(null);
-        setContextMenu(null);
-        scheduleReconnect();
+        // A superseded generation may close while the replacement is still
+        // becoming ready; dropping here would throw that replacement away.
+        if (stream.state === "rotating") return;
+        dropLiveAndReconnect();
       });
       nextSocket.addEventListener("error", () => {
-        if (disposed || attempt.signal.aborted || socket !== nextSocket) return;
+        if (disposed || attempt.signal.aborted) return;
+        nextSocket.close();
+      });
+    }
+
+    function connectReplacement(
+      issued: Extract<BrowserPanelCapabilityResponse, { outcome: "issued" }>,
+    ) {
+      if (disposed) return;
+      discardReplacement();
+      const attempt = new AbortController();
+      let nextSocket: WebSocket;
+      try {
+        nextSocket = new WebSocket(streamUrl(issued));
+      } catch {
+        failRotation();
+        return;
+      }
+      replacementAbort = attempt;
+      replacementSocket = nextSocket;
+      nextSocket.binaryType = "arraybuffer";
+      redeemOnOpen(nextSocket, issued, attempt);
+      listenForHostMessages(nextSocket, attempt, () => {
+        if (stream.state !== "rotating") {
+          discardReplacement();
+          return;
+        }
+        replacementAbort = null;
+        replacementSocket = null;
+        const previousSocket = socket;
+        const previousAttempt = attemptAbort;
+        socket = nextSocket;
+        socketRef.current = nextSocket;
+        attemptAbort = attempt;
+        stream.rotationSucceeded();
+        setStreamState("streaming");
+        setLivePush(true);
+        scheduleRotation();
+        previousAttempt?.abort();
+        if (previousSocket !== null && previousSocket !== nextSocket) {
+          previousSocket.close();
+        }
+      });
+      nextSocket.addEventListener("close", () => {
+        if (disposed || attempt.signal.aborted) return;
+        if (socket === nextSocket) {
+          socket = null;
+          socketRef.current = null;
+          dropLiveAndReconnect();
+          return;
+        }
+        failRotation();
+      });
+      nextSocket.addEventListener("error", () => {
+        if (disposed || attempt.signal.aborted) return;
         nextSocket.close();
       });
     }
@@ -635,9 +786,11 @@ function PanelStreamSurface({
 
     return () => {
       disposed = true;
+      discardReplacement();
       abortAttempt();
       setLivePush(false);
       clearReconnect();
+      clearRotation();
       stream.release();
       streamRef.current = null;
       if (socket !== null) {
