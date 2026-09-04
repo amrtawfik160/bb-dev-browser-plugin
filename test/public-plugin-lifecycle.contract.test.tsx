@@ -6,7 +6,18 @@ import {
   PANEL_CAPABILITY_TTL_MS,
   PANEL_RECONNECT_INITIAL_BACKOFF_MS,
 } from "../contracts.js";
+import { ownerSessionIdFromContext } from "../panel-owner-session.js";
 import { createPublicPanelLifecycleHarness } from "./public-plugin-lifecycle-harness.js";
+
+const LIFECYCLE_HOST_COMMANDS = new Set([
+  "panelTransport",
+  "panelVisibility",
+  "panelRelease",
+]);
+
+function lifecycleHostCommands(calls: readonly string[]) {
+  return calls.filter((method) => LIFECYCLE_HOST_COMMANDS.has(method));
+}
 
 describe("public Browser Panel lifecycle seam", () => {
   it("gives two rendered Browser Panels distinct identities that redeem a Panel Capability and become ready", async () => {
@@ -19,6 +30,10 @@ describe("public Browser Panel lifecycle seam", () => {
       expect(second.panelId).toMatch(/^browser-panel-/);
       expect(first.ownerSessionId).toBe(browser.ownerSessionId);
       expect(second.ownerSessionId).toBe(browser.ownerSessionId);
+      expect(first.ownerSessionId).toBe(
+        `bb-owner-session:thread:${browser.threadId}`,
+      );
+      expect(browser.threadLookups).not.toContain("panel-capability");
       expect(first.hostId).toBe(browser.hostId);
       expect(first.profileId).toBe(DEFAULT_PROFILE_ID);
       expect(first.capabilityId).not.toBe(second.capabilityId);
@@ -102,6 +117,9 @@ describe("public Browser Panel lifecycle seam", () => {
 
       await browser.closePanel(second);
       expect(second.container.innerHTML).toBe("");
+      expect(lifecycleHostCommands(browser.hostRpcCalls)).toContain(
+        "panelRelease",
+      );
       await first.findByText("Reconnecting to the browser…");
 
       const created = await browser.createBrowserProfile({
@@ -130,16 +148,38 @@ describe("public Browser Panel lifecycle seam", () => {
       ).rejects.toThrow("HTTP 404: Thread not found");
       expect(browser.threadLookups).toEqual(["thread-does-not-exist"]);
 
+      const unknownHostAt = browser.hostRpcCalls.length;
       const unknownHost = await browser.issuePanelCapability({
         hostId: "host-does-not-exist",
         profileId: DEFAULT_PROFILE_ID,
         panelId: "panel-unknown-host",
-        ownerSessionId: browser.ownerSessionId,
+        ownerSessionId: ownerSessionIdFromContext({
+          projectId: null,
+          threadId: null,
+        }),
       });
       expect(unknownHost.outcome).toBe("unavailable");
       if (unknownHost.outcome === "unavailable") {
         expect(unknownHost.reason).toBe("host-offline");
       }
+      expect(
+        lifecycleHostCommands(browser.hostRpcCalls.slice(unknownHostAt)),
+      ).toEqual([]);
+
+      const mismatchedHostAt = browser.hostRpcCalls.length;
+      const mismatchedHost = await browser.issuePanelCapability({
+        hostId: "host-does-not-exist",
+        profileId: DEFAULT_PROFILE_ID,
+        panelId: "panel-mismatched-host",
+        ownerSessionId: browser.ownerSessionId,
+      });
+      expect(mismatchedHost).toMatchObject({
+        outcome: "rejected",
+        reason: "host-mismatch",
+      });
+      expect(
+        lifecycleHostCommands(browser.hostRpcCalls.slice(mismatchedHostAt)),
+      ).toEqual([]);
 
       await expect(
         browser.issuePanelCapability({
@@ -158,25 +198,201 @@ describe("public Browser Panel lifecycle seam", () => {
         }),
       ).rejects.toThrow();
 
-      await expect(
-        browser.issuePanelCapability({
-          hostId: browser.hostId,
-          profileId: "profile-does-not-exist",
-          panelId: "panel-unknown-profile",
-          ownerSessionId: browser.ownerSessionId,
-        }),
-      ).rejects.toThrow(/Browser Profile/i);
+      const unknownProfileAt = browser.hostRpcCalls.length;
+      const unknownProfile = await browser.issuePanelCapability({
+        hostId: browser.hostId,
+        profileId: "profile-does-not-exist",
+        panelId: "panel-unknown-profile",
+        ownerSessionId: browser.ownerSessionId,
+      });
+      expect(unknownProfile).toMatchObject({
+        outcome: "rejected",
+        reason: "profile-mismatch",
+      });
+      expect(
+        browser.panelCapabilityExchanges.some(
+          (exchange) =>
+            exchange.request.panelId === "panel-unknown-profile" &&
+            exchange.response.outcome === "issued",
+        ),
+      ).toBe(false);
+      expect(
+        lifecycleHostCommands(browser.hostRpcCalls.slice(unknownProfileAt)),
+      ).toEqual(["panelTransport"]);
 
-      const preservedSession = "owner-session-does-not-match";
-      await browser.issuePanelCapability({
+      const mismatchedSessionAt = browser.hostRpcCalls.length;
+      const mismatchedSession = await browser.issuePanelCapability({
         hostId: browser.hostId,
         profileId: DEFAULT_PROFILE_ID,
         panelId: "panel-mismatched-session",
-        ownerSessionId: preservedSession,
+        ownerSessionId: "owner-session-does-not-match",
       });
-      expect(browser.panelCapabilityRequests.at(-1)?.ownerSessionId).toBe(
-        preservedSession,
-      );
+      expect(mismatchedSession).toMatchObject({
+        outcome: "rejected",
+        reason: "owner-session-mismatch",
+      });
+      expect(
+        lifecycleHostCommands(browser.hostRpcCalls.slice(mismatchedSessionAt)),
+      ).toEqual([]);
+
+      const missingThreadAt = browser.hostRpcCalls.length;
+      const missingThread = await browser.issuePanelCapability({
+        hostId: browser.hostId,
+        profileId: DEFAULT_PROFILE_ID,
+        panelId: "panel-missing-thread",
+        ownerSessionId: ownerSessionIdFromContext({
+          projectId: null,
+          threadId: "thread-does-not-exist",
+        }),
+      });
+      expect(missingThread).toMatchObject({
+        outcome: "rejected",
+        reason: "thread-mismatch",
+      });
+      expect(browser.threadLookups).toContain("thread-does-not-exist");
+      expect(
+        lifecycleHostCommands(browser.hostRpcCalls.slice(missingThreadAt)),
+      ).toEqual([]);
+
+      const missingProjectAt = browser.hostRpcCalls.length;
+      const missingProject = await browser.issuePanelCapability({
+        hostId: browser.hostId,
+        profileId: DEFAULT_PROFILE_ID,
+        panelId: "panel-missing-project",
+        ownerSessionId: ownerSessionIdFromContext({
+          projectId: "project-does-not-exist",
+          threadId: null,
+        }),
+      });
+      expect(missingProject).toMatchObject({
+        outcome: "rejected",
+        reason: "project-mismatch",
+      });
+      expect(browser.projectLookups).toContain("project-does-not-exist");
+      expect(
+        lifecycleHostCommands(browser.hostRpcCalls.slice(missingProjectAt)),
+      ).toEqual([]);
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it.each([
+    {
+      reason: "host-mismatch" as const,
+      override: { hostId: "host-does-not-exist" },
+    },
+    {
+      reason: "owner-session-mismatch" as const,
+      override: { ownerSessionId: "owner-session-does-not-match" },
+    },
+    {
+      reason: "thread-mismatch" as const,
+      override: {
+        ownerSessionId: ownerSessionIdFromContext({
+          projectId: null,
+          threadId: "thread-does-not-exist",
+        }),
+      },
+    },
+  ])(
+    "returns a typed $reason identity rejection for visibility matching capability and release",
+    async ({ reason, override }) => {
+      const browser = await createPublicPanelLifecycleHarness();
+      try {
+        const request = {
+          hostId: browser.hostId,
+          profileId: DEFAULT_PROFILE_ID,
+          panelId: `panel-visibility-${reason}`,
+          ownerSessionId: browser.ownerSessionId,
+          ...override,
+        };
+        const expected = { outcome: "rejected" as const, reason };
+        const before = browser.hostRpcCalls.length;
+
+        const capability = await browser.issuePanelCapability(request);
+        expect(capability).toMatchObject(expected);
+
+        const released = await browser.releasePanel(request);
+        expect(released).toMatchObject(expected);
+
+        const visibility = await browser.setPanelVisibility({
+          ...request,
+          visibility: "hidden",
+        });
+        expect(visibility).toMatchObject(expected);
+        expect(
+          lifecycleHostCommands(browser.hostRpcCalls.slice(before)),
+        ).toEqual([]);
+      } finally {
+        await browser.dispose();
+      }
+    },
+  );
+
+  it("resolves a valid public-plugin request to one host and one typed host command", async () => {
+    const browser = await createPublicPanelLifecycleHarness();
+    try {
+      const before = browser.hostRpcCalls.length;
+      const response = await browser.issuePanelCapability({
+        hostId: browser.hostId,
+        profileId: DEFAULT_PROFILE_ID,
+        panelId: "panel-dispatch-valid",
+        ownerSessionId: browser.ownerSessionId,
+      });
+      expect(response.outcome).toBe("issued");
+      if (response.outcome !== "issued") {
+        throw new Error("expected an issued Panel Capability");
+      }
+      expect(response.capabilityId).toMatch(/^panel-capability-/);
+      expect(response.gatewayPort).toBeGreaterThan(0);
+      expect(response.tunnel).toEqual({
+        label: "ci-gate",
+        baseDomain: "ci.getbb.app",
+      });
+      expect(browser.hostRpcCalls.slice(before)).toEqual(["panelTransport"]);
+      expect(browser.threadLookups).toEqual([browser.threadId]);
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("revokes active lifecycle authority through an explicit public panel release", async () => {
+    const browser = await createPublicPanelLifecycleHarness();
+    try {
+      const issued = await browser.issuePanelCapability({
+        hostId: browser.hostId,
+        profileId: DEFAULT_PROFILE_ID,
+        panelId: "panel-explicit-release",
+        ownerSessionId: browser.ownerSessionId,
+      });
+      if (issued.outcome !== "issued") {
+        throw new Error("expected an issued Panel Capability");
+      }
+
+      const beforeRelease = browser.hostRpcCalls.length;
+      const released = await browser.releasePanel({
+        hostId: browser.hostId,
+        profileId: DEFAULT_PROFILE_ID,
+        panelId: "panel-explicit-release",
+        ownerSessionId: browser.ownerSessionId,
+      });
+      expect(released).toEqual({ outcome: "released" });
+      expect(browser.hostRpcCalls.slice(beforeRelease)).toEqual([
+        "panelRelease",
+      ]);
+
+      const reissued = await browser.issuePanelCapability({
+        hostId: browser.hostId,
+        profileId: DEFAULT_PROFILE_ID,
+        panelId: "panel-explicit-release",
+        ownerSessionId: browser.ownerSessionId,
+      });
+      if (reissued.outcome !== "issued") {
+        throw new Error("expected a replacement Panel Capability");
+      }
+      expect(reissued.capabilityId).not.toBe(issued.capabilityId);
+      expect(reissued.secret).not.toBe(issued.secret);
     } finally {
       await browser.dispose();
     }

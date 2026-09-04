@@ -34,8 +34,9 @@ import {
   browserNavigationRequestSchema,
   browserHistoryRequestSchema,
   browserNavigationResponseSchema,
-  browserPanelVisibilityRequestSchema,
+  browserHostPanelVisibilityRequestSchema,
   browserPanelTransportRequestSchema,
+  browserPanelReleaseHostRequestSchema,
   browserPanelControlRequestSchema,
   browserPanelReleaseControlRequestSchema,
   browserPurgeRequestSchema,
@@ -68,6 +69,8 @@ import {
   type BrowserPanelHistoryInput,
   type BrowserPanelTabActionInput,
   type BrowserPanelCapabilityResponse,
+  type BrowserPanelReleaseResponse,
+  type BrowserPanelVisibilityResponse,
   type BrowserPanelControlResponse,
   type BrowserNavigationRequest,
   type BrowserHistoryRequest,
@@ -115,6 +118,7 @@ import {
   type rpcContract,
   type BrowserScriptResponse,
 } from "../contracts.js";
+import { ownerSessionIdFromContext } from "../panel-owner-session.js";
 import { createBrowserHostEntry, type HostSetupBoundary } from "../host.js";
 import type { ScreencastSource } from "../panel-transport.js";
 import type {
@@ -146,6 +150,13 @@ const THREAD_ID = "thread-browser-test";
 const FOREIGN_THREAD_ID = "thread-foreign-project";
 const ENVIRONMENT_ID = "environment-browser-test";
 const KNOWN_HARNESS_THREAD_IDS = new Set([THREAD_ID, FOREIGN_THREAD_ID]);
+const KNOWN_HARNESS_PROJECT_IDS = new Set([
+  PROJECT_ID,
+  "project-foreign",
+  "project-copy",
+  "project-a",
+  "project-b",
+]);
 const persistedGrantRequestEventSchema = z.object({
   request_id: z.string(),
   event_type: z.string(),
@@ -461,6 +472,8 @@ export async function createPublicPluginHarness(options?: {
     typeof browserHostConnectionRequestSchema
   >[] = [];
   const threadLookups: string[] = [];
+  const projectLookups: string[] = [];
+  const hostRpcCalls: string[] = [];
   const setupInspectionTargets: BrowserHostTarget[] = [];
   const expectedStatus =
     options?.status ??
@@ -628,14 +641,21 @@ export async function createPublicPluginHarness(options?: {
           ),
       },
       projects: {
-        get: async () => {
+        get: async ({ projectId }: { projectId: string }) => {
+          projectLookups.push(projectId);
           resolveProjectLookupStarted?.();
           await projectLookupGate;
-          return projectFixture(configuredProjectHostIds);
+          if (!KNOWN_HARNESS_PROJECT_IDS.has(projectId)) {
+            throw new Error("HTTP 404: Project not found");
+          }
+          return projectId === "project-foreign"
+            ? { ...projectFixture([]), id: projectId }
+            : { ...projectFixture(configuredProjectHostIds), id: projectId };
         },
       },
     },
     experimental_callHostRpc: async ({ method, input, signal }) => {
+      hostRpcCalls.push(method);
       const failure = hostRpcFailures.get(method);
       if (failure !== undefined) throw new Error(failure);
       if (method === "browserScript") options?.browserScriptStarted?.();
@@ -662,7 +682,7 @@ export async function createPublicPluginHarness(options?: {
       if (method === "panelVisibility") {
         return host.experimental_call(
           "panelVisibility",
-          browserPanelVisibilityRequestSchema.parse(input),
+          browserHostPanelVisibilityRequestSchema.parse(input),
           { signal },
         );
       }
@@ -670,6 +690,13 @@ export async function createPublicPluginHarness(options?: {
         return host.experimental_call(
           "panelTransport",
           browserPanelTransportRequestSchema.parse(input),
+          { signal },
+        );
+      }
+      if (method === "panelRelease") {
+        return host.experimental_call(
+          "panelRelease",
+          browserPanelReleaseHostRequestSchema.parse(input),
           { signal },
         );
       }
@@ -997,12 +1024,13 @@ export async function createPublicPluginHarness(options?: {
       hostId: string;
       profileId: string;
       panelId: string;
+      ownerSessionId: string;
       visibility: "visible" | "hidden";
     }) =>
       backend.harness.behavior.callRpc(
         "browser_panel_visibility",
         input,
-      ) as Promise<BrowserStatus>,
+      ) as Promise<BrowserPanelVisibilityResponse>,
     browser_panel_capability: async (input: {
       hostId: string;
       profileId: string;
@@ -1056,6 +1084,16 @@ export async function createPublicPluginHarness(options?: {
         "browser_panel_release_control",
         input,
       ) as Promise<BrowserPanelControlResponse>,
+    browser_panel_release: (input: {
+      hostId: string;
+      profileId: string;
+      panelId: string;
+      ownerSessionId: string;
+    }) =>
+      backend.harness.behavior.callRpc(
+        "browser_panel_release",
+        input,
+      ) as Promise<BrowserPanelReleaseResponse>,
     browser_panel_reclaim_control: (input: {
       hostId: string;
       profileId: string;
@@ -1895,8 +1933,22 @@ export async function createPublicPluginHarness(options?: {
       hostId: input.hostId,
       profileId: input.profileId,
       panelId: input.panelId,
-      ownerSessionId: input.ownerSessionId ?? "owner-session-test",
+      ownerSessionId:
+        input.ownerSessionId ??
+        ownerSessionIdFromContext({
+          projectId: null,
+          threadId: null,
+        }),
     });
+  }
+
+  function runBrowserPanelRelease(input: {
+    hostId: string;
+    profileId: string;
+    panelId: string;
+    ownerSessionId: string;
+  }) {
+    return rpc.browser_panel_release(input);
   }
 
   function runBrowserPanelControl(input: {
@@ -2234,6 +2286,12 @@ export async function createPublicPluginHarness(options?: {
     get threadLookups() {
       return [...threadLookups];
     },
+    get projectLookups() {
+      return [...projectLookups];
+    },
+    get hostRpcCalls() {
+      return [...hostRpcCalls];
+    },
     get hostConnectionRequests() {
       return [...hostConnectionRequests];
     },
@@ -2299,6 +2357,7 @@ export async function createPublicPluginHarness(options?: {
     runBrowserControlLeaseState,
     runBrowserFileTransferAuthorize,
     runBrowserPanelCapability,
+    runBrowserPanelRelease,
     runBrowserPanelControl,
     runBrowserTakeControl,
     runBrowserReleaseControl,

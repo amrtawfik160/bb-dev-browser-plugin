@@ -388,6 +388,25 @@ export async function createPublicPanelLifecycleHarness() {
     return browser.rpc.browser_panel_capability(input);
   }
 
+  async function releasePanel(input: {
+    hostId: string;
+    profileId: string;
+    panelId: string;
+    ownerSessionId: string;
+  }) {
+    return browser.rpc.browser_panel_release(input);
+  }
+
+  async function setPanelVisibility(input: {
+    hostId: string;
+    profileId: string;
+    panelId: string;
+    ownerSessionId: string;
+    visibility: "visible" | "hidden";
+  }) {
+    return browser.rpc.browser_panel_visibility(input);
+  }
+
   function liveSocketFor(panel: LifecyclePanel) {
     return [...sockets].find(
       (socket) =>
@@ -437,8 +456,17 @@ export async function createPublicPanelLifecycleHarness() {
     get threadLookups() {
       return browser.threadLookups;
     },
+    get projectLookups() {
+      return browser.projectLookups;
+    },
+    get hostRpcCalls() {
+      return browser.hostRpcCalls;
+    },
     get panelCapabilityRequests() {
       return browser.panelCapabilityRequests;
+    },
+    get panelCapabilityExchanges() {
+      return browser.panelCapabilityExchanges;
     },
     get receivedInputs() {
       return receivedInputs;
@@ -450,6 +478,8 @@ export async function createPublicPanelLifecycleHarness() {
     closePanel,
     switchBrowserProfile,
     issuePanelCapability,
+    setPanelVisibility,
+    releasePanel,
     createBrowserProfile: (input: { hostId: string; name: string }) =>
       browser.createBrowserProfile(input),
     runBrowserProfiles: () =>

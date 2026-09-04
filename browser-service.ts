@@ -86,8 +86,11 @@ import {
   type BrowserPanelHistoryInput,
   type BrowserPanelTabActionInput,
   type BrowserPanelVisibilityRequest,
+  type BrowserPanelVisibilityResponse,
   type BrowserPanelCapabilityRequest,
   type BrowserPanelCapabilityResponse,
+  type BrowserPanelReleaseRequest,
+  type BrowserPanelReleaseResponse,
   type BrowserNavigationResponse,
   type BrowserTabStrip,
   type BrowserPanelControlRequest,
@@ -126,6 +129,7 @@ import {
   type BrowserDownloadPurgeOutcome,
 } from "./contracts.js";
 import { browserHostContract } from "./host-contract.js";
+import { createPanelLifecycleDispatch } from "./panel-dispatch.js";
 import { dependencyInventory } from "./dependency-inventory.js";
 import { authorizeFileTransfer } from "./transfer-staging.js";
 
@@ -552,6 +556,10 @@ export function createBrowserService(
   const hostConnectionGenerations = new Map<string, number>();
   let grantStateQueue: Promise<void> = Promise.resolve();
   const host = bb.hosts.experimental_client({ contract: browserHostContract });
+  const panelLifecycle = createPanelLifecycleDispatch(bb, {
+    call: (method, request, options) =>
+      host.call(method, request as never, options),
+  });
 
   function requireOwnerSettingsAuthority(candidate: unknown) {
     if (candidate !== ownerAuthority) {
@@ -2470,12 +2478,8 @@ export function createBrowserService(
   async function panelVisibility(
     request: BrowserPanelVisibilityRequest,
     signal?: AbortSignal,
-  ) {
-    await requireConnectedHost(request.hostId, signal);
-    return host.call("panelVisibility", request, {
-      hostId: request.hostId,
-      signal,
-    });
+  ): Promise<BrowserPanelVisibilityResponse> {
+    return panelLifecycle.setVisibility(request, signal);
   }
 
   /**
@@ -2493,71 +2497,14 @@ export function createBrowserService(
     request: BrowserPanelCapabilityRequest,
     signal?: AbortSignal,
   ): Promise<BrowserPanelCapabilityResponse> {
-    // A capability request names its host outright and carries no thread or
-    // project, so there is no context to resolve one from. Passing a literal
-    // in place of a thread id made every request ask BB for a thread called
-    // "panel-capability", which has never existed: the lookup threw
-    // `404 thread_not_found` before any of the checks below ran, and the panel
-    // reported its stream offline for the life of the plugin. With no thread
-    // and no project, host resolution falls through to validating the named
-    // host against the real host list, which is the only check this request
-    // needs.
-    const hostId = await resolvedHostId(bb, { hostId: request.hostId });
-    if (hostId === null || hostId !== request.hostId) {
-      return {
-        outcome: "unavailable",
-        reason: "host-offline",
-        message: "The selected workspace host is unavailable.",
-      };
-    }
-    const status = await host.call(
-      "status",
-      { hostId, profileId: request.profileId },
-      { hostId, signal },
-    );
-    const connectCapability = status.capabilities.find(
-      (capability) => capability.id === "bb-connect",
-    );
-    if (
-      connectCapability === undefined ||
-      connectCapability.status !== "ready"
-    ) {
-      return {
-        outcome: "unavailable",
-        reason: "bb-connect-required",
-        message:
-          "Enroll this host in BB Connect before opening the Browser Panel.",
-      };
-    }
-    if (!hostCanDispatchAutomation(status)) {
-      return {
-        outcome: "unavailable",
-        reason:
-          status.state === "host-offline" ? "host-offline" : "setup-required",
-        message: status.message,
-      };
-    }
-    const transport = await host.call(
-      "panelTransport",
-      {
-        hostId,
-        profileId: request.profileId,
-        panelId: request.panelId,
-        ownerSessionId: request.ownerSessionId,
-      },
-      { hostId, signal },
-    );
-    const tunnel = await bb.hosts.ensureSharedPortTunnel(hostId);
-    bb.hosts.declareSharedPorts(hostId, [transport.gatewayPort]);
-    return {
-      outcome: "issued",
-      capabilityId: transport.capabilityId,
-      secret: transport.secret,
-      gatewayPort: transport.gatewayPort,
-      tunnel: { label: tunnel.label, baseDomain: tunnel.baseDomain },
-      expiresAt: transport.expiresAt,
-      rotatesAt: transport.rotatesAt,
-    };
+    return panelLifecycle.issueCapability(request, signal);
+  }
+
+  async function panelRelease(
+    request: BrowserPanelReleaseRequest,
+    signal?: AbortSignal,
+  ): Promise<BrowserPanelReleaseResponse> {
+    return panelLifecycle.release(request, signal);
   }
 
   /**
@@ -2958,6 +2905,7 @@ export function createBrowserService(
     tabAction,
     panelVisibility,
     panelCapability,
+    panelRelease,
     tabs,
     panelControl,
     takeControl,

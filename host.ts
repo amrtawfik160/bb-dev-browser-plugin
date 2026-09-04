@@ -35,6 +35,7 @@ import {
   DEFAULT_PROFILE_ID,
   STOP_BROWSER_CONFIRMATION,
   browserProfileUnavailableStatus,
+  hostCanDispatchAutomation,
   hostOfflineStatus,
   hostProbeFailedStatus,
   sleepingBrowserStatus,
@@ -46,8 +47,10 @@ import {
   type BrowserNavigationRequest,
   type BrowserHistoryRequest,
   type BrowserTabActionRequest,
-  type BrowserPanelVisibilityRequest,
+  type BrowserHostPanelVisibilityRequest,
+  type BrowserPanelReleaseHostRequest,
   type BrowserPanelTransportRequest,
+  type BrowserPanelTransportResponse,
   type BrowserPanelControlResponse,
   type BrowserPanelControlState,
   type BrowserStatus,
@@ -1240,7 +1243,7 @@ export function createBrowserHostEntry(
     }
   }
   async function setPanelVisibility(
-    request: BrowserPanelVisibilityRequest,
+    request: BrowserHostPanelVisibilityRequest,
     dataDir: string,
   ) {
     const readiness = await administration(dataDir).inspect({
@@ -1259,7 +1262,7 @@ export function createBrowserHostEntry(
     return runtimeBrowserStatus(readiness, browserRuntime, controlLeases);
   }
   async function panelRuntimeTarget(
-    request: BrowserPanelVisibilityRequest,
+    request: { hostId: string; profileId: string },
     dataDir: string,
   ) {
     const inventory = await profiles(dataDir).listProfiles(request.hostId);
@@ -1277,7 +1280,7 @@ export function createBrowserHostEntry(
         };
   }
   async function pinVisiblePanel(
-    request: BrowserPanelVisibilityRequest,
+    request: BrowserHostPanelVisibilityRequest,
     target: Parameters<BrowserRuntimeHost["pinPanel"]>[0],
     readiness: BrowserStatus,
     browserRuntime: BrowserRuntimeHost,
@@ -1294,6 +1297,64 @@ export function createBrowserHostEntry(
       throw error;
     }
     return runtimeBrowserStatus(readiness, browserRuntime, controlLeases);
+  }
+  function openedPanelTransport(
+    issued: {
+      capabilityId: string;
+      secret: string;
+      expiresAt: number;
+      issuedAt: number;
+    },
+    gatewayPort: number,
+    bindHost: string,
+  ): Extract<BrowserPanelTransportResponse, { outcome: "opened" }> {
+    return {
+      outcome: "opened",
+      gatewayPort,
+      bindHost,
+      capabilityId: issued.capabilityId,
+      secret: issued.secret,
+      expiresAt: new Date(issued.expiresAt).toISOString(),
+      rotatesAt: new Date(
+        issued.issuedAt + panelCapabilities.rotationMs,
+      ).toISOString(),
+    };
+  }
+  function panelTransportRefusal(
+    readiness: BrowserStatus,
+  ): Extract<
+    BrowserPanelTransportResponse,
+    { outcome: "unavailable" | "rejected" }
+  > | null {
+    const connect = readiness.capabilities.find(
+      (capability) => capability.id === "bb-connect",
+    );
+    if (connect === undefined || connect.status !== "ready") {
+      return {
+        outcome: "unavailable",
+        reason: "bb-connect-required",
+        message:
+          "Enroll this host in BB Connect before opening the Browser Panel.",
+      };
+    }
+    if (!hostCanDispatchAutomation(readiness) || readiness.hostId === null) {
+      return {
+        outcome: "unavailable",
+        reason:
+          readiness.state === "host-offline"
+            ? "host-offline"
+            : "setup-required",
+        message: readiness.message,
+      };
+    }
+    if (readiness.state !== "healthy") {
+      return {
+        outcome: "unavailable",
+        reason: "setup-required",
+        message: readiness.message,
+      };
+    }
+    return null;
   }
   async function startBoundPanelTransport(
     request: BrowserPanelTransportRequest,
@@ -1397,28 +1458,18 @@ export function createBrowserHostEntry(
         await transport.stop();
       },
     });
-    return {
-      gatewayPort: port,
-      bindHost: gateway.declaredBindHost(),
-      capabilityId: issued.capabilityId,
-      secret: issued.secret,
-      expiresAt: new Date(issued.expiresAt).toISOString(),
-      rotatesAt: new Date(
-        issued.issuedAt + panelCapabilities.rotationMs,
-      ).toISOString(),
-    };
+    return openedPanelTransport(issued, port, gateway.declaredBindHost());
   }
   async function openPanelTransport(
     request: BrowserPanelTransportRequest,
     dataDir: string,
-  ) {
+  ): Promise<BrowserPanelTransportResponse> {
     const readiness = await administration(dataDir).inspect({
       hostId: request.hostId,
       profileId: request.profileId,
     });
-    if (readiness.state !== "healthy" || readiness.hostId === null) {
-      throw new Error(readiness.message);
-    }
+    const refusal = panelTransportRefusal(readiness);
+    if (refusal !== null) return refusal;
     if (request.profileId !== DEFAULT_PROFILE_ID) {
       const inventory = await profiles(dataDir).listProfiles(request.hostId);
       if (
@@ -1428,9 +1479,11 @@ export function createBrowserHostEntry(
             profile.state === "active",
         )
       ) {
-        throw new Error(
-          `Unknown Browser Profile ${request.profileId} on host ${request.hostId}.`,
-        );
+        return {
+          outcome: "rejected",
+          reason: "profile-mismatch",
+          message: `Unknown Browser Profile ${request.profileId} on host ${request.hostId}.`,
+        };
       }
     }
     // A remount issues a fresh single-use Panel Capability. The pool retires
@@ -1497,16 +1550,31 @@ export function createBrowserHostEntry(
       });
       return startBoundPanelTransport(request, dataDir, opened, source);
     }
-    return {
-      gatewayPort: gateway.choosePort(),
-      bindHost: gateway.declaredBindHost(),
-      capabilityId: issued.capabilityId,
-      secret: issued.secret,
-      expiresAt: new Date(issued.expiresAt).toISOString(),
-      rotatesAt: new Date(
-        issued.issuedAt + panelCapabilities.rotationMs,
-      ).toISOString(),
-    };
+    return openedPanelTransport(
+      issued,
+      gateway.choosePort(),
+      gateway.declaredBindHost(),
+    );
+  }
+  async function releasePanelTransport(
+    request: BrowserPanelReleaseHostRequest,
+    dataDir: string,
+  ) {
+    const transportKey = `${request.hostId}\u0000${request.profileId}\u0000${request.panelId}`;
+    const previous = panelTransports.get(transportKey);
+    if (previous !== undefined) {
+      await previous.stop().catch(() => undefined);
+      panelTransports.delete(transportKey);
+    }
+    panelGateways.closePanel(request);
+    const browserRuntime = runtime(dataDir);
+    if (browserRuntime !== undefined) {
+      const target = await panelRuntimeTarget(request, dataDir);
+      if (target !== null) {
+        await browserRuntime.unpinPanel(target, request.panelId);
+      }
+    }
+    return { outcome: "released" as const };
   }
   function retainWorker(context: {
     experimental_retainWorker(): { dispose(): Promise<void> };
@@ -1762,6 +1830,13 @@ export function createBrowserHostEntry(
       panelTransport: (request, context) => {
         retainWorker(context);
         return openPanelTransport(request, context.experimental_paths.dataDir);
+      },
+      panelRelease: (request, context) => {
+        retainWorker(context);
+        return releasePanelTransport(
+          request,
+          context.experimental_paths.dataDir,
+        );
       },
       tabs: (target, context) => {
         retainWorker(context);
