@@ -1,4 +1,4 @@
-import { act, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, waitFor, within } from "@testing-library/react";
 import type { RenderedSlot } from "@get-bb/plugin-sdk/testing/app";
 import { expect } from "vitest";
 import { WebSocket as NodeWebSocket } from "ws";
@@ -11,6 +11,7 @@ import {
   setTestLoopbackPanelTransport,
   setTestPanelLifecycleClock,
 } from "../panel-test-loopback.js";
+import { DEFAULT_PROFILE_ID } from "../contracts.js";
 import { ownerSessionIdFromContext } from "../panel-owner-session.js";
 import type { HostProbeSnapshot } from "../readiness.js";
 import { createPublicPluginHarness } from "./public-plugin-harness.js";
@@ -57,6 +58,10 @@ function createDeterministicPanelFrameSource(
 ): ScreencastSource {
   return {
     async start(onFrame, signal) {
+      // An already-aborted stream subscription cannot recover a live frame.
+      // Reusing cancellation state from a prior physical connection therefore
+      // fails closed instead of painting a stale generation.
+      if (signal.aborted) return;
       const frame: ScreencastFrame = {
         sequence: 1,
         mimeType: "image/png",
@@ -150,6 +155,17 @@ export async function createPublicPanelLifecycleHarness() {
       this.on("close", () => {
         sockets.delete(socket);
       });
+      const protoSend = NodeWebSocket.prototype.send;
+      this.send = function (
+        this: NodeWebSocket,
+        data: Parameters<NodeWebSocket["send"]>[0],
+        ...args: unknown[]
+      ) {
+        recordSocketMessage(socket, data);
+        return protoSend.apply(this, [data, ...args] as Parameters<
+          NodeWebSocket["send"]
+        >);
+      } as NodeWebSocket["send"];
       const protoAdd = NodeWebSocket.prototype.addEventListener as (
         type: string,
         listener: (event: unknown) => void,
@@ -221,10 +237,14 @@ export async function createPublicPanelLifecycleHarness() {
   type ParsedPanelMessage = {
     type?: string;
     category?: string;
+    capabilityId?: string;
+    secret?: string;
     control?: {
+      controllerPanelId?: string | null;
       panels?: Array<{
         panelId: string;
         ownerSessionId: string;
+        role?: "controller" | "spectator";
         connection: "connected" | "disconnected";
         reclaimUntil: number | null;
       }>;
@@ -266,8 +286,13 @@ export async function createPublicPanelLifecycleHarness() {
     return latest ?? [];
   }
 
-  function latestIssuedGeneration(panel: LifecyclePanel) {
-    return issuedGatewayPorts(panel.panelId).length;
+  function latestIssuedGeneration(panel: LifecyclePanel, profileId?: string) {
+    return browser.panelCapabilityExchanges.filter(
+      (exchange) =>
+        exchange.request.panelId === panel.panelId &&
+        (profileId === undefined || exchange.request.profileId === profileId) &&
+        exchange.response.outcome === "issued",
+    ).length;
   }
 
   function portHasOpenSocket(port: number) {
@@ -308,35 +333,73 @@ export async function createPublicPanelLifecycleHarness() {
       profileId: request.profileId,
       capabilityId: issued.capabilityId,
       gatewayPort: issued.gatewayPort,
-      get redeemed() {
+    });
+    // Object.assign copies getter values; reconnect must be observed live
+    // across every gateway generation issued for this panel identity.
+    Object.defineProperty(assigned, "redeemed", {
+      configurable: true,
+      enumerable: true,
+      get() {
         return panelHasReady(request.panelId);
       },
-      get framesReceived() {
-        return browser.panelCapabilityExchanges.reduce((count, exchange) => {
-          if (
-            exchange.request.panelId !== request.panelId ||
-            exchange.response.outcome !== "issued"
-          ) {
-            return count;
-          }
-          return (
+    });
+    Object.defineProperty(assigned, "framesReceived", {
+      configurable: true,
+      enumerable: true,
+      get() {
+        return issuedGatewayPorts(request.panelId).reduce(
+          (count, port) =>
             count +
-            parsedMessages(exchange.response.gatewayPort).filter(
-              (message) => message.type === "frame",
-            ).length
-          );
-        }, 0);
+            parsedMessages(port).filter((message) => message.type === "frame")
+              .length,
+          0,
+        );
       },
     });
-    // Object.assign copies getter values; reconnect must be observed live.
     Object.defineProperty(assigned, "connectionAttempts", {
       configurable: true,
       enumerable: true,
       get() {
-        return connectionAttemptsByPort.get(String(issued.gatewayPort)) ?? 0;
+        return issuedGatewayPorts(request.panelId).reduce(
+          (count, port) =>
+            count + (connectionAttemptsByPort.get(String(port)) ?? 0),
+          0,
+        );
       },
     });
     return assigned as LifecyclePanel;
+  }
+
+  function issuedExchanges(panelId: string) {
+    return browser.panelCapabilityExchanges.filter(
+      (exchange) =>
+        exchange.request.panelId === panelId &&
+        exchange.response.outcome === "issued",
+    );
+  }
+
+  function issuedSecrets(panelId: string) {
+    return issuedExchanges(panelId).flatMap((exchange) =>
+      exchange.response.outcome === "issued" ? [exchange.response.secret] : [],
+    );
+  }
+
+  function redeemedSecrets(panelId: string) {
+    return issuedGatewayPorts(panelId).flatMap((port) =>
+      parsedMessages(port).flatMap((message) =>
+        message.type === "redeem" && typeof message.secret === "string"
+          ? [message.secret]
+          : [],
+      ),
+    );
+  }
+
+  function socketUrls() {
+    return [...sockets].map((socket) => socket.url);
+  }
+
+  function jsonContainsSecret(value: unknown, secret: string) {
+    return JSON.stringify(value).includes(secret);
   }
 
   function panelHasReady(panelId: string) {
@@ -422,11 +485,79 @@ export async function createPublicPanelLifecycleHarness() {
     });
   }
 
-  async function switchBrowserProfile(profileId: string) {
-    return browser.selectBrowserProfile({
-      hostId: HOST_ID,
-      profileId,
+  function panelRequestedProfile(
+    panel: LifecyclePanel,
+    method: string,
+    requestedProfileId: string,
+  ) {
+    return panel.inspection.rpcCalls.some(
+      (call: { method: string; input: unknown }) =>
+        call.method === method &&
+        (call.input as { profileId?: string }).profileId === requestedProfileId,
+    );
+  }
+
+  async function switchMountedPanelProfile(
+    panel: LifecyclePanel,
+    nextProfileId: string,
+  ) {
+    const picker = await within(panel.container).findByRole("combobox", {
+      name: "Browser Profile",
+      hidden: true,
     });
+    await waitFor(() => {
+      expect(
+        within(picker)
+          .getAllByRole("option", { hidden: true })
+          .some(
+            (option) => (option as HTMLOptionElement).value === nextProfileId,
+          ),
+      ).toBe(true);
+    });
+    await act(async () => {
+      fireEvent.change(picker, { target: { value: nextProfileId } });
+    });
+    await waitFor(() => {
+      expect(
+        panelRequestedProfile(panel, "browser_profile_select", nextProfileId),
+      ).toBe(true);
+    });
+    await waitFor(() => {
+      expect(
+        panelRequestedProfile(panel, "browser_status", nextProfileId),
+      ).toBe(true);
+    });
+    await waitFor(() => {
+      expect(
+        browser.panelCapabilityRequests.some(
+          (request) =>
+            request.panelId === panel.panelId &&
+            request.profileId === nextProfileId,
+        ),
+      ).toBe(true);
+    });
+    return browser.runBrowserProfiles(HOST_ID, {
+      projectId: PROJECT_ID,
+      threadId: THREAD_ID,
+    });
+  }
+
+  async function switchBrowserProfile(
+    panelOrProfileId: LifecyclePanel | string,
+    profileId?: string,
+  ) {
+    if (typeof panelOrProfileId === "string") {
+      return browser.selectBrowserProfile({
+        hostId: HOST_ID,
+        profileId: panelOrProfileId,
+      });
+    }
+    if (profileId === undefined) {
+      throw new Error(
+        "A mounted panel switch requires the target Browser Profile id.",
+      );
+    }
+    return switchMountedPanelProfile(panelOrProfileId, profileId);
   }
 
   async function issuePanelCapability(input: {
@@ -565,6 +696,19 @@ export async function createPublicPanelLifecycleHarness() {
     sendSocketInput,
     latestSessionPanels,
     latestIssuedGeneration,
+    issuedSecrets,
+    redeemedSecrets,
+    socketUrls,
+    jsonContainsSecret,
+    diagnosticLogEntries: () => browser.diagnosticLogEntries(),
+    activityRecords: (profileId?: string) =>
+      browser.runBrowserActivityRecords(profileId),
+    persistedActivityRows: () => browser.persistedActivityRows(),
+    runDiagnostics: () =>
+      browser.rpc.browser_diagnostics({
+        hostId: HOST_ID,
+        profileId: DEFAULT_PROFILE_ID,
+      }),
     portHasOpenSocket,
     redeemIssuedCapability,
     forcePhysicalSocketLoss,

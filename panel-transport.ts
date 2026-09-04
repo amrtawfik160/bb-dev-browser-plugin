@@ -218,7 +218,7 @@ export function createPanelTransportServer(
   let connection: WebSocket | undefined;
   let authorized = false;
   let firstMessageTimeout: ReturnType<typeof setTimeout> | undefined;
-  const controller = new AbortController();
+  let streamAbort: AbortController | undefined;
   /**
    * Open dialogs keyed by id, so multiple dialogs stay answerable and a
    * reconnect re-pushes each still-open event exactly once. Cleared when the
@@ -391,7 +391,8 @@ export function createPanelTransportServer(
       if (capabilityId !== undefined)
         stream.markCapabilityDisconnected(capabilityId);
     }
-    controller.abort();
+    streamAbort?.abort();
+    streamAbort = undefined;
     void source.stop();
     connection = undefined;
     authorized = false;
@@ -415,9 +416,12 @@ export function createPanelTransportServer(
       fps: stream.fps,
     });
     clearFailClosedTimer();
+    streamAbort?.abort();
+    const subscriptionAbort = new AbortController();
+    streamAbort = subscriptionAbort;
     void source.start(
       (frame) => deliverFrame(socket, frame),
-      controller.signal,
+      subscriptionAbort.signal,
     );
     if (source.subscribeDialogs !== undefined) {
       unsubscribeDialogs?.();
@@ -672,7 +676,8 @@ export function createPanelTransportServer(
     unsubscribeDialogs?.();
     unsubscribeDialogs = undefined;
     openDialogs.clear();
-    controller.abort();
+    streamAbort?.abort();
+    streamAbort = undefined;
     await source.stop();
     closeConnection("closed");
     if (connection !== undefined) {

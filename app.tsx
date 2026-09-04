@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useId,
   useRef,
   useState,
   type FormEvent,
@@ -185,13 +186,14 @@ function PanelProfilePicker({
   inventory: BrowserProfileInventory;
   onChange: (profileId: string) => void;
 }) {
+  const selectionId = useId();
   return (
     <div className="mt-5 text-left">
-      <label className="block text-sm" htmlFor="browser-profile-selection">
+      <label className="block text-sm" htmlFor={selectionId}>
         Browser Profile
       </label>
       <select
-        id="browser-profile-selection"
+        id={selectionId}
         aria-label="Browser Profile"
         className="mt-2 w-full rounded border px-3 py-2 text-sm"
         value={inventory.selectedProfileId}
@@ -360,6 +362,7 @@ function PanelStreamSurface({
       return;
     }
     let disposed = false;
+    setCapability(undefined);
     setStreamState("connecting");
     setStreamError(null);
     void rpc
@@ -425,6 +428,9 @@ function PanelStreamSurface({
     let disposed = false;
     let socket: WebSocket | null = null;
     let reconnectTimer: ReturnType<typeof schedulePanelTimeout> | null = null;
+    let attemptAbort: AbortController | null = null;
+    const streamHostId = status.hostId;
+    const streamProfileId = status.profileId;
     const stream = createAutomationStreamAdapter();
     streamRef.current = stream;
     stream.start();
@@ -434,6 +440,11 @@ function PanelStreamSurface({
         clearPanelTimeout(reconnectTimer);
         reconnectTimer = null;
       }
+    }
+
+    function abortAttempt() {
+      attemptAbort?.abort();
+      attemptAbort = null;
     }
 
     function drawFrame(frame: { mimeType: string; data: string }) {
@@ -451,7 +462,10 @@ function PanelStreamSurface({
 
     function scheduleReconnect() {
       if (disposed) return;
-      const delay = stream.beginReconnect();
+      const delay =
+        stream.state === "reconnecting"
+          ? stream.reconnectFailed()
+          : stream.beginReconnect();
       if (delay === 0) {
         setStreamState("offline");
         return;
@@ -460,30 +474,65 @@ function PanelStreamSurface({
       clearReconnect();
       reconnectTimer = schedulePanelTimeout(() => {
         reconnectTimer = null;
-        if (!disposed) connect();
+        if (!disposed) void requestFreshCapability();
       }, delay);
     }
 
-    function connect() {
+    async function requestFreshCapability() {
+      if (disposed || streamHostId === null) return;
+      abortAttempt();
+      const attempt = new AbortController();
+      attemptAbort = attempt;
+      try {
+        const response = await rpc.call("browser_panel_capability", {
+          hostId: streamHostId,
+          profileId: streamProfileId,
+          panelId,
+          ownerSessionId,
+        });
+        if (disposed || attempt.signal.aborted) return;
+        if (response.outcome !== "issued") {
+          scheduleReconnect();
+          return;
+        }
+        setCapability(response);
+        connect(response);
+      } catch {
+        if (!disposed && !attempt.signal.aborted) scheduleReconnect();
+      }
+    }
+
+    function connect(
+      issued: Extract<BrowserPanelCapabilityResponse, { outcome: "issued" }>,
+    ) {
       if (disposed) return;
-      const issued = capability;
-      if (issued?.outcome !== "issued") return;
+      abortAttempt();
+      const attempt = new AbortController();
+      attemptAbort = attempt;
+      if (socket !== null) {
+        const previous = socket;
+        socket = null;
+        socketRef.current = null;
+        previous.close();
+      }
       // Production reaches the loopback gateway through BB Connect. The public
       // lifecycle seam substitutes that tunnel with the declared loopback port
       // so tests redeem a real Panel Capability without a Connect daemon.
       const url = isTestLoopbackPanelTransport()
         ? `ws://127.0.0.1:${issued.gatewayPort}`
         : `wss://${issued.tunnel.label}.${issued.tunnel.baseDomain}`;
+      let nextSocket: WebSocket;
       try {
-        socket = new WebSocket(url);
+        nextSocket = new WebSocket(url);
       } catch {
-        if (!disposed) scheduleReconnect();
+        if (!disposed && !attempt.signal.aborted) scheduleReconnect();
         return;
       }
-      socketRef.current = socket;
-      socket.binaryType = "arraybuffer";
-      socket.addEventListener("open", () => {
-        if (disposed || socket === null) return;
+      socket = nextSocket;
+      socketRef.current = nextSocket;
+      nextSocket.binaryType = "arraybuffer";
+      nextSocket.addEventListener("open", () => {
+        if (disposed || attempt.signal.aborted || socket !== nextSocket) return;
         const encoded = encodePanelProtocolMessage({
           protocolVersion: PANEL_PROTOCOL_VERSION,
           type: "redeem",
@@ -492,10 +541,10 @@ function PanelStreamSurface({
           ownerSessionId,
           panelId,
         });
-        if (encoded.outcome === "encoded") socket.send(encoded.raw);
+        if (encoded.outcome === "encoded") nextSocket.send(encoded.raw);
       });
-      socket.addEventListener("message", (event) => {
-        if (disposed) return;
+      nextSocket.addEventListener("message", (event) => {
+        if (disposed || attempt.signal.aborted) return;
         if (typeof event.data !== "string") return;
         const decoded = decodePanelProtocolMessage(event.data, {
           direction: "host-to-client",
@@ -503,7 +552,7 @@ function PanelStreamSurface({
         });
         if (decoded.outcome === "rejected") {
           stream.freezeInput();
-          socket?.close();
+          nextSocket.close();
           return;
         }
         const message = decoded.message;
@@ -541,7 +590,7 @@ function PanelStreamSurface({
         }
         if (message.type === "protocol_error") {
           stream.freezeInput();
-          socket?.close();
+          nextSocket.close();
           return;
         }
         if (message.type === "dialog") {
@@ -561,31 +610,32 @@ function PanelStreamSurface({
           setDownloadsLimits(message.update.limits);
         }
       });
-      socket.addEventListener("close", () => {
-        socket = null;
-        socketRef.current = null;
+      nextSocket.addEventListener("close", () => {
+        if (socket === nextSocket) {
+          socket = null;
+          socketRef.current = null;
+        }
         setLivePush(false);
-        if (disposed) return;
+        if (disposed || attempt.signal.aborted) return;
         // Input freezes immediately on disconnect; reconnect uses bounded
-        // backoff driven by the stream adapter.
+        // backoff driven by the stream adapter. Queued chrome gestures cannot
+        // ride the next generation: dialog and context-menu state is dropped.
         stream.freezeInput();
-        // Fail closed: clear any open dialog and context menu so a stranded
-        // prompt never leaves an invisible modal block. The host re-pushes a
-        // still-open dialog after a bounded reconnect succeeds.
         setDialog(null);
         setContextMenu(null);
         scheduleReconnect();
       });
-      socket.addEventListener("error", () => {
-        if (disposed || socket === null) return;
-        socket.close();
+      nextSocket.addEventListener("error", () => {
+        if (disposed || attempt.signal.aborted || socket !== nextSocket) return;
+        nextSocket.close();
       });
     }
 
-    connect();
+    connect(capability);
 
     return () => {
       disposed = true;
+      abortAttempt();
       setLivePush(false);
       clearReconnect();
       stream.release();
@@ -595,12 +645,21 @@ function PanelStreamSurface({
         socket = null;
       }
     };
-  }, [capability, ownerSessionId, panelId]);
+  }, [capability?.outcome, ownerSessionId, panelId, rpc]);
 
   // Render the stream surface whenever the panel is authorized to stream. The
   // region always carries the Automation Mode policy text so spectators see the
   // viewport bounds and FPS window regardless of the live connection state.
   function sendStream(message: PanelProtocolMessage) {
+    const adapter = streamRef.current;
+    if (
+      adapter !== null &&
+      (adapter.state === "input-frozen" ||
+        adapter.state === "reconnecting" ||
+        adapter.state === "released")
+    ) {
+      return;
+    }
     const socket = socketRef.current;
     if (socket === null || socket.readyState !== WebSocket.OPEN) return;
     const encoded = encodePanelProtocolMessage(message);
@@ -1609,6 +1668,14 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
         <p role="alert" className="px-2 py-1 text-xs">
           {profileError}
         </p>
+      )}
+      {profiles === null || status.hostId === null ? null : (
+        // Issue #50 keeps profile selection out of the visible chrome. The
+        // picker stays in the tree so a reconnecting panel can still run the
+        // in-panel switch path and stop the abandoned profile's reconnect.
+        <div hidden>
+          <PanelProfilePicker inventory={profiles} onChange={selectProfile} />
+        </div>
       )}
       <div ref={pageSurfaceRef} className="relative min-h-0 flex-1">
         <PanelStreamSurface
