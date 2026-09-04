@@ -34,6 +34,7 @@ import {
   preferOriginScopeDenial,
   type HostOriginScopeGuard,
 } from "./origin-scope.js";
+import type { ResolvePlaywrightRuntimeOptions } from "./playwright-runtime.js";
 import {
   BROWSER_SCRIPT_MAX_SCREENSHOT_BYTES,
   BROWSER_SCRIPT_RESULT_LIMIT_BYTES,
@@ -60,9 +61,22 @@ const DEV_BROWSER_NODE_MODULES = [
 type BrowserProcessBoundaryOptions = {
   devBrowserExecutable: string;
   devBrowserPackageDirectory?: string;
+  playwrightSearchRoots?: readonly string[];
   passwdPath?: string;
   setprivExecutable?: string;
 };
+
+function originScopePlaywrightOptions(
+  options: BrowserProcessBoundaryOptions,
+): ResolvePlaywrightRuntimeOptions {
+  const extraSearchRoots = [
+    ...(options.playwrightSearchRoots ?? []),
+    ...(options.devBrowserPackageDirectory === undefined
+      ? []
+      : [dirname(options.devBrowserPackageDirectory)]),
+  ];
+  return extraSearchRoots.length === 0 ? {} : { extraSearchRoots };
+}
 
 async function stagedDevBrowserExecutable(
   options: BrowserProcessBoundaryOptions,
@@ -1409,6 +1423,8 @@ async function executeBrowserHelper(
       originGuard = await installHostOriginScopeGuard(
         request.endpoint,
         request.originPolicy,
+        undefined,
+        originScopePlaywrightOptions(context.options),
       );
     }
     devBrowserProcess.stdin.end(request.code);
