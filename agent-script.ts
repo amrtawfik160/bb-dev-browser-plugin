@@ -17,6 +17,9 @@ export const TAB_INVALID_MESSAGE =
   "Browser Tab is invalid or belongs to a previous runtime";
 export const NON_WEB_NAVIGATION_DENIED_MESSAGE =
   "Browser navigation to a non-web URL was denied by the active Profile Grant.";
+export const ACTIVE_TAB_MARKER_FIELD = "__bbActiveTabMarker";
+export const ACTIVE_TAB_UNAVAILABLE_MESSAGE =
+  "The Browser Profile has no visible active tab.";
 
 export function preferredTabOrigin(originScope?: string): string | undefined {
   if (
@@ -322,7 +325,7 @@ await page.bringToFront();
 ${cutAgentBrowserRoots("__bbTargetPages", enforceNonWebNavigation, operationTimeoutMs)}`;
   }
   return `const __bbPages = await browser.listPages();
-let page = await browser.getPage(__bbPages.length === 0 ? "main" : __bbPages[0].id);
+let page;
 const __bbPreferred = ${JSON.stringify(preferredOrigin ?? null)};
 if (__bbPreferred !== null) {
   for (const __bbEntry of __bbPages) {
@@ -343,11 +346,31 @@ if (__bbPreferred !== null) {
     }
   }
 }
+if (page === undefined) throw new Error(${JSON.stringify(ACTIVE_TAB_UNAVAILABLE_MESSAGE)});
 await page.bringToFront();
 ${cutAgentBrowserRoots("__bbPages", enforceNonWebNavigation, operationTimeoutMs)}`;
 }
 
-export function wrapAgentScriptResult(code: string): string {
+function activeTabReport(activeTabMarker: string) {
+  return `const __bbActivePages = await browser.listPages();
+let __bbActiveTabId;
+for (const __bbActiveEntry of __bbActivePages) {
+  const __bbActiveCandidate = await browser.getPage(__bbActiveEntry.id);
+  if (await __bbActiveCandidate.evaluate(() => document.visibilityState === "visible")) {
+    __bbActiveTabId = __bbActiveEntry.id;
+    break;
+  }
+}
+if (__bbActiveTabId === undefined) throw new Error(${JSON.stringify(ACTIVE_TAB_UNAVAILABLE_MESSAGE)});
+console.log(JSON.stringify({ ${ACTIVE_TAB_MARKER_FIELD}: ${JSON.stringify(activeTabMarker)}, id: __bbActiveTabId }));`;
+}
+
+export function wrapAgentScriptResult(
+  code: string,
+  activeTabMarker?: string,
+): string {
+  const activeReport =
+    activeTabMarker === undefined ? "" : activeTabReport(activeTabMarker);
   return `let __bbResult;
 let __bbScriptError;
 let __bbScriptFailed = false;
@@ -365,6 +388,9 @@ if (
 ) {
   throw new Error(${JSON.stringify(NON_WEB_NAVIGATION_DENIED_MESSAGE)});
 }
+if (!__bbScriptFailed) {
+${activeReport}
+}
 if (__bbScriptFailed) throw __bbScriptError;
 if (__bbResult !== undefined) {
   console.log(typeof __bbResult === "string" ? __bbResult : JSON.stringify(__bbResult));
@@ -377,6 +403,7 @@ export function prepareAgentExecution(input: {
   preferredOrigin?: string;
   timeoutMs?: number;
   enforceNonWebNavigation?: boolean;
+  activeTabMarker?: string;
   screenshot?: { fileName: string; marker: string };
 }): string {
   const operationTimeoutMs = boundedOperationTimeoutMs(
@@ -388,7 +415,7 @@ export function prepareAgentExecution(input: {
     input.enforceNonWebNavigation ?? false,
     operationTimeoutMs,
   );
-  const wrappedUser = wrapAgentScriptResult(input.code);
+  const wrappedUser = wrapAgentScriptResult(input.code, input.activeTabMarker);
   if (input.screenshot === undefined) {
     return `${pagePreamble}${wrappedUser}`;
   }

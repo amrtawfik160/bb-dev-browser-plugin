@@ -194,7 +194,9 @@ describe("CDP screencast source contract", () => {
     const source = createCdpScreencastSource({
       resolveEndpoint: async () => stub.endpoint,
       viewport: { width: 1280, height: 720 },
-      onTargetCreated: (target) => opened.push(target),
+      onTargetCreated: (target) => {
+        opened.push(target);
+      },
     });
     try {
       void source.start(() => undefined, controller.signal);
@@ -217,6 +219,40 @@ describe("CDP screencast source contract", () => {
           (command) => command.method === "Target.createTarget",
         ),
       ).toBe(true);
+    } finally {
+      controller.abort();
+      await source.stop();
+      await stub.close();
+    }
+  });
+
+  it("reports created-target enrollment failure instead of claiming success", async () => {
+    const stub = createCdpEndpointStub();
+    const controller = new AbortController();
+    const results: { actionId: string; ok: boolean }[] = [];
+    const source = createCdpScreencastSource({
+      resolveEndpoint: async () => stub.endpoint,
+      viewport: { width: 1280, height: 720 },
+      onTargetCreated: async () => {
+        throw new Error("retention close failed");
+      },
+      onContextActionResult: (result) => results.push(result),
+    });
+    try {
+      void source.start(() => undefined, controller.signal);
+      await waitForStartScreencast(stub);
+      await source.resolveContextActions?.({ x: 0, y: 0 });
+      source.performContextAction?.("open-link-new-tab");
+      await waitFor(() =>
+        results.find(
+          (result) =>
+            result.actionId === "open-link-new-tab" && result.ok === false,
+        ),
+      );
+      expect(results).toContainEqual({
+        actionId: "open-link-new-tab",
+        ok: false,
+      });
     } finally {
       controller.abort();
       await source.stop();

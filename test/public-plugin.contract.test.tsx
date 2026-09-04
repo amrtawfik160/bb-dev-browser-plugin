@@ -157,6 +157,7 @@ function publicRuntime(
       location: { direction, tabId: target.tabId ?? "public-tab" },
       tabId: target.tabId ?? "public-tab",
     }),
+    closePages: async () => 0,
     listPages: async () => [],
     status: async (target) => ({
       state: "running",
@@ -172,6 +173,8 @@ function publicRuntime(
       automationEndpoint: "http://127.0.0.1:9222",
     }),
     unpinPanel: async () => undefined,
+    activeTabId: async () => "public-tab",
+    checkRendererProcessLimit: async () => undefined,
     hostDisconnected: () => undefined,
     hostReconnected: async () => undefined,
     dispose: async () => undefined,

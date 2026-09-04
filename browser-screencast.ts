@@ -38,7 +38,10 @@ export type CdpScreencastSourceOptions = {
    * so created targets are normalized into the profile's ordered tab set rather
    * than spawning an untracked window.
    */
-  onTargetCreated?: (target: { targetId: string; url: string }) => void;
+  onTargetCreated?: (target: {
+    targetId: string;
+    url: string;
+  }) => void | Promise<void>;
   /**
    * Outcome of a context action the controller triggered. Clipboard actions
    * may fail when the page lacks transient activation or the clipboard
@@ -345,12 +348,22 @@ export function createCdpScreencastSource(
       const created = (await send("Target.createTarget", {
         url: action.targetUrl,
       }).catch(() => undefined)) as { targetId?: string } | undefined;
-      if (created?.targetId !== undefined)
-        options.onTargetCreated?.({
-          targetId: created.targetId,
-          url: action.targetUrl,
-        });
-      report?.({ actionId, ok: created?.targetId !== undefined });
+      let ok = false;
+      if (created?.targetId !== undefined) {
+        ok = true;
+        try {
+          await options.onTargetCreated?.({
+            targetId: created.targetId,
+            url: action.targetUrl,
+          });
+        } catch {
+          // The target was created, but the host could not finish enrolling it
+          // and reclaiming any retention eviction. Report the incomplete
+          // bounded operation instead of silently treating it as success.
+          ok = false;
+        }
+      }
+      report?.({ actionId, ok });
       return;
     }
     if (action.kind === "copy-link" || action.kind === "copy-image-address") {

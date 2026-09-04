@@ -5,7 +5,8 @@ This report maps every parent requirement from
 [`docs/verification-plan.md`](../verification-plan.md) decomposition) to
 automated evidence, planned human acceptance, or an explicit version-one
 limitation. It cross-references the test/evidence suites from issue #21, the
-contract tests from issues #2–#20, and the issue #64 boundary corrections.
+contract tests from issues #2–#20, and the issue #64 and #66 boundary
+corrections.
 
 ## Evidence status legend
 
@@ -61,6 +62,18 @@ Baseline at the issue #21 head (`41ad3be`): **637 passed, 13 skipped** across
 | Clean profile skips welcome, opens `about:blank`; later starts restore active tab                                            | Automated: `browserProfileStartupSchema` literals (`about:blank`, `--no-first-run`, `--no-default-browser-check`); `test/browser-auth.integration.test.ts`.                           |
 | Locale/timezone captured from creating client, stable, editable                                                              | Automated: `test/profile-lifecycle.contract.test.ts`.                                                                                                                                 |
 | Refuse new instances/downloads below 5 GiB host free space                                                                   | Automated: `readiness.ts` (`FIVE_GIB`, `disk-headroom` capability → `repair-required`); `test/host-readiness.contract.test.ts`; `test/evidence/storage-failure.evidence.test.ts`.     |
+
+### Memory, retention, and host cgroup boundaries
+
+| Claim                                                                                                                            | Evidence                                                                                                                                                                                                            |
+| -------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Browser Instances run in the BB host daemon's shared cgroup; no per-instance memory slice is reserved                            | Limitation: [limitations.md](limitations.md#memory); the host worker owns the process boundary (`browser-process.ts`).                                                                                              |
+| `--renderer-process-limit=8` is a soft Chromium process-reuse hint, not a renderer ceiling                                       | Automated: `test/browser-process.integration.test.ts` launches pinned Chromium 145 with the flag and observes more than eight renderers; Limitation: [limitations.md](limitations.md#memory).                       |
+| The production boundary fails closed when more than eight live renderer descendants are observed or the count cannot be verified | Automated: `test/browser-process.integration.test.ts` (pinned Chromium process-tree enforcement); `browser-process.ts` and `browser-runtime.ts` enforce launch, recovery, operation, navigation, and restart paths. |
+| `--js-flags=--max-old-space-size=512` remains a per-renderer V8 old-space setting, not a total-browser memory cap                | Automated: `test/browser-runtime.contract.test.ts` (launch arguments); Limitation: [limitations.md](limitations.md#memory) (native and total-memory scope).                                                         |
+| The shared 64-tab retention cap closes evicted live pages and is separate from renderer-process enforcement                      | Automated: `test/browser-tabs.contract.test.ts`, `test/host-browser-runtime.contract.test.ts`; implementation in `browser-tabs.ts` and `browser-runtime.ts`.                                                        |
+| Native, GPU, other non-renderer memory, and shared-cgroup pressure remain outside the renderer/V8 bound                          | Limitation: [limitations.md](limitations.md#memory).                                                                                                                                                                |
+| Operators may apply a host-daemon `MemoryMax`; Chromium renderer `oom_score_adj` behavior remains host-kernel policy             | Limitation: [limitations.md](limitations.md#memory).                                                                                                                                                                |
 
 ### Modes — Automation
 

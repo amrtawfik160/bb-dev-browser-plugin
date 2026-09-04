@@ -23,7 +23,11 @@ import type {
   BrowserProcessIdentity,
   RunningBrowserProcess,
 } from "./browser-runtime.js";
-import { BrowserScriptExecutionError } from "./browser-runtime.js";
+import {
+  BrowserInstanceError,
+  RENDERER_PROCESS_LIMIT,
+  BrowserScriptExecutionError,
+} from "./browser-runtime.js";
 import {
   BrowserOriginScopeDeniedError,
   installHostOriginScopeGuard,
@@ -44,6 +48,7 @@ const MAX_SCREENSHOT_BYTES = BROWSER_SCRIPT_MAX_SCREENSHOT_BYTES;
 const SCREENSHOT_READ_CHUNK_BYTES = 64 * 1024;
 const HELPER_STOP_TIMEOUT_MS = 2_000;
 const BROWSER_CLOSE_TIMEOUT_MS = 2_000;
+const RENDERER_PROCESS_CHECK_INTERVAL_MS = 250;
 const UNIX_SOCKET_PATH_MAX_BYTES = 107;
 const DEV_BROWSER_NODE_MODULES = [
   "playwright",
@@ -350,6 +355,120 @@ async function processIdentity(pid: number): Promise<BrowserProcessIdentity> {
   };
 }
 
+type ProcessSnapshot = {
+  pid: number;
+  parentId: number;
+  isRenderer: boolean;
+};
+
+function processHasGone(error: unknown) {
+  return error instanceof Error && "code" in error && error.code === "ENOENT";
+}
+
+function processParentId(statContents: string) {
+  const statEnd = statContents.lastIndexOf(")");
+  if (statEnd === -1) throw new Error("Process metadata is malformed.");
+  const fields = statContents
+    .slice(statEnd + 2)
+    .trim()
+    .split(/\s+/u);
+  const parentId = Number(fields[1]);
+  if (!Number.isSafeInteger(parentId) || parentId < 0) {
+    throw new Error("Process parent metadata is unavailable.");
+  }
+  return parentId;
+}
+
+function isRendererProcess(commandLine: string) {
+  return commandLine.split(/\0|\s+/u).includes("--type=renderer");
+}
+
+async function readProcessSnapshot(
+  pid: number,
+): Promise<ProcessSnapshot | null> {
+  try {
+    const [statContents, commandLine] = await Promise.all([
+      readFile(`/proc/${pid}/stat`, "utf8"),
+      readFile(`/proc/${pid}/cmdline`, "utf8"),
+    ]);
+    return {
+      pid,
+      parentId: processParentId(statContents),
+      isRenderer: isRendererProcess(commandLine),
+    };
+  } catch (error) {
+    if (processHasGone(error)) return null;
+    throw error;
+  }
+}
+
+async function liveProcessSnapshots() {
+  const processIds = (await readdir("/proc"))
+    .filter((entry) => /^\d+$/u.test(entry))
+    .map(Number);
+  const processes = await Promise.all(processIds.map(readProcessSnapshot));
+  return processes.filter(
+    (process_): process_ is NonNullable<typeof process_> => process_ !== null,
+  );
+}
+
+function processChildren(liveProcesses: readonly ProcessSnapshot[]) {
+  const children = new Map<number, number[]>();
+  for (const process_ of liveProcesses) {
+    const siblings = children.get(process_.parentId) ?? [];
+    siblings.push(process_.pid);
+    children.set(process_.parentId, siblings);
+  }
+  return children;
+}
+
+function processDescendants(
+  browserPid: number,
+  liveProcesses: readonly ProcessSnapshot[],
+) {
+  if (!liveProcesses.some((process_) => process_.pid === browserPid)) {
+    throw new Error("Browser process metadata is unavailable.");
+  }
+  const children = processChildren(liveProcesses);
+  const descendants = new Set<number>([browserPid]);
+  const pending = [browserPid];
+  for (let index = 0; index < pending.length; index += 1) {
+    const parentId = pending[index]!;
+    for (const childId of children.get(parentId) ?? []) {
+      if (descendants.has(childId)) continue;
+      descendants.add(childId);
+      pending.push(childId);
+    }
+  }
+  return descendants;
+}
+
+async function rendererProcessCount(browserPid: number) {
+  const liveProcesses = await liveProcessSnapshots();
+  const descendants = processDescendants(browserPid, liveProcesses);
+  return liveProcesses.filter(
+    (process_) => process_.isRenderer && descendants.has(process_.pid),
+  ).length;
+}
+
+async function assertRendererProcessLimit(browserPid: number) {
+  let count: number;
+  try {
+    count = await rendererProcessCount(browserPid);
+  } catch {
+    throw new BrowserInstanceError(
+      "renderer-limit",
+      "The Browser Instance renderer process limit could not be verified.",
+    );
+  }
+  if (count > RENDERER_PROCESS_LIMIT) {
+    throw new BrowserInstanceError(
+      "renderer-limit",
+      `The Browser Instance has ${count} renderer processes; the limit is ${RENDERER_PROCESS_LIMIT}.`,
+    );
+  }
+}
+
 function processRunsAsBrowserUser(
   status: string,
   identity: ReturnType<typeof browserUserIdentity>,
@@ -614,6 +733,115 @@ async function attemptBrowserClose(profileDirectory: string) {
   );
 }
 
+type RendererProcessMonitor = {
+  checkNow(): Promise<void>;
+  start(): void;
+  dispose(): void;
+  failure: Promise<never>;
+};
+
+async function reportRendererLimitFailure(
+  error: unknown,
+  onViolation: () => Promise<void>,
+) {
+  try {
+    await onViolation();
+    return error;
+  } catch (cleanupError) {
+    return new AggregateError(
+      [error, cleanupError],
+      "Browser Instance renderer limit enforcement failed.",
+      { cause: cleanupError },
+    );
+  }
+}
+
+type RendererProcessMonitorState = {
+  disposed: boolean;
+  checking: boolean;
+  violationReported: boolean;
+  timer: NodeJS.Timeout | undefined;
+  rejectFailure: (error: unknown) => void;
+};
+
+function rendererProcessMonitorState(
+  rejectFailure: (error: unknown) => void,
+): RendererProcessMonitorState {
+  return {
+    disposed: false,
+    checking: false,
+    violationReported: false,
+    timer: undefined,
+    rejectFailure,
+  };
+}
+
+function stopRendererMonitoring(state: RendererProcessMonitorState) {
+  state.disposed = true;
+  if (state.timer !== undefined) clearInterval(state.timer);
+  state.timer = undefined;
+}
+
+export async function deliverRendererMonitorFailure(
+  rejectFailure: (error: unknown) => void,
+  error: unknown,
+  onViolation: () => Promise<void>,
+) {
+  // Reject before invoking stop. Awaiting stop first lets waitForExit win
+  // Promise.race, and the runtime ordinary-restarts a ceiling retirement.
+  rejectFailure(error);
+  await reportRendererLimitFailure(error, onViolation);
+}
+
+async function checkRendererProcessWhileRunning(
+  state: RendererProcessMonitorState,
+  browserPid: number,
+  onViolation: () => Promise<void>,
+) {
+  if (state.disposed || state.checking || state.violationReported) return;
+  state.checking = true;
+  try {
+    await assertRendererProcessLimit(browserPid);
+  } catch (error) {
+    if (state.disposed || state.violationReported) return;
+    state.violationReported = true;
+    stopRendererMonitoring(state);
+    void deliverRendererMonitorFailure(state.rejectFailure, error, onViolation);
+  } finally {
+    state.checking = false;
+  }
+}
+
+function startRendererMonitoring(
+  state: RendererProcessMonitorState,
+  browserPid: number,
+  onViolation: () => Promise<void>,
+) {
+  if (state.disposed || state.timer !== undefined) return;
+  state.timer = setInterval(() => {
+    void checkRendererProcessWhileRunning(state, browserPid, onViolation);
+  }, RENDERER_PROCESS_CHECK_INTERVAL_MS);
+  state.timer.unref();
+}
+
+function createRendererProcessMonitor(
+  browserPid: number,
+  onViolation: () => Promise<void>,
+): RendererProcessMonitor {
+  let rejectFailure!: (error: unknown) => void;
+  const failure = new Promise<never>((_resolve, reject) => {
+    rejectFailure = reject;
+  });
+  const state = rendererProcessMonitorState(rejectFailure);
+
+  return {
+    checkNow: () => assertRendererProcessLimit(browserPid),
+    start: () => startRendererMonitoring(state, browserPid, onViolation),
+    dispose: () => stopRendererMonitoring(state),
+    failure,
+  };
+}
+
 async function helperIsRunning(helperHome: string) {
   try {
     await access(join(helperHome, ".dev-browser", "daemon.sock"));
@@ -860,12 +1088,50 @@ async function launchProductionBrowser(
     await stopProcess(browserProcess);
     throw error;
   }
+  const rendererMonitor = createRendererProcessMonitor(
+    browserProcess.pid!,
+    () => stopBrowserProcess(context, request, identity, browserProcess),
+  );
+  try {
+    await rendererMonitor.checkNow();
+  } catch (error) {
+    rendererMonitor.dispose();
+    const failure = await reportRendererLimitFailure(error, () =>
+      stopBrowserProcess(context, request, identity, browserProcess),
+    );
+    throw failure;
+  }
+  rendererMonitor.start();
   return {
     pid: browserProcess.pid!,
     automationEndpoint,
-    exited: waitForExit(browserProcess),
-    stop: () => stopBrowserProcess(context, request, identity, browserProcess),
+    exited: Promise.race([
+      waitForExit(browserProcess),
+      rendererMonitor.failure,
+    ]),
+    stop: async () => {
+      rendererMonitor.dispose();
+      await stopBrowserProcess(context, request, identity, browserProcess);
+    },
   };
+}
+
+async function stopRecoveredBrowser(input: {
+  context: ProductionProcessContext;
+  request: BrowserLaunchRequest;
+  identity: ReturnType<typeof browserUserIdentity>;
+  automationEndpoint: string;
+  pid: number;
+}) {
+  try {
+    await stopAttachedHelper(input.context, input.request, input.identity);
+  } finally {
+    await requestBrowserClose(input.automationEndpoint).then(
+      () => undefined,
+      () => undefined,
+    );
+    await stopRecoveredProcess(input.pid);
+  }
 }
 
 async function recoverProductionBrowser(
@@ -895,20 +1161,49 @@ async function recoverProductionBrowser(
     return null;
   }
   const identity = browserUserIdentity(context.passwdPath);
+  const rendererMonitor = createRendererProcessMonitor(
+    expectedIdentity.pid,
+    () =>
+      stopRecoveredBrowser({
+        context,
+        request,
+        identity,
+        automationEndpoint,
+        pid: expectedIdentity.pid,
+      }),
+  );
+  try {
+    await rendererMonitor.checkNow();
+  } catch (error) {
+    rendererMonitor.dispose();
+    const failure = await reportRendererLimitFailure(error, () =>
+      stopRecoveredBrowser({
+        context,
+        request,
+        identity,
+        automationEndpoint,
+        pid: expectedIdentity.pid,
+      }),
+    );
+    throw failure;
+  }
+  rendererMonitor.start();
   return {
     pid: expectedIdentity.pid,
     automationEndpoint,
-    exited: waitForProcessExit(expectedIdentity.pid),
+    exited: Promise.race([
+      waitForProcessExit(expectedIdentity.pid),
+      rendererMonitor.failure,
+    ]),
     stop: async () => {
-      try {
-        await stopAttachedHelper(context, request, identity);
-      } finally {
-        await requestBrowserClose(automationEndpoint).then(
-          () => undefined,
-          () => undefined,
-        );
-        await stopRecoveredProcess(expectedIdentity.pid);
-      }
+      rendererMonitor.dispose();
+      await stopRecoveredBrowser({
+        context,
+        request,
+        identity,
+        automationEndpoint,
+        pid: expectedIdentity.pid,
+      });
     },
   };
 }
@@ -1229,6 +1524,7 @@ export function createProductionBrowserProcessBoundary(
     recover: (request, identity, endpoint) =>
       recoverProductionBrowser(context, request, identity, endpoint),
     processIdentity,
+    assertRendererProcessLimit,
     execute: (request) => executeBrowserHelper(context, request),
     configuredSearchUrl: ({ profileDirectory, text }) =>
       configuredSearchUrl(profileDirectory, text),

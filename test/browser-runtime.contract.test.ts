@@ -15,17 +15,20 @@ import {
   BrowserInstanceError,
   BrowserOriginScopeDeniedError,
   createBrowserInstanceRuntime,
+  RENDERER_PROCESS_LIMIT,
   selectBrowserExecutable,
   validateBrowserLaunchPolicy,
   type BrowserExecutionRequest,
   type BrowserLaunchBoundary,
   type BrowserLaunchRequest,
 } from "../browser-runtime.js";
+import { deliverRendererMonitorFailure } from "../browser-process.js";
 import { fallbackBrowserPaths } from "../browser-fallback.js";
 import { PINNED_BROWSER_RUNTIME } from "../dependency-inventory.js";
 import { profileStoragePaths } from "../profile-storage.js";
 import { BROWSER_SCRIPT_RESULT_LIMIT_BYTES } from "../contracts.js";
 import { NON_WEB_NAVIGATION_DENIED_MESSAGE } from "../agent-script.js";
+import { waitForSettled } from "./wait.js";
 
 function launchFixture(
   options: {
@@ -34,12 +37,20 @@ function launchFixture(
     groupId?: number;
     recoveredPid?: number;
     recoveredLaunchingPid?: number;
+    untargetedAgentTabId?: string;
   } = {},
 ) {
   const launches: BrowserLaunchRequest[] = [];
   const executions: BrowserExecutionRequest[] = [];
   const stopped: number[] = [];
   const exits = new Map<number, (error?: Error) => void>();
+  const liveMonitors = new Map<
+    number,
+    {
+      rejectFailure: (error: unknown) => void;
+      stop: () => Promise<void>;
+    }
+  >();
   const pages = new Set(["actual-active-tab"]);
   let nextPid = 4100;
   const boundary: BrowserLaunchBoundary = {
@@ -50,9 +61,13 @@ function launchFixture(
       launches.push(request);
       const pid = nextPid++;
       let reportExit!: (error?: Error) => void;
-      const exited = new Promise<void>((resolve, reject) => {
+      let rejectFailure!: (error: unknown) => void;
+      const waitForExit = new Promise<void>((resolve, reject) => {
         reportExit = (error) =>
           error === undefined ? resolve() : reject(error);
+      });
+      const monitorFailure = new Promise<never>((_resolve, reject) => {
+        rejectFailure = reject;
       });
       exits.set(pid, reportExit);
       const identity = {
@@ -61,15 +76,17 @@ function launchFixture(
         commandHash: `fixture-command-${pid}`,
       };
       await onSpawn?.(identity);
+      async function stop() {
+        stopped.push(pid);
+        reportExit();
+      }
+      liveMonitors.set(pid, { rejectFailure, stop });
       return {
         pid,
         automationEndpoint:
           options.endpoint ?? `http://127.0.0.1:${12_000 + launches.length}`,
-        async stop() {
-          stopped.push(pid);
-          reportExit();
-        },
-        exited,
+        stop,
+        exited: Promise.race([waitForExit, monitorFailure]),
       };
     },
     async recover(_request, identity, endpoint) {
@@ -111,7 +128,8 @@ function launchFixture(
       }
       if (
         request.code.includes("document.visibilityState") &&
-        request.code.includes("active ?? pages[0]")
+        (request.code.includes("active ?? pages[0]") ||
+          request.code.includes("let active = null"))
       ) {
         return JSON.stringify({
           id: "actual-active-tab",
@@ -124,6 +142,22 @@ function launchFixture(
         /browser\.getPage\(("(?:[^"\\]|\\.)*")\)/u,
       )?.[1];
       if (requestedPage !== undefined) pages.add(JSON.parse(requestedPage));
+      const activeTabMarker = request.code.match(
+        /__bbActiveTabMarker:\s*"([^"\\]+)"/u,
+      )?.[1];
+      if (activeTabMarker !== undefined) {
+        const foregroundTabId =
+          requestedPage === undefined
+            ? (options.untargetedAgentTabId ?? "actual-active-tab")
+            : JSON.parse(requestedPage);
+        pages.add(foregroundTabId);
+        return {
+          output: `attached\n${JSON.stringify({
+            __bbActiveTabMarker: activeTabMarker,
+            id: foregroundTabId,
+          })}`,
+        };
+      }
       return { output: "attached" };
     },
     async configuredSearchUrl({ text }) {
@@ -142,15 +176,31 @@ function launchFixture(
     fail(pid: number) {
       exits.get(pid)?.(new Error("fixture process observer failed"));
     },
+    async exceedLiveRendererCeiling(pid: number) {
+      const monitor = liveMonitors.get(pid);
+      if (monitor === undefined) {
+        throw new Error(`No live renderer monitor for pid ${pid}.`);
+      }
+      await deliverRendererMonitorFailure(
+        monitor.rejectFailure,
+        new BrowserInstanceError(
+          "renderer-limit",
+          `The Browser Instance has ${RENDERER_PROCESS_LIMIT + 1} renderer processes; the limit is ${RENDERER_PROCESS_LIMIT}.`,
+        ),
+        monitor.stop,
+      );
+    },
   };
 }
 
-async function runtimeFixture() {
+async function runtimeFixture(
+  processOptions: Parameters<typeof launchFixture>[0] = {},
+) {
   const rootDirectory = await mkdtemp(join(tmpdir(), "browser-runtime-"));
   const browserExecutable = join(rootDirectory, "chrome");
   await writeFile(browserExecutable, "fixture");
   await chmod(browserExecutable, 0o755);
-  const processFixture = launchFixture();
+  const processFixture = launchFixture(processOptions);
   const runtime = createBrowserInstanceRuntime({
     rootDirectory,
     installationId: "installation-a",
@@ -749,6 +799,13 @@ describe("Browser Instance runtime", () => {
       expect(launch.chromeArguments.join(" ")).toContain("AutofillCreditCard");
       expect(launch.chromeArguments).not.toContain("--password-store=basic");
       expect(launch.chromeArguments).not.toContain("about:blank");
+      // The renderer switch remains a Chromium reuse hint; the production
+      // process boundary enforces the live renderer count. V8's old-space
+      // setting remains a per-renderer heap cap.
+      expect(launch.chromeArguments).toContain("--renderer-process-limit=8");
+      expect(launch.chromeArguments).toContain(
+        "--js-flags=--max-old-space-size=512",
+      );
 
       await fixture.runtime.stop(fixture.target);
       for (const [name, contents] of retainedFiles) {
@@ -999,6 +1056,29 @@ describe("Browser Instance runtime", () => {
     }
   });
 
+  it("retains the foreground reported by an untargeted agent execution", async () => {
+    const fixture = await runtimeFixture({
+      untargetedAgentTabId: "agent-selected-tab",
+    });
+    try {
+      await fixture.runtime.execute(
+        { ...fixture.target, projectId: "project-a" },
+        "return page.url()",
+        5_000,
+      );
+      await fixture.runtime.navigate(
+        { ...fixture.target, projectId: "project-a" },
+        "https://fixture.example/after-agent",
+      );
+
+      expect(fixture.processFixture.executions[1]?.code).toContain(
+        'browser.getPage("agent-selected-tab")',
+      );
+    } finally {
+      await fixture.dispose();
+    }
+  });
+
   it("captures an explicitly targeted tab without redeclaring its binding", async () => {
     const fixture = await runtimeFixture();
     try {
@@ -1073,6 +1153,50 @@ describe("Browser Instance runtime", () => {
       await expect(
         fixture.runtime.execute(fixture.target, "return page.url()", 5_000),
       ).rejects.toThrow("256 KiB");
+    } finally {
+      await fixture.dispose();
+    }
+  });
+
+  it("fails closed before browser work when the renderer ceiling is exceeded", async () => {
+    const fixture = await runtimeFixture();
+    let checks = 0;
+    fixture.processFixture.boundary.assertRendererProcessLimit = async () => {
+      checks += 1;
+      if (checks > 1) {
+        throw new BrowserInstanceError(
+          "renderer-limit",
+          "The renderer process limit could not be verified.",
+        );
+      }
+    };
+    try {
+      await expect(
+        fixture.runtime.execute(fixture.target, "return page.url()", 5_000),
+      ).rejects.toMatchObject({ code: "renderer-limit" });
+      expect(checks).toBe(2);
+      expect(fixture.processFixture.executions).toHaveLength(0);
+      expect(fixture.processFixture.stopped).toEqual([4100]);
+    } finally {
+      await fixture.dispose();
+    }
+  });
+
+  it("issue #66 does not ordinary-restart after a live renderer-monitor ceiling stop", async () => {
+    const fixture = await runtimeFixture();
+    try {
+      const running = await fixture.runtime.start(fixture.target);
+      await fixture.processFixture.exceedLiveRendererCeiling(running.pid);
+      await vi.waitFor(async () => {
+        expect(await fixture.runtime.status(fixture.target)).toMatchObject({
+          state: "sleeping",
+        });
+      });
+      await waitForSettled(() => fixture.processFixture.launches.length === 1, {
+        timeoutMs: 200,
+      });
+      expect(fixture.processFixture.launches).toHaveLength(1);
+      expect(fixture.processFixture.stopped).toEqual([running.pid]);
     } finally {
       await fixture.dispose();
     }

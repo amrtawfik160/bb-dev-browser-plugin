@@ -52,11 +52,12 @@ export function newTabId(): string {
 }
 
 export function createBrowserTabStrip(options: BrowserTabStripOptions = {}) {
-  const maxTabs = options.maxTabs ?? TAB_STRIP_DEFAULT_MAX_TABS;
+  const maxTabs = Math.max(1, options.maxTabs ?? TAB_STRIP_DEFAULT_MAX_TABS);
   let generation = 0;
   let tabs = new Map<string, BrowserTab>();
   let order: string[] = [];
   let activeTabId: string | null = null;
+  let evicted: string[] = [];
   const listeners = new Set<BrowserTabStripListener>();
 
   function snapshot(): BrowserTabStrip {
@@ -71,13 +72,41 @@ export function createBrowserTabStrip(options: BrowserTabStripOptions = {}) {
     for (const listener of listeners) listener(strip);
   }
 
+  /**
+   * Drop the oldest tabs past the retention cap and record which real pages
+   * they were.
+   *
+   * Trimming used to forget a tab and leave its page open in the browser, so
+   * the cap bounded nothing: the next inventory reported the same page, the
+   * strip re-added it, and something else was evicted. Pages accumulated for
+   * the life of the profile — and `--restore-last-session` brought them all
+   * back on the next launch — with each one holding renderer memory. The
+   * caller drains {@link takeEvictedTabIds} and closes those pages, which is
+   * what makes the cap a real bound.
+   *
+   * The active tab is never evicted; the owner is looking at it.
+   */
   function trimToMax() {
     while (order.length > maxTabs) {
-      const dropped = order.shift()!;
-      tabs.delete(dropped);
-      if (activeTabId === dropped)
-        activeTabId = order[order.length - 1] ?? null;
+      const oldest = order.findIndex((id) => id !== activeTabId);
+      if (oldest === -1) break;
+      const [dropped] = order.splice(oldest, 1);
+      tabs.delete(dropped!);
+      // One reconcile both adds pages individually and re-syncs the whole
+      // inventory, so the same page can be trimmed twice before the caller
+      // drains. Report it once.
+      if (!evicted.includes(dropped!)) evicted.push(dropped!);
     }
+  }
+
+  /**
+   * Hand back the pages evicted since the last call, so the caller can close
+   * them in the browser. Draining keeps a page from being closed twice.
+   */
+  function takeEvictedTabIds(): string[] {
+    const drained = evicted;
+    evicted = [];
+    return drained;
   }
 
   /**
@@ -91,6 +120,9 @@ export function createBrowserTabStrip(options: BrowserTabStripOptions = {}) {
     tabs = new Map();
     order = [];
     activeTabId = null;
+    // A new instance owns no pages from the previous one, so pending
+    // evictions would name ids that no longer exist.
+    evicted = [];
     emit();
   }
 
@@ -142,7 +174,10 @@ export function createBrowserTabStrip(options: BrowserTabStripOptions = {}) {
   /**
    * Sync the strip from a runtime page inventory. Pages not present are
    * dropped; new pages are added (preserving popup origin and opener when the
-   * runtime reports them); the first reported page becomes active if none is.
+   * runtime reports them). A supplied active tab is protected while trimming;
+   * otherwise the current active tab is preserved when possible. An inventory
+   * larger than the retention cap cannot be trimmed without a known active
+   * tab, so it fails closed instead of selecting an arbitrary reported page.
    * Runtime tab ids are preserved unchanged so they stay consistent for the
    * life of the instance.
    */
@@ -154,6 +189,7 @@ export function createBrowserTabStrip(options: BrowserTabStripOptions = {}) {
       origin?: BrowserTabOrigin;
       openerTabId?: string | null;
     }>,
+    preferredActiveTabId?: string,
   ) {
     const next = new Map<string, BrowserTab>();
     const nextOrder: string[] = [];
@@ -171,14 +207,22 @@ export function createBrowserTabStrip(options: BrowserTabStripOptions = {}) {
       next.set(page.id, tab);
       nextOrder.push(page.id);
     }
+    const nextActiveTabId =
+      preferredActiveTabId !== undefined && next.has(preferredActiveTabId)
+        ? preferredActiveTabId
+        : activeTabId !== null && next.has(activeTabId)
+          ? activeTabId
+          : nextOrder.length === 1
+            ? nextOrder[0]!
+            : null;
+    if (nextOrder.length > maxTabs && nextActiveTabId === null) {
+      throw new Error(
+        "Cannot trim the Browser Tab inventory without a known active Browser Tab.",
+      );
+    }
     tabs = next;
     order = nextOrder;
-    if (activeTabId !== null && !tabs.has(activeTabId)) {
-      activeTabId = order[order.length - 1] ?? null;
-    }
-    if (activeTabId === null && order.length > 0) {
-      activeTabId = order[order.length - 1] ?? null;
-    }
+    activeTabId = nextActiveTabId;
     trimToMax();
     emit();
   }
@@ -224,6 +268,7 @@ export function createBrowserTabStrip(options: BrowserTabStripOptions = {}) {
     tabs.clear();
     order = [];
     activeTabId = null;
+    evicted = [];
   }
 
   return {
@@ -233,6 +278,7 @@ export function createBrowserTabStrip(options: BrowserTabStripOptions = {}) {
     syncPages,
     activateTab,
     closeTab,
+    takeEvictedTabIds,
     tab,
     isValidTabId,
     snapshot,
