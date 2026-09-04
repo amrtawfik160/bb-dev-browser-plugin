@@ -1939,6 +1939,12 @@ export type PanelIdentityRejection = z.infer<
   typeof panelIdentityRejectionSchema
 >;
 
+export function isPanelIdentityRejection(
+  value: unknown,
+): value is PanelIdentityRejection {
+  return panelIdentityRejectionSchema.safeParse(value).success;
+}
+
 /**
  * Shared Browser Tab strip for one profile (ADR 0005). Tabs, one active tab,
  * and one Browser Instance belong to a Browser Profile rather than a BB
@@ -1966,6 +1972,14 @@ export const browserTabStripSchema = z
 
 export type BrowserTab = z.infer<typeof browserTabSchema>;
 export type BrowserTabStrip = z.infer<typeof browserTabStripSchema>;
+
+export const browserPanelTabActionResponseSchema = z.union([
+  browserTabStripSchema,
+  panelIdentityRejectionSchema,
+]);
+export type BrowserPanelTabActionResponse = z.infer<
+  typeof browserPanelTabActionResponseSchema
+>;
 
 /**
  * Shared Control Lease state across every Browser Panel using one profile
@@ -2048,6 +2062,14 @@ export type BrowserPanelControlResponse = z.infer<
   typeof browserPanelControlResponseSchema
 >;
 
+export const browserPanelControlResultSchema = z.union([
+  browserPanelControlResponseSchema,
+  panelIdentityRejectionSchema,
+]);
+export type BrowserPanelControlResult = z.infer<
+  typeof browserPanelControlResultSchema
+>;
+
 /** The controller explicitly transfers control to another panel. */
 export const browserPanelTakeControlRequestSchema =
   browserPanelControlRequestSchema;
@@ -2066,14 +2088,23 @@ export type BrowserPanelReclaimControlRequest = z.infer<
   typeof browserPanelReclaimControlRequestSchema
 >;
 
-/** The controller releases control and returns to spectator. */
-export const browserPanelReleaseControlRequestSchema = z
+/** Host-side Control Lease release. Identity is resolved on the server. */
+export const browserHostReleaseControlRequestSchema = z
   .object({
     hostId: z.string().min(1),
     profileId: z.string().min(1),
     panelId: z.string().min(1),
   })
   .strict();
+
+/** The controller releases control and returns to spectator. */
+export const browserPanelReleaseControlRequestSchema =
+  browserHostReleaseControlRequestSchema.extend({
+    ownerSessionId: z.string().min(1),
+  });
+export type BrowserHostReleaseControlRequest = z.infer<
+  typeof browserHostReleaseControlRequestSchema
+>;
 export type BrowserPanelReleaseControlRequest = z.infer<
   typeof browserPanelReleaseControlRequestSchema
 >;
@@ -3043,6 +3074,14 @@ export type BrowserNavigationResponse = z.infer<
   typeof browserNavigationResponseSchema
 >;
 
+export const browserPanelNavigationResponseSchema = z.union([
+  browserNavigationResponseSchema,
+  panelIdentityRejectionSchema,
+]);
+export type BrowserPanelNavigationResponse = z.infer<
+  typeof browserPanelNavigationResponseSchema
+>;
+
 export const rpcContract = defineRpcContract({
   browser_status: {
     input: browserStatusInputSchema,
@@ -3050,11 +3089,11 @@ export const rpcContract = defineRpcContract({
   },
   browser_navigate: {
     input: browserPanelNavigationRequestSchema,
-    output: browserNavigationResponseSchema,
+    output: browserPanelNavigationResponseSchema,
   },
   browser_history: {
     input: browserPanelHistoryRequestSchema,
-    output: browserNavigationResponseSchema,
+    output: browserPanelNavigationResponseSchema,
   },
   browser_panel_visibility: {
     input: browserPanelVisibilityRequestSchema,
@@ -3074,23 +3113,23 @@ export const rpcContract = defineRpcContract({
   },
   browser_tab_action: {
     input: browserPanelTabActionRequestSchema,
-    output: browserTabStripSchema,
+    output: browserPanelTabActionResponseSchema,
   },
   browser_panel_control: {
     input: browserPanelControlRequestSchema,
-    output: browserPanelControlResponseSchema,
+    output: browserPanelControlResultSchema,
   },
   browser_panel_take_control: {
     input: browserPanelTakeControlRequestSchema,
-    output: browserPanelControlResponseSchema,
+    output: browserPanelControlResultSchema,
   },
   browser_panel_reclaim_control: {
     input: browserPanelReclaimControlRequestSchema,
-    output: browserPanelControlResponseSchema,
+    output: browserPanelControlResultSchema,
   },
   browser_panel_release_control: {
     input: browserPanelReleaseControlRequestSchema,
-    output: browserPanelControlResponseSchema,
+    output: browserPanelControlResultSchema,
   },
   browser_settings_status: {
     input: z.object({ profileId: z.string().min(1) }).strict(),

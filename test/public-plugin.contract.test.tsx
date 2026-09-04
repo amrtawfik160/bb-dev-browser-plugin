@@ -35,6 +35,7 @@ import {
   setupRequiredStatus,
   type BrowserGrantRequest,
 } from "../contracts.js";
+import { ownerSessionIdFromContext } from "../panel-owner-session.js";
 import {
   createPublicPluginHarness,
   createTabInventoryRuntime,
@@ -591,13 +592,19 @@ describe("Browser public plugin contract", () => {
         hostId: "host-browser-test",
         profileId: DEFAULT_PROFILE_ID,
         panelId: "panel-controller",
-        ownerSessionId: "session-controller",
+        ownerSessionId: ownerSessionIdFromContext({
+          projectId: null,
+          threadId: "thread-browser-test",
+        }),
       });
       const spectator = await browser.runBrowserPanelControl({
         hostId: "host-browser-test",
         profileId: DEFAULT_PROFILE_ID,
         panelId: "panel-spectator",
-        ownerSessionId: "session-spectator",
+        ownerSessionId: ownerSessionIdFromContext({
+          projectId: "project-browser-test",
+          threadId: null,
+        }),
       });
       expect(controller.role).toBe("controller");
       expect(spectator.role).toBe("spectator");

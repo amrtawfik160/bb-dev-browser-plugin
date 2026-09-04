@@ -2,12 +2,21 @@
 import { waitFor } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import { DEFAULT_PROFILE_ID } from "../contracts.js";
+import { ownerSessionIdFromContext } from "../panel-owner-session.js";
 import {
   createPublicPluginHarness,
   healthyBrowserStatus as healthyStatus,
 } from "./public-plugin-harness.js";
 
 const HOST_ID = "host-browser-test";
+const THREAD_SESSION = ownerSessionIdFromContext({
+  projectId: null,
+  threadId: "thread-browser-test",
+});
+const PROJECT_SESSION = ownerSessionIdFromContext({
+  projectId: "project-browser-test",
+  threadId: null,
+});
 
 function target() {
   return {
@@ -23,7 +32,7 @@ describe("Browser Panel multi-client control (issue #16)", () => {
     const first = await browser.runBrowserPanelControl({
       ...target(),
       panelId: "panel-a",
-      ownerSessionId: "session-a",
+      ownerSessionId: THREAD_SESSION,
     });
     expect(first.role).toBe("controller");
     expect(first.control.controllerPanelId).toBe("panel-a");
@@ -31,7 +40,7 @@ describe("Browser Panel multi-client control (issue #16)", () => {
     const second = await browser.runBrowserPanelControl({
       ...target(),
       panelId: "panel-b",
-      ownerSessionId: "session-b",
+      ownerSessionId: PROJECT_SESSION,
     });
     // A second client starts view-only and cannot send browser input.
     expect(second.role).toBe("spectator");
@@ -45,18 +54,18 @@ describe("Browser Panel multi-client control (issue #16)", () => {
     await browser.runBrowserPanelControl({
       ...target(),
       panelId: "panel-a",
-      ownerSessionId: "session-a",
+      ownerSessionId: THREAD_SESSION,
     });
     await browser.runBrowserPanelControl({
       ...target(),
       panelId: "panel-b",
-      ownerSessionId: "session-b",
+      ownerSessionId: PROJECT_SESSION,
     });
 
     const transferred = await browser.runBrowserTakeControl({
       ...target(),
       panelId: "panel-b",
-      ownerSessionId: "session-b",
+      ownerSessionId: PROJECT_SESSION,
       viewport: { width: 1280, height: 720 },
     });
     // The transfer is atomic: exactly one controller after the call, and the
@@ -72,7 +81,7 @@ describe("Browser Panel multi-client control (issue #16)", () => {
     const observer = await browser.runBrowserPanelControl({
       ...target(),
       panelId: "panel-a",
-      ownerSessionId: "session-a",
+      ownerSessionId: THREAD_SESSION,
     });
     expect(observer.role).toBe("spectator");
     expect(observer.control.controllerPanelId).toBe("panel-b");
@@ -88,12 +97,12 @@ describe("Browser Panel multi-client control (issue #16)", () => {
     await browser.runBrowserPanelControl({
       ...target(),
       panelId: "panel-a",
-      ownerSessionId: "session-a",
+      ownerSessionId: THREAD_SESSION,
     });
     await browser.runBrowserPanelControl({
       ...target(),
       panelId: "panel-b",
-      ownerSessionId: "session-b",
+      ownerSessionId: PROJECT_SESSION,
     });
 
     // Release the controller so control becomes available, then take it from
@@ -101,11 +110,12 @@ describe("Browser Panel multi-client control (issue #16)", () => {
     await browser.runBrowserReleaseControl({
       ...target(),
       panelId: "panel-a",
+      ownerSessionId: THREAD_SESSION,
     });
     const takeover = await browser.runBrowserTakeControl({
       ...target(),
       panelId: "panel-b",
-      ownerSessionId: "session-b",
+      ownerSessionId: PROJECT_SESSION,
     });
     expect(takeover.role).toBe("controller");
     expect(takeover.control.controllerPanelId).toBe("panel-b");
@@ -117,7 +127,7 @@ describe("Browser Panel multi-client control (issue #16)", () => {
     const first = await browser.runBrowserPanelControl({
       ...target(),
       panelId: "panel-a",
-      ownerSessionId: "session-a",
+      ownerSessionId: THREAD_SESSION,
     });
     // The shared strip starts empty (no runtime pages reported yet) but is the
     // same view every panel sees.
@@ -132,13 +142,13 @@ describe("Browser Panel multi-client control (issue #16)", () => {
     await browser.runBrowserPanelControl({
       ...target(),
       panelId: "panel-a",
-      ownerSessionId: "session-a",
+      ownerSessionId: THREAD_SESSION,
     });
     // Reconnecting the same panel id resumes its role rather than duplicating.
     const reconnect = await browser.runBrowserPanelControl({
       ...target(),
       panelId: "panel-a",
-      ownerSessionId: "session-a",
+      ownerSessionId: THREAD_SESSION,
     });
     expect(
       reconnect.control.panels.filter((p) => p.panelId === "panel-a"),
@@ -154,12 +164,12 @@ describe("Browser Panel multi-client control (issue #16)", () => {
     await browser.runBrowserPanelControl({
       ...target(),
       panelId: "panel-a",
-      ownerSessionId: "session-owner-1",
+      ownerSessionId: THREAD_SESSION,
     });
     const second = await browser.runBrowserPanelControl({
       ...target(),
       panelId: "panel-b",
-      ownerSessionId: "session-owner-2",
+      ownerSessionId: PROJECT_SESSION,
     });
     expect(second.role).toBe("spectator");
     expect(second.control.panels).toHaveLength(2);
@@ -167,7 +177,7 @@ describe("Browser Panel multi-client control (issue #16)", () => {
     const transferred = await browser.runBrowserTakeControl({
       ...target(),
       panelId: "panel-b",
-      ownerSessionId: "session-owner-2",
+      ownerSessionId: PROJECT_SESSION,
     });
     expect(transferred.role).toBe("controller");
 
@@ -175,7 +185,7 @@ describe("Browser Panel multi-client control (issue #16)", () => {
     const firstObserved = await browser.runBrowserPanelControl({
       ...target(),
       panelId: "panel-a",
-      ownerSessionId: "session-owner-1",
+      ownerSessionId: THREAD_SESSION,
     });
     expect(firstObserved.role).toBe("spectator");
     expect(firstObserved.control.controllerPanelId).toBe("panel-b");
@@ -188,7 +198,7 @@ describe("Browser Panel multi-client control (issue #16)", () => {
     const first = await browser.runBrowserPanelControl({
       ...target(),
       panelId: "panel-a",
-      ownerSessionId: "session-a",
+      ownerSessionId: THREAD_SESSION,
       viewport: { width: 1280, height: 720 },
     });
     expect(first.control.controllerViewport).toEqual({
@@ -199,7 +209,7 @@ describe("Browser Panel multi-client control (issue #16)", () => {
     const second = await browser.runBrowserPanelControl({
       ...target(),
       panelId: "panel-b",
-      ownerSessionId: "session-b",
+      ownerSessionId: PROJECT_SESSION,
       viewport: { width: 800, height: 600 },
     });
     expect(second.role).toBe("spectator");
@@ -217,7 +227,7 @@ describe("Browser Panel multi-client control (issue #16)", () => {
     const transferred = await browser.runBrowserTakeControl({
       ...target(),
       panelId: "panel-b",
-      ownerSessionId: "session-b",
+      ownerSessionId: PROJECT_SESSION,
       viewport: { width: 1600, height: 900 },
     });
     expect(transferred.control.controllerViewport).toEqual({
@@ -232,7 +242,7 @@ describe("Browser Panel multi-client control (issue #16)", () => {
     await browser.runBrowserPanelControl({
       ...target(),
       panelId: "panel-a",
-      ownerSessionId: "session-a",
+      ownerSessionId: THREAD_SESSION,
     });
     // A spectator with no disconnect/reclaim window that calls reclaim stays
     // view-only; reclaim only re-grants input within the 10-second window after
@@ -240,7 +250,7 @@ describe("Browser Panel multi-client control (issue #16)", () => {
     const reclaim = await browser.runBrowserReclaimControl({
       ...target(),
       panelId: "panel-b",
-      ownerSessionId: "session-b",
+      ownerSessionId: PROJECT_SESSION,
     });
     expect(reclaim.role).toBe("spectator");
     expect(reclaim.control.controllerPanelId).toBe("panel-a");
@@ -253,7 +263,7 @@ describe("Browser Panel multi-client control (issue #16)", () => {
       const joined = await browser.runBrowserPanelControl({
         ...target(),
         panelId: "panel-a",
-        ownerSessionId: "session-a",
+        ownerSessionId: THREAD_SESSION,
         viewport: { width: 1024, height: 768 },
       });
       expect(joined.control.controllerViewport).toEqual({
@@ -267,7 +277,7 @@ describe("Browser Panel multi-client control (issue #16)", () => {
       const resized = await browser.runBrowserPanelControl({
         ...target(),
         panelId: "panel-a",
-        ownerSessionId: "session-a",
+        ownerSessionId: THREAD_SESSION,
         viewport: { width: 1440, height: 900 },
       });
       expect(resized.control.controllerViewport).toEqual({
@@ -279,7 +289,7 @@ describe("Browser Panel multi-client control (issue #16)", () => {
       const clamped = await browser.runBrowserPanelControl({
         ...target(),
         panelId: "panel-a",
-        ownerSessionId: "session-a",
+        ownerSessionId: THREAD_SESSION,
         viewport: { width: 5000, height: 4000 },
       });
       expect(clamped.control.controllerViewport).toEqual({
@@ -292,7 +302,7 @@ describe("Browser Panel multi-client control (issue #16)", () => {
       const spectator = await browser.runBrowserPanelControl({
         ...target(),
         panelId: "panel-b",
-        ownerSessionId: "session-b",
+        ownerSessionId: PROJECT_SESSION,
         viewport: { width: 400, height: 300 },
       });
       expect(spectator.role).toBe("spectator");
