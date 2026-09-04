@@ -37,7 +37,8 @@ export type PanelProtocolErrorCategory =
   | "invalid-direction"
   | "invalid-phase"
   | "invalid-shape"
-  | "stale-generation";
+  | "stale-generation"
+  | "rate-limited";
 
 export type PanelProtocolError = {
   category: PanelProtocolErrorCategory;
@@ -313,6 +314,7 @@ const PROTOCOL_ERROR_MESSAGES: Record<PanelProtocolErrorCategory, string> = {
   "invalid-shape": "The Browser Panel message failed shape validation.",
   "stale-generation":
     "The Browser Panel message belongs to a superseded connection generation.",
+  "rate-limited": "The Browser Panel sent too many messages in one second.",
 };
 
 const protocolVersionField = z.literal(PANEL_PROTOCOL_VERSION).optional();
@@ -391,6 +393,7 @@ const protocolErrorSchema = z
       "invalid-phase",
       "invalid-shape",
       "stale-generation",
+      "rate-limited",
     ]),
     message: z.string().min(1),
   })
@@ -479,21 +482,6 @@ const pingSchema = z
   .object({
     type: z.literal("ping"),
     protocolVersion: protocolVersionField,
-  })
-  .strict();
-
-const legacyControlSchema = z
-  .object({
-    type: z.literal("control"),
-    control: browserPanelControlStateSchema,
-    tabs: browserTabStripSchema,
-  })
-  .strict();
-
-const legacyErrorSchema = z
-  .object({
-    type: z.literal("error"),
-    reason: z.string().min(1),
   })
   .strict();
 
@@ -896,47 +884,6 @@ function parseAuxiliaryMessage(
   return parseAccepted(pingSchema.safeParse(value), () => normalizePing());
 }
 
-function decodeLegacyAliases(
-  type: string,
-  value: Record<string, unknown>,
-  context: PanelProtocolDecodeContext,
-): PanelProtocolDecodeResult | undefined {
-  if (type === "control") {
-    if (context.direction !== "host-to-client")
-      return rejected("invalid-direction");
-    if (context.phase !== "authenticated") return rejected("invalid-phase");
-    const parsed = legacyControlSchema.safeParse(value);
-    if (!parsed.success) return rejected("invalid-shape");
-    return {
-      outcome: "accepted",
-      message: normalizeSession(parsed.data.control, parsed.data.tabs),
-    };
-  }
-  if (type === "error") {
-    if (context.direction !== "host-to-client")
-      return rejected("invalid-direction");
-    const parsed = legacyErrorSchema.safeParse(value);
-    if (!parsed.success) return rejected("invalid-shape");
-    return {
-      outcome: "accepted",
-      message: normalizeProtocolError(legacyErrorCategory(parsed.data.reason)),
-    };
-  }
-  return undefined;
-}
-
-function legacyErrorCategory(reason: string): PanelProtocolErrorCategory {
-  if (reason === "too-large") return "too-large";
-  if (reason === "incompatible-version") return "incompatible-version";
-  if (reason === "invalid-direction") return "invalid-direction";
-  if (reason === "invalid-phase" || reason === "unauthorized") {
-    return "invalid-phase";
-  }
-  if (reason === "stale-generation") return "stale-generation";
-  if (reason === "unknown-type") return "unknown-type";
-  return "malformed";
-}
-
 export function encodePanelProtocolMessage(
   message: PanelProtocolMessage,
   options: { maxBytes?: number } = {},
@@ -968,8 +915,6 @@ export function decodePanelProtocolMessage(
   if (typeof type !== "string" || type.length === 0) {
     return rejected("invalid-shape");
   }
-  const aliased = decodeLegacyAliases(type, value, context);
-  if (aliased !== undefined) return aliased;
   if (!isProtocolType(type)) return rejected("unknown-type");
   if (MESSAGE_DIRECTION[type] !== context.direction) {
     return rejected("invalid-direction");

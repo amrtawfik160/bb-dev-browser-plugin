@@ -66,11 +66,6 @@ export type BrowserTabStripStore = {
 export type BrowserTabStripOptions = {
   /** Maximum number of tabs retained in the shared strip. */
   maxTabs?: number;
-  /**
-   * Compatibility adapter: when a shared Panel session is supplied, the
-   * former Browser Tab registry delegates to that session's strip.
-   */
-  session?: { tabStrip(): BrowserTabStripStore };
 };
 
 export const TAB_STRIP_DEFAULT_MAX_TABS = 64;
@@ -87,7 +82,6 @@ export function newTabId(): string {
 export function createBrowserTabStrip(
   options: BrowserTabStripOptions = {},
 ): BrowserTabStripStore {
-  if (options.session !== undefined) return options.session.tabStrip();
   const maxTabs = Math.max(1, options.maxTabs ?? TAB_STRIP_DEFAULT_MAX_TABS);
   let generation = 0;
   let tabs = new Map<string, BrowserTab>();

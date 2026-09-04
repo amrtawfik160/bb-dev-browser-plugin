@@ -791,6 +791,49 @@ export async function createPublicPanelLifecycleHarness(options?: {
     socket.send(encoded.raw);
   }
 
+  function sendIncompatibleProtocol(panel: LifecyclePanel) {
+    const socket = latestLiveSocketFor(panel);
+    if (socket === undefined) {
+      throw new Error("Browser Panel has no live stream connection.");
+    }
+    socket.send(
+      JSON.stringify({
+        protocolVersion: PANEL_PROTOCOL_VERSION + 1,
+        type: "input",
+        sequence: receivedInputs.length + 1,
+        payload: { kind: "click", text: "typed-owner-input" },
+      }),
+    );
+  }
+
+  async function replayRedeemedCapability(panel: LifecyclePanel) {
+    const original = issuedExchanges(panel.panelId)[0];
+    if (original === undefined || original.response.outcome !== "issued") {
+      throw new Error(
+        "Browser Panel has no issued Panel Capability to replay.",
+      );
+    }
+    const href = `ws://127.0.0.1:${original.response.gatewayPort}`;
+    const socket = new LifecycleWebSocket(href) as unknown as TrackedSocket;
+    await new Promise<void>((resolve, reject) => {
+      socket.once("open", () => resolve());
+      socket.once("error", reject);
+    });
+    const encoded = encodePanelProtocolMessage({
+      protocolVersion: PANEL_PROTOCOL_VERSION,
+      type: "redeem",
+      capabilityId: original.response.capabilityId,
+      secret: original.response.secret,
+      ownerSessionId: panel.ownerSessionId,
+      panelId: panel.panelId,
+    });
+    if (encoded.outcome !== "encoded") {
+      throw new Error("Browser Panel redeem failed protocol encoding.");
+    }
+    socket.send(encoded.raw);
+    return socket;
+  }
+
   async function redeemIssuedCapability(input: {
     hostId: string;
     profileId: string;
@@ -870,6 +913,8 @@ export async function createPublicPanelLifecycleHarness(options?: {
     sendAuthorizedInput,
     sendLiveInput,
     sendSocketInput,
+    sendIncompatibleProtocol,
+    replayRedeemedCapability,
     setHostRpcFailure: (method: string, message?: string) =>
       browser.setHostRpcFailure(method, message),
     latestSessionPanels,

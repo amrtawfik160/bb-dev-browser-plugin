@@ -1564,6 +1564,82 @@ describe("public Browser Panel lifecycle seam", () => {
     }
   });
 
+  it("fails closed on protocol incompatibility and recovers with a fresh Panel Capability", async () => {
+    const browser = await createPublicPanelLifecycleHarness();
+    try {
+      const [first, second] = await browser.openTwoPanels();
+      await first.findByText("The page is live.");
+      await second.findByText("The page is live.");
+      const framesBefore = first.framesReceived;
+      const originalSecret = browser.issuedSecrets(first.panelId)[0]!;
+      browser.sendAuthorizedInput(first, { kind: "click", generation: 1 });
+      await waitFor(() => {
+        expect(browser.receivedInputs).toEqual([
+          { kind: "click", generation: 1 },
+        ]);
+      });
+
+      browser.sendIncompatibleProtocol(first);
+      await first.findByText("Reconnecting to the browser…");
+      await first.findByRole("img", { name: "Browser page view" });
+      expect(first.framesReceived).toBeGreaterThanOrEqual(framesBefore);
+      const recovering = first.container.textContent ?? "";
+      expect(recovering).not.toMatch(/protocolVersion/u);
+      expect(recovering).not.toMatch(/WebSocket/u);
+      expect(recovering).not.toContain("typed-owner-input");
+      expect(recovering).not.toContain(originalSecret);
+      expect(() =>
+        browser.sendAuthorizedInput(first, { kind: "click", queued: true }),
+      ).toThrow("Browser Panel has no live stream connection.");
+      expect(browser.receivedInputs).toEqual([
+        { kind: "click", generation: 1 },
+      ]);
+      await second.findByText("The page is live.");
+
+      await browser.advanceTime(PANEL_RECONNECT_INITIAL_BACKOFF_MS);
+      await waitFor(() => {
+        expect(browser.issuedSecrets(first.panelId).length).toBeGreaterThan(1);
+      });
+      expect(browser.issuedSecrets(first.panelId).at(-1)).not.toBe(
+        originalSecret,
+      );
+      await first.findByText("The page is live.");
+      expect(first.framesReceived).toBeGreaterThan(framesBefore);
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("rejects a replayed Panel Capability and keeps the live panel on loopback", async () => {
+    const browser = await createPublicPanelLifecycleHarness();
+    try {
+      const [first, second] = await browser.openTwoPanels();
+      await first.findByText("The page is live.");
+      await second.findByText("The page is live.");
+      await browser.forcePhysicalSocketLoss(first);
+      await first.findByText("Reconnecting to the browser…");
+      const replay = await browser.replayRedeemedCapability(first);
+      await waitFor(() => {
+        expect(replay.readyState).not.toBe(WebSocket.OPEN);
+      });
+      expect(browser.receivedInputs).toEqual([]);
+      await browser.advanceTime(PANEL_RECONNECT_INITIAL_BACKOFF_MS);
+      await first.findByText("The page is live.");
+      await second.findByText("The page is live.");
+      expect(browser.issuedSecrets(first.panelId).at(-1)).not.toBe(
+        browser.issuedSecrets(first.panelId)[0],
+      );
+      expect(
+        [...browser.socketUrls()].every((url) => url.includes("127.0.0.1")),
+      ).toBe(true);
+      for (const secret of browser.issuedSecrets(first.panelId)) {
+        expect(browser.socketUrls().join("\n")).not.toContain(secret);
+      }
+    } finally {
+      await browser.dispose();
+    }
+  });
+
   it("removes panel-only stream resources after the final panel closes", async () => {
     const browser = await createPublicPanelLifecycleHarness();
     const ports: number[] = [];
