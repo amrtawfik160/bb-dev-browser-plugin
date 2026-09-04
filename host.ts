@@ -2364,13 +2364,15 @@ export function createBrowserHostEntry(
 function productionDevBrowserRuntime(dataDir: string) {
   const daemonRoot = daemonRootFromHostDataDir(dataDir);
   const pluginSource = readDaemonPluginSourcePath(daemonRoot, "browser");
-  return requireDevBrowserRuntime({
-    extraSearchRoots: [
-      dataDir,
-      daemonRoot,
-      ...(pluginSource === null ? [] : [pluginSource]),
-    ],
-  });
+  const extraSearchRoots = [
+    dataDir,
+    daemonRoot,
+    ...(pluginSource === null ? [] : [pluginSource]),
+  ];
+  return {
+    ...requireDevBrowserRuntime({ extraSearchRoots }),
+    extraSearchRoots,
+  };
 }
 
 const playwrightChromiumSetupSource = join(
@@ -2429,6 +2431,7 @@ export default createBrowserHostEntry(
       launchBoundary: createProductionBrowserProcessBoundary({
         devBrowserExecutable: devBrowser.executable,
         devBrowserPackageDirectory: devBrowser.packageDirectory,
+        playwrightSearchRoots: devBrowser.extraSearchRoots,
       }),
     });
   },

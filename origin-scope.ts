@@ -1,4 +1,5 @@
 import { createRequire } from "node:module";
+import { join } from "node:path";
 import type { Browser, BrowserContext, Page, Request, Route } from "playwright";
 import {
   matcherPermitsOrigin,
@@ -8,6 +9,10 @@ import {
   installPageNavigationGuard,
   type PageNavigationGuard,
 } from "./origin-scope-cdp.js";
+import {
+  requirePlaywrightRuntime,
+  type ResolvePlaywrightRuntimeOptions,
+} from "./playwright-runtime.js";
 
 export type BrowserOriginScopePolicy = {
   matcher: OriginScopeMatcher;
@@ -72,7 +77,6 @@ type PageRegistration = {
 };
 
 const ORIGIN_SCOPE_ROUTE_PATTERN = "**/*";
-const requireFromPlugin = createRequire(import.meta.url);
 
 export class BrowserOriginScopeDeniedError extends Error {
   constructor(
@@ -325,10 +329,19 @@ function contextChannel(
   return channel ?? null;
 }
 
-async function connectOriginScopeBrowser(endpoint: string, timeoutMs: number) {
+async function connectOriginScopeBrowser(
+  endpoint: string,
+  timeoutMs: number,
+  playwright?: ResolvePlaywrightRuntimeOptions,
+) {
   // Keep Playwright at the host runtime boundary. Bundling its server internals
   // pulls optional BiDi modules that a CDP-only attachment never executes.
-  const playwright = requireFromPlugin("playwright") as {
+  // Isolated host artifacts have no node_modules beside host.mjs.
+  const { packageDirectory } = requirePlaywrightRuntime(playwright);
+  const requireFromPlugin = createRequire(
+    join(packageDirectory, "package.json"),
+  );
+  const loaded = requireFromPlugin("playwright") as {
     chromium: {
       connectOverCDP(
         endpoint: string,
@@ -336,7 +349,7 @@ async function connectOriginScopeBrowser(endpoint: string, timeoutMs: number) {
       ): Promise<Browser>;
     };
   };
-  return playwright.chromium.connectOverCDP(endpoint, { timeout: timeoutMs });
+  return loaded.chromium.connectOverCDP(endpoint, { timeout: timeoutMs });
 }
 
 async function removeRoutes(registrations: readonly RouteRegistration[]) {
@@ -396,9 +409,14 @@ async function installRoutes(registrations: readonly RouteRegistration[]) {
 export async function installHostOriginScopeGuard(
   endpoint: string,
   policy: BrowserOriginScopePolicy,
-  connect: ConnectOriginScopeBrowser = connectOriginScopeBrowser,
+  connect?: ConnectOriginScopeBrowser,
+  playwright?: ResolvePlaywrightRuntimeOptions,
 ): Promise<HostOriginScopeGuard> {
-  const browser = await connect(endpoint, policy.timeoutMs);
+  const resolvedConnect: ConnectOriginScopeBrowser =
+    connect ??
+    ((target, timeoutMs) =>
+      connectOriginScopeBrowser(target, timeoutMs, playwright));
+  const browser = await resolvedConnect(endpoint, policy.timeoutMs);
   let denial: BrowserOriginScopeDeniedError | null = null;
   const registrations: RouteRegistration[] = [];
   const registeredContexts = new Set<BrowserContext>();
