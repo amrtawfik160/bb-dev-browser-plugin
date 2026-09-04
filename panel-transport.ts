@@ -22,6 +22,7 @@ import {
   panelProtocolErrorMessage,
   toBrowserPanelRedeemMessage,
   type PanelProtocolError,
+  type PanelProtocolErrorCategory,
   type PanelProtocolMessage,
 } from "./panel-protocol.js";
 
@@ -236,11 +237,6 @@ export function createPanelTransportServer(
   let failClosedTimer: ReturnType<typeof setTimeout> | undefined;
   let unsubscribeDialogs: (() => void) | undefined;
 
-  function sendJson(socket: WebSocket, message: unknown) {
-    if (socket.readyState !== socket.OPEN) return;
-    socket.send(JSON.stringify(message));
-  }
-
   function sendProtocol(socket: WebSocket, message: PanelProtocolMessage) {
     if (socket.readyState !== socket.OPEN) return;
     const encoded = encodePanelProtocolMessage(message, {
@@ -327,11 +323,22 @@ export function createPanelTransportServer(
     return undefined;
   }
 
-  function closeConnection(reason: string) {
-    if (connection !== undefined && connection.readyState === connection.OPEN) {
-      sendJson(connection, { type: "error", reason });
-      connection.close();
+  function protocolCategoryForGatewayReason(
+    reason: string,
+  ): PanelProtocolErrorCategory {
+    if (reason === "too-large") return "too-large";
+    if (reason === "rate-limited") return "rate-limited";
+    if (reason === "unauthorized" || reason === "binding-mismatch") {
+      return "invalid-phase";
     }
+    if (reason === "stale-frame") return "stale-generation";
+    return "malformed";
+  }
+
+  function closeConnection(reason: string) {
+    rejectProtocol(
+      panelProtocolErrorMessage(protocolCategoryForGatewayReason(reason)),
+    );
   }
 
   function clearFailClosedTimer() {
@@ -621,8 +628,9 @@ export function createPanelTransportServer(
 
   async function handleConnection(socket: WebSocket) {
     if (connection !== undefined) {
-      // A single panel owns one stream connection at a time.
-      sendJson(socket, { type: "error", reason: "busy" });
+      // A single panel owns one stream connection at a time. Reject the extra
+      // socket without freezing the live generation.
+      sendProtocol(socket, panelProtocolErrorMessage("invalid-phase"));
       socket.close();
       return;
     }
@@ -679,7 +687,9 @@ export function createPanelTransportServer(
     streamAbort?.abort();
     streamAbort = undefined;
     await source.stop();
-    closeConnection("closed");
+    if (connection !== undefined && connection.readyState === connection.OPEN) {
+      connection.close();
+    }
     if (connection !== undefined) {
       await new Promise<void>((resolve) => {
         if (connection!.readyState === connection!.CLOSED) return resolve();

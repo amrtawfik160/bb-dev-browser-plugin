@@ -577,4 +577,35 @@ describe("versioned Panel wire protocol", () => {
     expect(encoded.error.category).toBe("too-large");
     expectPrivacySafe(encoded.error.message);
   });
+
+  it.each([
+    {
+      name: "unversioned control snapshot",
+      raw: JSON.stringify({
+        type: "control",
+        control: sessionMessage.control,
+        tabs: sessionMessage.tabs,
+      }),
+      direction: "host-to-client" as const,
+      phase: "authenticated" as const,
+    },
+    {
+      name: "unversioned error frame",
+      raw: JSON.stringify({
+        type: "error",
+        reason: "unauthorized",
+      }),
+      direction: "host-to-client" as const,
+      phase: "authenticated" as const,
+    },
+  ])(
+    "rejects the superseded $name instead of aliasing it into the versioned protocol",
+    ({ raw, direction, phase }) => {
+      const decoded = decodePanelProtocolMessage(raw, { direction, phase });
+      expect(decoded.outcome).toBe("rejected");
+      if (decoded.outcome !== "rejected") return;
+      expect(decoded.error.category).toBe("unknown-type");
+      expectPrivacySafe(decoded.error.message);
+    },
+  );
 });

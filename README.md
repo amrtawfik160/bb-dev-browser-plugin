@@ -163,7 +163,7 @@ browser-runtime.ts  Workspace Browser runtime and operation options
 browser-process.ts   Browser process management and DevTools transport
 browser-screencast.ts CDP-backed screencast source for the panel stream
 panel-transport.ts   WebSocket loopback gateway driving the screencast
-panel-control-state.ts Multi-client controller/spectator coordination
+panel-session.ts     Shared Panel session, Control Lease, and Browser Tabs
 panel-gateway.ts     Per-owner panel gateway and stream multiplexing
 authorization.ts      Profile Grants, Origin Scope, and Grant Requests
 grant-requests.ts    Grant Request lifecycle and owner approvals

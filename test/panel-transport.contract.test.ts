@@ -1096,13 +1096,27 @@ describe("Panel transport server contract", () => {
         send(socket, { type: "clipboard_copy", copyId: `copy-${index}` });
       }
       const errorRaw = await inbox.waitFor((message) => {
-        const parsed = decode<{ type?: string; reason?: string }>(message);
-        return parsed.type === "error" && parsed.reason === "rate-limited";
+        const decoded = decodePanelProtocolMessage(message, {
+          direction: "host-to-client",
+          phase: "authenticated",
+        });
+        return (
+          decoded.outcome === "accepted" &&
+          decoded.message.type === "protocol_error"
+        );
       });
-      expect(decode<{ type: string; reason: string }>(errorRaw)).toEqual({
-        type: "error",
-        reason: "rate-limited",
+      const decoded = decodePanelProtocolMessage(errorRaw, {
+        direction: "host-to-client",
+        phase: "authenticated",
       });
+      expect(decoded.outcome).toBe("accepted");
+      if (decoded.outcome !== "accepted") return;
+      expect(decoded.message.type).toBe("protocol_error");
+      if (decoded.message.type !== "protocol_error") return;
+      expect(decoded.message.category).toBe("rate-limited");
+      expect(decoded.message.message).not.toContain(
+        "capability-secret-must-never-leak",
+      );
       expect(copies.length).toBeLessThanOrEqual(
         PANEL_GATEWAY_INPUT_MAX_PER_SECOND,
       );
