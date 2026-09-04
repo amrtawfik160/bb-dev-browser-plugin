@@ -142,7 +142,9 @@ import plugin from "../server.js";
 const HOST_ID = "host-browser-test";
 const PROJECT_ID = "project-browser-test";
 const THREAD_ID = "thread-browser-test";
+const FOREIGN_THREAD_ID = "thread-foreign-project";
 const ENVIRONMENT_ID = "environment-browser-test";
+const KNOWN_HARNESS_THREAD_IDS = new Set([THREAD_ID, FOREIGN_THREAD_ID]);
 const persistedGrantRequestEventSchema = z.object({
   request_id: z.string(),
   event_type: z.string(),
@@ -450,6 +452,7 @@ export async function createPublicPluginHarness(options?: {
   const hostConnectionRequests: z.output<
     typeof browserHostConnectionRequestSchema
   >[] = [];
+  const threadLookups: string[] = [];
   const setupInspectionTargets: BrowserHostTarget[] = [];
   const expectedStatus =
     options?.status ??
@@ -586,16 +589,19 @@ export async function createPublicPluginHarness(options?: {
         };
       },
       threads: {
-        get: async ({ threadId }) =>
-          makeThreadResponse({
+        get: async ({ threadId }) => {
+          threadLookups.push(threadId);
+          if (!KNOWN_HARNESS_THREAD_IDS.has(threadId)) {
+            throw new Error("HTTP 404: Thread not found");
+          }
+          return makeThreadResponse({
             id: threadId,
             projectId:
-              threadId === "thread-foreign-project"
-                ? "project-foreign"
-                : PROJECT_ID,
+              threadId === FOREIGN_THREAD_ID ? "project-foreign" : PROJECT_ID,
             environmentId:
               options?.environmentlessThread === true ? null : ENVIRONMENT_ID,
-          }),
+          });
+        },
       },
       environments: {
         get: async () =>
@@ -2185,6 +2191,9 @@ export async function createPublicPluginHarness(options?: {
     },
     get panelCapabilityRequests() {
       return [...panelCapabilityRequests];
+    },
+    get threadLookups() {
+      return [...threadLookups];
     },
     get hostConnectionRequests() {
       return [...hostConnectionRequests];
