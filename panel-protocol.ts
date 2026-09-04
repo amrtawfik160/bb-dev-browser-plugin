@@ -36,7 +36,8 @@ export type PanelProtocolErrorCategory =
   | "too-large"
   | "invalid-direction"
   | "invalid-phase"
-  | "invalid-shape";
+  | "invalid-shape"
+  | "stale-generation";
 
 export type PanelProtocolError = {
   category: PanelProtocolErrorCategory;
@@ -310,6 +311,8 @@ const PROTOCOL_ERROR_MESSAGES: Record<PanelProtocolErrorCategory, string> = {
   "invalid-phase":
     "The Browser Panel message is not allowed in this lifecycle phase.",
   "invalid-shape": "The Browser Panel message failed shape validation.",
+  "stale-generation":
+    "The Browser Panel message belongs to a superseded connection generation.",
 };
 
 const protocolVersionField = z.literal(PANEL_PROTOCOL_VERSION).optional();
@@ -387,6 +390,7 @@ const protocolErrorSchema = z
       "invalid-direction",
       "invalid-phase",
       "invalid-shape",
+      "stale-generation",
     ]),
     message: z.string().min(1),
   })
@@ -928,6 +932,7 @@ function legacyErrorCategory(reason: string): PanelProtocolErrorCategory {
   if (reason === "invalid-phase" || reason === "unauthorized") {
     return "invalid-phase";
   }
+  if (reason === "stale-generation") return "stale-generation";
   if (reason === "unknown-type") return "unknown-type";
   return "malformed";
 }

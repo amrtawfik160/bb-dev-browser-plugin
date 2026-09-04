@@ -55,8 +55,12 @@ describe("Panel gateway pool contract", () => {
         .outcome,
     ).toBe("accepted");
 
-    // The prior connection was revoked when its gateway was retired; its
-    // single-use secret remains replay-protected (never re-redeemable).
+    // The prior generation stays live on its own gateway until the host
+    // session closes that generation.
+    expect(
+      capabilities.connection(first.issued.capabilityId)?.capabilityId,
+    ).toBe(first.issued.capabilityId);
+    first.gateway.close();
     expect(capabilities.connection(first.issued.capabilityId)).toBeUndefined();
     expect(
       capabilities.redeem(

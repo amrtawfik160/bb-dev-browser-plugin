@@ -218,14 +218,64 @@ export async function createPublicPanelLifecycleHarness() {
     return messagesByPort.get(String(port)) ?? [];
   }
 
+  type ParsedPanelMessage = {
+    type?: string;
+    category?: string;
+    control?: {
+      panels?: Array<{
+        panelId: string;
+        ownerSessionId: string;
+        connection: "connected" | "disconnected";
+        reclaimUntil: number | null;
+      }>;
+    };
+  };
+
+  function issuedGatewayPorts(panelId: string) {
+    return browser.panelCapabilityExchanges.flatMap((exchange) => {
+      if (
+        exchange.request.panelId !== panelId ||
+        exchange.response.outcome !== "issued"
+      ) {
+        return [];
+      }
+      return [exchange.response.gatewayPort];
+    });
+  }
+
   function parsedMessages(port: number) {
     return portMessages(port).flatMap((raw) => {
       try {
-        return [JSON.parse(raw) as { type?: string }];
+        return [JSON.parse(raw) as ParsedPanelMessage];
       } catch {
         return [];
       }
     });
+  }
+
+  function latestSessionPanels(panel: LifecyclePanel) {
+    const ports = issuedGatewayPorts(panel.panelId);
+    const latestPort = ports.at(-1);
+    if (latestPort === undefined) return [];
+    let latest: NonNullable<ParsedPanelMessage["control"]>["panels"] = [];
+    for (const message of parsedMessages(latestPort)) {
+      if (message.type === "session" && message.control?.panels !== undefined) {
+        latest = message.control.panels;
+      }
+    }
+    return latest ?? [];
+  }
+
+  function latestIssuedGeneration(panel: LifecyclePanel) {
+    return issuedGatewayPorts(panel.panelId).length;
+  }
+
+  function portHasOpenSocket(port: number) {
+    return [...sockets].some(
+      (socket) =>
+        socketPort(socket) === String(port) &&
+        socket.readyState === NodeWebSocket.OPEN,
+    );
   }
 
   function attachLifecycle(
@@ -420,6 +470,10 @@ export async function createPublicPanelLifecycleHarness() {
     if (socket === undefined) {
       throw new Error("Browser Panel has no live stream connection.");
     }
+    sendSocketInput(socket, payload);
+  }
+
+  function sendSocketInput(socket: TrackedSocket, payload: unknown) {
     const encoded = encodePanelProtocolMessage({
       protocolVersion: PANEL_PROTOCOL_VERSION,
       type: "input",
@@ -430,6 +484,41 @@ export async function createPublicPanelLifecycleHarness() {
       throw new Error("Browser Panel input failed protocol encoding.");
     }
     socket.send(encoded.raw);
+  }
+
+  async function redeemIssuedCapability(input: {
+    hostId: string;
+    profileId: string;
+    panelId: string;
+    ownerSessionId: string;
+    capabilityId: string;
+    secret: string;
+    gatewayPort: number;
+  }) {
+    const href = `ws://127.0.0.1:${input.gatewayPort}`;
+    const socket = new LifecycleWebSocket(href) as unknown as TrackedSocket;
+    await new Promise<void>((resolve, reject) => {
+      socket.once("open", () => resolve());
+      socket.once("error", reject);
+    });
+    const encoded = encodePanelProtocolMessage({
+      protocolVersion: PANEL_PROTOCOL_VERSION,
+      type: "redeem",
+      capabilityId: input.capabilityId,
+      secret: input.secret,
+      ownerSessionId: input.ownerSessionId,
+      panelId: input.panelId,
+    });
+    if (encoded.outcome !== "encoded") {
+      throw new Error("Browser Panel redeem failed protocol encoding.");
+    }
+    socket.send(encoded.raw);
+    await waitFor(() =>
+      parsedMessages(input.gatewayPort).some(
+        (message) => message.type === "ready",
+      ),
+    );
+    return socket;
   }
 
   async function dispose() {
@@ -473,6 +562,11 @@ export async function createPublicPanelLifecycleHarness() {
     },
     openTwoPanels,
     sendAuthorizedInput,
+    sendSocketInput,
+    latestSessionPanels,
+    latestIssuedGeneration,
+    portHasOpenSocket,
+    redeemIssuedCapability,
     forcePhysicalSocketLoss,
     advanceTime,
     closePanel,

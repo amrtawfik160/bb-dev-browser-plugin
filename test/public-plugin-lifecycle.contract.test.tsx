@@ -1,11 +1,13 @@
 // @vitest-environment jsdom
 import { waitFor } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
+import { WebSocket } from "ws";
 import {
   DEFAULT_PROFILE_ID,
   PANEL_CAPABILITY_TTL_MS,
   PANEL_RECONNECT_INITIAL_BACKOFF_MS,
 } from "../contracts.js";
+import { waitForSettled } from "./wait.js";
 import { ownerSessionIdFromContext } from "../panel-owner-session.js";
 import { createPublicPanelLifecycleHarness } from "./public-plugin-lifecycle-harness.js";
 
@@ -43,6 +45,201 @@ describe("public Browser Panel lifecycle seam", () => {
     } finally {
       await browser.dispose();
     }
+  });
+
+  it("joins two panels on one Browser Profile into a shared session and isolates another profile", async () => {
+    const browser = await createPublicPanelLifecycleHarness();
+    try {
+      const [first, second] = await browser.openTwoPanels();
+      await waitFor(() => {
+        const members = browser
+          .latestSessionPanels(first)
+          .map((panel) => panel.panelId);
+        expect(members.sort()).toEqual([first.panelId, second.panelId].sort());
+      });
+      expect(
+        browser
+          .latestSessionPanels(second)
+          .map((panel) => panel.panelId)
+          .sort(),
+      ).toEqual([first.panelId, second.panelId].sort());
+
+      const created = await browser.createBrowserProfile({
+        hostId: browser.hostId,
+        name: "Isolated session",
+      });
+      const isolated = await browser.issuePanelCapability({
+        hostId: browser.hostId,
+        profileId: created.profileId,
+        panelId: "panel-isolated-profile",
+        ownerSessionId: browser.ownerSessionId,
+      });
+      expect(isolated.outcome).toBe("issued");
+      await waitForSettled(() => {
+        const members = browser
+          .latestSessionPanels(first)
+          .map((panel) => panel.panelId);
+        return (
+          members.includes(first.panelId) &&
+          members.includes(second.panelId) &&
+          !members.includes("panel-isolated-profile")
+        );
+      });
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("reconnects the same panel identity onto one membership and rejects the older generation", async () => {
+    const browser = await createPublicPanelLifecycleHarness();
+    try {
+      const [first, second] = await browser.openTwoPanels();
+      await first.findByRole("img", { name: "Browser page view" });
+      browser.sendAuthorizedInput(first, { kind: "click", generation: 1 });
+      await waitFor(() => {
+        expect(browser.receivedInputs).toEqual([
+          { kind: "click", generation: 1 },
+        ]);
+      });
+
+      const replacement = await browser.issuePanelCapability({
+        hostId: first.hostId,
+        profileId: first.profileId,
+        panelId: first.panelId,
+        ownerSessionId: first.ownerSessionId,
+      });
+      if (replacement.outcome !== "issued") {
+        throw new Error("expected a replacement Panel Capability");
+      }
+      const nextSocket = await browser.redeemIssuedCapability({
+        ...replacement,
+        hostId: first.hostId,
+        profileId: first.profileId,
+        panelId: first.panelId,
+        ownerSessionId: first.ownerSessionId,
+      });
+      try {
+        browser.sendAuthorizedInput(first, {
+          kind: "click",
+          generation: "stale",
+        });
+      } catch {
+        // The superseded generation may already have closed.
+      }
+      await waitFor(() => {
+        expect(browser.portHasOpenSocket(first.gatewayPort)).toBe(false);
+      });
+      expect(browser.latestIssuedGeneration(first)).toBe(2);
+      await waitForSettled(() => {
+        const live = browser
+          .latestSessionPanels(first)
+          .find((panel) => panel.panelId === first.panelId);
+        return (
+          live?.connection === "connected" &&
+          !browser.receivedInputs.some(
+            (input) =>
+              input !== null &&
+              typeof input === "object" &&
+              "generation" in input &&
+              input.generation === "stale",
+          )
+        );
+      });
+      browser.sendSocketInput(nextSocket, { kind: "click", generation: 2 });
+      await waitFor(() => {
+        expect(browser.receivedInputs).toContainEqual({
+          kind: "click",
+          generation: 2,
+        });
+      });
+      await waitFor(() => {
+        const members = browser.latestSessionPanels(second);
+        expect(
+          members.filter((panel) => panel.panelId === first.panelId),
+        ).toHaveLength(1);
+        expect(
+          members.find((panel) => panel.panelId === first.panelId),
+        ).toMatchObject({ connection: "connected" });
+        expect(members.map((panel) => panel.panelId).sort()).toEqual(
+          [first.panelId, second.panelId].sort(),
+        );
+      });
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("keeps reclaim membership after abrupt disconnect and removes an explicit close immediately", async () => {
+    const browser = await createPublicPanelLifecycleHarness();
+    try {
+      const [first, second] = await browser.openTwoPanels();
+      await waitFor(() =>
+        expect(
+          browser
+            .latestSessionPanels(second)
+            .map((panel) => panel.panelId)
+            .sort(),
+        ).toEqual([first.panelId, second.panelId].sort()),
+      );
+
+      await browser.forcePhysicalSocketLoss(first);
+      await waitFor(() => {
+        expect(
+          browser
+            .latestSessionPanels(second)
+            .find((panel) => panel.panelId === first.panelId),
+        ).toMatchObject({ connection: "disconnected" });
+      });
+
+      const released = await browser.releasePanel({
+        hostId: first.hostId,
+        profileId: first.profileId,
+        panelId: first.panelId,
+        ownerSessionId: first.ownerSessionId,
+      });
+      expect(released).toEqual({ outcome: "released" });
+      await waitFor(() => {
+        expect(
+          browser
+            .latestSessionPanels(second)
+            .map((panel) => panel.panelId)
+            .includes(first.panelId),
+        ).toBe(false);
+      });
+      expect(
+        browser.latestSessionPanels(second).map((panel) => panel.panelId),
+      ).toEqual([second.panelId]);
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("disposes every session generation and loopback listener on host-worker shutdown", async () => {
+    const browser = await createPublicPanelLifecycleHarness();
+    const ports: number[] = [];
+    try {
+      const [first, second] = await browser.openTwoPanels();
+      ports.push(first.gatewayPort, second.gatewayPort);
+    } finally {
+      await browser.dispose();
+    }
+    await Promise.all(
+      ports.map(
+        (port) =>
+          new Promise<void>((resolve, reject) => {
+            const socket = new WebSocket(`ws://127.0.0.1:${port}`);
+            socket.once("open", () => {
+              socket.close();
+              reject(
+                new Error(
+                  `loopback port ${port} still accepted a Browser Panel connection`,
+                ),
+              );
+            });
+            socket.once("error", () => resolve());
+          }),
+      ),
+    );
   });
 
   it("delivers a deterministic first frame to both rendered panels over the real loopback transport", async () => {

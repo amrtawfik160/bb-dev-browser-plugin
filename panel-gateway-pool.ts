@@ -11,12 +11,11 @@ import {
 
 /**
  * The Panel Capability is single-use: it is redeemed in the first WebSocket
- * message rather than placed in a URL. A panel remount (for example a React
- * useEffect re-run) issues a fresh capability. If the gateway were reused
- * across mounts, the prior redeemed capability would block the fresh redeem
- * with an unauthorized result. The pool therefore retires the prior gateway
- * (revoking its redeemed capability) and binds a fresh one per issued
- * capability, so remount-after-redeem always succeeds.
+ * message rather than placed in a URL. A panel remount issues a fresh
+ * capability on a new gateway. The prior gateway stays bound until the shared
+ * Panel session makes the newer generation authoritative, so remount-after-
+ * redeem succeeds without immediately killing the still-authoritative
+ * connection.
  */
 
 export type PanelGatewayPoolOptions = {
@@ -73,13 +72,6 @@ export function createPanelGatewayPool(options: PanelGatewayPoolOptions) {
 
   function openPanel(binding: PanelGatewayBinding): PanelGatewayPanel {
     const key = panelGatewayKey(binding);
-    const existing = gateways.get(key);
-    if (existing !== undefined) {
-      // A remount issues a new capability; retire the prior gateway so its
-      // redeemed capability is revoked and the fresh redeem is not blocked.
-      retire(existing);
-      gateways.delete(key);
-    }
     const gateway = gatewayFactory({
       capabilities,
       hostId: binding.hostId,
