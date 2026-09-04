@@ -4962,6 +4962,46 @@ describe("Browser public plugin contract", () => {
     await browser.dispose();
   });
 
+  it("shares the server-host panel through Connect without separate machine enrollment", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+      serverTunnelOnly: true,
+    });
+    const target = {
+      hostId: "host-browser-test",
+      profileId: DEFAULT_PROFILE_ID,
+    };
+    try {
+      const first = await browser.runBrowserPanelCapability({
+        ...target,
+        panelId: "server-panel-a",
+      });
+      const second = await browser.runBrowserPanelCapability({
+        ...target,
+        panelId: "server-panel-b",
+      });
+      expect(first.outcome).toBe("issued");
+      expect(second.outcome).toBe("issued");
+      if (first.outcome !== "issued" || second.outcome !== "issued")
+        throw new Error("Panel connection was not issued");
+      expect(browser.connectShares.has(first.gatewayPort)).toBe(true);
+      expect(browser.connectShares.has(second.gatewayPort)).toBe(true);
+      await browser.runBrowserPanelRelease({
+        ...target,
+        panelId: "server-panel-a",
+        ownerSessionId: ownerSessionIdFromContext({
+          projectId: null,
+          threadId: null,
+        }),
+      });
+      expect(browser.connectShares.has(first.gatewayPort)).toBe(false);
+      expect(browser.connectShares.has(second.gatewayPort)).toBe(true);
+    } finally {
+      await browser.dispose();
+    }
+    expect(browser.connectShares.size).toBe(0);
+  });
+
   it("requires BB Connect enrollment to mint a Panel Capability and declares the loopback gateway port", async () => {
     const browser = await createPublicPluginHarness({
       snapshot: { ...preparedSnapshot, connect: { enrolled: true } },

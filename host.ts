@@ -1580,8 +1580,11 @@ export function createBrowserHostEntry(
       return startBoundPanelTransport(request, dataDir, opened, () =>
         createCdpScreencastSource({
           tabs: strip,
-          resolveEndpoint: async () =>
-            (await browserRuntime.start(target)).automationEndpoint,
+          resolveEndpoint: async () => {
+            const instance = await browserRuntime.start(target);
+            await reconcileRuntimeTabs(dataDir, target);
+            return instance.automationEndpoint;
+          },
           // The controller's logical viewport drives the screencast capture size;
           // spectators scale and letterbox it rather than resizing it.
           viewport: control.controllerViewport ?? undefined,
@@ -1891,8 +1894,9 @@ export function createBrowserHostEntry(
           context.experimental_paths.dataDir,
         );
       },
-      tabs: (target, context) => {
+      tabs: async (target, context) => {
         retainWorker(context);
+        await reconcileRuntimeTabs(context.experimental_paths.dataDir, target);
         return browserTabStrip(target).snapshot() as BrowserTabStrip;
       },
       panelControl: (request, context) => {

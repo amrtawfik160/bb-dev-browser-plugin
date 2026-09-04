@@ -43,6 +43,28 @@ function panelOperationHostCommands(calls: readonly string[]) {
 }
 
 describe("public Browser Panel lifecycle seam", () => {
+  it("restores the runtime tab inventory when a fresh panel session opens", async () => {
+    const runtime = createTabInventoryRuntime();
+    const restored = await runtime.openPage({
+      hostId: "ci-host",
+      profileId: DEFAULT_PROFILE_ID,
+      locale: "en-US",
+      timezone: "UTC",
+    });
+    const browser = await createPublicPanelLifecycleHarness({
+      browserRuntime: runtime,
+    });
+    try {
+      const strip = await browser.rpc.browser_tabs({
+        hostId: browser.hostId,
+        profileId: DEFAULT_PROFILE_ID,
+      });
+      expect(strip.tabs.map((tab) => tab.tabId)).toContain(restored.id);
+      expect(strip.activeTabId).toBe(restored.id);
+    } finally {
+      await browser.dispose();
+    }
+  });
   it.each([false, true])(
     "copies an address to the displaying client's clipboard and reports refusal (%s)",
     async (refused) => {
