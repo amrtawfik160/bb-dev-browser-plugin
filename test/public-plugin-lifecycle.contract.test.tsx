@@ -315,6 +315,12 @@ describe("public Browser Panel lifecycle seam", () => {
       await browser.forcePhysicalSocketLoss(first);
       await first.findByText("Reconnecting to the browser…");
       await first.findByRole("img", { name: "Browser page view" });
+      const reconnecting = first.container.textContent ?? "";
+      expect(reconnecting).not.toMatch(/WebSocket/u);
+      expect(reconnecting).not.toMatch(/panelTransport/u);
+      expect(reconnecting).not.toContain(originalSecret);
+      expect(reconnecting).not.toContain(first.capabilityId);
+      expect(reconnecting).not.toContain(first.panelId);
       await second.findByText("The page is live.");
       expect(() =>
         browser.sendAuthorizedInput(first, { kind: "click", queued: true }),
@@ -544,12 +550,19 @@ describe("public Browser Panel lifecycle seam", () => {
 
       browser.setHostRpcFailure(
         "panelTransport",
-        "replacement Panel Capability unavailable",
+        "replacement Panel Capability unavailable ws://127.0.0.1 leaked-secret",
       );
       await browser.advanceTime(PANEL_AUTH_ROTATION_MS);
       await first.findByText("Reconnecting to the browser…");
       await first.findByRole("img", { name: "Browser page view" });
       expect(first.framesReceived).toBeGreaterThanOrEqual(framesBeforeFailure);
+      const recovering = first.container.textContent ?? "";
+      expect(recovering).not.toMatch(/Panel Capability unavailable/u);
+      expect(recovering).not.toMatch(/WebSocket/u);
+      expect(recovering).not.toMatch(/127\.0\.0\.1/u);
+      expect(recovering).not.toContain(originalSecret);
+      expect(recovering).not.toContain(first.capabilityId);
+      expect(recovering).not.toContain(first.panelId);
       expect(() =>
         browser.sendAuthorizedInput(first, { kind: "click", queued: true }),
       ).toThrow("Browser Panel has no live stream connection.");

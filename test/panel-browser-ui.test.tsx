@@ -853,4 +853,27 @@ describe("Browser Panel", () => {
       await browser.dispose();
     }
   });
+
+  it("announces owner-facing recovery instead of transport internals when the stream cannot open", async () => {
+    const browser = await createPublicPluginHarness({
+      status: healthyBrowserStatus,
+    });
+    try {
+      browser.setHostRpcFailure(
+        "panelTransport",
+        "WebSocket ws://127.0.0.1:9 capability panel-capability-abc secret leaked-secret generation 4",
+      );
+      const panel = browser.renderPanel();
+
+      await panel.findByText("This browser is not connected.");
+      const shown = panel.container.textContent ?? "";
+      expect(shown).not.toMatch(/WebSocket/u);
+      expect(shown).not.toMatch(/127\.0\.0\.1/u);
+      expect(shown).not.toMatch(/panel-capability-/u);
+      expect(shown).not.toMatch(/leaked-secret/u);
+      expect(shown).not.toMatch(/generation 4/u);
+    } finally {
+      await browser.dispose();
+    }
+  });
 });

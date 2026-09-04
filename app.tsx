@@ -47,7 +47,6 @@ import {
   type BrowserStatus,
   type BrowserStatusInput,
   type BrowserTabAction,
-  type BrowserTab,
   type BrowserTabStrip,
   type rpcContract,
 } from "./contracts.js";
@@ -66,10 +65,15 @@ import {
   browserAccessRequestKey,
   browserStateIsSettling,
   browserStateReplacesPage,
-  isBlankBrowserPage,
   type BrowserAccessRequest,
   type BrowserPanelOption,
 } from "./panel-browser.js";
+import {
+  browserPanelRecoveryAnnouncement,
+  presentBrowserPanel,
+  type BrowserPanelConnectionPhase,
+  type BrowserPanelOptionDescriptor,
+} from "./panel-presentation.js";
 import { ownerSessionIdFromContext } from "./panel-owner-session.js";
 import {
   PANEL_PROTOCOL_VERSION,
@@ -216,37 +220,6 @@ function PanelProfilePicker({
 }
 
 /**
- * The pending site-access questions this panel can answer. A request that
- * expired, was decided, or was consumed is not a question any more, so it
- * leaves the panel; the full history stays in Browser Settings.
- */
-function pendingAccessRequests(
-  requests: readonly BrowserGrantRequest[],
-): BrowserAccessRequest[] {
-  const questions = new Map<string, BrowserAccessRequest>();
-  for (const request of requests) {
-    if (request.status !== "pending") continue;
-    const elevations = [
-      request.requestedElevations.fileTransfer ? "file transfer" : null,
-      request.requestedElevations.invalidCertificate
-        ? "an invalid certificate"
-        : null,
-    ].filter((elevation): elevation is string => elevation !== null);
-    // An agent denied five times on one site asked one question, so the owner
-    // is asked it once, and answering it answers every one of them.
-    const key = browserAccessRequestKey(request);
-    const asked = questions.get(key);
-    questions.set(key, {
-      requestIds: [...(asked?.requestIds ?? []), request.requestId],
-      projectId: request.projectId,
-      origin: request.origin,
-      elevations: [...new Set([...(asked?.elevations ?? []), ...elevations])],
-    });
-  }
-  return [...questions.values()];
-}
-
-/**
  * Save exported client bytes as a browser download so the owner receives the
  * file. Privacy-safe: the bytes are the owner's own quarantined file, and
  * leaving quarantine took an explicit owner decision to get here.
@@ -310,10 +283,8 @@ function PanelStreamSurface({
   const [capability, setCapability] = useState<
     BrowserPanelCapabilityResponse | undefined
   >();
-  const [streamState, setStreamState] = useState<
-    "connecting" | "streaming" | "reconnecting" | "offline"
-  >("connecting");
-  const [streamError, setStreamError] = useState<string | null>(null);
+  const [streamState, setStreamState] =
+    useState<BrowserPanelConnectionPhase>("connecting");
   // Whether the host is actually pushing over this stream. The capability being
   // issued is not the same thing: it authorizes a connection that may not be
   // open, and control transfers only arrive once one is.
@@ -364,7 +335,6 @@ function PanelStreamSurface({
     let disposed = false;
     setCapability(undefined);
     setStreamState("connecting");
-    setStreamError(null);
     void rpc
       .call("browser_panel_capability", {
         hostId: status.hostId,
@@ -376,7 +346,6 @@ function PanelStreamSurface({
         if (disposed) return;
         if (response.outcome !== "issued") {
           setStreamState("offline");
-          setStreamError(response.message);
           return;
         }
         setCapability(response);
@@ -387,12 +356,9 @@ function PanelStreamSurface({
         // a ready state over the real loopback transport.
         if (!isTestLoopbackPanelTransport()) setStreamState("streaming");
       })
-      .catch((error: unknown) => {
+      .catch(() => {
         if (disposed) return;
         setStreamState("offline");
-        setStreamError(
-          error instanceof Error ? error.message : "Browser transport failed.",
-        );
       });
     return () => {
       disposed = true;
@@ -945,11 +911,7 @@ function PanelStreamSurface({
         />
       ) : null}
       <p className="sr-only" aria-live="polite">
-        {capability?.outcome !== "issued"
-          ? (streamError ?? streamStateMessage(streamState))
-          : streamState === "streaming"
-            ? "The page is live."
-            : streamStateMessage(streamState)}
+        {browserPanelRecoveryAnnouncement(streamState)}
       </p>
       {dialog === null ? null : (
         <PanelDialogLayer
@@ -993,15 +955,6 @@ function PanelStreamSurface({
       )}
     </section>
   );
-}
-
-function streamStateMessage(
-  streamState: "connecting" | "streaming" | "reconnecting" | "offline",
-) {
-  if (streamState === "connecting") return "Connecting to the browser…";
-  if (streamState === "reconnecting") return "Reconnecting to the browser…";
-  if (streamState === "streaming") return "The page is live.";
-  return "This browser is not connected.";
 }
 
 /**
@@ -1248,19 +1201,6 @@ function usePanelControlSession({
     ownEntry.reclaimUntil > Date.now();
 
   return {
-    /**
-     * A panel with no control state yet is treated as the controller it is
-     * about to become: the first panel on a profile always is, and the
-     * navigation boundary rejects the request if it turns out not to be.
-     */
-    isController: control === null || control.role === "controller",
-    spectatorCount:
-      control === null
-        ? 0
-        : control.control.panels.filter(
-            (panel) => panel.role === "spectator" && panel.panelId !== panelId,
-          ).length,
-    agentPurpose: control?.control.agentPurpose ?? null,
     transferPending,
     /**
      * Take the session. The same action interrupts an agent that holds
@@ -1721,51 +1661,6 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
       );
   }
 
-  const tabs = tabStrip?.tabs ?? [];
-  const activeTab =
-    tabs.find((tab) => tab.tabId === tabStrip?.activeTabId) ?? null;
-  const address = omniboxAddress(activeTab, lastNavigation);
-  // Nothing to read means nothing to show: the new-tab surface stands in for a
-  // page only while the browser has not reached one, so a navigation this
-  // panel just drove takes it down without waiting for the strip.
-  const showsNewTabSurface = address === "";
-  const hostName =
-    hostChoices.find((choice) => choice.hostId === status?.hostId)?.name ??
-    null;
-  const sessionOptions: BrowserPanelOption[] = [
-    controlSession.isController
-      ? {
-          kind: "action",
-          id: "release-control",
-          label: "Let another panel take over",
-          description: "Hands this browser to the next panel that asks for it.",
-          onSelect: controlSession.releaseControl,
-          disabled: controlSession.transferPending,
-        }
-      : {
-          kind: "action",
-          id: "take-control",
-          label: "Take control",
-          onSelect: controlSession.takeControl,
-          disabled: controlSession.transferPending,
-        },
-    {
-      kind: "toggle",
-      id: "raw-localhost",
-      label: "Use plain localhost addresses",
-      description:
-        "Only for sites that reject this project's own localhost name.",
-      checked: rawLocalhost,
-      onChange: setRawLocalhost,
-    },
-    {
-      kind: "note",
-      id: "settings",
-      label:
-        "Browser profiles, agent access, downloads, and activity are in BB settings under Browser.",
-    },
-  ];
-
   if (status === null) {
     return (
       <div role="status" className="p-6 text-sm text-muted-foreground">
@@ -1773,7 +1668,28 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
       </div>
     );
   }
-  if (browserStateReplacesPage(status.state)) {
+
+  const hostName =
+    hostChoices.find((choice) => choice.hostId === status.hostId)?.name ?? null;
+  const view = presentBrowserPanel({
+    status,
+    control,
+    panelId,
+    grantRequests,
+    hostName,
+    tabStrip,
+    lastNavigation,
+    rawLocalhost,
+    transferPending: controlSession.transferPending,
+    showStatusDetail,
+  });
+  const sessionOptions = attachPresentedOptions(view.options, {
+    takeControl: controlSession.takeControl,
+    releaseControl: controlSession.releaseControl,
+    setRawLocalhost,
+  });
+
+  if (view.replacesPage) {
     // Nothing can be browsed until the host is fixed, so the failure gets the
     // whole panel rather than a line above an empty page.
     return (
@@ -1785,11 +1701,9 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
         {profiles === null || status.hostId === null ? null : (
           <PanelProfilePicker inventory={profiles} onChange={selectProfile} />
         )}
-        {status.state === "safe-login-elsewhere" ? (
-          <SafeLoginLimitationsNotice />
-        ) : null}
+        {view.showsSafeLoginNotice ? <SafeLoginLimitationsNotice /> : null}
         <BrowserAccessRequestNotices
-          requests={pendingAccessRequests(grantRequests)}
+          requests={view.accessQuestions}
           answering={accessDecision}
           onAllow={allowAccessRequest}
           onDeny={denyAccessRequest}
@@ -1804,32 +1718,32 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
       <BrowserToolbar
         status={status}
         navigation={{
-          address,
-          focusAddress: showsNewTabSurface,
+          address: view.address,
+          focusAddress: view.showsNewTabSurface,
           onSubmit: navigateTo,
           onHistory: navigateHistory,
         }}
         control={{
-          role: controlSession.isController ? "controller" : "spectator",
-          spectatorCount: controlSession.spectatorCount,
-          agentPurpose: controlSession.agentPurpose,
+          role: view.role,
+          spectatorCount: view.spectatorCount,
+          agentPurpose: view.agentPurpose,
           onTakeControl: controlSession.takeControl,
         }}
         options={sessionOptions}
         reducedMotion={reducedMotion}
-        statusHint={showStatusDetail ? hostStatusHint(status, hostName) : null}
+        statusHint={view.statusHint}
         onStatusSelect={() => setShowStatusDetail((shown) => !shown)}
       />
       <BrowserTabStripView
-        tabs={tabs}
+        tabs={tabStrip?.tabs ?? []}
         activeTabId={tabStrip?.activeTabId ?? null}
-        canDrive={controlSession.isController}
+        canDrive={view.canDrive}
         onSelect={(tabId) => driveTabs("activate", tabId)}
         onClose={(tabId) => driveTabs("close", tabId)}
         onOpen={() => driveTabs("open")}
       />
       <BrowserAccessRequestNotices
-        requests={pendingAccessRequests(grantRequests)}
+        requests={view.accessQuestions}
         answering={accessDecision}
         onAllow={allowAccessRequest}
         onDeny={denyAccessRequest}
@@ -1852,12 +1766,12 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
         <PanelStreamSurface
           status={status}
           panelId={panelId}
-          isController={controlSession.isController}
-          agentDriven={controlSession.agentPurpose !== null}
+          isController={view.canDrive}
+          agentDriven={view.agentDriven}
           onControlState={applyControlState}
           onLiveChange={setStreamIsLive}
         />
-        {showsNewTabSurface ? (
+        {view.showsNewTabSurface ? (
           <div className="absolute inset-0">
             <BrowserNewTabSurface hostName={hostName} />
           </div>
@@ -1867,40 +1781,29 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
   );
 }
 
-/**
- * What the host-status indicator says when the owner asks it. The panel has no
- * way to open a settings section from a panel surface, so the indicator names
- * where the detail lives instead of pretending to navigate there.
- */
-function hostStatusHint(status: BrowserStatus, hostName: string | null) {
-  const host = hostName ?? "this workspace host";
-  const state =
-    status.state === "healthy"
-      ? `This browser is ready on ${host}.`
-      : `${status.label} on ${host}. ${status.message}`;
-  return `${state} Browser profiles, agent access, downloads, and activity are in BB settings under Browser.`;
-}
-
-/**
- * What the omnibox shows. The tab the browser is on is the truth, because it
- * is what an agent or another panel moved; the navigation this panel drove is
- * only a stand-in for the second or so before the shared strip reports it, and
- * it stands in for exactly the tab it happened in. Anything else and the field
- * would keep naming a page the owner has already left.
- */
-function omniboxAddress(
-  activeTab: BrowserTab | null,
-  lastNavigation: { tabId: string | null; url: string } | null,
-) {
-  if (activeTab !== null && !isBlankBrowserPage(activeTab.url)) {
-    return activeTab.url;
-  }
-  if (lastNavigation === null) return "";
-  const belongsToAnotherTab =
-    activeTab !== null &&
-    lastNavigation.tabId !== null &&
-    lastNavigation.tabId !== activeTab.tabId;
-  return belongsToAnotherTab ? "" : lastNavigation.url;
+function attachPresentedOptions(
+  options: readonly BrowserPanelOptionDescriptor[],
+  handlers: {
+    takeControl: () => void;
+    releaseControl: () => void;
+    setRawLocalhost: (checked: boolean) => void;
+  },
+): BrowserPanelOption[] {
+  return options.map((option) => {
+    if (option.kind === "action") {
+      return {
+        ...option,
+        onSelect:
+          option.id === "take-control"
+            ? handlers.takeControl
+            : handlers.releaseControl,
+      };
+    }
+    if (option.kind === "toggle") {
+      return { ...option, onChange: handlers.setRawLocalhost };
+    }
+    return option;
+  });
 }
 
 function administrationErrorMessage(error: unknown) {

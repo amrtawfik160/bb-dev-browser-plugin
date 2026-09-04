@@ -15,8 +15,10 @@ import { isBbGlobalShortcut } from "./panel-chrome.js";
 /**
  * The browser the owner sees (issue #50): a toolbar, a tab strip, and the page
  * filling everything below them. These are SDK-free presentational components,
- * like the dialog and download chrome in {@link ./panel-chrome.js}, so app.tsx
- * owns the RPC wiring and this module owns what is on screen.
+ * like the dialog and download chrome in {@link ./panel-chrome.js}.
+ * {@link ./panel-presentation.js} owns owner-facing wording and action
+ * availability from typed connection and session state; this module paints
+ * that view. The app route supplies trusted context and wires actions.
  *
  * The panel speaks owner-facing language rather than the domain vocabulary
  * this repository is built on (ADR 0014). A held Control Lease is a coloured
