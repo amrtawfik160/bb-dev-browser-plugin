@@ -302,11 +302,14 @@ export async function createPublicPanelLifecycleHarness() {
     secret?: string;
     control?: {
       controllerPanelId?: string | null;
+      controllerViewport?: { width: number; height: number } | null;
+      agentPurpose?: string | null;
       panels?: Array<{
         panelId: string;
         ownerSessionId: string;
         role?: "controller" | "spectator";
         connection: "connected" | "disconnected";
+        viewport?: { width: number; height: number };
         reclaimUntil: number | null;
       }>;
     };
@@ -335,16 +338,20 @@ export async function createPublicPanelLifecycleHarness() {
   }
 
   function latestSessionPanels(panel: LifecyclePanel) {
+    return latestControl(panel)?.panels ?? [];
+  }
+
+  function latestControl(panel: LifecyclePanel) {
     const ports = issuedGatewayPorts(panel.panelId);
     const latestPort = ports.at(-1);
-    if (latestPort === undefined) return [];
-    let latest: NonNullable<ParsedPanelMessage["control"]>["panels"] = [];
+    if (latestPort === undefined) return null;
+    let latest: NonNullable<ParsedPanelMessage["control"]> | null = null;
     for (const message of parsedMessages(latestPort)) {
-      if (message.type === "session" && message.control?.panels !== undefined) {
-        latest = message.control.panels;
+      if (message.type === "session" && message.control !== undefined) {
+        latest = message.control;
       }
     }
-    return latest ?? [];
+    return latest;
   }
 
   function latestIssuedGeneration(panel: LifecyclePanel, profileId?: string) {
@@ -842,6 +849,46 @@ export async function createPublicPanelLifecycleHarness() {
     setHostRpcFailure: (method: string, message?: string) =>
       browser.setHostRpcFailure(method, message),
     latestSessionPanels,
+    latestControl,
+    takeControl: (
+      panel: LifecyclePanel,
+      viewport?: { width: number; height: number },
+    ) =>
+      browser.runBrowserTakeControl({
+        hostId: panel.hostId,
+        profileId: panel.profileId,
+        panelId: panel.panelId,
+        ownerSessionId: panel.ownerSessionId,
+        ...(viewport === undefined ? {} : { viewport }),
+      }),
+    releaseControl: (panel: LifecyclePanel) =>
+      browser.runBrowserReleaseControl({
+        hostId: panel.hostId,
+        profileId: panel.profileId,
+        panelId: panel.panelId,
+      }),
+    reclaimControl: (
+      panel: LifecyclePanel,
+      viewport?: { width: number; height: number },
+    ) =>
+      browser.runBrowserReclaimControl({
+        hostId: panel.hostId,
+        profileId: panel.profileId,
+        panelId: panel.panelId,
+        ownerSessionId: panel.ownerSessionId,
+        ...(viewport === undefined ? {} : { viewport }),
+      }),
+    reportViewport: (
+      panel: LifecyclePanel,
+      viewport: { width: number; height: number },
+    ) =>
+      browser.runBrowserPanelControl({
+        hostId: panel.hostId,
+        profileId: panel.profileId,
+        panelId: panel.panelId,
+        ownerSessionId: panel.ownerSessionId,
+        viewport,
+      }),
     latestIssuedGeneration,
     issuedSecrets,
     redeemedSecrets,
