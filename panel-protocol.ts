@@ -2,15 +2,26 @@ import { z } from "zod";
 import {
   PANEL_GATEWAY_MESSAGE_MAX_BYTES,
   PANEL_PROTOCOL_VERSION,
+  browserClipboardCopyMessageSchema,
+  browserClipboardOutcomeSchema,
+  browserClipboardPasteMessageSchema,
+  browserContextActionMessageSchema,
+  browserContextActionSchema,
+  browserContextQueryMessageSchema,
+  browserDialogEventSchema,
+  browserDialogResponseMessageSchema,
+  browserDownloadCancelMessageSchema,
+  browserDownloadListResultSchema,
   browserPanelControlStateSchema,
   browserTabStripSchema,
+  browserTransferCancelMessageSchema,
 } from "./contracts.js";
 
 /**
- * Shared versioned Panel wire protocol for the core authenticated stream.
- * Client and host both encode and decode through this module so they cannot
- * drift. Auxiliary dialog, context, clipboard, transfer, and Host Download
- * messages stay on the legacy path until their migration ticket.
+ * Shared versioned Panel wire protocol. Client and host both encode and decode
+ * through this module so they cannot drift. Core stream messages and the
+ * remaining dialog, browser-context, clipboard, transfer, and Host Download
+ * families share the same direction, phase, shape, and size checks.
  */
 
 export { PANEL_PROTOCOL_VERSION };
@@ -83,6 +94,97 @@ export type PanelProtocolErrorMessage = {
   message: string;
 };
 
+export type PanelProtocolDialogMessage = {
+  protocolVersion: typeof PANEL_PROTOCOL_VERSION;
+  type: "dialog";
+  dialog: z.infer<typeof browserDialogEventSchema>;
+};
+
+export type PanelProtocolDialogResponseMessage = {
+  protocolVersion: typeof PANEL_PROTOCOL_VERSION;
+  type: "dialog_response";
+  dialogId: string;
+  accept: boolean;
+  text?: string;
+};
+
+export type PanelProtocolContextQueryMessage = {
+  protocolVersion: typeof PANEL_PROTOCOL_VERSION;
+  type: "context_query";
+  queryId: string;
+  x: number;
+  y: number;
+};
+
+export type PanelProtocolContextActionMessage = {
+  protocolVersion: typeof PANEL_PROTOCOL_VERSION;
+  type: "context_action";
+  actionId: string;
+};
+
+export type PanelProtocolContextMenuMessage = {
+  protocolVersion: typeof PANEL_PROTOCOL_VERSION;
+  type: "context_menu";
+  queryId: string;
+  point: { x: number; y: number };
+  actions: Array<z.infer<typeof browserContextActionSchema>>;
+};
+
+export type PanelProtocolClipboardCopyMessage = {
+  protocolVersion: typeof PANEL_PROTOCOL_VERSION;
+  type: "clipboard_copy";
+  copyId: string;
+};
+
+export type PanelProtocolClipboardPasteMessage = {
+  protocolVersion: typeof PANEL_PROTOCOL_VERSION;
+  type: "clipboard_paste";
+  pasteId: string;
+  bytes: number;
+};
+
+export type PanelProtocolClipboardOutcomeMessage = {
+  protocolVersion: typeof PANEL_PROTOCOL_VERSION;
+  type: "clipboard_outcome";
+  outcome: z.infer<typeof browserClipboardOutcomeSchema>;
+};
+
+export type PanelProtocolTransferCancelMessage = {
+  protocolVersion: typeof PANEL_PROTOCOL_VERSION;
+  type: "transfer_cancel";
+  transferId: string;
+};
+
+export type PanelProtocolTransferCancelAckMessage = {
+  protocolVersion: typeof PANEL_PROTOCOL_VERSION;
+  type: "transfer_cancel_ack";
+  transferId: string;
+};
+
+export type PanelProtocolDownloadCancelMessage = {
+  protocolVersion: typeof PANEL_PROTOCOL_VERSION;
+  type: "download_cancel";
+  downloadId: string;
+};
+
+export type PanelProtocolDownloadAckMessage = {
+  protocolVersion: typeof PANEL_PROTOCOL_VERSION;
+  type: "download_ack";
+  downloadId: string;
+  action: "cancelled";
+};
+
+export type PanelProtocolDownloadsUpdateMessage = {
+  protocolVersion: typeof PANEL_PROTOCOL_VERSION;
+  type: "downloads_update";
+  update: z.infer<typeof browserDownloadListResultSchema>;
+};
+
+export type PanelProtocolPingMessage = {
+  protocolVersion: typeof PANEL_PROTOCOL_VERSION;
+  type: "ping";
+};
+
 export type PanelProtocolMessage =
   | PanelProtocolRedeemMessage
   | PanelProtocolReadyMessage
@@ -90,7 +192,21 @@ export type PanelProtocolMessage =
   | PanelProtocolInputMessage
   | PanelProtocolAckMessage
   | PanelProtocolSessionMessage
-  | PanelProtocolErrorMessage;
+  | PanelProtocolErrorMessage
+  | PanelProtocolDialogMessage
+  | PanelProtocolDialogResponseMessage
+  | PanelProtocolContextQueryMessage
+  | PanelProtocolContextActionMessage
+  | PanelProtocolContextMenuMessage
+  | PanelProtocolClipboardCopyMessage
+  | PanelProtocolClipboardPasteMessage
+  | PanelProtocolClipboardOutcomeMessage
+  | PanelProtocolTransferCancelMessage
+  | PanelProtocolTransferCancelAckMessage
+  | PanelProtocolDownloadCancelMessage
+  | PanelProtocolDownloadAckMessage
+  | PanelProtocolDownloadsUpdateMessage
+  | PanelProtocolPingMessage;
 
 export type PanelProtocolEncodeResult =
   | { outcome: "encoded"; raw: string }
@@ -104,12 +220,11 @@ export type PanelProtocolDecodeContext = {
 
 export type PanelProtocolDecodeResult =
   | { outcome: "accepted"; message: PanelProtocolMessage }
-  | { outcome: "legacy"; value: unknown }
   | { outcome: "rejected"; error: PanelProtocolError };
 
 const utf8 = new TextEncoder();
 
-const CORE_TYPES = [
+const PROTOCOL_TYPES = [
   "redeem",
   "ready",
   "frame",
@@ -117,11 +232,6 @@ const CORE_TYPES = [
   "ack",
   "session",
   "protocol_error",
-] as const;
-
-type PanelProtocolCoreType = (typeof CORE_TYPES)[number];
-
-const AUXILIARY_TYPES = new Set([
   "dialog",
   "dialog_response",
   "context_query",
@@ -136,31 +246,58 @@ const AUXILIARY_TYPES = new Set([
   "download_ack",
   "downloads_update",
   "ping",
-]);
+] as const;
 
-const MESSAGE_DIRECTION: Record<PanelProtocolCoreType, PanelProtocolDirection> =
-  {
-    redeem: "client-to-host",
-    input: "client-to-host",
-    ack: "client-to-host",
-    ready: "host-to-client",
-    frame: "host-to-client",
-    session: "host-to-client",
-    protocol_error: "host-to-client",
-  };
+type PanelProtocolType = (typeof PROTOCOL_TYPES)[number];
 
-const MESSAGE_PHASES: Record<
-  PanelProtocolCoreType,
-  readonly PanelProtocolPhase[]
-> = {
-  redeem: ["pre-redemption"],
-  ready: ["authenticated"],
-  frame: ["authenticated"],
-  input: ["authenticated"],
-  ack: ["authenticated"],
-  session: ["authenticated"],
-  protocol_error: ["pre-redemption", "authenticated"],
+const MESSAGE_DIRECTION: Record<PanelProtocolType, PanelProtocolDirection> = {
+  redeem: "client-to-host",
+  input: "client-to-host",
+  ack: "client-to-host",
+  dialog_response: "client-to-host",
+  context_query: "client-to-host",
+  context_action: "client-to-host",
+  clipboard_copy: "client-to-host",
+  clipboard_paste: "client-to-host",
+  transfer_cancel: "client-to-host",
+  download_cancel: "client-to-host",
+  ping: "client-to-host",
+  ready: "host-to-client",
+  frame: "host-to-client",
+  session: "host-to-client",
+  protocol_error: "host-to-client",
+  dialog: "host-to-client",
+  context_menu: "host-to-client",
+  clipboard_outcome: "host-to-client",
+  transfer_cancel_ack: "host-to-client",
+  download_ack: "host-to-client",
+  downloads_update: "host-to-client",
 };
+
+const MESSAGE_PHASES: Record<PanelProtocolType, readonly PanelProtocolPhase[]> =
+  {
+    redeem: ["pre-redemption"],
+    protocol_error: ["pre-redemption", "authenticated"],
+    ready: ["authenticated"],
+    frame: ["authenticated"],
+    input: ["authenticated"],
+    ack: ["authenticated"],
+    session: ["authenticated"],
+    dialog: ["authenticated"],
+    dialog_response: ["authenticated"],
+    context_query: ["authenticated"],
+    context_action: ["authenticated"],
+    context_menu: ["authenticated"],
+    clipboard_copy: ["authenticated"],
+    clipboard_paste: ["authenticated"],
+    clipboard_outcome: ["authenticated"],
+    transfer_cancel: ["authenticated"],
+    transfer_cancel_ack: ["authenticated"],
+    download_cancel: ["authenticated"],
+    download_ack: ["authenticated"],
+    downloads_update: ["authenticated"],
+    ping: ["authenticated"],
+  };
 
 const PROTOCOL_ERROR_MESSAGES: Record<PanelProtocolErrorCategory, string> = {
   malformed: "The Browser Panel message is not valid JSON.",
@@ -255,6 +392,92 @@ const protocolErrorSchema = z
   })
   .strict();
 
+const dialogSchema = z
+  .object({
+    type: z.literal("dialog"),
+    protocolVersion: protocolVersionField,
+    dialog: browserDialogEventSchema,
+  })
+  .strict();
+
+const dialogResponseSchema = browserDialogResponseMessageSchema.extend({
+  protocolVersion: protocolVersionField,
+});
+
+const contextQuerySchema = browserContextQueryMessageSchema.extend({
+  protocolVersion: protocolVersionField,
+});
+
+const contextActionSchema = browserContextActionMessageSchema.extend({
+  protocolVersion: protocolVersionField,
+});
+
+const contextMenuSchema = z
+  .object({
+    type: z.literal("context_menu"),
+    protocolVersion: protocolVersionField,
+    queryId: z.string().min(1),
+    point: z.object({ x: z.number(), y: z.number() }).strict(),
+    actions: z.array(browserContextActionSchema),
+  })
+  .strict();
+
+const clipboardCopySchema = browserClipboardCopyMessageSchema.extend({
+  protocolVersion: protocolVersionField,
+});
+
+const clipboardPasteSchema = browserClipboardPasteMessageSchema.extend({
+  protocolVersion: protocolVersionField,
+});
+
+const clipboardOutcomeSchema = z
+  .object({
+    type: z.literal("clipboard_outcome"),
+    protocolVersion: protocolVersionField,
+    outcome: browserClipboardOutcomeSchema,
+  })
+  .strict();
+
+const transferCancelSchema = browserTransferCancelMessageSchema.extend({
+  protocolVersion: protocolVersionField,
+});
+
+const transferCancelAckSchema = z
+  .object({
+    type: z.literal("transfer_cancel_ack"),
+    protocolVersion: protocolVersionField,
+    transferId: z.string().min(1).max(120),
+  })
+  .strict();
+
+const downloadCancelSchema = browserDownloadCancelMessageSchema.extend({
+  protocolVersion: protocolVersionField,
+});
+
+const downloadAckSchema = z
+  .object({
+    type: z.literal("download_ack"),
+    protocolVersion: protocolVersionField,
+    downloadId: z.string().min(1).max(120),
+    action: z.literal("cancelled"),
+  })
+  .strict();
+
+const downloadsUpdateSchema = z
+  .object({
+    type: z.literal("downloads_update"),
+    protocolVersion: protocolVersionField,
+    update: browserDownloadListResultSchema,
+  })
+  .strict();
+
+const pingSchema = z
+  .object({
+    type: z.literal("ping"),
+    protocolVersion: protocolVersionField,
+  })
+  .strict();
+
 const legacyControlSchema = z
   .object({
     type: z.literal("control"),
@@ -286,8 +509,8 @@ function rejected(
   return { outcome: "rejected", error: protocolError(category) };
 }
 
-function isCoreType(value: string): value is PanelProtocolCoreType {
-  return (CORE_TYPES as readonly string[]).includes(value);
+function isProtocolType(value: string): value is PanelProtocolType {
+  return (PROTOCOL_TYPES as readonly string[]).includes(value);
 }
 
 function parseJsonObject(
@@ -386,8 +609,161 @@ function normalizeProtocolError(
   };
 }
 
+function normalizeDialog(
+  value: z.infer<typeof dialogSchema>,
+): PanelProtocolDialogMessage {
+  return {
+    protocolVersion: PANEL_PROTOCOL_VERSION,
+    type: "dialog",
+    dialog: value.dialog,
+  };
+}
+
+function normalizeDialogResponse(
+  value: z.infer<typeof dialogResponseSchema>,
+): PanelProtocolDialogResponseMessage {
+  return {
+    protocolVersion: PANEL_PROTOCOL_VERSION,
+    type: "dialog_response",
+    dialogId: value.dialogId,
+    accept: value.accept,
+    ...(value.text === undefined ? {} : { text: value.text }),
+  };
+}
+
+function normalizeContextQuery(
+  value: z.infer<typeof contextQuerySchema>,
+): PanelProtocolContextQueryMessage {
+  return {
+    protocolVersion: PANEL_PROTOCOL_VERSION,
+    type: "context_query",
+    queryId: value.queryId,
+    x: value.x,
+    y: value.y,
+  };
+}
+
+function normalizeContextAction(
+  value: z.infer<typeof contextActionSchema>,
+): PanelProtocolContextActionMessage {
+  return {
+    protocolVersion: PANEL_PROTOCOL_VERSION,
+    type: "context_action",
+    actionId: value.actionId,
+  };
+}
+
+function normalizeContextMenu(
+  value: z.infer<typeof contextMenuSchema>,
+): PanelProtocolContextMenuMessage {
+  return {
+    protocolVersion: PANEL_PROTOCOL_VERSION,
+    type: "context_menu",
+    queryId: value.queryId,
+    point: value.point,
+    actions: value.actions,
+  };
+}
+
+function normalizeClipboardCopy(
+  value: z.infer<typeof clipboardCopySchema>,
+): PanelProtocolClipboardCopyMessage {
+  return {
+    protocolVersion: PANEL_PROTOCOL_VERSION,
+    type: "clipboard_copy",
+    copyId: value.copyId,
+  };
+}
+
+function normalizeClipboardPaste(
+  value: z.infer<typeof clipboardPasteSchema>,
+): PanelProtocolClipboardPasteMessage {
+  return {
+    protocolVersion: PANEL_PROTOCOL_VERSION,
+    type: "clipboard_paste",
+    pasteId: value.pasteId,
+    bytes: value.bytes,
+  };
+}
+
+function normalizeClipboardOutcome(
+  value: z.infer<typeof clipboardOutcomeSchema>,
+): PanelProtocolClipboardOutcomeMessage {
+  return {
+    protocolVersion: PANEL_PROTOCOL_VERSION,
+    type: "clipboard_outcome",
+    outcome: value.outcome,
+  };
+}
+
+function normalizeTransferCancel(
+  value: z.infer<typeof transferCancelSchema>,
+): PanelProtocolTransferCancelMessage {
+  return {
+    protocolVersion: PANEL_PROTOCOL_VERSION,
+    type: "transfer_cancel",
+    transferId: value.transferId,
+  };
+}
+
+function normalizeTransferCancelAck(
+  value: z.infer<typeof transferCancelAckSchema>,
+): PanelProtocolTransferCancelAckMessage {
+  return {
+    protocolVersion: PANEL_PROTOCOL_VERSION,
+    type: "transfer_cancel_ack",
+    transferId: value.transferId,
+  };
+}
+
+function normalizeDownloadCancel(
+  value: z.infer<typeof downloadCancelSchema>,
+): PanelProtocolDownloadCancelMessage {
+  return {
+    protocolVersion: PANEL_PROTOCOL_VERSION,
+    type: "download_cancel",
+    downloadId: value.downloadId,
+  };
+}
+
+function normalizeDownloadAck(
+  value: z.infer<typeof downloadAckSchema>,
+): PanelProtocolDownloadAckMessage {
+  return {
+    protocolVersion: PANEL_PROTOCOL_VERSION,
+    type: "download_ack",
+    downloadId: value.downloadId,
+    action: value.action,
+  };
+}
+
+function normalizeDownloadsUpdate(
+  value: z.infer<typeof downloadsUpdateSchema>,
+): PanelProtocolDownloadsUpdateMessage {
+  return {
+    protocolVersion: PANEL_PROTOCOL_VERSION,
+    type: "downloads_update",
+    update: value.update,
+  };
+}
+
+function normalizePing(): PanelProtocolPingMessage {
+  return {
+    protocolVersion: PANEL_PROTOCOL_VERSION,
+    type: "ping",
+  };
+}
+
+function parseAccepted<T>(
+  parsed: { success: false } | { success: true; data: T },
+  message: (value: T) => PanelProtocolMessage,
+): PanelProtocolDecodeResult {
+  if (!parsed.success) return rejected("invalid-shape");
+  return { outcome: "accepted", message: message(parsed.data) };
+}
+
 function parseCoreMessage(
-  type: PanelProtocolCoreType,
+  type: PanelProtocolType,
   value: Record<string, unknown>,
 ): PanelProtocolDecodeResult {
   if (type === "redeem") {
@@ -423,12 +799,97 @@ function parseCoreMessage(
       message: normalizeSession(parsed.data.control, parsed.data.tabs),
     };
   }
-  const parsed = protocolErrorSchema.safeParse(value);
-  if (!parsed.success) return rejected("invalid-shape");
-  return {
-    outcome: "accepted",
-    message: normalizeProtocolError(parsed.data.category),
-  };
+  if (type === "protocol_error") {
+    const parsed = protocolErrorSchema.safeParse(value);
+    if (!parsed.success) return rejected("invalid-shape");
+    return {
+      outcome: "accepted",
+      message: normalizeProtocolError(parsed.data.category),
+    };
+  }
+  return parseAuxiliaryMessage(type, value);
+}
+
+function parseAuxiliaryMessage(
+  type: PanelProtocolType,
+  value: Record<string, unknown>,
+): PanelProtocolDecodeResult {
+  if (type === "dialog") {
+    return parseAccepted(dialogSchema.safeParse(value), normalizeDialog);
+  }
+  if (type === "dialog_response") {
+    return parseAccepted(
+      dialogResponseSchema.safeParse(value),
+      normalizeDialogResponse,
+    );
+  }
+  if (type === "context_query") {
+    return parseAccepted(
+      contextQuerySchema.safeParse(value),
+      normalizeContextQuery,
+    );
+  }
+  if (type === "context_action") {
+    return parseAccepted(
+      contextActionSchema.safeParse(value),
+      normalizeContextAction,
+    );
+  }
+  if (type === "context_menu") {
+    return parseAccepted(
+      contextMenuSchema.safeParse(value),
+      normalizeContextMenu,
+    );
+  }
+  if (type === "clipboard_copy") {
+    return parseAccepted(
+      clipboardCopySchema.safeParse(value),
+      normalizeClipboardCopy,
+    );
+  }
+  if (type === "clipboard_paste") {
+    return parseAccepted(
+      clipboardPasteSchema.safeParse(value),
+      normalizeClipboardPaste,
+    );
+  }
+  if (type === "clipboard_outcome") {
+    return parseAccepted(
+      clipboardOutcomeSchema.safeParse(value),
+      normalizeClipboardOutcome,
+    );
+  }
+  if (type === "transfer_cancel") {
+    return parseAccepted(
+      transferCancelSchema.safeParse(value),
+      normalizeTransferCancel,
+    );
+  }
+  if (type === "transfer_cancel_ack") {
+    return parseAccepted(
+      transferCancelAckSchema.safeParse(value),
+      normalizeTransferCancelAck,
+    );
+  }
+  if (type === "download_cancel") {
+    return parseAccepted(
+      downloadCancelSchema.safeParse(value),
+      normalizeDownloadCancel,
+    );
+  }
+  if (type === "download_ack") {
+    return parseAccepted(
+      downloadAckSchema.safeParse(value),
+      normalizeDownloadAck,
+    );
+  }
+  if (type === "downloads_update") {
+    return parseAccepted(
+      downloadsUpdateSchema.safeParse(value),
+      normalizeDownloadsUpdate,
+    );
+  }
+  return parseAccepted(pingSchema.safeParse(value), () => normalizePing());
 }
 
 function decodeLegacyAliases(
@@ -502,12 +963,9 @@ export function decodePanelProtocolMessage(
   if (typeof type !== "string" || type.length === 0) {
     return rejected("invalid-shape");
   }
-  if (AUXILIARY_TYPES.has(type)) {
-    return { outcome: "legacy", value };
-  }
   const aliased = decodeLegacyAliases(type, value, context);
   if (aliased !== undefined) return aliased;
-  if (!isCoreType(type)) return rejected("unknown-type");
+  if (!isProtocolType(type)) return rejected("unknown-type");
   if (MESSAGE_DIRECTION[type] !== context.direction) {
     return rejected("invalid-direction");
   }

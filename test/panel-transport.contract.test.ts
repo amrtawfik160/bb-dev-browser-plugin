@@ -2,6 +2,10 @@ import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { WebSocket } from "ws";
 import {
+  BROWSER_DOWNLOAD_MAX_FILE_BYTES,
+  BROWSER_DOWNLOAD_MAX_PROFILE_BYTES,
+  BROWSER_DOWNLOAD_TTL_MS,
+  PANEL_GATEWAY_INPUT_MAX_PER_SECOND,
   PANEL_MAX_FRAMES_PER_SECOND,
   PANEL_MAX_VIEWPORT_HEIGHT,
   PANEL_MAX_VIEWPORT_WIDTH,
@@ -26,7 +30,7 @@ import {
   type ScreencastFrame,
   type ScreencastSource,
 } from "../panel-transport.js";
-import { waitFor } from "./wait.js";
+import { waitFor, waitForSettled } from "./wait.js";
 
 const hostId = "host-transport";
 const profileId = "profile-transport";
@@ -222,9 +226,15 @@ describe("Panel transport server contract", () => {
       const socket = await connect(port);
       send(socket, { type: "ping" });
       const message = await onceMessage(socket);
-      const error = decode<{ type: string; reason: string }>(message);
-      expect(error.type).toBe("error");
-      expect(error.reason).toBe("unauthorized");
+      const decoded = decodePanelProtocolMessage(message, {
+        direction: "host-to-client",
+        phase: "pre-redemption",
+      });
+      expect(decoded.outcome).toBe("accepted");
+      if (decoded.outcome !== "accepted") return;
+      expect(decoded.message.type).toBe("protocol_error");
+      if (decoded.message.type !== "protocol_error") return;
+      expect(decoded.message.category).toBe("invalid-phase");
       await new Promise<void>((resolve) => socket.once("close", resolve));
     } finally {
       await transport.stop();
@@ -472,32 +482,33 @@ describe("Panel transport server contract", () => {
       // receives the privacy-safe outcome (bytes only, never contents).
       send(socket, { type: "clipboard_copy", copyId: "copy-1" });
       const copyRaw = await onceMessage(socket);
-      const copyOutcome = decode<{
-        type: string;
-        outcome: { outcome: string; copyId: string; bytes: number };
-      }>(copyRaw);
-      expect(copyOutcome.type).toBe("clipboard_outcome");
-      expect(copyOutcome.outcome).toEqual({
-        outcome: "copied",
-        copyId: "copy-1",
-        bytes: 48,
+      const copyDecoded = decodePanelProtocolMessage(copyRaw, {
+        direction: "host-to-client",
+        phase: "authenticated",
       });
-      // An explicit owner paste dispatches to the exchange too.
+      expect(copyDecoded.outcome).toBe("accepted");
+      if (copyDecoded.outcome !== "accepted") return;
+      expect(copyDecoded.message).toEqual({
+        protocolVersion: PANEL_PROTOCOL_VERSION,
+        type: "clipboard_outcome",
+        outcome: { outcome: "copied", copyId: "copy-1", bytes: 48 },
+      });
       send(socket, {
         type: "clipboard_paste",
         pasteId: "paste-1",
         bytes: 32,
       });
       const pasteRaw = await onceMessage(socket);
-      const pasteOutcome = decode<{
-        type: string;
-        outcome: { outcome: string; pasteId: string; bytes: number };
-      }>(pasteRaw);
-      expect(pasteOutcome.type).toBe("clipboard_outcome");
-      expect(pasteOutcome.outcome).toEqual({
-        outcome: "pasted",
-        pasteId: "paste-1",
-        bytes: 32,
+      const pasteDecoded = decodePanelProtocolMessage(pasteRaw, {
+        direction: "host-to-client",
+        phase: "authenticated",
+      });
+      expect(pasteDecoded.outcome).toBe("accepted");
+      if (pasteDecoded.outcome !== "accepted") return;
+      expect(pasteDecoded.message).toEqual({
+        protocolVersion: PANEL_PROTOCOL_VERSION,
+        type: "clipboard_outcome",
+        outcome: { outcome: "pasted", pasteId: "paste-1", bytes: 32 },
       });
       socket.close();
     } finally {
@@ -540,8 +551,14 @@ describe("Panel transport server contract", () => {
       await onceMessage(socket); // ready
       send(socket, { type: "transfer_cancel", transferId: "transfer-1" });
       const ackRaw = await onceMessage(socket);
-      const ack = decode<{ type: string; transferId: string }>(ackRaw);
-      expect(ack).toEqual({
+      const ack = decodePanelProtocolMessage(ackRaw, {
+        direction: "host-to-client",
+        phase: "authenticated",
+      });
+      expect(ack.outcome).toBe("accepted");
+      if (ack.outcome !== "accepted") return;
+      expect(ack.message).toEqual({
+        protocolVersion: PANEL_PROTOCOL_VERSION,
         type: "transfer_cancel_ack",
         transferId: "transfer-1",
       });
@@ -586,12 +603,14 @@ describe("Panel transport server contract", () => {
       await onceMessage(socket); // ready
       send(socket, { type: "download_cancel", downloadId: "download-1" });
       const ackRaw = await onceMessage(socket);
-      const ack = decode<{
-        type: string;
-        downloadId: string;
-        action: string;
-      }>(ackRaw);
-      expect(ack).toEqual({
+      const ack = decodePanelProtocolMessage(ackRaw, {
+        direction: "host-to-client",
+        phase: "authenticated",
+      });
+      expect(ack.outcome).toBe("accepted");
+      if (ack.outcome !== "accepted") return;
+      expect(ack.message).toEqual({
+        protocolVersion: PANEL_PROTOCOL_VERSION,
         type: "download_ack",
         downloadId: "download-1",
         action: "cancelled",
@@ -623,7 +642,15 @@ describe("Panel transport server contract", () => {
       subscribeDownloads: (onUpdate) => {
         const interval = setInterval(() => {
           pushCount += 1;
-          onUpdate({ downloads: [], limits: { maxFileBytes: 1 } });
+          onUpdate({
+            downloads: [],
+            limits: {
+              maxFileBytes: BROWSER_DOWNLOAD_MAX_FILE_BYTES,
+              maxProfileBytes: BROWSER_DOWNLOAD_MAX_PROFILE_BYTES,
+              expiryMs: BROWSER_DOWNLOAD_TTL_MS,
+            },
+            freeSpaceBytes: null,
+          });
         }, 5);
         return () => clearInterval(interval);
       },
@@ -640,8 +667,13 @@ describe("Panel transport server contract", () => {
       send(socket, redeemMessage(issued));
       await onceMessage(socket); // ready
       const updateRaw = await onceMessage(socket);
-      const update = decode<{ type: string; update: unknown }>(updateRaw);
-      expect(update.type).toBe("downloads_update");
+      const update = decodePanelProtocolMessage(updateRaw, {
+        direction: "host-to-client",
+        phase: "authenticated",
+      });
+      expect(update.outcome).toBe("accepted");
+      if (update.outcome !== "accepted") return;
+      expect(update.message.type).toBe("downloads_update");
       expect(pushCount).toBeGreaterThan(0);
       socket.close();
     } finally {
@@ -808,6 +840,29 @@ describe("Panel transport server contract", () => {
       }),
       category: "invalid-shape",
     },
+    {
+      name: "pre-redemption dialog response",
+      redeemFirst: false,
+      raw: JSON.stringify({
+        protocolVersion: PANEL_PROTOCOL_VERSION,
+        type: "dialog_response",
+        dialogId: "dialog-1",
+        accept: true,
+        text: "typed-owner-input",
+      }),
+      category: "invalid-phase",
+    },
+    {
+      name: "malformed clipboard copy",
+      redeemFirst: true,
+      raw: JSON.stringify({
+        protocolVersion: PANEL_PROTOCOL_VERSION,
+        type: "clipboard_copy",
+        secret: "capability-secret-must-never-leak",
+        payload: { kind: "click", text: "typed-owner-input" },
+      }),
+      category: "invalid-shape",
+    },
   ])(
     "fails closed on $name without forwarding input or leaking payload bytes",
     async ({ redeemFirst, raw, category }) => {
@@ -875,4 +930,124 @@ describe("Panel transport server contract", () => {
       }
     },
   );
+
+  it("drops an out-of-order dialog response that names no open dialog", async () => {
+    const clock = { now: () => 1_000_000 };
+    const capabilities = createPanelCapabilityStore({ clock });
+    const gateway = createPanelGateway({
+      capabilities,
+      hostId,
+      profileId,
+      clock,
+    });
+    const stream = createAutomationStreamAdapter({ clock, capabilities });
+    const source = createFakeScreencastSource({ frameCount: 0 });
+    const responses: string[] = [];
+    source.respondToDialog = (dialogId) => {
+      responses.push(dialogId);
+    };
+    const transport = createPanelTransportServer({
+      gateway,
+      stream,
+      source,
+      clock,
+    });
+    const port = await transport.start();
+    try {
+      const socket = await connect(port);
+      send(
+        socket,
+        redeemMessage(
+          capabilities.issue({
+            ownerSessionId,
+            panelId,
+            hostId,
+            profileId,
+          }),
+        ),
+      );
+      await onceMessage(socket);
+      send(socket, {
+        type: "dialog_response",
+        dialogId: "missing-dialog",
+        accept: true,
+        text: "typed-owner-input",
+      });
+      await waitForSettled(() => responses.length === 0);
+      expect(responses).toEqual([]);
+      expect(source.inputs).toEqual([]);
+      socket.close();
+    } finally {
+      await transport.stop();
+    }
+  });
+
+  it("fails closed when auxiliary clipboard actions exceed the rate limit", async () => {
+    const clock = { now: () => 1_000_000 };
+    const capabilities = createPanelCapabilityStore({ clock });
+    const gateway = createPanelGateway({
+      capabilities,
+      hostId,
+      profileId,
+      clock,
+    });
+    const stream = createAutomationStreamAdapter({ clock, capabilities });
+    const source = createFakeScreencastSource({ frameCount: 0 });
+    const copies: string[] = [];
+    const transport = createPanelTransportServer({
+      gateway,
+      stream,
+      source,
+      clock,
+      clipboardExchange: createClipboardExchange({
+        effects: {
+          readSelectionBytes: async () => {
+            copies.push("copy");
+            return 4;
+          },
+          writeClipboardToPage: async (_actor, bytes) => bytes,
+        },
+      }),
+    });
+    const port = await transport.start();
+    try {
+      const socket = await connect(port);
+      const inbox = collectMessages(socket);
+      send(
+        socket,
+        redeemMessage(
+          capabilities.issue({
+            ownerSessionId,
+            panelId,
+            hostId,
+            profileId,
+          }),
+        ),
+      );
+      await inbox.waitFor(
+        (message) => decode<{ type: string }>(message).type === "ready",
+      );
+      for (
+        let index = 0;
+        index <= PANEL_GATEWAY_INPUT_MAX_PER_SECOND;
+        index += 1
+      ) {
+        send(socket, { type: "clipboard_copy", copyId: `copy-${index}` });
+      }
+      const errorRaw = await inbox.waitFor((message) => {
+        const parsed = decode<{ type?: string; reason?: string }>(message);
+        return parsed.type === "error" && parsed.reason === "rate-limited";
+      });
+      expect(decode<{ type: string; reason: string }>(errorRaw)).toEqual({
+        type: "error",
+        reason: "rate-limited",
+      });
+      expect(copies.length).toBeLessThanOrEqual(
+        PANEL_GATEWAY_INPUT_MAX_PER_SECOND,
+      );
+      socket.close();
+    } finally {
+      await transport.stop();
+    }
+  });
 });

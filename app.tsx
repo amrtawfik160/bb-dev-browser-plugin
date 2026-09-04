@@ -72,6 +72,7 @@ import {
   PANEL_PROTOCOL_VERSION,
   decodePanelProtocolMessage,
   encodePanelProtocolMessage,
+  type PanelProtocolMessage,
 } from "./panel-protocol.js";
 import {
   clearPanelTimeout,
@@ -494,49 +495,6 @@ function PanelStreamSurface({
           socket?.close();
           return;
         }
-        if (decoded.outcome === "legacy") {
-          const message = decoded.value as {
-            type?: string;
-            dialog?: BrowserDialogEvent | null;
-            queryId?: string;
-            point?: { x: number; y: number };
-            actions?: BrowserContextAction[];
-            update?: {
-              downloads?: BrowserDownloadListingEntry[];
-              limits?: BrowserDownloadLimits;
-            } | null;
-          };
-          if (message.type === "dialog") {
-            // A null dialog clears any open modal; a non-null dialog opens (or
-            // re-opens after a bounded reconnect) the actionable BB panel UI.
-            setDialog(message.dialog ?? null);
-            if (message.dialog === null) setContextMenu(null);
-            return;
-          }
-          if (message.type === "context_menu") {
-            if (message.queryId !== undefined && message.point !== undefined) {
-              setContextMenu({
-                queryId: message.queryId,
-                point: message.point,
-                actions: message.actions ?? [],
-              });
-            }
-            return;
-          }
-          if (message.type === "downloads_update") {
-            // The host pushed the live Host Downloads quarantine listing. Only
-            // metadata (id, safe name, size, state, limits, expiry, errors) is
-            // carried — never file contents or full URLs (issue #20).
-            const update = message.update ?? {};
-            if (Array.isArray(update.downloads)) {
-              setDownloads(update.downloads);
-            }
-            if (update.limits !== undefined) {
-              setDownloadsLimits(update.limits);
-            }
-          }
-          return;
-        }
         const message = decoded.message;
         if (message.type === "ready") {
           if (stream.state === "reconnecting") stream.reconnectSucceeded();
@@ -573,6 +531,23 @@ function PanelStreamSurface({
         if (message.type === "protocol_error") {
           stream.freezeInput();
           socket?.close();
+          return;
+        }
+        if (message.type === "dialog") {
+          setDialog(message.dialog);
+          return;
+        }
+        if (message.type === "context_menu") {
+          setContextMenu({
+            queryId: message.queryId,
+            point: message.point,
+            actions: message.actions,
+          });
+          return;
+        }
+        if (message.type === "downloads_update") {
+          setDownloads(message.update.downloads);
+          setDownloadsLimits(message.update.limits);
         }
       });
       socket.addEventListener("close", () => {
@@ -614,10 +589,11 @@ function PanelStreamSurface({
   // Render the stream surface whenever the panel is authorized to stream. The
   // region always carries the Automation Mode policy text so spectators see the
   // viewport bounds and FPS window regardless of the live connection state.
-  function sendStream(message: unknown) {
+  function sendStream(message: PanelProtocolMessage) {
     const socket = socketRef.current;
-    if (socket !== null && socket.readyState === WebSocket.OPEN)
-      socket.send(JSON.stringify(message));
+    if (socket === null || socket.readyState !== WebSocket.OPEN) return;
+    const encoded = encodePanelProtocolMessage(message);
+    if (encoded.outcome === "encoded") socket.send(encoded.raw);
   }
 
   function handleContext(event: React.MouseEvent<HTMLCanvasElement>) {
@@ -634,12 +610,19 @@ function PanelStreamSurface({
     const x = (event.clientX - rect.left) * scaleX;
     const y = (event.clientY - rect.top) * scaleY;
     const queryId = `ctx-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-    sendStream({ type: "context_query", queryId, x, y });
+    sendStream({
+      protocolVersion: PANEL_PROTOCOL_VERSION,
+      type: "context_query",
+      queryId,
+      x,
+      y,
+    });
   }
 
   function respondToDialog(accept: boolean, text?: string) {
     if (dialog === null) return;
     sendStream({
+      protocolVersion: PANEL_PROTOCOL_VERSION,
       type: "dialog_response",
       dialogId: dialog.dialogId,
       accept,
@@ -649,7 +632,11 @@ function PanelStreamSurface({
   }
 
   function chooseContextAction(action: BrowserContextAction) {
-    sendStream({ type: "context_action", actionId: action.actionId });
+    sendStream({
+      protocolVersion: PANEL_PROTOCOL_VERSION,
+      type: "context_action",
+      actionId: action.actionId,
+    });
     setContextMenu(null);
   }
 
@@ -660,7 +647,11 @@ function PanelStreamSurface({
    */
   function cancelDownload(downloadId: string) {
     if (!isController) return;
-    sendStream({ type: "download_cancel", downloadId });
+    sendStream({
+      protocolVersion: PANEL_PROTOCOL_VERSION,
+      type: "download_cancel",
+      downloadId,
+    });
   }
 
   /**
