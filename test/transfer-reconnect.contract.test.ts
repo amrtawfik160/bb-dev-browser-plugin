@@ -69,6 +69,12 @@ describe("Transfer Staging on host reconnect (issue #19)", () => {
       history: async () => {
         throw new Error("not used");
       },
+      openPage: async () => {
+        throw new Error("not used");
+      },
+      focusPage: async () => {
+        throw new Error("not used");
+      },
       closePages: async () => 0,
       listPages: async () => [],
       status: async ({

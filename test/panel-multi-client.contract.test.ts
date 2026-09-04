@@ -1,35 +1,13 @@
 // @vitest-environment jsdom
 import { waitFor } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
-import { DEFAULT_PROFILE_ID, type BrowserStatus } from "../contracts.js";
-import { createPublicPluginHarness } from "./public-plugin-harness.js";
+import { DEFAULT_PROFILE_ID } from "../contracts.js";
+import {
+  createPublicPluginHarness,
+  healthyBrowserStatus as healthyStatus,
+} from "./public-plugin-harness.js";
 
 const HOST_ID = "host-browser-test";
-
-const healthyStatus: BrowserStatus = {
-  hostId: HOST_ID,
-  profileId: DEFAULT_PROFILE_ID,
-  state: "healthy",
-  code: "healthy",
-  label: "Ready",
-  message: "Workspace Browser is ready on this host.",
-  capabilities: [
-    ["operating-system", "Operating system", "Ubuntu 24.04 is supported."],
-    ["architecture", "Architecture", "x86_64 is supported."],
-    ["bb-connect", "BB Connect", "The host is enrolled in BB Connect."],
-    ["browser", "Browser", "Google Chrome 140 is available."],
-    ["sandbox", "Browser sandbox", "The Chrome sandbox is available."],
-    ["dedicated-user", "Dedicated browser user", "bb-browser is configured."],
-    ["protected-storage", "Protected storage", "Storage is protected."],
-    ["disk-headroom", "Disk headroom", "At least 5 GiB is free."],
-    ["loopback", "Loopback networking", "Loopback is available."],
-  ].map(([id, label, reason]) => ({
-    id: id as BrowserStatus["capabilities"][number]["id"],
-    label,
-    status: "ready" as const,
-    reason,
-  })),
-};
 
 function target() {
   return {
@@ -269,21 +247,84 @@ describe("Browser Panel multi-client control (issue #16)", () => {
     await browser.dispose();
   });
 
-  it("renders the control surface and Take control control on the panel", async () => {
+  it("takes the panel's own size as the shared viewport, clamped to the streaming ceiling", async () => {
     const browser = await createPublicPluginHarness({ status: healthyStatus });
-    const panel = await browser.openExistingThreadPanel();
-    // The panel mounts and fetches control state; the control surface is
-    // labeled and exposes the Take/Release control action.
-    await waitFor(() =>
-      expect(
-        panel.panel.queryByLabelText("Browser Control Lease"),
-      ).not.toBeNull(),
-    );
-    // The control surface shows a Take control or Release control button.
-    const button = await panel.panel.findByRole("button", {
-      name: /control/iu,
-    });
-    expect(button).toBeTruthy();
-    await browser.dispose();
+    try {
+      const joined = await browser.runBrowserPanelControl({
+        ...target(),
+        panelId: "panel-a",
+        ownerSessionId: "session-a",
+        viewport: { width: 1024, height: 768 },
+      });
+      expect(joined.control.controllerViewport).toEqual({
+        width: 1024,
+        height: 768,
+      });
+
+      // A resize reports the new size through the same call, so what the host
+      // captures is what the owner is looking at rather than a fixed size
+      // unrelated to the panel.
+      const resized = await browser.runBrowserPanelControl({
+        ...target(),
+        panelId: "panel-a",
+        ownerSessionId: "session-a",
+        viewport: { width: 1440, height: 900 },
+      });
+      expect(resized.control.controllerViewport).toEqual({
+        width: 1440,
+        height: 900,
+      });
+
+      // ADR 0007 sets a ceiling, and a panel wider than it never asks for more.
+      const clamped = await browser.runBrowserPanelControl({
+        ...target(),
+        panelId: "panel-a",
+        ownerSessionId: "session-a",
+        viewport: { width: 5000, height: 4000 },
+      });
+      expect(clamped.control.controllerViewport).toEqual({
+        width: 1920,
+        height: 1080,
+      });
+
+      // A second client letterboxes the controller's viewport; its own size
+      // never resizes the shared page.
+      const spectator = await browser.runBrowserPanelControl({
+        ...target(),
+        panelId: "panel-b",
+        ownerSessionId: "session-b",
+        viewport: { width: 400, height: 300 },
+      });
+      expect(spectator.role).toBe("spectator");
+      expect(spectator.control.controllerViewport).toEqual({
+        width: 1920,
+        height: 1080,
+      });
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("gives the panel that holds control the address bar, and a second panel the way to take it", async () => {
+    const browser = await createPublicPluginHarness({ status: healthyStatus });
+    try {
+      const controller = browser.renderPanel();
+      const spectator = browser.renderPanel();
+
+      // The panel that holds control drives the browser, so it gets the
+      // address bar and the history controls.
+      await controller.findByLabelText("Address or search");
+      await controller.findByRole("button", { name: "Go back" });
+
+      // The second client is view-only, so where the address bar would be it
+      // gets the one action that changes that.
+      await waitFor(() =>
+        expect(spectator.queryByLabelText("Address or search")).toBeNull(),
+      );
+      await spectator.findByRole("button", { name: "Take control" });
+      expect(spectator.queryByRole("button", { name: "Go back" })).toBeNull();
+    } finally {
+      await browser.dispose();
+    }
   });
 });
