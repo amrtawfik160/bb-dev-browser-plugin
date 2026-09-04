@@ -264,7 +264,10 @@ export async function createPublicPluginHarness(options?: {
   };
   hostIds?: readonly string[];
   projectHostIds?: readonly string[];
+  environmentlessThread?: boolean;
   probeFailure?: boolean;
+  /** Fail this many readiness probes, then answer normally. */
+  probeFailuresBeforeReady?: number;
   snapshot?: HostProbeSnapshot;
   privilegedExecutor?: PrivilegedExecutor;
   administrationStateStore?: HostAdministrationStateStore;
@@ -372,11 +375,16 @@ export async function createPublicPluginHarness(options?: {
       : createHostReadinessBoundary({
           snapshot: async () => options.snapshot!,
         });
+  let remainingProbeFailures = options?.probeFailuresBeforeReady ?? 0;
   const setupBoundary: HostSetupBoundary = {
     inspect: (target) => {
       setupInspectionTargets.push(target);
       if (options?.probeFailure === true) {
         throw new Error("retained worker probe failed");
+      }
+      if (remainingProbeFailures > 0) {
+        remainingProbeFailures -= 1;
+        throw new Error("retained worker is still starting");
       }
       return fixtureBoundary.inspect(target);
     },
@@ -473,7 +481,8 @@ export async function createPublicPluginHarness(options?: {
               threadId === "thread-foreign-project"
                 ? "project-foreign"
                 : PROJECT_ID,
-            environmentId: ENVIRONMENT_ID,
+            environmentId:
+              options?.environmentlessThread === true ? null : ENVIRONMENT_ID,
           }),
       },
       environments: {

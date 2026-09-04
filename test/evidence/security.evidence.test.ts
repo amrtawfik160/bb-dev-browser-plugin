@@ -10,11 +10,11 @@
  * Login opacity, Transfer Staging traversal/symlink rejection, stream frame
  * rate/reclaim, Browser Result bounds). This file therefore does not re-assert
  * them in isolation; it keeps only the genuinely novel cross-cutting evidence
- * that the contract suites do not cover:
- *   - origin enforcement registered at the context level so a later newPage()
- *     shares interception (an ordering angle beyond the contract suite), and
- *   - QuickJS isolation proven by source-grepping the bundled dev-browser
- *     daemon for `Object.freeze(browserApi)` and the absence of `newContext`.
+ * that the contract suites do not cover: QuickJS isolation proven by
+ * source-grepping the bundled dev-browser daemon for
+ * `Object.freeze(browserApi)` and the absence of `newContext`. Host-owned
+ * Origin Scope interception is covered by
+ * `origin-scope-host.contract.test.ts`.
  *
  * The real-process boundaries (unprivileged OS identity, Chrome sandbox,
  * loopback CDP listener) are proven by the mandatory provisioned-host gate and
@@ -28,28 +28,12 @@ import { dirname } from "node:path";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { enforcementPreambleScript } from "../../origin-scope.js";
 import {
   integrationEnabled,
   realBrowserProvisioned,
 } from "../fixtures/evidence-helpers.js";
 
 describe("issue #21 AC3 Security matrix", () => {
-  it("enforces origin scope at the context level so new pages share interception", () => {
-    const preamble = enforcementPreambleScript(
-      { kind: "exact", origin: "https://app.example.test" },
-      "bb-security-denial",
-      [],
-    );
-    // The enforcement route is registered at the context level before agent
-    // code runs, so a newPage() the agent opens shares interception.
-    expect(preamble).toContain('await context.route("**/*"');
-    const wrapped = `${preamble}\nawait browser.newPage()`;
-    expect(wrapped.indexOf("__bbEnforceOriginScope")).toBeLessThan(
-      wrapped.indexOf("browser.newPage()"),
-    );
-  });
-
   it("proves QuickJS isolation: the dev-browser sandbox browser global is frozen with no newContext", async () => {
     const require = createRequire(import.meta.url);
     const devBrowserDirectory = dirname(

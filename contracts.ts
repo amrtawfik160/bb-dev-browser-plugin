@@ -17,6 +17,7 @@ export const PROFILE_ARCHIVE_RETENTION_DAYS = 30;
 export const ACTIVITY_RECORD_LIMIT = 10_000;
 export const ACTIVITY_RETENTION_DAYS = 30;
 export const ACTIVITY_OUTBOX_BATCH_LIMIT = 100;
+export const BROWSER_SCRIPT_MIN_TIMEOUT_MS = 1_000;
 export const BROWSER_SCRIPT_MAX_TIMEOUT_MS = 30_000;
 export const BROWSER_SCRIPT_RESULT_LIMIT_BYTES = 256 * 1024;
 export const BROWSER_SCRIPT_MAX_SCREENSHOTS = 3;
@@ -1525,6 +1526,14 @@ export function wakingBrowserStatus(ready: BrowserStatus): BrowserStatus {
     label: "Waking",
     message: "This Browser Instance is waking from its Browser Profile.",
   };
+}
+
+export function hostCanDispatchAutomation(status: BrowserStatus): boolean {
+  return (
+    status.state === "healthy" ||
+    status.state === "sleeping" ||
+    status.state === "waking"
+  );
 }
 
 export function hostProbeFailedStatus(
@@ -3118,7 +3127,7 @@ export const browserScriptParametersSchema = z
     timeoutMs: z
       .number()
       .int()
-      .positive()
+      .min(BROWSER_SCRIPT_MIN_TIMEOUT_MS)
       .max(BROWSER_SCRIPT_MAX_TIMEOUT_MS)
       .default(BROWSER_SCRIPT_MAX_TIMEOUT_MS),
     screenshot: z.boolean().default(false),
@@ -3143,7 +3152,7 @@ export const browserScriptRequestSchema = browserScriptParametersSchema
     originScope: browserOriginScopeSchema.optional(),
     /**
      * The per-origin invalid-certificate opt-ins resolved from the active
-     * grant. The host carries them into the enforcement preamble so navigation
+     * grant. The host carries them into its navigation guard so navigation
      * to a granted origin can load despite a bad TLS certificate, using the
      * same normalized policy the grant store approved.
      */

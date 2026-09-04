@@ -331,7 +331,7 @@ async function originScopeAcceptance() {
         attacks.push({
           kind: attack.kind,
           blocked: true,
-          deniedOrigin: error.origin,
+          ...(error.origin === null ? {} : { deniedOrigin: error.origin }),
         });
         continue;
       }

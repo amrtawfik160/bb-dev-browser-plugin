@@ -9,10 +9,27 @@ Common conventions:
 
 - `--json` (where shown) returns structured output; without it, commands print
   human-readable text.
-- `--host <id>` (where shown) selects a host. The `script` command does not
-  accept `--host` — it derives the host from BB context.
+- `--host <id>` (where shown) selects a host. The agent `script` and `open`
+  commands do not accept `--host` — they derive the host from BB context.
 - `--profile <id>` (where shown) selects a Browser Profile; omit it to use the
   selected profile.
+
+## Opening the browser
+
+```text
+bb browser open <url> [--profile <id>] [--timeout <ms>] [--screenshot] [--json]
+```
+
+With an HTTP(S) URL, navigates the active tab and reports the resulting URL,
+page title, and tab ID. URL navigation is an agent operation: it derives the
+project and host from BB context, requires a matching Profile Grant, holds a
+Control Lease, and records the actor as `agent`.
+
+The URL is required. A no-argument `open` fails before resolving the profile or
+reading the host's tab inventory, so it cannot disclose an owner's tab URL,
+title, or runtime tab ID. Use the authenticated Browser Panel to inspect or
+navigate the current tab. Bare search text is rejected for agent opens; enter
+searches in the Browser Panel.
 
 ## Readiness and diagnostics
 
@@ -31,13 +48,16 @@ bb browser diagnostics [--profile <id>] [--host <id>] [--json]
 ## Agent script
 
 ```text
-bb browser script --purpose <text> --code <source> \
-  [--profile <id>] [--tab <id>] [--origin <origin>] [--timeout <ms>] \
+bb browser script --purpose <text> --code <source> --origin <origin> \
+  [--profile <id>] [--tab <id>] [--timeout <ms>] \
   [--screenshot] [--file-transfer] [--invalid-certificate] [--json]
 ```
 
-`--purpose` and `--code` are required. `--timeout` must be an integer from 1 to 30000. `--host` and `--confirm` are invalid for `script`. See
-[agent-reference.md](agent-reference.md) for typed results.
+`--purpose`, `--code`, and `--origin` are required. `--origin` must be an exact
+web origin such as `https://example.com`. `--timeout` must be an integer from
+1000 to 30000. `--host` and `--confirm` are invalid for `script`. The script
+runs with Playwright `page` bound to the active tab; `return` values print as
+the result. See [agent-reference.md](agent-reference.md) for typed results.
 
 ## Activity records
 
@@ -49,15 +69,22 @@ bb browser activity-clear [--profile <id>] --confirm "Clear Browser activity rec
 
 `activity-clear` requires the literal confirmation text shown above.
 
-## Grant requests
+## Grants and grant requests
 
 ```text
 bb browser requests [--json]
 bb browser request-status --request <id> [--json]
 ```
 
-Grant approval itself happens in authenticated Browser Settings; the CLI exposes
-inspection only. `--request` is only valid for `request-status`.
+These are project-scoped, metadata-only request reads. Profile Grant creation,
+listing, revocation, approval, and denial require an authenticated owner session
+in Browser Settings. The compatibility command names `trust`, `untrust`,
+`grants`, `grant`, `revoke`, `approve`, and `deny` always exit nonzero with that
+guidance, including when their flags are incomplete. The CLI never treats shell
+access, TTY presence, or a confirmation flag as owner authentication.
+
+Grantable scopes remain exact origins (`https://example.com`), explicit
+subdomain patterns (`https://*.example.com`), or `*`; paths are not grantable.
 
 ## Profiles
 

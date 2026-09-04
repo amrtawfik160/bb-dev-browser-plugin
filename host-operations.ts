@@ -35,6 +35,10 @@ import {
 import type { HostReadinessBoundary } from "./readiness.js";
 import { fallbackBrowserPaths } from "./browser-fallback.js";
 import { PINNED_BROWSER_RUNTIME } from "./dependency-inventory.js";
+import {
+  stageFallbackPack,
+  type StagedFallbackPack,
+} from "./fallback-ingestion.js";
 
 export const BROWSER_USER = "bb-browser";
 export const BROWSER_USER_HOME = BROWSER_STORAGE_ROOT;
@@ -297,22 +301,28 @@ async function installOwnedDirectory(run: ExecuteFile, path: string) {
   ]);
 }
 
-async function installFallbackExecutable(
+async function installFallbackPack(
   run: ExecuteFile,
   fallback: Extract<
     PrivilegedOperation,
     { kind: "configure-protected-storage" }
   >["fallback"],
+  stagedPack: StagedFallbackPack,
 ) {
-  await run("/usr/bin/install", [
-    "-m",
-    "0755",
-    "-o",
-    BROWSER_USER,
-    "-g",
-    BROWSER_USER,
-    fallback.sourcePath,
-    fallback.executablePath,
+  // Playwright's cache is mutable. Only the private, regular-file staging tree
+  // crosses into the privileged setup boundary.
+  await run("/usr/bin/cp", [
+    "-a",
+    "--no-preserve=ownership",
+    "--remove-destination",
+    `${stagedPack.packDirectory}/.`,
+    fallback.directory,
+  ]);
+  await run("/usr/bin/chown", [
+    "-R",
+    "--no-dereference",
+    `${BROWSER_USER}:${BROWSER_USER}`,
+    fallback.directory,
   ]);
 }
 
@@ -322,8 +332,9 @@ async function writeSetupEvidence(
     PrivilegedOperation,
     { kind: "configure-protected-storage" }
   >,
+  executablePath: string,
 ) {
-  const executable = await readFile(operation.fallback.sourcePath);
+  const executable = await readFile(executablePath);
   const hostStatePath = join(directory, "host-state.json");
   const manifestPath = join(directory, "version.json");
   await writeFile(
@@ -351,28 +362,95 @@ async function configureProtectedStorage(
     { kind: "configure-protected-storage" }
   >,
 ) {
-  for (const directory of [operation.path, operation.fallback.directory]) {
-    await installOwnedDirectory(run, directory);
-  }
-  await installFallbackExecutable(run, operation.fallback);
-  const temporaryDirectory = await mkdtemp(join(tmpdir(), "bb-browser-setup-"));
+  const stagedPack = await stageFallbackPack(operation.fallback.sourcePath);
   try {
-    const { hostStatePath, manifestPath } = await writeSetupEvidence(
-      temporaryDirectory,
-      operation,
+    for (const directory of [operation.path, operation.fallback.directory]) {
+      await installOwnedDirectory(run, directory);
+    }
+    await installFallbackPack(run, operation.fallback, stagedPack);
+    const temporaryDirectory = await mkdtemp(
+      join(tmpdir(), "bb-browser-setup-"),
     );
-    await installConfigurationFile(
-      run,
-      hostStatePath,
-      join(operation.path, "host-state.json"),
-    );
-    await installConfigurationFile(
-      run,
-      manifestPath,
-      operation.fallback.manifestPath,
-    );
+    try {
+      const { hostStatePath, manifestPath } = await writeSetupEvidence(
+        temporaryDirectory,
+        operation,
+        stagedPack.executablePath,
+      );
+      await installConfigurationFile(
+        run,
+        hostStatePath,
+        join(operation.path, "host-state.json"),
+      );
+      await installConfigurationFile(
+        run,
+        manifestPath,
+        operation.fallback.manifestPath,
+      );
+    } finally {
+      await rm(temporaryDirectory, { recursive: true, force: true });
+    }
   } finally {
-    await rm(temporaryDirectory, { recursive: true, force: true });
+    await rm(stagedPack.rootDirectory, { recursive: true, force: true });
+  }
+}
+
+async function createDedicatedUser(
+  run: ExecuteFile,
+  operation: Extract<PrivilegedOperation, { kind: "create-dedicated-user" }>,
+) {
+  try {
+    await run("/usr/sbin/useradd", [
+      "--system",
+      "--shell",
+      operation.shell,
+      "--home",
+      operation.homeDirectory,
+      operation.username,
+    ]);
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === 9) return;
+    throw error;
+  }
+}
+
+function stderrOf(error: unknown): string {
+  if (typeof error === "object" && error !== null && "stderr" in error) {
+    const stderr = (error as { stderr: unknown }).stderr;
+    if (typeof stderr === "string") return stderr;
+    if (Buffer.isBuffer(stderr)) return stderr.toString("utf8");
+  }
+  return error instanceof Error ? error.message : "";
+}
+
+function isMissingAptPackage(error: unknown, packageName: string): boolean {
+  return stderrOf(error).includes(`Unable to locate package ${packageName}`);
+}
+
+async function installSystemPackages(
+  run: ExecuteFile,
+  operation: Extract<PrivilegedOperation, { kind: "install-system-packages" }>,
+) {
+  for (const packageName of operation.packages) {
+    try {
+      await run("/usr/bin/apt-get", [
+        "install",
+        "-y",
+        "--no-remove",
+        packageName,
+      ]);
+    } catch (error) {
+      // Chrome Stable is the preferred browser but is not in the default
+      // Ubuntu/Debian archive. Setup still completes so the pinned Playwright
+      // Chromium fallback can be copied during protected-storage.
+      if (
+        packageName === "google-chrome-stable" &&
+        isMissingAptPackage(error, packageName)
+      ) {
+        continue;
+      }
+      throw error;
+    }
   }
 }
 
@@ -380,6 +458,12 @@ async function executeProductionOperation(
   run: ExecuteFile,
   operation: PrivilegedOperation,
 ) {
+  if (operation.kind === "create-dedicated-user") {
+    return createDedicatedUser(run, operation);
+  }
+  if (operation.kind === "install-system-packages") {
+    return installSystemPackages(run, operation);
+  }
   if (operation.kind === "stop-profile-processes") {
     return stopMatchingProcesses(run, profileStopArguments(operation));
   }

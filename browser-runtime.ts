@@ -30,9 +30,16 @@ import {
   type OriginScopeMatcher,
 } from "./authorization.js";
 import {
-  enforcementPreambleScript,
-  extractOriginDenial,
+  BrowserOriginScopeDeniedError,
+  type BrowserOriginScopePolicy,
 } from "./origin-scope.js";
+export { BrowserOriginScopeDeniedError } from "./origin-scope.js";
+import {
+  NON_WEB_NAVIGATION_DENIED_MESSAGE,
+  prepareAgentExecution,
+  preferredTabOrigin,
+  TAB_INVALID_MESSAGE,
+} from "./agent-script.js";
 import { inspectFallbackBrowser } from "./browser-fallback.js";
 import {
   BROWSER_SCRIPT_MAX_SCREENSHOT_BYTES,
@@ -96,13 +103,7 @@ export type BrowserExecutionRequest = {
     marker: string;
     mimeType: "image/png";
   };
-  /**
-   * An opaque Origin Scope denial marker the enforcement preamble prints when it
-   * blocks an out-of-scope navigation. When set, the process boundary surfaces
-   * stdout even on a non-zero exit if the marker appears, so the runtime can
-   * classify the denial instead of reporting a generic script failure.
-   */
-  denialMarker?: string;
+  originPolicy?: BrowserOriginScopePolicy;
 };
 
 export type BrowserOperationOptions = {
@@ -111,15 +112,14 @@ export type BrowserOperationOptions = {
   screenshot?: boolean;
   /**
    * The resolved Profile Grant Origin Scope to enforce during real browser
-   * navigation while an agent script runs. When present, the runtime wraps the
-   * agent code with a preamble that aborts out-of-scope navigation requests
-   * before commit and surfaces a typed origin_denied result. Omitting it leaves
-   * navigation unrestricted (owner browsing through the panel).
+   * navigation while an agent script runs. The process boundary installs a
+   * host-owned guard before starting the sandbox helper. Omitting it leaves
+   * navigation unrestricted for owner browsing through the panel.
    */
   originScope?: string;
   /**
    * The per-origin invalid-certificate opt-ins resolved from the active grant.
-   * When set alongside {@link originScope}, the enforcement preamble bypasses
+   * When set alongside {@link originScope}, the host-owned guard bypasses
    * TLS certificate errors for navigation to these granted origins so they can
    * load despite a bad certificate, using the same normalized policy the grant
    * store approved. Origins within scope that lack the opt-in continue
@@ -216,15 +216,6 @@ export class BrowserScriptExecutionError extends Error {
  * The host turns this into a typed `origin_denied` Browser Result carrying the
  * denied origin so the server can attach a Grant Request.
  */
-export class BrowserOriginScopeDeniedError extends Error {
-  constructor(public readonly origin: string) {
-    super(
-      `Browser navigation to ${origin} was denied by the active Profile Grant.`,
-    );
-    this.name = "BrowserOriginScopeDeniedError";
-  }
-}
-
 export function validateBrowserLaunchPolicy(launch: {
   runAsUser: string;
   effectiveUserId: number;
@@ -842,7 +833,7 @@ function executionRequest(
   timeoutMs: number,
   signal?: AbortSignal,
   screenshot?: BrowserExecutionRequest["screenshot"],
-  denialMarker?: string,
+  originPolicy?: BrowserOriginScopePolicy,
 ): BrowserExecutionRequest {
   return {
     endpoint: held.publicState.automationEndpoint,
@@ -852,12 +843,9 @@ function executionRequest(
     runtimeDirectory: held.runtimeDirectory,
     ...(signal === undefined ? {} : { signal }),
     ...(screenshot === undefined ? {} : { screenshot }),
-    ...(denialMarker === undefined ? {} : { denialMarker }),
+    ...(originPolicy === undefined ? {} : { originPolicy }),
   };
 }
-
-const TAB_INVALID_MESSAGE =
-  "Browser Tab is invalid or belongs to a previous runtime";
 
 /**
  * Classifies a worker-execution error from a typed signal this runtime owns.
@@ -868,58 +856,22 @@ const TAB_INVALID_MESSAGE =
  * module. Unrecognized worker errors are left untouched so the host reports
  * them as `script_failed`.
  */
-function classifyExecutionError(error: unknown): unknown {
+function classifyExecutionError(
+  error: unknown,
+  enforceNonWebNavigation: boolean,
+): unknown {
   if (error instanceof BrowserScriptExecutionError) return error;
+  if (
+    enforceNonWebNavigation &&
+    error instanceof Error &&
+    error.message.includes(NON_WEB_NAVIGATION_DENIED_MESSAGE)
+  ) {
+    return new BrowserOriginScopeDeniedError(null);
+  }
   if (error instanceof Error && error.message.includes(TAB_INVALID_MESSAGE)) {
     return new BrowserScriptExecutionError("tab_invalid", error.message);
   }
   return error;
-}
-
-function targetedTabPreamble(tabId: string) {
-  return `const __bbTargetPages = await browser.listPages();
-if (!__bbTargetPages.some((entry) => entry.id === ${JSON.stringify(tabId)})) throw new Error(${JSON.stringify(
-    TAB_INVALID_MESSAGE,
-  )});
-const __bbTargetPage = await browser.getPage(${JSON.stringify(tabId)});
-await __bbTargetPage.bringToFront();`;
-}
-
-function activateTargetedTab(tabId: string, code: string) {
-  return `${targetedTabPreamble(tabId)}
-${code}`;
-}
-
-function appendNativeScreenshot(
-  code: string,
-  tabId: string | undefined,
-  screenshot: NonNullable<BrowserExecutionRequest["screenshot"]>,
-) {
-  const suffix = screenshot.marker.replace(/[^A-Za-z0-9]/gu, "");
-  const pageVariable = `__bbScreenshotPage${suffix}`;
-  const entryVariable = `__bbScreenshotEntry${suffix}`;
-  const pagesVariable = `__bbScreenshotPages${suffix}`;
-  const markerLine = JSON.stringify({ __bbScreenshot: screenshot.marker });
-  const pageSelection =
-    tabId === undefined
-      ? `const ${pagesVariable} = await browser.listPages();
-if (${pagesVariable}.length === 0) throw new Error("The Browser Profile has no open tabs");
-let ${pageVariable} = await browser.getPage(${pagesVariable}[0].id);
-for (const ${entryVariable} of ${pagesVariable}) {
-  const candidate = await browser.getPage(${entryVariable}.id);
-  if (await candidate.evaluate(() => document.visibilityState === "visible")) {
-    ${pageVariable} = candidate;
-    break;
-  }
-}`
-      : `const ${pageVariable} = __bbTargetPage;`;
-  return `try {
-${code}
-} finally {
-${pageSelection}
-await saveScreenshot(await ${pageVariable}.screenshot({ type: "png" }), ${JSON.stringify(screenshot.fileName)});
-console.log(${JSON.stringify(markerLine)});
-}`;
 }
 
 function linkedOperationSignal(options: BrowserOperationOptions) {
@@ -1485,6 +1437,23 @@ export function createBrowserInstanceRuntime(
     }
   }
 
+  async function quarantineOriginScopeFailure(
+    key: string,
+    held: HeldBrowserInstance,
+    denial: BrowserOriginScopeDeniedError,
+  ) {
+    try {
+      await stopHeld(key, held);
+    } catch (error) {
+      throw new BrowserOriginScopeDeniedError(denial.origin, {
+        cause: new AggregateError(
+          [denial.cause, error],
+          "Browser Instance quarantine failed.",
+        ),
+      });
+    }
+  }
+
   async function repairLifecycleStatus(
     target: Pick<BrowserRuntimeTarget, "hostId" | "profileId">,
   ) {
@@ -1589,25 +1558,23 @@ export function createBrowserInstanceRuntime(
         operationOptions.originScope === undefined
           ? undefined
           : originScopeMatcher(operationOptions.originScope);
-      const denialMarker =
-        matcher === undefined ? undefined : `bb-denial-${randomUUID()}`;
-      const codeForTarget =
-        target.tabId === undefined
-          ? code
-          : activateTargetedTab(target.tabId, code);
-      const enforcedCode =
-        matcher === undefined || denialMarker === undefined
-          ? codeForTarget
-          : `${enforcementPreambleScript(
+      const originPolicy: BrowserOriginScopePolicy | undefined =
+        matcher === undefined
+          ? undefined
+          : {
               matcher,
-              denialMarker,
-              operationOptions.invalidCertificateOrigins ?? [],
-            )}
-${codeForTarget}`;
-      const executionCode =
-        screenshot === undefined
-          ? enforcedCode
-          : appendNativeScreenshot(enforcedCode, target.tabId, screenshot);
+              invalidCertificateOrigins:
+                operationOptions.invalidCertificateOrigins ?? [],
+              timeoutMs,
+            };
+      const executionCode = prepareAgentExecution({
+        code,
+        tabId: target.tabId,
+        preferredOrigin: preferredTabOrigin(operationOptions.originScope),
+        timeoutMs,
+        enforceNonWebNavigation: originPolicy !== undefined,
+        screenshot,
+      });
       const operationSignal = linkedOperationSignal(operationOptions);
       try {
         try {
@@ -1620,20 +1587,24 @@ ${codeForTarget}`;
                 timeoutMs,
                 operationSignal.signal,
                 screenshot,
-                denialMarker,
+                originPolicy,
               ),
             ),
           );
-          if (matcher !== undefined && denialMarker !== undefined) {
-            const denial = extractOriginDenial(browserResult, denialMarker);
-            if (denial !== null) {
-              throw new BrowserOriginScopeDeniedError(denial.origin);
-            }
-          }
           if (target.tabId !== undefined) activeTabs.set(key, target.tabId);
           return browserResult;
         } catch (error) {
-          throw classifyExecutionError(error);
+          const classified = classifyExecutionError(
+            error,
+            originPolicy !== undefined,
+          );
+          if (
+            classified instanceof BrowserOriginScopeDeniedError &&
+            classified.cause !== undefined
+          ) {
+            await quarantineOriginScopeFailure(key, held, classified);
+          }
+          throw classified;
         }
       } finally {
         operationSignal.dispose();

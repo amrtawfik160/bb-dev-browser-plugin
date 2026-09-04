@@ -1,264 +1,614 @@
-import type { OriginScopeMatcher } from "./authorization.js";
+import { createRequire } from "node:module";
+import type { Browser, BrowserContext, Page, Request, Route } from "playwright";
+import {
+  matcherPermitsOrigin,
+  type OriginScopeMatcher,
+} from "./authorization.js";
+import {
+  installPageNavigationGuard,
+  type PageNavigationGuard,
+} from "./origin-scope-cdp.js";
 
-/**
- * Origin Scope enforcement during real browser navigation.
- *
- * The server resolves a Profile Grant into an {@link OriginScopeMatcher} and
- * hands it to the host, which injects the {@link enforcementPreambleScript}
- * into the QuickJS-sandboxed Playwright code before the agent script runs. The
- * preamble registers context-level request interception that aborts any
- * navigation request whose destination origin is outside the matcher before
- * its content commits, then signals the denial back to the host through a
- * unique stdout marker so the host can return a typed `origin_denied` result.
- *
- * Only navigation requests (top-level documents, redirects, popups, and
- * sub-document frames) are checked; ordinary cross-origin subresources such as
- * images, scripts, styles, fonts, and XHR continue to render. The matcher is
- * the same normalized policy the server grant store uses, so exact scheme,
- * host, and port matching, explicit subdomain patterns, Project Loopback
- * Aliases, raw localhost fallback, and whole-web access share one policy.
- */
+export type BrowserOriginScopePolicy = {
+  matcher: OriginScopeMatcher;
+  invalidCertificateOrigins: readonly string[];
+  timeoutMs: number;
+};
 
-const DENIAL_MARKER_PREFIX = "__bbOriginDenied";
+export type HostOriginScopeGuard = {
+  deniedError(): BrowserOriginScopeDeniedError | null;
+  deniedOrigin(): string | null;
+  dispose(): Promise<void>;
+};
 
-/**
- * Returns the source of a pure function `(origin, matcher) => boolean` that
- * mirrors {@link matcherPermitsOrigin} for the QuickJS sandbox. It is written
- * as a self-contained string so it can be evaluated in a Node `vm` for parity
- * tests and embedded verbatim in the generated preamble.
- */
-export function originPermittedFunctionSource(): string {
-  return String.raw`function __bbOriginPermitted(origin, matcher) {
-  var url;
-  try { url = new URL(origin); } catch (error) { return false; }
-  var hostname = url.hostname.toLowerCase();
-  if (matcher.kind === "whole-web") return !__bbIsRawLocalhost(hostname, matcher.rawLocalhostHosts);
-  if (matcher.kind === "never") return false;
-  if (matcher.kind === "exact") return matcher.origin === url.origin;
-  var protocol = matcher.protocol + ":";
-  var portMatches = matcher.port === url.port || (matcher.port === "" && url.port === "");
-  return url.protocol === protocol && portMatches && hostname !== matcher.baseHost && hostname.endsWith("." + matcher.baseHost);
-}
-function __bbIsRawLocalhost(hostname, rawLocalhostHosts) {
-  var h = hostname.toLowerCase();
-  if (rawLocalhostHosts && rawLocalhostHosts.indexOf(h) !== -1) return true;
-  if (h === "localhost" || h === "localhost.") return true;
-  var octets = h.split(".");
-  if (octets.length === 4 && octets[0] === "127" && octets.every(function (octet) {
-    return /^\d+$/.test(octet) && Number(octet) >= 0 && Number(octet) <= 255;
-  })) return true;
-  return __bbIsIpv6Loopback(h);
-}
-function __bbIpv6Hextets(hostname) {
-  var value = hostname.charAt(0) === "[" && hostname.charAt(hostname.length - 1) === "]"
-    ? hostname.slice(1, -1)
-    : hostname;
-  if (value.indexOf(":") === -1) return null;
-  function parsePart(part) {
-    if (part === "") return [];
-    var segments = part.split(":");
-    var hextets = [];
-    for (var index = 0; index < segments.length; index += 1) {
-      var segment = segments[index];
-      if (segment.indexOf(".") !== -1) {
-        if (index !== segments.length - 1) return null;
-        var octets = segment.split(".");
-        if (octets.length !== 4 || octets.some(function (octet) {
-          return !/^\d+$/.test(octet) || Number(octet) < 0 || Number(octet) > 255;
-        })) return null;
-        hextets.push(Number(octets[0]) * 256 + Number(octets[1]), Number(octets[2]) * 256 + Number(octets[3]));
-        continue;
-      }
-      if (!/^[0-9a-f]{1,4}$/.test(segment)) return null;
-      hextets.push(Number.parseInt(segment, 16));
-    }
-    return hextets;
+export type ConnectOriginScopeBrowser = (
+  endpoint: string,
+  timeoutMs: number,
+) => Promise<Browser>;
+
+// Playwright emits context/page creation on private channel proxies rather than
+// the public BrowserContext event surface. This narrow adapter is pinned to
+// Playwright's channel object and its _object back-reference.
+type BrowserContextChannelEvent = {
+  context: { _object?: BrowserContext };
+};
+
+type BrowserPageChannelEvent = {
+  page: { _object?: Page };
+};
+
+type BrowserChannelEmitter = {
+  prependListener(
+    event: "context",
+    listener: (event: BrowserContextChannelEvent) => void | Promise<void>,
+  ): void;
+  off(
+    event: "context",
+    listener: (event: BrowserContextChannelEvent) => void,
+  ): void;
+};
+
+type BrowserContextChannelEmitter = {
+  prependListener(
+    event: "page",
+    listener: (event: BrowserPageChannelEvent) => void | Promise<void>,
+  ): void;
+  off(
+    event: "page",
+    listener: (event: BrowserPageChannelEvent) => void | Promise<void>,
+  ): void;
+};
+
+type RouteRegistration = {
+  context: BrowserContext;
+  handler: (route: Route) => Promise<void>;
+  pending: Set<Promise<void>>;
+  failures: unknown[];
+};
+
+type PageRegistration = {
+  page: Page;
+  guard: PageNavigationGuard;
+};
+
+const ORIGIN_SCOPE_ROUTE_PATTERN = "**/*";
+const requireFromPlugin = createRequire(import.meta.url);
+
+export class BrowserOriginScopeDeniedError extends Error {
+  constructor(
+    public readonly origin: string | null,
+    options?: ErrorOptions,
+  ) {
+    super(
+      origin === null
+        ? "Browser navigation to a non-web URL was denied by the active Profile Grant."
+        : `Browser navigation to ${origin} was denied by the active Profile Grant.`,
+      options,
+    );
+    this.name = "BrowserOriginScopeDeniedError";
   }
-  var halves = value.split("::");
-  if (halves.length > 2) return null;
-  var left = parsePart(halves[0]);
-  var right = parsePart(halves.length === 2 ? halves[1] : "");
-  if (left === null || right === null) return null;
-  if (halves.length === 1) return left.length === 8 ? left : null;
-  if (left.length + right.length >= 8) return null;
-  var middle = new Array(8 - left.length - right.length).fill(0);
-  return left.concat(middle, right);
-}
-function __bbIsIpv6Loopback(hostname) {
-  var hextets = __bbIpv6Hextets(hostname);
-  if (hextets === null) return false;
-  if (hextets.slice(0, 7).every(function (hextet) { return hextet === 0; }) && hextets[7] === 1) return true;
-  var isIpv4Mapped = hextets.slice(0, 5).every(function (hextet) { return hextet === 0; }) && hextets[5] === 0xffff;
-  if (!isIpv4Mapped) return false;
-  return hextets[6] >= 0x7f00 && hextets[6] <= 0x7fff;
-}`;
 }
 
+function rejectedReasons(
+  results: readonly PromiseSettledResult<unknown>[],
+): unknown[] {
+  return results.flatMap((result) =>
+    result.status === "rejected" ? [result.reason] : [],
+  );
+}
+
+function cleanupFailure(message: string, failures: readonly unknown[]) {
+  const causes = failures.flatMap((failure) =>
+    failure instanceof AggregateError ? [...failure.errors] : [failure],
+  );
+  if (causes.length === 1) {
+    const [cause] = causes;
+    return cause instanceof Error ? cause : new Error(message, { cause });
+  }
+  return new AggregateError(causes, message);
+}
+
+function preservePrimaryFailure(primary: unknown, cleanup: Error) {
+  if (primary instanceof BrowserOriginScopeDeniedError) {
+    const cause =
+      primary.cause === undefined
+        ? cleanup
+        : new AggregateError(
+            [primary.cause, cleanup],
+            "Origin Scope setup and cleanup failed.",
+          );
+    return new BrowserOriginScopeDeniedError(primary.origin, {
+      cause,
+    });
+  }
+  return cleanupFailure("Origin Scope setup and cleanup failed.", [
+    primary,
+    cleanup,
+  ]);
+}
+
+export function preferOriginScopeDenial<T>(
+  guard: HostOriginScopeGuard | null,
+  fallback: T,
+): BrowserOriginScopeDeniedError | T {
+  return guard?.deniedError() ?? fallback;
+}
+
+type NavigationClassification =
+  | { kind: "web"; origin: string; protocol: "http:" | "https:" | "blob:" }
+  | { kind: "safe-internal" }
+  | { kind: "non-web" };
+
 /**
- * Decides whether a candidate web origin carries a per-origin invalid
- * certificate opt-in. The grant store persists invalid-certificate approvals
- * as normalized exact origins (`new URL(candidate).origin`), so this matches
- * the same normalized form the route handler computes from a navigation URL.
- * An origin that is not a valid URL is never granted a certificate bypass.
+ * Classify document navigations before matching a web Origin Scope. Exact
+ * about:blank is the only internal page that does not carry host browsing
+ * data; every other non-web location is denied, while blob URLs inherit an
+ * exposed HTTP(S) origin.
  */
+function classifyNavigation(address: string): NavigationClassification {
+  let url: URL;
+  try {
+    url = new URL(address);
+  } catch {
+    return { kind: "non-web" };
+  }
+  if (url.protocol === "http:" || url.protocol === "https:") {
+    return { kind: "web", origin: url.origin, protocol: url.protocol };
+  }
+  if (url.protocol === "blob:" && isWebOrigin(url.origin)) {
+    return { kind: "web", origin: url.origin, protocol: url.protocol };
+  }
+  if (url.href === "about:blank") return { kind: "safe-internal" };
+  return { kind: "non-web" };
+}
+
+function isWebOrigin(origin: string): boolean {
+  return origin.startsWith("http://") || origin.startsWith("https://");
+}
+
+function webOrigin(address: string): string | null {
+  const classification = classifyNavigation(address);
+  return classification.kind === "web" ? classification.origin : null;
+}
+
+function deniedExistingPages(
+  contexts: readonly BrowserContext[],
+  matcher: OriginScopeMatcher,
+): { denial: BrowserOriginScopeDeniedError; page: Page }[] {
+  const denied: { denial: BrowserOriginScopeDeniedError; page: Page }[] = [];
+  for (const context of contexts) {
+    for (const page of context.pages()) {
+      const classification = classifyNavigation(page.url());
+      if (
+        classification.kind === "non-web" ||
+        (classification.kind === "web" &&
+          !matcherPermitsOrigin(matcher, classification.origin))
+      ) {
+        denied.push({
+          denial: new BrowserOriginScopeDeniedError(
+            classification.kind === "web" ? classification.origin : null,
+          ),
+          page,
+        });
+      }
+    }
+  }
+  return denied;
+}
+
+async function closeDeniedExistingPages(denied: readonly { page: Page }[]) {
+  const results = await Promise.allSettled(
+    denied.map(({ page }) => page.close()),
+  );
+  const failures = rejectedReasons(results);
+  if (failures.length > 0) {
+    throw cleanupFailure(
+      "An out-of-scope Browser Tab could not be closed.",
+      failures,
+    );
+  }
+}
+
 export function originRequiresCertificateBypass(
   origin: string,
   invalidCertificateOrigins: readonly string[],
 ): boolean {
-  let destination: URL;
+  const normalized = webOrigin(origin);
+  return normalized !== null && invalidCertificateOrigins.includes(normalized);
+}
+
+async function closeDeniedPopup(request: Request) {
+  let page: Page;
   try {
-    destination = new URL(origin);
+    page = request.frame().page();
   } catch {
-    return false;
+    // Chromium can issue a popup's first navigation before Playwright creates
+    // its Frame object. The route is already aborted; the CDP window-open
+    // guard owns cleanup for non-web popups, so there is no page to close here.
+    return;
   }
-  return invalidCertificateOrigins.includes(destination.origin);
+  if ((await page.opener()) !== null && !page.isClosed()) await page.close();
 }
 
-/**
- * Returns the source of a pure function `(origin, origins) => boolean` that
- * mirrors {@link originRequiresCertificateBypass} for the QuickJS sandbox. It
- * is written as a self-contained string so it can be evaluated in a Node `vm`
- * for parity tests and embedded verbatim in the generated preamble.
- */
-export function originRequiresCertificateBypassSource(): string {
-  return String.raw`function __bbOriginRequiresCertificateBypass(origin, origins) {
-  var url;
-  try { url = new URL(origin); } catch (error) { return false; }
-  if (!origins) return false;
-  for (var index = 0; index < origins.length; index += 1) {
-    if (origins[index] === url.origin) return true;
-  }
-  return false;
-}`;
+async function denyNavigation(
+  route: Route,
+  request: Request,
+  denial: BrowserOriginScopeDeniedError,
+  recordDenial: (denial: BrowserOriginScopeDeniedError) => void,
+) {
+  recordDenial(denial);
+  await route.abort("blockedbyclient");
+  await closeDeniedPopup(request);
 }
 
-/**
- * Builds the QuickJS preamble that enforces one Origin Scope during real
- * navigation. The preamble registers a context-level route that aborts any
- * navigation request whose destination origin the matcher rejects, and prints
- * a unique denial marker line to stdout so the host can surface a typed
- * `origin_denied` result. A context-level route covers top-level documents,
- * redirects, sub-document frames, and popup pages that share the context, so
- * no per-popup re-registration is needed. It must wrap the agent code so the
- * route is registered first.
- *
- * Per-origin invalid-certificate opt-ins use the same normalized policy: a
- * navigation to an in-scope origin that the grant also approved for invalid
- * certificates is fetched through the shared context request context with
- * `ignoreHTTPSErrors` and fulfilled to the page so it loads despite a bad
- * certificate, while every other navigation continues normally so a bad
- * certificate still surfaces naturally. The dev-browser sandbox strips
- * `ignoreHTTPSErrors` from `route.continue`, so the context request context is
- * the one mechanism that honors per-origin certificate bypass for a connected
- * browser.
- */
-export function enforcementPreambleScript(
-  matcher: OriginScopeMatcher,
-  denialMarker: string,
-  invalidCertificateOrigins: readonly string[] = [],
-): string {
-  const matcherJson = JSON.stringify(matcher);
-  const permitted = originPermittedFunctionSource();
-  const bypass = originRequiresCertificateBypassSource();
-  const originsJson = JSON.stringify(invalidCertificateOrigins);
-  return `${permitted}
-${bypass}
-const __bbMatcher = ${matcherJson};
-const __bbDenialMarker = ${JSON.stringify(denialMarker)};
-const __bbInvalidCertificateOrigins = ${originsJson};
-function __bbReportOriginDenied(origin) {
-  console.log(JSON.stringify({ ${JSON.stringify(DENIAL_MARKER_PREFIX)}: __bbDenialMarker, origin }));
-}
-async function __bbEnforceOriginScope(context) {
-  await context.route("**/*", async (route) => {
-    const request = route.request();
-    if (!request.isNavigationRequest()) {
-      await route.continue();
-      return;
-    }
-    let origin;
-    try { origin = new URL(request.url()).origin; }
-    catch { await route.continue(); return; }
-    if (!__bbOriginPermitted(origin, __bbMatcher)) {
-      __bbReportOriginDenied(origin);
-      await route.abort("blockedbyclient");
-      return;
-    }
-    if (__bbOriginRequiresCertificateBypass(origin, __bbInvalidCertificateOrigins)) {
-      const response = await context.request.fetch(request.url(), {
-        ignoreHTTPSErrors: true,
-        method: request.method(),
-        headers: request.headers(),
-        // Let redirects re-fire the route so each hop is re-checked against scope.
-        maxRedirects: 0,
-        timeout: 30000
-      });
-      await route.fulfill({ response });
-      return;
-    }
-    await route.continue();
+async function fulfillCertificateBypass(
+  route: Route,
+  request: Request,
+  context: BrowserContext,
+  timeoutMs: number,
+) {
+  const response = await context.request.fetch(request, {
+    ignoreHTTPSErrors: true,
+    maxRedirects: 0,
+    timeout: timeoutMs,
   });
-}
-const __bbEnforcementPages = await browser.listPages();
-if (__bbEnforcementPages.length === 0) throw new Error("The Browser Profile has no open tabs");
-const __bbEnforcementPage = await browser.getPage(__bbEnforcementPages[0].id);
-await __bbEnforceOriginScope(__bbEnforcementPage.context());
-`;
+  await route.fulfill({ response });
 }
 
-/**
- * Extracts a denial marker line from a script result.
- *
- * Returns the denied origin when the unique marker the host generated appears
- * in the script output (a plain string result, or the `output` field of a
- * structured screenshot result). The marker is opaque to the agent: it is
- * generated by the host and embedded in the preamble, so an agent cannot forge
- * it. The result is left untouched because a denial discards the result.
- */
-export function extractOriginDenial(
-  result: unknown,
-  denialMarker: string,
-): { origin: string } | null {
-  const output = readOutput(result);
-  if (output === null) return null;
-  for (const line of output.split("\n")) {
-    const origin = parseDenialLine(line, denialMarker);
-    if (origin !== null) return { origin };
-  }
-  return null;
-}
-
-function readOutput(result: unknown): string | null {
-  if (typeof result === "string") return result;
-  if (
-    typeof result === "object" &&
-    result !== null &&
-    "output" in result &&
-    typeof (result as { output?: unknown }).output === "string"
-  ) {
-    return (result as { output: string }).output;
-  }
-  return null;
-}
-
-function parseDenialLine(line: string, denialMarker: string): string | null {
-  const trimmed = line.trim();
-  if (trimmed === "" || trimmed === "undefined") return null;
-  try {
-    const parsed = JSON.parse(trimmed) as unknown;
-    if (
-      typeof parsed !== "object" ||
-      parsed === null ||
-      !(DENIAL_MARKER_PREFIX in parsed)
-    ) {
-      return null;
-    }
-    const marker = (parsed as Record<string, unknown>)[DENIAL_MARKER_PREFIX];
-    const origin = (parsed as Record<string, unknown>).origin;
-    return marker === denialMarker && typeof origin === "string"
-      ? origin
+function originScopeRouteHandler(
+  context: BrowserContext,
+  policy: BrowserOriginScopePolicy,
+  recordDenial: (denial: BrowserOriginScopeDeniedError) => void,
+) {
+  return async (route: Route) => {
+    const request = route.request();
+    const classification = request.isNavigationRequest()
+      ? classifyNavigation(request.url())
       : null;
-  } catch {
-    return null;
+    if (classification === null || classification.kind === "safe-internal") {
+      await route.continue();
+    } else if (classification.kind === "non-web") {
+      await denyNavigation(
+        route,
+        request,
+        new BrowserOriginScopeDeniedError(null),
+        recordDenial,
+      );
+    } else if (!matcherPermitsOrigin(policy.matcher, classification.origin)) {
+      await denyNavigation(
+        route,
+        request,
+        new BrowserOriginScopeDeniedError(classification.origin),
+        recordDenial,
+      );
+    } else if (
+      originRequiresCertificateBypass(
+        classification.origin,
+        policy.invalidCertificateOrigins,
+      )
+    ) {
+      await fulfillCertificateBypass(route, request, context, policy.timeoutMs);
+    } else {
+      await route.continue();
+    }
+  };
+}
+
+function navigationDenial(
+  address: string,
+  policy: BrowserOriginScopePolicy,
+): BrowserOriginScopeDeniedError | null {
+  const classification = classifyNavigation(address);
+  if (classification.kind === "safe-internal") return null;
+  if (classification.kind === "non-web") {
+    return new BrowserOriginScopeDeniedError(null);
   }
+  return matcherPermitsOrigin(policy.matcher, classification.origin)
+    ? null
+    : new BrowserOriginScopeDeniedError(classification.origin);
+}
+
+function shouldCloseDeniedPage(address: string): boolean {
+  const classification = classifyNavigation(address);
+  return (
+    classification.kind === "non-web" ||
+    (classification.kind === "web" && classification.protocol === "blob:")
+  );
+}
+
+function contextChannel(
+  context: BrowserContext,
+): BrowserContextChannelEmitter | null {
+  const channel = (
+    context as unknown as { _channel?: BrowserContextChannelEmitter }
+  )._channel;
+  return channel ?? null;
+}
+
+async function connectOriginScopeBrowser(endpoint: string, timeoutMs: number) {
+  // Keep Playwright at the host runtime boundary. Bundling its server internals
+  // pulls optional BiDi modules that a CDP-only attachment never executes.
+  const playwright = requireFromPlugin("playwright") as {
+    chromium: {
+      connectOverCDP(
+        endpoint: string,
+        options: { timeout: number },
+      ): Promise<Browser>;
+    };
+  };
+  return playwright.chromium.connectOverCDP(endpoint, { timeout: timeoutMs });
+}
+
+async function removeRoutes(registrations: readonly RouteRegistration[]) {
+  return rejectedReasons(
+    await Promise.allSettled(
+      registrations.map(({ context, handler }) =>
+        context.unroute(ORIGIN_SCOPE_ROUTE_PATTERN, handler),
+      ),
+    ),
+  );
+}
+
+async function settlePendingRoutes(
+  registrations: readonly RouteRegistration[],
+) {
+  await Promise.allSettled(
+    registrations.flatMap(({ pending }) => [...pending]),
+  );
+  return registrations.flatMap(({ failures }) => failures.splice(0));
+}
+
+async function settlePendingInstallations(installations: Set<Promise<void>>) {
+  while (installations.size > 0) {
+    await Promise.allSettled([...installations]);
+  }
+}
+
+function routeRegistration(
+  context: BrowserContext,
+  handler: (route: Route) => Promise<void>,
+): RouteRegistration {
+  const pending = new Set<Promise<void>>();
+  const failures: unknown[] = [];
+  const trackedHandler = (route: Route) => {
+    const execution = handler(route);
+    pending.add(execution);
+    void execution.then(
+      () => pending.delete(execution),
+      (error: unknown) => {
+        pending.delete(execution);
+        failures.push(error);
+      },
+    );
+    return execution;
+  };
+  return { context, handler: trackedHandler, pending, failures };
+}
+
+async function installRoutes(registrations: readonly RouteRegistration[]) {
+  await Promise.all(
+    registrations.map(({ context, handler }) =>
+      context.route(ORIGIN_SCOPE_ROUTE_PATTERN, handler),
+    ),
+  );
+}
+
+export async function installHostOriginScopeGuard(
+  endpoint: string,
+  policy: BrowserOriginScopePolicy,
+  connect: ConnectOriginScopeBrowser = connectOriginScopeBrowser,
+): Promise<HostOriginScopeGuard> {
+  const browser = await connect(endpoint, policy.timeoutMs);
+  let denial: BrowserOriginScopeDeniedError | null = null;
+  const registrations: RouteRegistration[] = [];
+  const registeredContexts = new Set<BrowserContext>();
+  const pendingContextInstallations = new Set<Promise<void>>();
+  const pageRegistrations: PageRegistration[] = [];
+  const registeredPages = new Set<Page>();
+  const pendingPageInstallations = new Set<Promise<void>>();
+  const installationFailures: unknown[] = [];
+  let browserCloseAttempt: Promise<void> | undefined;
+  let browserCloseObserved = false;
+  const browserCloseFailures: unknown[] = [];
+  const browserClose = () => {
+    browserCloseAttempt ??= Promise.resolve().then(() => browser.close());
+    return browserCloseAttempt;
+  };
+  const observeBrowserClose = () => {
+    if (browserCloseObserved) return;
+    browserCloseObserved = true;
+    void browserClose().then(
+      () => undefined,
+      (error: unknown) => browserCloseFailures.push(error),
+    );
+  };
+  const collectBrowserCloseFailures = async () => {
+    observeBrowserClose();
+    await Promise.allSettled([browserClose()]);
+    return browserCloseFailures.splice(0);
+  };
+  const pageObservers = new Map<
+    BrowserContext,
+    (event: BrowserPageChannelEvent) => void | Promise<void>
+  >();
+  const recordDenial = (candidate: BrowserOriginScopeDeniedError) => {
+    denial ??= candidate;
+  };
+  const recordPageDenial = (candidate: Error) => {
+    if (candidate instanceof BrowserOriginScopeDeniedError) {
+      recordDenial(candidate);
+    } else {
+      recordDenial(new BrowserOriginScopeDeniedError(null));
+    }
+  };
+  const recordInstallationFailure = (error: unknown) => {
+    installationFailures.push(error);
+    observeBrowserClose();
+  };
+  const trackPageInstallation = (installation: Promise<void>) => {
+    pendingPageInstallations.add(installation);
+    void installation.then(
+      () => pendingPageInstallations.delete(installation),
+      (error: unknown) => {
+        pendingPageInstallations.delete(installation);
+        denial ??= new BrowserOriginScopeDeniedError(null);
+        recordInstallationFailure(error);
+      },
+    );
+    return installation;
+  };
+  const installPage = async (context: BrowserContext, page: Page) => {
+    if (
+      registeredPages.has(page) ||
+      page.isClosed() ||
+      typeof (context as unknown as { newCDPSession?: unknown })
+        .newCDPSession !== "function"
+    ) {
+      return;
+    }
+    registeredPages.add(page);
+    try {
+      const guard = await installPageNavigationGuard(page, {
+        classify: (address) => navigationDenial(address, policy),
+        closeDeniedPage: shouldCloseDeniedPage,
+        recordDenial: recordPageDenial,
+      });
+      pageRegistrations.push({ page, guard });
+    } catch (error) {
+      registeredPages.delete(page);
+      throw error;
+    }
+  };
+  const installContext = async (context: BrowserContext) => {
+    if (registeredContexts.has(context)) return;
+    registeredContexts.add(context);
+    const pageChannel = contextChannel(context);
+    if (pageChannel !== null) {
+      const observePage = (event: BrowserPageChannelEvent) => {
+        const page = event.page._object;
+        if (page === undefined) {
+          denial ??= new BrowserOriginScopeDeniedError(null);
+          observeBrowserClose();
+          return;
+        }
+        trackPageInstallation(installPage(context, page));
+      };
+      pageObservers.set(context, observePage);
+      pageChannel.prependListener("page", observePage);
+    }
+    const registration = routeRegistration(
+      context,
+      originScopeRouteHandler(context, policy, recordDenial),
+    );
+    registrations.push(registration);
+    const pageInstallations = context
+      .pages()
+      .map((page) => trackPageInstallation(installPage(context, page)));
+    await Promise.all([installRoutes([registration]), ...pageInstallations]);
+    const existingDenials = deniedExistingPages([context], policy.matcher);
+    if (existingDenials.length > 0) {
+      recordDenial(existingDenials[0].denial);
+      await closeDeniedExistingPages(existingDenials);
+    }
+  };
+  const observeContext = (context: BrowserContext) => {
+    const installation = installContext(context);
+    pendingContextInstallations.add(installation);
+    return installation.then(
+      () => pendingContextInstallations.delete(installation),
+      (error: unknown) => {
+        denial ??= new BrowserOriginScopeDeniedError(null);
+        pendingContextInstallations.delete(installation);
+        recordInstallationFailure(error);
+      },
+    );
+  };
+  const contextEmitter = (
+    browser as unknown as { _channel: BrowserChannelEmitter }
+  )._channel;
+  const observeBrowserContext = async (event: BrowserContextChannelEvent) => {
+    const context = event.context._object;
+    if (context === undefined) {
+      denial ??= new BrowserOriginScopeDeniedError(null);
+      observeBrowserClose();
+      return;
+    }
+    await observeContext(context);
+  };
+  const disposeResources = async () => {
+    const cleanupFailures: unknown[] = installationFailures.splice(0);
+    try {
+      contextEmitter.off("context", observeBrowserContext);
+    } catch (error) {
+      cleanupFailures.push(error);
+    }
+    for (const [context, observer] of pageObservers) {
+      try {
+        contextChannel(context)?.off("page", observer);
+      } catch (error) {
+        cleanupFailures.push(error);
+      }
+    }
+    await settlePendingInstallations(pendingContextInstallations);
+    await settlePendingInstallations(pendingPageInstallations);
+    cleanupFailures.push(...installationFailures.splice(0));
+    cleanupFailures.push(
+      ...rejectedReasons(
+        await Promise.allSettled(
+          pageRegistrations.map(({ guard }) => guard.dispose()),
+        ),
+      ),
+    );
+    cleanupFailures.push(...(await removeRoutes(registrations)));
+    cleanupFailures.push(...(await settlePendingRoutes(registrations)));
+    cleanupFailures.push(...(await collectBrowserCloseFailures()));
+    return cleanupFailures;
+  };
+  try {
+    contextEmitter.prependListener("context", observeBrowserContext);
+    const contexts = browser.contexts();
+    await Promise.all(contexts.map((context) => installContext(context)));
+    await settlePendingInstallations(pendingContextInstallations);
+    await settlePendingInstallations(pendingPageInstallations);
+    const backgroundFailures = installationFailures.splice(0);
+    if (denial !== null) {
+      if (backgroundFailures.length > 0) {
+        throw preservePrimaryFailure(
+          denial,
+          cleanupFailure(
+            "Origin Scope installation failed.",
+            backgroundFailures,
+          ),
+        );
+      }
+      throw denial;
+    }
+    if (backgroundFailures.length > 0) {
+      throw cleanupFailure(
+        "Origin Scope installation failed.",
+        backgroundFailures,
+      );
+    }
+  } catch (error) {
+    const cleanupFailures = await disposeResources();
+    if (denial !== null && error !== denial) cleanupFailures.push(error);
+    if (cleanupFailures.length > 0) {
+      const primary = denial ?? error;
+      throw preservePrimaryFailure(
+        primary,
+        cleanupFailure("Origin Scope cleanup failed.", cleanupFailures),
+      );
+    }
+    throw denial ?? error;
+  }
+  return {
+    deniedError: () => denial,
+    deniedOrigin: () => denial?.origin ?? null,
+    dispose: async () => {
+      const cleanupFailures = await disposeResources();
+      if (cleanupFailures.length > 0) {
+        throw cleanupFailure("Origin Scope cleanup failed.", cleanupFailures);
+      }
+    },
+  };
 }

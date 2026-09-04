@@ -10,11 +10,12 @@ import {
   open,
   readFile,
   readdir,
+  symlink,
   unlink,
   watch,
 } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import type {
   BrowserExecutionRequest,
   BrowserLaunchBoundary,
@@ -24,9 +25,17 @@ import type {
 } from "./browser-runtime.js";
 import { BrowserScriptExecutionError } from "./browser-runtime.js";
 import {
+  BrowserOriginScopeDeniedError,
+  installHostOriginScopeGuard,
+  preferOriginScopeDenial,
+  type HostOriginScopeGuard,
+} from "./origin-scope.js";
+import {
   BROWSER_SCRIPT_MAX_SCREENSHOT_BYTES,
   BROWSER_SCRIPT_RESULT_LIMIT_BYTES,
+  BROWSER_STORAGE_ROOT,
 } from "./contracts.js";
+import { DEV_BROWSER_PACKAGE_VERSION } from "./dev-browser-runtime.js";
 
 const DEVTOOLS_PORT_FILE = "DevToolsActivePort";
 const MAX_BROWSER_RESULT_BYTES = BROWSER_SCRIPT_RESULT_LIMIT_BYTES;
@@ -35,6 +44,13 @@ const MAX_SCREENSHOT_BYTES = BROWSER_SCRIPT_MAX_SCREENSHOT_BYTES;
 const SCREENSHOT_READ_CHUNK_BYTES = 64 * 1024;
 const HELPER_STOP_TIMEOUT_MS = 2_000;
 const BROWSER_CLOSE_TIMEOUT_MS = 2_000;
+const UNIX_SOCKET_PATH_MAX_BYTES = 107;
+const DEV_BROWSER_NODE_MODULES = [
+  "playwright",
+  "playwright-core",
+  "quickjs-emscripten",
+  "quickjs-emscripten-core",
+] as const;
 
 type BrowserProcessBoundaryOptions = {
   devBrowserExecutable: string;
@@ -51,10 +67,17 @@ async function stagedDevBrowserExecutable(
   if (options.devBrowserPackageDirectory === undefined) {
     return options.devBrowserExecutable;
   }
-  const stagedDirectory = join(runtimeDirectory, "dev-browser-0.2.9");
+  const stagedDirectory = join(
+    runtimeDirectory,
+    `dev-browser-${DEV_BROWSER_PACKAGE_VERSION}`,
+  );
   const stagedExecutable = join(stagedDirectory, "bin", "dev-browser.js");
   try {
     await access(stagedExecutable, constants.X_OK);
+    await access(
+      join(stagedDirectory, "node_modules", "playwright", "package.json"),
+      constants.F_OK,
+    );
   } catch (error) {
     if (!(
       error instanceof Error &&
@@ -66,10 +89,89 @@ async function stagedDevBrowserExecutable(
     await cp(options.devBrowserPackageDirectory, stagedDirectory, {
       recursive: true,
     });
+    await stageDevBrowserNodeModules(
+      options.devBrowserPackageDirectory,
+      stagedDirectory,
+    );
     await chmod(stagedExecutable, 0o755);
   }
-  await chown(stagedDirectory, identity.userId, identity.groupId);
+  await chownTree(stagedDirectory, identity.userId, identity.groupId);
   return stagedExecutable;
+}
+
+async function stageDevBrowserNodeModules(
+  packageDirectory: string,
+  stagedDirectory: string,
+) {
+  const sourceRoot = dirname(packageDirectory);
+  const targetRoot = join(stagedDirectory, "node_modules");
+  await mkdir(targetRoot, { recursive: true });
+  for (const name of DEV_BROWSER_NODE_MODULES) {
+    await cp(join(sourceRoot, name), join(targetRoot, name), {
+      recursive: true,
+    });
+  }
+  await cp(join(sourceRoot, "@jitl"), join(targetRoot, "@jitl"), {
+    recursive: true,
+  });
+}
+
+async function chownTree(path: string, userId: number, groupId: number) {
+  await chown(path, userId, groupId);
+  let entries;
+  try {
+    entries = await readdir(path, { withFileTypes: true });
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      "code" in error &&
+      (error.code === "ENOTDIR" || error.code === "ENOENT")
+    ) {
+      return;
+    }
+    throw error;
+  }
+  for (const entry of entries) {
+    if (entry.isSymbolicLink()) continue;
+    await chownTree(join(path, entry.name), userId, groupId);
+  }
+}
+
+function helperRuntimeHome(runtimeDirectory: string, browserName: string) {
+  const nested = join(runtimeDirectory, browserName);
+  const socketPath = join(nested, ".dev-browser", "daemon.sock");
+  if (Buffer.byteLength(socketPath) <= UNIX_SOCKET_PATH_MAX_BYTES) {
+    return nested;
+  }
+  const digest = createHash("sha256")
+    .update(socketPath)
+    .digest("hex")
+    .slice(0, 16);
+  return join(BROWSER_STORAGE_ROOT, "run", digest);
+}
+
+async function seedDaemonNodeModules(
+  stagedDirectory: string,
+  helperHome: string,
+  identity: ReturnType<typeof browserUserIdentity>,
+) {
+  const daemonHome = join(helperHome, ".dev-browser");
+  const target = join(daemonHome, "node_modules");
+  try {
+    await access(target, constants.F_OK);
+    return;
+  } catch (error) {
+    if (!(
+      error instanceof Error &&
+      "code" in error &&
+      error.code === "ENOENT"
+    )) {
+      throw error;
+    }
+  }
+  await mkdir(daemonHome, { recursive: true });
+  await symlink(join(stagedDirectory, "node_modules"), target);
+  await chownTree(daemonHome, identity.userId, identity.groupId);
 }
 
 function browserUserIdentity(passwdPath: string) {
@@ -335,18 +437,30 @@ async function recoveredAutomationEndpoint(
   return null;
 }
 
+/**
+ * Identify the Browser Instance that currently owns a Browser Profile.
+ *
+ * The recorded identity is the fast path, but it goes stale whenever the host
+ * worker restarts while its Chromium keeps running — a plugin reload, a daemon
+ * recycle, a crashed worker. Trusting only the record left the live browser
+ * orphaned, and the relaunch that followed was rejected by Chromium's profile
+ * singleton, which rewrote the record with the rejected process and wedged the
+ * profile for good. Scanning for the real owner when the record does not match
+ * turns that dead end back into a reattach.
+ */
 async function recoverableBrowserIdentity(
   context: ProductionProcessContext,
   request: BrowserLaunchRequest,
   expectedIdentity: BrowserProcessIdentity | null,
 ) {
-  if (expectedIdentity === null) {
-    const browserUser = browserUserIdentity(context.passwdPath);
-    return discoverLaunchedBrowser(request, browserUser);
+  if (
+    expectedIdentity !== null &&
+    (await processMatchesIdentity(expectedIdentity))
+  ) {
+    return expectedIdentity;
   }
-  return (await processMatchesIdentity(expectedIdentity))
-    ? expectedIdentity
-    : null;
+  const browserUser = browserUserIdentity(context.passwdPath);
+  return discoverLaunchedBrowser(request, browserUser);
 }
 
 function sameProcessIdentity(
@@ -411,7 +525,19 @@ async function stopRecoveredProcess(pid: number) {
   await waitForProcessExit(pid);
 }
 
-async function stopProcess(child: ChildProcessWithoutNullStreams) {
+const PROCESS_STOP_GRACE_MS = 10_000;
+/**
+ * A helper being stopped because its own deadline passed has nothing left to
+ * flush, and the full grace period spent waiting for it to notice SIGTERM was
+ * long enough for the surrounding host call to blow its transport deadline —
+ * replacing a typed `browser_timeout` with an opaque transport error.
+ */
+const ABORTED_PROCESS_STOP_GRACE_MS = 1_500;
+
+async function stopProcess(
+  child: ChildProcessWithoutNullStreams,
+  graceMs = PROCESS_STOP_GRACE_MS,
+) {
   if (child.exitCode !== null || child.signalCode !== null) return;
   child.kill("SIGTERM");
   let deadline: NodeJS.Timeout | undefined;
@@ -419,7 +545,7 @@ async function stopProcess(child: ChildProcessWithoutNullStreams) {
     deadline = setTimeout(() => {
       child.kill("SIGKILL");
       void waitForExit(child).then(resolve);
-    }, 10_000);
+    }, graceMs);
     deadline.unref();
   });
   await Promise.race([waitForExit(child), forcedExit]);
@@ -506,29 +632,9 @@ function processAbortError(signal: AbortSignal) {
     : new Error("Browser script aborted.");
 }
 
-function stdoutContainsDenialMarker(stdout: string, marker: string) {
-  if (marker === "") return false;
-  return stdout.split("\n").some((line) => {
-    const trimmed = line.trim();
-    if (trimmed === "" || trimmed === "undefined") return false;
-    try {
-      const parsed = JSON.parse(trimmed) as unknown;
-      return (
-        typeof parsed === "object" &&
-        parsed !== null &&
-        "__bbOriginDenied" in parsed &&
-        (parsed as Record<string, unknown>).__bbOriginDenied === marker
-      );
-    } catch {
-      return false;
-    }
-  });
-}
-
 function collectOutput(
   child: ChildProcessWithoutNullStreams,
   signal?: AbortSignal,
-  denialMarker?: string,
 ) {
   return new Promise<string>((resolve, reject) => {
     const chunks: Buffer[] = [];
@@ -581,14 +687,6 @@ function collectOutput(
       if (settled) return;
       if (code === 0) {
         finish(() => resolve(Buffer.concat(chunks).toString("utf8").trimEnd()));
-        return;
-      }
-      const stdout = Buffer.concat(chunks).toString("utf8");
-      if (
-        denialMarker !== undefined &&
-        stdoutContainsDenialMarker(stdout, denialMarker)
-      ) {
-        finish(() => resolve(stdout.trimEnd()));
         return;
       }
       finish(() =>
@@ -684,7 +782,10 @@ async function stopAttachedHelper(
   request: BrowserLaunchRequest,
   identity: ReturnType<typeof browserUserIdentity>,
 ) {
-  const helperHome = join(request.runtimeDirectory, request.browserName);
+  const helperHome = helperRuntimeHome(
+    request.runtimeDirectory,
+    request.browserName,
+  );
   if (!(await helperIsRunning(helperHome))) return;
   const executable = await stagedDevBrowserExecutable(
     context.options,
@@ -770,17 +871,24 @@ async function launchProductionBrowser(
 async function recoverProductionBrowser(
   context: ProductionProcessContext,
   request: BrowserLaunchRequest,
-  expectedIdentity: BrowserProcessIdentity | null,
+  recordedIdentity: BrowserProcessIdentity | null,
   storedEndpoint: string | null,
 ): Promise<RunningBrowserProcess | null> {
-  expectedIdentity = await recoverableBrowserIdentity(
+  const expectedIdentity = await recoverableBrowserIdentity(
     context,
     request,
-    expectedIdentity,
+    recordedIdentity,
   );
   if (expectedIdentity === null) return null;
+  // A discovered owner is not the process the record described, so its
+  // endpoint has to be read from the profile rather than taken on faith.
+  const trustedEndpoint =
+    recordedIdentity !== null &&
+    sameProcessIdentity(recordedIdentity, expectedIdentity)
+      ? storedEndpoint
+      : null;
   const automationEndpoint =
-    storedEndpoint ??
+    trustedEndpoint ??
     (await recoveredAutomationEndpoint(request, expectedIdentity));
   if (automationEndpoint === null) {
     await stopRecoveredProcess(expectedIdentity.pid);
@@ -805,11 +913,14 @@ async function recoverProductionBrowser(
   };
 }
 
-async function executeBrowserHelper(
+async function prepareHelperRuntime(
   context: ProductionProcessContext,
   request: BrowserExecutionRequest,
 ) {
-  const helperHome = join(request.runtimeDirectory, request.browserName);
+  const helperHome = helperRuntimeHome(
+    request.runtimeDirectory,
+    request.browserName,
+  );
   const identity = browserUserIdentity(context.passwdPath);
   await ownedDirectory(helperHome, identity);
   const executable = await stagedDevBrowserExecutable(
@@ -817,15 +928,28 @@ async function executeBrowserHelper(
     request.runtimeDirectory,
     identity,
   );
-  const screenshot = request.screenshot;
-  const screenshotPath =
-    screenshot === undefined
-      ? undefined
-      : safeScreenshotPath(helperHome, screenshot.fileName);
-  const devBrowserProcess = ownedProcess(
+  if (context.options.devBrowserPackageDirectory !== undefined) {
+    await seedDaemonNodeModules(
+      join(
+        request.runtimeDirectory,
+        `dev-browser-${DEV_BROWSER_PACKAGE_VERSION}`,
+      ),
+      helperHome,
+      identity,
+    );
+  }
+  return { executable, helperHome, identity };
+}
+
+function spawnDevBrowserHelper(
+  context: ProductionProcessContext,
+  request: BrowserExecutionRequest,
+  helperRuntime: Awaited<ReturnType<typeof prepareHelperRuntime>>,
+) {
+  return ownedProcess(
     context.setprivExecutable,
-    identity,
-    executable,
+    helperRuntime.identity,
+    helperRuntime.executable,
     [
       "--browser",
       request.browserName,
@@ -834,62 +958,187 @@ async function executeBrowserHelper(
       "--timeout",
       String(Math.ceil(request.timeoutMs / 1000)),
     ],
-    restrictedEnvironment({ HOME: helperHome, XDG_CONFIG_HOME: helperHome }),
-    helperHome,
+    restrictedEnvironment({
+      HOME: helperRuntime.helperHome,
+      XDG_CONFIG_HOME: helperRuntime.helperHome,
+    }),
+    helperRuntime.helperHome,
+  );
+}
+
+async function readScreenshotResult(
+  output: string,
+  screenshot: NonNullable<BrowserExecutionRequest["screenshot"]>,
+  screenshotPath: string,
+) {
+  const screenshotFile = await open(
+    screenshotPath,
+    constants.O_RDONLY | constants.O_NOFOLLOW,
+  );
+  let image: Buffer;
+  try {
+    const screenshotStats = await screenshotFile.stat();
+    if (!screenshotStats.isFile()) {
+      throw new Error("Browser Screenshot file is invalid.");
+    }
+    if (screenshotStats.size > MAX_SCREENSHOT_BYTES) {
+      throw new BrowserScriptExecutionError(
+        "result_too_large",
+        `Browser Screenshot exceeds the ${MAX_SCREENSHOT_BYTES / 1024 / 1024} MiB limit.`,
+      );
+    }
+    image = await readBoundedScreenshot(screenshotFile);
+  } finally {
+    await screenshotFile.close();
+  }
+  return {
+    output: removeScreenshotMarker(output, screenshot.marker),
+    screenshots: [
+      { data: image.toString("base64"), mimeType: screenshot.mimeType },
+    ],
+  };
+}
+
+type CollectHelperResultInput = {
+  child: ChildProcessWithoutNullStreams;
+  request: BrowserExecutionRequest;
+  signal: AbortSignal;
+  guard: HostOriginScopeGuard | null;
+  screenshotPath?: string;
+};
+
+async function collectHelperResult(input: CollectHelperResultInput) {
+  try {
+    const output = await collectOutput(input.child, input.signal);
+    const denial = preferOriginScopeDenial(input.guard, null);
+    if (denial !== null) throw denial;
+    if (input.request.screenshot === undefined) return output;
+    if (input.screenshotPath === undefined) {
+      throw new Error("Browser Screenshot path was not prepared.");
+    }
+    return readScreenshotResult(
+      output,
+      input.request.screenshot,
+      input.screenshotPath,
+    );
+  } catch (error) {
+    throw preferOriginScopeDenial(input.guard, error);
+  }
+}
+
+async function removeScreenshot(path: string | undefined) {
+  if (path === undefined) return;
+  try {
+    await unlink(path);
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      return;
+    }
+    throw error;
+  }
+}
+
+async function cleanupBrowserHelper(
+  child: ChildProcessWithoutNullStreams,
+  aborted: boolean,
+  guard: HostOriginScopeGuard | null,
+  screenshotPath: string | undefined,
+) {
+  const cleanupErrors: unknown[] = [];
+  for (const action of [
+    () =>
+      stopProcess(
+        child,
+        aborted ? ABORTED_PROCESS_STOP_GRACE_MS : PROCESS_STOP_GRACE_MS,
+      ),
+    () => guard?.dispose() ?? Promise.resolve(),
+    () => removeScreenshot(screenshotPath),
+  ]) {
+    try {
+      await action();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+  }
+  if (cleanupErrors.length === 1) throw cleanupErrors[0];
+  if (cleanupErrors.length > 1) {
+    throw new AggregateError(cleanupErrors, "Browser helper cleanup failed.");
+  }
+}
+
+function preserveExecutionFailure(
+  executionError: unknown,
+  cleanupError: unknown,
+) {
+  if (executionError instanceof BrowserOriginScopeDeniedError) {
+    const cause =
+      executionError.cause === undefined
+        ? cleanupError
+        : new AggregateError(
+            [executionError.cause, cleanupError],
+            "Browser execution and cleanup failed.",
+          );
+    return new BrowserOriginScopeDeniedError(executionError.origin, {
+      cause,
+    });
+  }
+  return new AggregateError(
+    [executionError, cleanupError],
+    "Browser execution and cleanup failed.",
+  );
+}
+
+async function executeBrowserHelper(
+  context: ProductionProcessContext,
+  request: BrowserExecutionRequest,
+) {
+  const helperRuntime = await prepareHelperRuntime(context, request);
+  const screenshot = request.screenshot;
+  const screenshotPath =
+    screenshot === undefined
+      ? undefined
+      : safeScreenshotPath(helperRuntime.helperHome, screenshot.fileName);
+  const devBrowserProcess = spawnDevBrowserHelper(
+    context,
+    request,
+    helperRuntime,
   );
   const executionSignal = timedExecutionSignal(
     request.timeoutMs,
     request.signal,
   );
-  devBrowserProcess.stdin.end(request.code);
+  let originGuard: HostOriginScopeGuard | null = null;
+  let executionError: unknown;
   try {
-    const output = await collectOutput(
-      devBrowserProcess,
-      executionSignal.signal,
-      request.denialMarker,
-    );
-    if (screenshot === undefined) return output;
-    const screenshotFile = await open(
-      screenshotPath!,
-      constants.O_RDONLY | constants.O_NOFOLLOW,
-    );
-    let image: Buffer;
-    try {
-      const screenshotStats = await screenshotFile.stat();
-      if (!screenshotStats.isFile()) {
-        throw new Error("Browser Screenshot file is invalid.");
-      }
-      if (screenshotStats.size > MAX_SCREENSHOT_BYTES) {
-        throw new BrowserScriptExecutionError(
-          "result_too_large",
-          `Browser Screenshot exceeds the ${MAX_SCREENSHOT_BYTES / 1024 / 1024} MiB limit.`,
-        );
-      }
-      image = await readBoundedScreenshot(screenshotFile);
-    } finally {
-      await screenshotFile.close();
+    if (request.originPolicy !== undefined) {
+      originGuard = await installHostOriginScopeGuard(
+        request.endpoint,
+        request.originPolicy,
+      );
     }
-    return {
-      output: removeScreenshotMarker(output, screenshot.marker),
-      screenshots: [
-        { data: image.toString("base64"), mimeType: screenshot.mimeType },
-      ],
-    };
+    devBrowserProcess.stdin.end(request.code);
+    return await collectHelperResult({
+      child: devBrowserProcess,
+      request,
+      signal: executionSignal.signal,
+      guard: originGuard,
+      ...(screenshotPath === undefined ? {} : { screenshotPath }),
+    });
+  } catch (error) {
+    executionError = error;
+    throw error;
   } finally {
+    const aborted = executionSignal.signal.aborted;
     executionSignal.dispose();
-    await stopProcess(devBrowserProcess);
-    if (screenshotPath !== undefined) {
-      await unlink(screenshotPath).catch((error: unknown) => {
-        if (
-          error instanceof Error &&
-          "code" in error &&
-          error.code === "ENOENT"
-        ) {
-          return;
-        }
-        throw error;
-      });
-    }
+    await cleanupBrowserHelper(
+      devBrowserProcess,
+      aborted,
+      originGuard,
+      screenshotPath,
+    ).catch((error: unknown) => {
+      if (executionError === undefined) throw error;
+      throw preserveExecutionFailure(executionError, error);
+    });
   }
 }
 

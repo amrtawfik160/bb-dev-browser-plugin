@@ -53,6 +53,35 @@ each.
 - Automation Mode is adaptive 5–15 FPS up to 1920×1080 with no audio. Safe Login
   uses an X display and VNC stream. Neither promises high-fidelity media.
 
+## Origin Scope enforcement
+
+- Origin Scope applies to HTTP(S) document navigation and to `blob:` documents
+  when the browser exposes an embedded HTTP(S) origin. The host route blocks
+  denied HTTP(S) requests before commit. Direct agent `Frame.goto` calls to
+  non-web addresses are rejected before the Playwright command reaches
+  Chromium; renderer location changes, popups, redirects, and frame documents
+  use the CDP guard and fail closed by removing the denied page when needed. If
+  cleanup fails, the typed denial is surfaced and the Browser Instance is retired
+  before another call can reuse it. Pinned Chromium can report a precommit event
+  for a raw direct `data:` loader without exposing a cancellable loader command,
+  so this path guarantees typed denial and cleanup rather than a universal
+  no-commit event guarantee.
+  Ordinary cross-origin subresources may render. Cross-origin frame documents
+  therefore need their own grant.
+- Exact `about:blank` is allowed as a safe internal page. Other `about:`,
+  `data:`, `file:`, `chrome:`, `javascript:`, malformed, and unknown non-web
+  document navigations fail closed; they are never treated as an unscoped
+  destination.
+- Invalid-certificate access is an exact-origin elevation. It does not disable
+  certificate validation globally or for another allowed origin.
+
+## Anti-automation defenses
+
+- Major search engines and other sites serve bot-detection challenges to an
+  automated Chromium from a datacenter address. This is the remote site's
+  policy, not a plugin failure; the browser is driven normally and the
+  challenge page is what loads.
+
 ## Device permissions
 
 - Camera, microphone, geolocation, notifications, and device permissions are

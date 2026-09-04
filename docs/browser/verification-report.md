@@ -4,8 +4,8 @@ This report maps every parent requirement from
 [`docs/browser-plugin-spec.md`](../browser-plugin-spec.md) (and the
 [`docs/verification-plan.md`](../verification-plan.md) decomposition) to
 automated evidence, planned human acceptance, or an explicit version-one
-limitation. It cross-references the test/evidence suites from issue #21 and the
-contract tests from issues #2–#20.
+limitation. It cross-references the test/evidence suites from issue #21, the
+contract tests from issues #2–#20, and the issue #64 boundary corrections.
 
 ## Evidence status legend
 
@@ -36,15 +36,15 @@ Baseline at the issue #21 head (`41ad3be`): **637 passed, 13 skipped** across
 
 ### Runtime architecture
 
-| Requirement                                                                                                                     | Evidence                                                                                                                                                                                                                  |
-| ------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Plugin host worker owns processes, profiles, stream, helpers                                                                    | Automated: `test/host-browser-runtime.contract.test.ts`, `test/browser-process.integration.test.ts`, `test/evidence/storage-failure.evidence.test.ts` (clean dispose).                                                    |
-| Web content and helpers run as `bb-browser` with Chrome sandbox                                                                 | Automated: `test/evidence/security.evidence.test.ts` (unprivileged execution + loopback-only sockets); `test/host-readiness.contract.test.ts` (setup plan enforces `runAsUser`, `sandbox: required`, `noSandbox: false`). |
-| Chrome Stable primary, pinned Playwright Chromium fallback                                                                      | Automated: `test/package-contract.test.ts`, `test/evidence/security.evidence.test.ts`; pinned in `dependency-inventory.ts`.                                                                                               |
-| `dev-browser` attaches to plugin-owned Automation Mode; `default` profile untouched; `bb-personal` initial                      | Automated: `test/browser-runtime.contract.test.ts`, `test/browser-auth.integration.test.ts`.                                                                                                                              |
-| Instance sleeps after 30 min; ≤ 3 awake; LRU sleep; lazy wake                                                                   | Automated: `test/evidence/restorable-session.evidence.test.ts` (idle sleep, visible pin prevents sleep); constants in `browser-runtime.ts` (`DEFAULT_IDLE_SLEEP_MS`, `DEFAULT_AWAKE_INSTANCE_LIMIT`).                     |
-| Three crashes in five minutes → repair diagnostics                                                                              | Automated: `browser-runtime.ts` (`CRASH_LIMIT = 3`, `CRASH_WINDOW_MS`); `test/browser-runtime.contract.test.ts`; `test/evidence/storage-failure.evidence.test.ts`.                                                        |
-| Server DB owns grants/requests/preferences/activity; host owns profiles/downloads/manifests/outbox; reconciliation on reconnect | Automated: `test/host-activity-outbox.contract.test.ts`, `test/evidence/storage-failure.evidence.test.ts` (host-offline → healthy reconciliation).                                                                        |
+| Requirement                                                                                                                     | Evidence                                                                                                                                                                                              |
+| ------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Plugin host worker owns processes, profiles, stream, helpers                                                                    | Automated: `test/host-browser-runtime.contract.test.ts`, `test/browser-process.integration.test.ts`, `test/evidence/storage-failure.evidence.test.ts` (clean dispose).                                |
+| Web content and helpers run as `bb-browser` with Chrome sandbox                                                                 | Automated: `test/evidence/security.evidence.test.ts`, `test/host-readiness.contract.test.ts`, and `test/host-operations.contract.test.ts` (safe fallback staging).                                    |
+| Chrome Stable primary, pinned Playwright Chromium fallback                                                                      | Automated: `test/package-contract.test.ts`, `test/evidence/security.evidence.test.ts`; pinned in `dependency-inventory.ts`.                                                                           |
+| `dev-browser` attaches to plugin-owned Automation Mode; `default` profile untouched; `bb-personal` initial                      | Automated: `test/browser-runtime.contract.test.ts`, `test/browser-auth.integration.test.ts`.                                                                                                          |
+| Instance sleeps after 30 min; ≤ 3 awake; LRU sleep; lazy wake                                                                   | Automated: `test/evidence/restorable-session.evidence.test.ts` (idle sleep, visible pin prevents sleep); constants in `browser-runtime.ts` (`DEFAULT_IDLE_SLEEP_MS`, `DEFAULT_AWAKE_INSTANCE_LIMIT`). |
+| Three crashes in five minutes → repair diagnostics                                                                              | Automated: `browser-runtime.ts` (`CRASH_LIMIT = 3`, `CRASH_WINDOW_MS`); `test/browser-runtime.contract.test.ts`; `test/evidence/storage-failure.evidence.test.ts`.                                    |
+| Server DB owns grants/requests/preferences/activity; host owns profiles/downloads/manifests/outbox; reconciliation on reconnect | Automated: `test/host-activity-outbox.contract.test.ts`, `test/evidence/storage-failure.evidence.test.ts` (host-offline → healthy reconciliation).                                                    |
 
 ### Profiles and sessions
 
@@ -79,22 +79,24 @@ Baseline at the issue #21 head (`41ad3be`): **637 passed, 13 skipped** across
 
 ### Human and agent control
 
-| Requirement                                                                                                                                                                   | Evidence                                                                                                                                                                                   |
-| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| One Control Lease; owner priority; second owner view-only until Take control                                                                                                  | Automated: `test/control-lease.contract.test.ts`, `test/panel-control-state.contract.test.ts`, `test/panel-multi-client.contract.test.ts`.                                                 |
-| Agent leases ≤ 30 s, visible, interruptible, atomic                                                                                                                           | Automated: `test/control-lease.contract.test.ts`; `BROWSER_SCRIPT_MAX_TIMEOUT_MS`.                                                                                                         |
-| Agent fails immediately while owner has control; ≤ 5 s behind another agent → `browser_busy`; no queue                                                                        | Automated: `test/control-lease.contract.test.ts`, `test/public-plugin.contract.test.tsx`; `CONTROL_LEASE_AGENT_WAIT_MS`.                                                                   |
-| Agents denied by default; Profile Grant = one project + one profile + Origin Scope; unrestricted origins separate opt-in                                                      | Automated: `test/authorization.contract.test.ts`, `test/origin-scope.contract.test.ts`, `test/grant-requests.contract.test.ts`.                                                            |
-| Origin Scope exact origins + subdomain patterns; paths don't narrow; localhost ports separate; `*` whole-web                                                                  | Automated: `test/origin-scope.contract.test.ts`, `test/browser-origin-scope.integration.test.ts`.                                                                                          |
-| Grants confer full automation; file transfer separate flag                                                                                                                    | Automated: `test/authorization.contract.test.ts`.                                                                                                                                          |
-| Disallowed top-level nav/redirects/popups blocked before commit; cross-origin subresources render; frames need grant                                                          | Automated: `test/browser-navigation.contract.test.ts`, `test/browser-origin-scope.integration.test.ts`.                                                                                    |
-| `origin_denied` + non-blocking Grant Request; retry/1 h/persistent; default one retry; no auto-resume                                                                         | Automated: `test/grant-requests.contract.test.ts`, `test/public-plugin.contract.test.tsx`.                                                                                                 |
-| Grant Request expiry 15 min; one-retry 5 min; whole-web/file-transfer/invalid-cert default 1 h + second confirm                                                               | Automated: `test/grant-requests.contract.test.ts`; `grant-requests.ts` constants.                                                                                                          |
-| Grants bind to project id; cover providers/threads/environments/worktrees; don't follow copied projects; revoke interrupts work                                               | Automated: `test/authorization.contract.test.ts`, `test/grant-requests.contract.test.ts`.                                                                                                  |
-| `browser_script` native tool + `bb browser` CLI + bundled skill; boundaries enforce policy                                                                                    | Automated: `test/public-plugin.contract.test.tsx` (tool registration, skill config); `server.ts` `registerCli`/`registerAgentTool`.                                                        |
-| `browser_script` statically registered; derives host/project from context; optional profile/tab; required purpose; QuickJS sandbox; 30 s cap; purpose shown only during lease | Automated: `test/browser-runtime.contract.test.ts`, `test/evidence/security.evidence.test.ts` (QuickJS isolation), `test/evidence/sensitive-data.evidence.test.ts` (purpose not retained). |
-| Browser Results ≤ 256 KiB + explicit screenshots; ordinary thread content; no plugin copy                                                                                     | Automated: `BROWSER_SCRIPT_RESULT_LIMIT_BYTES`, `browserScriptResultSchema`; `test/evidence/sensitive-data.evidence.test.ts`.                                                              |
-| Tab IDs opaque, runtime-only; omit = active tab; list again after restart                                                                                                     | Automated: `test/browser-tabs.contract.test.ts`; SKILL guidance.                                                                                                                           |
+| Requirement                                                                                                                                                                                             | Evidence                                                                                                                                                                                                                         |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| One Control Lease; owner priority; second owner view-only until Take control                                                                                                                            | Automated: `test/control-lease.contract.test.ts`, `test/panel-control-state.contract.test.ts`, `test/panel-multi-client.contract.test.ts`.                                                                                       |
+| Agent leases ≤ 30 s, visible, interruptible, atomic                                                                                                                                                     | Automated: `test/control-lease.contract.test.ts`; `BROWSER_SCRIPT_MAX_TIMEOUT_MS`.                                                                                                                                               |
+| Agent fails immediately while owner has control; ≤ 5 s behind another agent → `browser_busy`; no queue                                                                                                  | Automated: `test/control-lease.contract.test.ts`, `test/public-plugin.contract.test.tsx`; `CONTROL_LEASE_AGENT_WAIT_MS`.                                                                                                         |
+| Agents denied by default; Profile Grant = one project + one profile + Origin Scope; unrestricted origins separate opt-in                                                                                | Automated: `test/authorization.contract.test.ts`, `test/origin-scope.contract.test.ts`, `test/grant-requests.contract.test.ts`.                                                                                                  |
+| Origin Scope exact origins + subdomain patterns; paths don't narrow; localhost ports separate; `*` whole-web                                                                                            | Automated: `test/origin-scope.contract.test.ts`, `test/origin-scope-host.contract.test.ts`, `test/browser-origin-scope.integration.test.ts`.                                                                                     |
+| Grants confer full automation; file transfer separate flag                                                                                                                                              | Automated: `test/authorization.contract.test.ts`.                                                                                                                                                                                |
+| Navigation policy uses route, protocol, and CDP boundaries; cleanup and exceptions preserved                                                                                                            | Automated: `test/origin-scope-host.contract.test.ts`, `test/agent-script.contract.test.ts`, `test/origin-scope-runtime.integration.test.ts`.                                                                                     |
+| Web `origin_denied` + non-blocking Grant Request; non-web typed denial without a request; retry/1 h/persistent; default one retry; no auto-resume                                                       | Automated: `test/grant-requests.contract.test.ts`, `test/public-plugin.contract.test.tsx`, `test/origin-scope-host.contract.test.ts`.                                                                                            |
+| Grant Request expiry 15 min; one-retry 5 min; whole-web/file-transfer/invalid-cert default 1 h + second confirm                                                                                         | Automated: `test/grant-requests.contract.test.ts`; `grant-requests.ts` constants.                                                                                                                                                |
+| Grants bind to project id; cover providers/threads/environments/worktrees; don't follow copied projects; revoke interrupts work                                                                         | Automated: `test/authorization.contract.test.ts`, `test/grant-requests.contract.test.ts`.                                                                                                                                        |
+| CLI has no owner authority; grant administration fails closed to authenticated Settings; URL open is agent-attributed; no-URL open discloses no tab state                                               | Automated: `test/public-plugin.contract.test.tsx` (privilege escalation, Activity attribution, no-URL disclosure, expired file-transfer elevation).                                                                              |
+| `browser_script` native tool + `bb browser` CLI + bundled skill; boundaries enforce policy                                                                                                              | Automated: `test/public-plugin.contract.test.tsx` (tool registration, skill config); `server.ts` `registerCli`/`registerAgentTool`.                                                                                              |
+| `browser_script` statically registered; derives host/project from context; optional profile/tab; required purpose; QuickJS sandbox; 30 s cap; page-to-browser root cut; purpose shown only during lease | Automated: `test/browser-runtime.contract.test.ts`, `test/agent-script.contract.test.ts`, `test/evidence/security.evidence.test.ts` (QuickJS isolation), `test/evidence/sensitive-data.evidence.test.ts` (purpose not retained). |
+| Accepted script timeouts are 1–30 s; shared-context Playwright deadlines retain host headroom for existing and future supported pages                                                                   | Automated: `test/agent-script.contract.test.ts`, `test/agent-script.playwright.integration.test.ts`, `test/public-plugin.contract.test.tsx` (999 ms rejection and 1,000 ms boundary).                                            |
+| Browser Results ≤ 256 KiB + explicit screenshots; ordinary thread content; no plugin copy                                                                                                               | Automated: `BROWSER_SCRIPT_RESULT_LIMIT_BYTES`, `browserScriptResultSchema`; `test/evidence/sensitive-data.evidence.test.ts`.                                                                                                    |
+| Tab IDs opaque, runtime-only; omit = active tab; list again after restart                                                                                                                               | Automated: `test/browser-tabs.contract.test.ts`; SKILL guidance.                                                                                                                                                                 |
 
 ### Browser Panel
 
@@ -137,13 +139,13 @@ Baseline at the issue #21 head (`41ad3be`): **637 passed, 13 skipped** across
 
 ### Browser security
 
-| Requirement                                                                                             | Evidence                                                                                                         |
-| ------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| Extensions and Chrome Sync disabled; extension password managers/wallets disabled                       | Limitation: [limitations.md](limitations.md#extensions).                                                         |
-| Saved passwords/autofill/payment autofill disabled                                                      | Limitation: [limitations.md](limitations.md#passwords).                                                          |
-| At-rest relies on Chrome + owner-only FS + host FDE; no unattended key                                  | Automated: `test/profile-storage.contract.test.ts` (owner-only modes); documented in [security.md](security.md). |
-| Exact HTTP localhost/private-network origins grantable; invalid TLS per-origin opt-in; no global bypass | Automated: `test/authorization.contract.test.ts`, `test/origin-scope.contract.test.ts`.                          |
-| Host system proxy honored; no per-profile proxy config or credentials                                   | Limitation: [limitations.md](limitations.md#proxies).                                                            |
+| Requirement                                                                                             | Evidence                                                                                                                           |
+| ------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| Extensions and Chrome Sync disabled; extension password managers/wallets disabled                       | Limitation: [limitations.md](limitations.md#extensions).                                                                           |
+| Saved passwords/autofill/payment autofill disabled                                                      | Limitation: [limitations.md](limitations.md#passwords).                                                                            |
+| At-rest relies on Chrome + owner-only FS + host FDE; no unattended key                                  | Automated: `test/profile-storage.contract.test.ts` (owner-only modes); documented in [security.md](security.md).                   |
+| Exact HTTP localhost/private-network origins grantable; invalid TLS per-origin opt-in; no global bypass | Automated: `test/authorization.contract.test.ts`, `test/origin-scope.contract.test.ts`, `test/origin-scope-host.contract.test.ts`. |
+| Host system proxy honored; no per-profile proxy config or credentials                                   | Limitation: [limitations.md](limitations.md#proxies).                                                                              |
 
 ### Profile maintenance
 
@@ -217,7 +219,24 @@ From `test/evidence/security.evidence.test.ts` and
 `test/evidence/sensitive-data.evidence.test.ts` (issue #21 AC3 and AC5):
 
 - Origin-scope enforcement at the context level (new pages share interception).
+- Direct non-web `Frame.goto` is rejected at the pinned Playwright connection
+  boundary before a navigation command is sent; boxed method/URL values are
+  covered by `test/agent-script.contract.test.ts`, and the typed denial remains
+  sticky after a caught navigation error.
+- Pinned Chromium runtime checks prove that `data:` navigation can bypass a
+  Playwright route, while the CDP guard observes the precommit signal, returns
+  the typed non-web denial, and closes the denied page. Renderer location
+  changes and data popups are covered without closing the owner page; approved
+  HTTP(S)-backed `blob:` remains usable.
 - QuickJS isolation: sandbox browser global frozen with no `newContext`.
+- Agent-visible Playwright Browser, BrowserType, BrowserContext, and connection
+  aliases cannot create an unguarded context; future host BrowserContexts are
+  registered by the Origin Scope guard, while same-context `browser.newPage()`
+  remains available (`test/agent-script.contract.test.ts`,
+  `test/origin-scope-host.contract.test.ts`).
+- The shared Playwright context applies action and navigation deadlines to the
+  initial page, existing pages, and future `browser.getPage`/`browser.newPage`
+  pages, with useful call-log tails (`test/agent-script.playwright.integration.test.ts`).
 - (Provisioned-host) unprivileged execution and loopback-only socket boundaries.
 - Sensitive-data scans across Activity Records, database, durable outbox, logs,
   diagnostics, and manifests prove exclusion of cookies, full URLs, scripts,
@@ -293,13 +312,11 @@ source and the public contracts:
 
 ### Validation run
 
-The documentation change adds Markdown files only and does not touch TypeScript
-source. The release gates that apply were run at the issue #21 head and remain
-green after these additions:
+The issue #64 boundary corrections and their documentation were validated with
+the repository gates:
 
 - `npm run typecheck` — passes.
 - `npm run lint` — passes.
 - `npx prettier --check .` — passes (new Markdown is Prettier-clean).
-- `npm run test` — 637 passed, 13 skipped (provisioned-host tests), unchanged
-  by documentation-only changes.
-- `npm run build` — production build of plugin source (unaffected by Markdown).
+- `npm run test` — 678 passed, 38 skipped across 67 test files (provisioned-host tests).
+- `npm run build` — production build of plugin source.

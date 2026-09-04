@@ -68,6 +68,13 @@ active agent work without closing the owner's page. Profile Grants confer **full
 automation** within scope because arbitrary Playwright scripts cannot be
 reliably classified as read-only.
 
+Grant administration and Grant Request decisions require the authenticated
+owner session available to Browser Settings. The CLI exposes no owner identity,
+so its grant-administration compatibility commands fail closed with Settings
+guidance. Shell access, TTY presence, and confirmation flags are not
+authentication. CLI URL opens and scripts instead use project/host-derived
+agent authorization, a Control Lease, and `agent` Activity attribution.
+
 ### Panel Capabilities
 
 A **Panel Capability** authorizes transport to one Workspace Browser. It is
@@ -82,11 +89,54 @@ Profile Grant**.
 
 Origin Scope uses exact `scheme://host:port` origins and optional explicit
 subdomain patterns (ADR 0004, ADR 0013). URL paths do not narrow a grant; each
-localhost port is separate; `*` is a distinct whole-web permission. Disallowed
-top-level navigation, redirects, and popups are blocked **before commit** and
-fail the operation. Cross-origin subresources may render normally, but agents
-cannot target a cross-origin frame without a matching grant. A denied origin
-produces a typed `origin_denied` result and a non-blocking Grant Request.
+localhost port is separate; `*` is a distinct whole-web permission. Cross-origin
+subresources may render normally. A denied web origin produces a typed
+`origin_denied` result and a non-blocking Grant Request. A denied non-web
+navigation produces the same typed error with a null origin and no Grant
+Request.
+
+Enforcement is host-owned and layered. Before the QuickJS helper starts, the
+host connects independently to the profile's Playwright context, rejects and
+closes any existing out-of-scope web or non-web document, installs the web
+grant-matching route, and attaches a CDP guard to each page. Exact
+`about:blank` is the only safe internal exception; `blob:` navigation is
+classified by its embedded HTTP(S) origin when exposed. The agent sandbox
+supplies no callback and cannot remove these controls.
+
+For an active Origin Scope, the generated agent boundary also rejects a direct
+Playwright `Frame.goto` whose address is not exact `about:blank`, HTTP(S), or an
+HTTP(S)-backed `blob:` before `sendMessageToServer` forwards the command to
+Chromium. That adapter checks only the protocol family; the host route remains
+the single owner of grant matching. The boundary handles boxed method and URL
+values from the pinned Playwright client. The host also hardens the pinned
+client's reachable Browser, BrowserType, BrowserContext, and connection paths,
+including enumerable `_browser`/`_parent` aliases and channel creation calls.
+An agent cannot create a later unguarded browser context; `browser.newPage()`
+continues to create pages in the guarded context. Every
+BrowserContext emitted after the initial connection snapshot is registered.
+
+- Out-of-scope HTTP(S) requests are aborted by the route before commit. Direct
+  agent non-web `Frame.goto` calls are rejected before the Playwright navigation
+  command; renderer-initiated location changes and frame documents use the CDP
+  guard, which fails closed and removes the denied page. If cleanup fails, the
+  typed denial reports that failure and the Browser Instance is retired before
+  another call can reuse it. Pinned Chromium can expose a diagnostic precommit
+  event for a raw direct `data:` loader without offering a cancellable loader
+  command, so the public guarantee there is typed denial plus page cleanup rather
+  than a universal no-commit claim. Ordinary cross-origin subresources continue
+  normally.
+- The first denied navigation is sticky for the operation. Navigating back into
+  scope, closing a popup, or throwing a later exception cannot erase it.
+- Denied popup targets and pre-existing denied tabs are closed when they exist;
+  a popup opener remains available when Chromium rejects the popup before a
+  target page exists, so a later call cannot recover denied page content.
+- Every new sandbox page uses the one routed context, so `browser.newPage()`
+  cannot create an unenforced context.
+
+Invalid-certificate elevation uses the same host-owned route. Only a navigation
+whose exact origin appears in the active grant's approved list is fetched with
+certificate validation disabled and fulfilled through the route. Other allowed
+origins use normal certificate validation; unrelated origins receive no bypass.
 
 ### Control Leases
 

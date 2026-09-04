@@ -324,8 +324,7 @@ export function originScopeMatcher(scope: string): OriginScopeMatcher {
  * Decides whether a candidate web origin is within one Origin Scope policy.
  *
  * This is the single matcher shared by the server grant store (via
- * {@link scopeMatchesOrigin}) and the host real-browser enforcement preamble,
- * which re-implements the same data-driven comparisons in the QuickJS sandbox.
+ * {@link scopeMatchesOrigin}) and the host-owned real-browser navigation guard.
  * An origin that is not a valid URL is treated as out of scope rather than
  * throwing, so the policy never lets an unparseable destination through.
  */
@@ -451,6 +450,9 @@ function isIpv6Loopback(hostname: string) {
   if (!isIpv4Mapped) return false;
   return hextets[6]! >= 0x7f00 && hextets[6]! <= 0x7fff;
 }
+
+export const AGENT_EXACT_ORIGIN_REQUIRED =
+  "Pass destinationOrigin as an exact web origin such as https://example.com.";
 
 function denial(
   message: string,
@@ -728,7 +730,7 @@ function authorizeAgainstGrants(
 ): BrowserAuthorizationDecision {
   const origin = normalizedAuthorizationOrigin(request);
   if (origin === null) {
-    return denial("The agent destination is not an exact web origin.");
+    return denial(AGENT_EXACT_ORIGIN_REQUIRED);
   }
   const matching = grantsForOrigin(grants, origin);
   if (matching.length === 0) {

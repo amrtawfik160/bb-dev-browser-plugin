@@ -18,37 +18,59 @@ to `dev-browser`.
 
 Parameters are defined by `browserScriptParametersSchema` (`.strict()`):
 
-| Parameter            | Required | Type / bounds                     | Notes                                                                                                                  |
-| -------------------- | -------- | --------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| `purpose`            | yes      | string, trimmed, 1–200 chars      | Human-readable reason. Shown to the owner only while the Control Lease is live, then discarded.                        |
-| `code`               | yes      | string, non-empty                 | QuickJS Playwright code. No Node, modules, process, or filesystem access.                                              |
-| `destinationOrigin`  | no       | exact `scheme://host:port` origin | Access is denied until the owner grants that origin to this project and profile. Grant changes apply to the next call. |
-| `profileId`          | no       | string                            | Host-local Browser Profile ID. Omit to use the selected profile (`bb-personal` by default).                            |
-| `tabId`              | no       | string                            | Opaque runtime-only tab ID from `browser.listPages()`. Omit to use the active tab.                                     |
-| `timeoutMs`          | no       | integer 1–30000                   | Default `30000` (`BROWSER_SCRIPT_MAX_TIMEOUT_MS`).                                                                     |
-| `screenshot`         | no       | boolean (default false)           | Request up to 3 native screenshots explicitly.                                                                         |
-| `fileTransfer`       | no       | boolean (default false)           | Separate elevation; needs its own owner grant.                                                                         |
-| `invalidCertificate` | no       | boolean (default false)           | Per-origin opt-in; needs its own owner grant.                                                                          |
+| Parameter            | Required | Type / bounds                     | Notes                                                                                                                                                       |
+| -------------------- | -------- | --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `purpose`            | yes      | string, trimmed, 1–200 chars      | Human-readable reason. Shown to the owner only while the Control Lease is live, then discarded.                                                             |
+| `code`               | yes      | string, non-empty                 | QuickJS Playwright code. No Node, modules, process, or filesystem access.                                                                                   |
+| `destinationOrigin`  | no       | exact `scheme://host:port` origin | Omitting it returns `origin_denied`. Access is denied until the owner grants that origin to this project and profile. Grant changes apply to the next call. |
+| `profileId`          | no       | string                            | Host-local Browser Profile ID. Omit to use the selected profile (`bb-personal` by default).                                                                 |
+| `tabId`              | no       | string                            | Opaque runtime-only tab ID from `browser.listPages()`. Omit to use the active tab.                                                                          |
+| `timeoutMs`          | no       | integer 1000–30000                | Default `30000`; the minimum is `BROWSER_SCRIPT_MIN_TIMEOUT_MS`.                                                                                            |
+| `screenshot`         | no       | boolean (default false)           | Request up to 3 native screenshots explicitly.                                                                                                              |
+| `fileTransfer`       | no       | boolean (default false)           | Separate elevation; needs its own owner grant.                                                                                                              |
+| `invalidCertificate` | no       | boolean (default false)           | Per-origin opt-in; the host bypasses certificate validation only for the exact approved origin.                                                             |
+
+The script runs with Playwright `page` bound to the active tab (or `tabId`).
+`return` values become the tool result. There is no `document` global.
+
+The host applies `BrowserContext.setDefaultTimeout` and
+`BrowserContext.setDefaultNavigationTimeout` to the shared context, reserving
+25% of the script timeout, capped at five seconds, for the host to return the
+result. This covers pages already in the context and later pages obtained
+through the supported `browser.getPage` and `browser.newPage` paths. At the
+minimum accepted 1,000 ms timeout, Playwright helpers receive 750 ms. A locator
+action that never becomes possible therefore returns its useful call log before
+the host deadline.
+
+```javascript
+return await page.title();
+```
 
 ```text
-bb browser script --purpose "Read the checkout total" --code "..." \
-  [--profile <id>] [--tab <id>] [--origin <origin>] [--timeout <ms>] \
+bb browser script --purpose "Read the page title" --code "return await page.title()" \
+  --origin https://example.com \
+  [--profile <id>] [--tab <id>] [--timeout <ms>] \
   [--screenshot] [--file-transfer] [--invalid-certificate] [--json]
 ```
 
 The CLI derives project and host from BB context and does **not** accept
-`--host` for `script`. Without `--json`, text results print directly; with
+`--host` for the agent `script` or `open` commands. Without `--json`, text results print directly; with
 `--json`, you get the JSON result or the screenshot envelope.
 
 > The `script` subcommand rejects `--host`, `--confirm`, and any script-only
-> option when used with another command (verified in `validateCliCommandOptions`).
+> option when used with another command; `open` also rejects `--host` (verified
+> in `validateCliCommandOptions`).
 
 ## The bundled skill
 
 The bundled skill lives at [`skills/browser/SKILL.md`](../../skills/browser/SKILL.md)
 and is configured for agents via `bb.agents.configure(() => ({ tools: ["browser_script"], skills: ["browser"] }))`.
-It tells agents to check readiness with `bb browser status --json` first and
-to use `bb browser diagnostics --json` when the status asks for repair details.
+It opens with the `browser_script` authorization flow and the agent-scoped
+`bb browser open <url>` equivalent, followed by automation recipes and the
+failure table. It carries the gotchas that cost real time:
+overlays that swallow clicks, keeping one script under ~25 seconds, preferring
+`fill` over `click` on inputs, and waiting on conditions rather than timers.
+
 Its guidance for `setup_required` is **final**: report that host setup is
 required; do not retry, provision packages, launch a browser through another
 path, or seek a raw browser endpoint.
@@ -76,12 +98,16 @@ additional copy.
 
 The `error` is one of:
 
-1. **`BrowserStatus`** — a host/instance state such as `setup_required`,
-   `host_offline`, `repair_required`, `unsupported`, `sleeping`, `waking`, or
+1. **`BrowserStatus`** — a blocking host/instance state such as
+   `setup_required`, `host_offline`, `repair_required`, `unsupported`, or
    `safe_login_elsewhere`. `setup_required` is final for the current call.
+   `sleeping` and `waking` appear on `bb browser status` while the instance is
+   idle or starting; they do not fail `browser_script`. The instance wakes on
+   demand.
 2. **Origin denied** (`state: "origin-denied"`, `code: "origin_denied"`) —
-   includes the denied `origin` and a non-blocking `grantRequest` for the owner
-   to approve.
+   a denied web navigation includes its `origin` and a non-blocking
+   `grantRequest` for the owner to approve. A denied non-web navigation has a
+   null `origin` and no request.
 3. **Runtime error** (`state: "runtime-error"`) — a `code` from:
 
    | code                | meaning                                                            |
@@ -112,7 +138,9 @@ diagnostics, or the database (verified by the sensitive-data evidence suite).
 
 ## Time and result bounds
 
-- Script timeout is capped at **30 seconds**.
+- Script timeout is **1–30 seconds**. Playwright navigation and locator waits
+  reserve 25% headroom, capped at five seconds, so a hung helper fails as
+  `script_failed` before the host deadline.
 - Structured results are capped at **256 KiB**.
 - Screenshots: at most **3** per call, each ≤ 1 MiB, PNG/JPEG/WebP only, and only
   when explicitly requested (`screenshot: true`).
@@ -132,12 +160,17 @@ Every script holds one atomic **Control Lease** for its host and profile.
 
 ## Grants and explicit retry after denial
 
-1. Without a matching grant, the call returns `origin_denied` with a non-blocking
-   Grant Request. **Stop and surface the denial to the owner**; do not loop.
+1. Without a matching web-origin grant, the call returns `origin_denied` with a
+   non-blocking Grant Request. Non-web navigation returns the typed denial
+   without a request. **Stop and surface the denial to the owner**; do not loop.
 2. The owner approves in authenticated Browser Settings: next retry, one hour,
    or persistent. The **default is one retry**.
 3. After approval, **retry explicitly**. The failed script never resumes
    automatically; grant changes apply to the **next** call only.
+
+The CLI has no authenticated owner identity. Grant administration and request
+decisions therefore fail closed there with Browser Settings guidance; a TTY,
+shell access, or confirmation flag does not confer owner authority.
 
 Grant Request expiry (verified in `grant-requests.ts`):
 

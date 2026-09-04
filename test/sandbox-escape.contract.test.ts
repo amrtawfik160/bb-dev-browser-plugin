@@ -2,7 +2,6 @@ import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
-import { enforcementPreambleScript } from "../origin-scope.js";
 
 /**
  * Issue #14 AC6: no raw Chrome, CDP, dev-browser, or helper endpoint bypasses
@@ -18,9 +17,9 @@ import { enforcementPreambleScript } from "../origin-scope.js";
  *    so the agent cannot create a fresh context that the enforcement route was
  *    never registered on.
  * 3. `newPage` reuses the one connected context (`entry.context.newPage()`),
- *    and the enforcement preamble registers a context-level `context.route()`
- *    on that same context, so any page the agent opens shares the interception
- *    instead of escaping it.
+ *    where the host-owned Origin Scope guard is installed before agent code.
+ *    The guard's navigation behavior is covered in
+ *    `origin-scope-host.contract.test.ts`.
  *
  * The contracts assert against the pinned `dev-browser` source so a version
  * bump that widens the sandbox surface fails loudly instead of silently
@@ -83,22 +82,5 @@ describe("issue #14 AC6 sandbox cannot escape the policy layer", () => {
     // The manager reuses the one connected context rather than spawning another.
     expect(source).toContain("async newPage(browserName)");
     expect(source).toContain("return entry.context.newPage();");
-  });
-
-  it("registers the enforcement route at the context level so new pages share interception", () => {
-    const preamble = enforcementPreambleScript(
-      { kind: "exact", origin: "https://app.example.test" },
-      "bb-denial-escape",
-      [],
-    );
-    expect(preamble).toContain('await context.route("**/*"');
-    expect(preamble).toContain("__bbEnforcementPage.context()");
-    // The preamble runs before the agent code, so a context-level route is in
-    // place before any newPage() call the agent makes.
-    const agentCode = "await browser.newPage()";
-    const wrapped = `${preamble}\n${agentCode}`;
-    expect(wrapped.indexOf("__bbEnforceOriginScope")).toBeLessThan(
-      wrapped.indexOf("browser.newPage()"),
-    );
   });
 });
