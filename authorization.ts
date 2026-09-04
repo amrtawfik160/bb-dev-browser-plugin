@@ -714,13 +714,46 @@ function normalizedAuthorizationOrigin(request: BrowserAuthorizationRequest) {
   }
 }
 
+/**
+ * Orders normalized scopes that match one origin from broadest to narrowest.
+ * A wildcard with fewer base-host labels covers more of the DNS tree.
+ */
+function compareScopeBreadth(leftScope: string, rightScope: string) {
+  const leftMatcher = originScopeMatcher(leftScope);
+  const rightMatcher = originScopeMatcher(rightScope);
+  if (leftMatcher.kind === "whole-web") {
+    return rightMatcher.kind === "whole-web" ? 0 : -1;
+  }
+  if (rightMatcher.kind === "whole-web") return 1;
+  if (leftMatcher.kind === "subdomain" && rightMatcher.kind === "subdomain") {
+    return (
+      leftMatcher.baseHost.split(".").length -
+      rightMatcher.baseHost.split(".").length
+    );
+  }
+  if (leftMatcher.kind === "subdomain") return -1;
+  if (rightMatcher.kind === "subdomain") return 1;
+  return 0;
+}
+
+/**
+ * Every active grant that covers an origin, broadest first.
+ *
+ * More than one grant can match — a project that later takes whole-web access
+ * still has the narrow grants it collected earlier. Authorizing against
+ * whichever happened to be stored first meant an old exact-origin grant kept
+ * constraining a project that had since been trusted with the whole web, and
+ * the navigation the owner expected to work was denied.
+ */
 function grantsForOrigin(
   grants: readonly BrowserProfileGrant[],
   origin: string,
 ) {
-  return grants.filter((grant) =>
-    scopeMatchesOrigin(grant.originScope, origin),
-  );
+  return grants
+    .filter((grant) => scopeMatchesOrigin(grant.originScope, origin))
+    .sort((left, right) =>
+      compareScopeBreadth(left.originScope, right.originScope),
+    );
 }
 
 function authorizeAgainstGrants(
