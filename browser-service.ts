@@ -91,10 +91,7 @@ import {
   type BrowserPanelCapabilityResponse,
   type BrowserPanelReleaseRequest,
   type BrowserPanelReleaseResponse,
-  type BrowserNavigationResponse,
-  type BrowserTabStrip,
   type BrowserPanelControlRequest,
-  type BrowserPanelControlResponse,
   type BrowserPanelTakeControlRequest,
   type BrowserPanelReclaimControlRequest,
   type BrowserPanelReleaseControlRequest,
@@ -130,6 +127,7 @@ import {
 } from "./contracts.js";
 import { browserHostContract } from "./host-contract.js";
 import { createPanelLifecycleDispatch } from "./panel-dispatch.js";
+import { BROWSER_SETTINGS_PROJECT_ID } from "./panel-owner-session.js";
 import { dependencyInventory } from "./dependency-inventory.js";
 import { authorizeFileTransfer } from "./transfer-staging.js";
 
@@ -266,7 +264,7 @@ function agentBrowserScriptRequest(
 const profilePreferenceRowSchema = z
   .object({ profile_id: browserProfileIdSchema })
   .strict();
-const SETTINGS_PROJECT_ID = "__browser_settings__";
+const SETTINGS_PROJECT_ID = BROWSER_SETTINGS_PROJECT_ID;
 /**
  * How hard a readiness probe tries before it reports a repair. Three attempts
  * spaced 400ms apart cover a worker restart without making a genuinely broken
@@ -2396,52 +2394,15 @@ export function createBrowserService(
   async function navigate(
     request: BrowserPanelNavigationInput,
     signal?: AbortSignal,
-  ): Promise<BrowserNavigationResponse> {
-    const identity = panelIdentity(request);
-    const hostId = await resolvedHostId(bb, identity);
-    if (hostId === null || hostId !== request.hostId) {
-      throw new Error("The selected workspace host is unavailable.");
-    }
-    const projectId = await profileContextProjectId(bb, identity);
-    await requireConnectedHost(hostId, signal);
-    return host.call(
-      "navigate",
-      {
-        hostId,
-        profileId: request.profileId,
-        projectId,
-        input: request.input,
-        ...(request.tabId === undefined ? {} : { tabId: request.tabId }),
-        ...(request.panelId === undefined ? {} : { panelId: request.panelId }),
-        rawLocalhost: request.rawLocalhost ?? false,
-      },
-      { hostId, signal },
-    );
+  ) {
+    return panelLifecycle.navigate(request, signal);
   }
 
   async function history(
     request: BrowserPanelHistoryInput,
     signal?: AbortSignal,
-  ): Promise<BrowserNavigationResponse> {
-    const identity = panelIdentity(request);
-    const hostId = await resolvedHostId(bb, identity);
-    if (hostId === null || hostId !== request.hostId) {
-      throw new Error("The selected workspace host is unavailable.");
-    }
-    const projectId = await profileContextProjectId(bb, identity);
-    await requireConnectedHost(hostId, signal);
-    return host.call(
-      "history",
-      {
-        hostId,
-        profileId: request.profileId,
-        projectId,
-        direction: request.direction,
-        ...(request.tabId === undefined ? {} : { tabId: request.tabId }),
-        ...(request.panelId === undefined ? {} : { panelId: request.panelId }),
-      },
-      { hostId, signal },
-    );
+  ) {
+    return panelLifecycle.history(request, signal);
   }
 
   /**
@@ -2453,26 +2414,8 @@ export function createBrowserService(
   async function tabAction(
     request: BrowserPanelTabActionInput,
     signal?: AbortSignal,
-  ): Promise<BrowserTabStrip> {
-    const identity = panelIdentity(request);
-    const hostId = await resolvedHostId(bb, identity);
-    if (hostId === null || hostId !== request.hostId) {
-      throw new Error("The selected workspace host is unavailable.");
-    }
-    const projectId = await profileContextProjectId(bb, identity);
-    await requireConnectedHost(hostId, signal);
-    return host.call(
-      "tabAction",
-      {
-        hostId,
-        profileId: request.profileId,
-        projectId,
-        action: request.action,
-        ...(request.tabId === undefined ? {} : { tabId: request.tabId }),
-        ...(request.panelId === undefined ? {} : { panelId: request.panelId }),
-      },
-      { hostId, signal },
-    );
+  ) {
+    return panelLifecycle.tabAction(request, signal);
   }
 
   async function panelVisibility(
@@ -2513,12 +2456,8 @@ export function createBrowserService(
    * popup windows are normalized into the strip and runtime tab identifiers
    * stay consistent for the life of the instance.
    */
-  async function tabs(
-    target: BrowserHostTarget,
-    signal?: AbortSignal,
-  ): Promise<BrowserTabStrip> {
-    await requireConnectedHost(target.hostId, signal);
-    return host.call("tabs", target, { hostId: target.hostId, signal });
+  async function tabs(target: BrowserHostTarget, signal?: AbortSignal) {
+    return panelLifecycle.tabs(target, signal);
   }
 
   /**
@@ -2531,12 +2470,8 @@ export function createBrowserService(
   async function panelControl(
     request: BrowserPanelControlRequest,
     signal?: AbortSignal,
-  ): Promise<BrowserPanelControlResponse> {
-    await requireConnectedHost(request.hostId, signal);
-    return host.call("panelControl", request, {
-      hostId: request.hostId,
-      signal,
-    });
+  ) {
+    return panelLifecycle.panelControl(request, signal);
   }
 
   /**
@@ -2547,12 +2482,8 @@ export function createBrowserService(
   async function takeControl(
     request: BrowserPanelTakeControlRequest,
     signal?: AbortSignal,
-  ): Promise<BrowserPanelControlResponse> {
-    await requireConnectedHost(request.hostId, signal);
-    return host.call("takeControl", request, {
-      hostId: request.hostId,
-      signal,
-    });
+  ) {
+    return panelLifecycle.takeControl(request, signal);
   }
 
   /**
@@ -2562,12 +2493,8 @@ export function createBrowserService(
   async function releaseControl(
     request: BrowserPanelReleaseControlRequest,
     signal?: AbortSignal,
-  ): Promise<BrowserPanelControlResponse> {
-    await requireConnectedHost(request.hostId, signal);
-    return host.call("releaseControl", request, {
-      hostId: request.hostId,
-      signal,
-    });
+  ) {
+    return panelLifecycle.releaseControl(request, signal);
   }
 
   /**
@@ -2578,12 +2505,8 @@ export function createBrowserService(
   async function reclaimControl(
     request: BrowserPanelReclaimControlRequest,
     signal?: AbortSignal,
-  ): Promise<BrowserPanelControlResponse> {
-    await requireConnectedHost(request.hostId, signal);
-    return host.call("reclaimControl", request, {
-      hostId: request.hostId,
-      signal,
-    });
+  ) {
+    return panelLifecycle.reclaimControl(request, signal);
   }
 
   subscribeToHostConnections();

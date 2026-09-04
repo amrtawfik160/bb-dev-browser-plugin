@@ -38,7 +38,7 @@ import {
   browserPanelTransportRequestSchema,
   browserPanelReleaseHostRequestSchema,
   browserPanelControlRequestSchema,
-  browserPanelReleaseControlRequestSchema,
+  browserHostReleaseControlRequestSchema,
   browserPurgeRequestSchema,
   browserScriptRequestSchema,
   browserSetupRequestSchema,
@@ -721,7 +721,7 @@ export async function createPublicPluginHarness(options?: {
       if (method === "releaseControl") {
         return host.experimental_call(
           "releaseControl",
-          browserPanelReleaseControlRequestSchema.parse(input),
+          browserHostReleaseControlRequestSchema.parse(input),
           { signal },
         );
       }
@@ -1079,6 +1079,7 @@ export async function createPublicPluginHarness(options?: {
       hostId: string;
       profileId: string;
       panelId: string;
+      ownerSessionId: string;
     }) =>
       backend.harness.behavior.callRpc(
         "browser_panel_release_control",
@@ -1975,6 +1976,7 @@ export async function createPublicPluginHarness(options?: {
     hostId: string;
     profileId: string;
     panelId: string;
+    ownerSessionId: string;
   }) {
     return rpc.browser_panel_release_control(input);
   }

@@ -22,8 +22,24 @@ const LIFECYCLE_HOST_COMMANDS = new Set([
   "panelRelease",
 ]);
 
+const PANEL_OPERATION_HOST_COMMANDS = new Set([
+  ...LIFECYCLE_HOST_COMMANDS,
+  "navigate",
+  "history",
+  "tabAction",
+  "tabs",
+  "panelControl",
+  "takeControl",
+  "releaseControl",
+  "reclaimControl",
+]);
+
 function lifecycleHostCommands(calls: readonly string[]) {
   return calls.filter((method) => LIFECYCLE_HOST_COMMANDS.has(method));
+}
+
+function panelOperationHostCommands(calls: readonly string[]) {
+  return calls.filter((method) => PANEL_OPERATION_HOST_COMMANDS.has(method));
 }
 
 describe("public Browser Panel lifecycle seam", () => {
@@ -898,6 +914,274 @@ describe("public Browser Panel lifecycle seam", () => {
       });
       expect(browser.hostRpcCalls.slice(before)).toEqual(["panelTransport"]);
       expect(browser.threadLookups).toEqual([browser.threadId]);
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it.each([
+    {
+      reason: "host-mismatch" as const,
+      override: { hostId: "host-does-not-exist" as const },
+    },
+    {
+      reason: "thread-mismatch" as const,
+      override: { threadId: "thread-does-not-exist" as const },
+    },
+    {
+      reason: "project-mismatch" as const,
+      surface: "new-thread" as const,
+      override: { projectId: "project-does-not-exist" as const },
+    },
+  ])(
+    "returns a typed $reason identity rejection for navigation, history, and Browser Tab actions without host mutation",
+    async ({
+      reason,
+      override,
+      surface,
+    }: {
+      reason: "host-mismatch" | "thread-mismatch" | "project-mismatch";
+      surface?: "new-thread";
+      override: { hostId?: string; threadId?: string; projectId?: string };
+    }) => {
+      const browser = await createPublicPanelLifecycleHarness({
+        browserRuntime: createTabInventoryRuntime(),
+      });
+      try {
+        const request =
+          surface === "new-thread"
+            ? {
+                surface: "new-thread" as const,
+                projectId: override.projectId ?? browser.projectId,
+                hostId: override.hostId ?? browser.hostId,
+                profileId: DEFAULT_PROFILE_ID,
+                panelId: `panel-drive-${reason}`,
+              }
+            : {
+                surface: "thread" as const,
+                threadId: override.threadId ?? browser.threadId,
+                hostId: override.hostId ?? browser.hostId,
+                profileId: DEFAULT_PROFILE_ID,
+                panelId: `panel-drive-${reason}`,
+              };
+        const expected = { outcome: "rejected" as const, reason };
+        const before = browser.hostRpcCalls.length;
+
+        const navigated = await browser.rpc.browser_navigate({
+          ...request,
+          input: "https://example.com/rejected",
+        });
+        expect(navigated).toMatchObject(expected);
+
+        const history = await browser.rpc.browser_history({
+          ...request,
+          direction: "reload",
+        });
+        expect(history).toMatchObject(expected);
+
+        const tabs = await browser.rpc.browser_tab_action({
+          ...request,
+          action: "open",
+        });
+        expect(tabs).toMatchObject(expected);
+        expect(
+          panelOperationHostCommands(browser.hostRpcCalls.slice(before)),
+        ).toEqual([]);
+      } finally {
+        await browser.dispose();
+      }
+    },
+  );
+
+  it.each([
+    {
+      reason: "host-mismatch" as const,
+      override: { hostId: "host-does-not-exist" },
+    },
+    {
+      reason: "owner-session-mismatch" as const,
+      override: { ownerSessionId: "owner-session-does-not-match" },
+    },
+    {
+      reason: "thread-mismatch" as const,
+      override: {
+        ownerSessionId: ownerSessionIdFromContext({
+          projectId: null,
+          threadId: "thread-does-not-exist",
+        }),
+      },
+    },
+  ])(
+    "returns a typed $reason identity rejection for Control Lease actions without host mutation",
+    async ({ reason, override }) => {
+      const browser = await createPublicPanelLifecycleHarness();
+      try {
+        const request = {
+          hostId: browser.hostId,
+          profileId: DEFAULT_PROFILE_ID,
+          panelId: `panel-control-${reason}`,
+          ownerSessionId: browser.ownerSessionId,
+          ...override,
+        };
+        const expected = { outcome: "rejected" as const, reason };
+        const before = browser.hostRpcCalls.length;
+
+        expect(await browser.rpc.browser_panel_control(request)).toMatchObject(
+          expected,
+        );
+        expect(
+          await browser.rpc.browser_panel_take_control(request),
+        ).toMatchObject(expected);
+        expect(
+          await browser.rpc.browser_panel_reclaim_control(request),
+        ).toMatchObject(expected);
+        expect(
+          await browser.rpc.browser_panel_release_control(request),
+        ).toMatchObject(expected);
+        expect(
+          panelOperationHostCommands(browser.hostRpcCalls.slice(before)),
+        ).toEqual([]);
+      } finally {
+        await browser.dispose();
+      }
+    },
+  );
+
+  it("resolves navigation, history, Browser Tab, and Control Lease requests to one host command each", async () => {
+    const browser = await createPublicPanelLifecycleHarness({
+      browserRuntime: createTabInventoryRuntime(),
+    });
+    try {
+      await browser.createBrowserProfile({
+        hostId: browser.hostId,
+        name: "Dispatch target",
+      });
+      const surface = {
+        surface: "thread" as const,
+        threadId: browser.threadId,
+        hostId: browser.hostId,
+        profileId: DEFAULT_PROFILE_ID,
+        panelId: "panel-dispatch-drive",
+      };
+      const session = {
+        hostId: browser.hostId,
+        profileId: DEFAULT_PROFILE_ID,
+        panelId: "panel-dispatch-drive",
+        ownerSessionId: browser.ownerSessionId,
+      };
+
+      let before = browser.hostRpcCalls.length;
+      const joined = await browser.rpc.browser_panel_control(session);
+      expect(joined).toMatchObject({ role: "controller" });
+      expect(browser.hostRpcCalls.slice(before)).toEqual(["panelControl"]);
+
+      before = browser.hostRpcCalls.length;
+      const navigated = await browser.rpc.browser_navigate({
+        ...surface,
+        input: "https://example.com/dispatch",
+      });
+      expect(navigated).toMatchObject({
+        address: { url: "https://example.com/dispatch" },
+      });
+      expect(browser.hostRpcCalls.slice(before)).toEqual(["navigate"]);
+
+      before = browser.hostRpcCalls.length;
+      const history = await browser.rpc.browser_history({
+        ...surface,
+        direction: "reload",
+      });
+      expect(history).toMatchObject({ address: { kind: "address" } });
+      expect(browser.hostRpcCalls.slice(before)).toEqual(["history"]);
+
+      before = browser.hostRpcCalls.length;
+      const opened = await browser.rpc.browser_tab_action({
+        ...surface,
+        action: "open",
+      });
+      expect(opened.tabs).toHaveLength(1);
+      expect(browser.hostRpcCalls.slice(before)).toEqual(["tabAction"]);
+
+      before = browser.hostRpcCalls.length;
+      const strip = await browser.rpc.browser_tabs({
+        hostId: browser.hostId,
+        profileId: DEFAULT_PROFILE_ID,
+      });
+      expect(strip).toEqual(opened);
+      expect(browser.hostRpcCalls.slice(before)).toEqual(["tabs"]);
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("rejects spectator navigation, history, and Browser Tab actions at the host when the interface is bypassed", async () => {
+    const browser = await createPublicPanelLifecycleHarness({
+      browserRuntime: createTabInventoryRuntime(),
+    });
+    try {
+      const [first, second] = await browser.openTwoPanels();
+      await waitFor(() => {
+        expect(browser.latestControl(second)?.controllerPanelId).toBe(
+          first.panelId,
+        );
+      });
+      const spectator = {
+        surface: "thread" as const,
+        threadId: browser.threadId,
+        hostId: second.hostId,
+        profileId: second.profileId,
+        panelId: second.panelId,
+      };
+
+      await expect(
+        browser.rpc.browser_navigate({
+          ...spectator,
+          input: "https://example.com/spectator",
+        }),
+      ).rejects.toThrow(/view-only/iu);
+      await expect(
+        browser.rpc.browser_history({
+          ...spectator,
+          direction: "reload",
+        }),
+      ).rejects.toThrow(/view-only/iu);
+      await expect(
+        browser.rpc.browser_tab_action({
+          ...spectator,
+          action: "open",
+        }),
+      ).rejects.toThrow(/view-only/iu);
+
+      expect(browser.latestTabs(first)?.tabs ?? []).toEqual([]);
+      expect(browser.latestTabs(second)?.tabs ?? []).toEqual([]);
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("keeps Profile Grants on the BB server while Browser Profiles stay host-owned", async () => {
+    const browser = await createPublicPanelLifecycleHarness();
+    try {
+      const created = await browser.createBrowserProfile({
+        hostId: browser.hostId,
+        name: "Host-owned profile",
+      });
+      const inventory = await browser.runBrowserProfiles();
+      expect(inventory.profiles.map((profile) => profile.profileId)).toContain(
+        created.profileId,
+      );
+      expect(browser.hostRpcCalls).toContain("createProfile");
+      expect(browser.hostRpcCalls).toContain("listProfiles");
+
+      const hostCallsBeforeGrants = browser.hostRpcCalls.length;
+      const grants = await browser.rpc.browser_grants({
+        hostId: browser.hostId,
+        profileId: DEFAULT_PROFILE_ID,
+      });
+      expect(grants).toEqual([]);
+      expect(browser.hostRpcCalls.slice(hostCallsBeforeGrants)).toEqual([]);
+      expect(JSON.stringify(browser.persistedActivityRows())).toContain(
+        '"kind":"lifecycle"',
+      );
     } finally {
       await browser.dispose();
     }

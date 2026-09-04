@@ -36,8 +36,7 @@ import {
   type BrowserGrantRequest,
   type BrowserPanelCapabilityResponse,
   type BrowserPanelControlResponse,
-  type BrowserPanelVisibilityResponse,
-  type PanelIdentityRejection,
+  isPanelIdentityRejection,
   type BrowserProfile,
   type BrowserProfileGrant,
   type BrowserProfileInventory,
@@ -1077,7 +1076,9 @@ function usePanelViewportReport({
           viewport: { width, height },
         })
         .then((response) => {
-          if (!disposed) onControlState(response);
+          if (!disposed && !isPanelIdentityRejection(response)) {
+            onControlState(response);
+          }
         })
         .catch(() => {
           // A viewport report is advisory: the shared session keeps its last
@@ -1165,7 +1166,9 @@ function usePanelControlSession({
           ownerSessionId,
         })
         .then((response) => {
-          if (!disposed) setControl(response);
+          if (!disposed && !isPanelIdentityRejection(response)) {
+            setControl(response);
+          }
         })
         .catch(() => {
           if (!disposed) setControl(null);
@@ -1205,8 +1208,9 @@ function usePanelControlSession({
             hostId,
             profileId,
             panelId,
+            ownerSessionId,
           });
-      setControl(response);
+      if (!isPanelIdentityRejection(response)) setControl(response);
     } finally {
       setTransferPending(false);
     }
@@ -1226,7 +1230,7 @@ function usePanelControlSession({
         panelId,
         ownerSessionId,
       });
-      setControl(response);
+      if (!isPanelIdentityRejection(response)) setControl(response);
     } finally {
       setTransferPending(false);
     }
@@ -1539,6 +1543,10 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
         rawLocalhost,
       })
       .then((response) => {
+        if (isPanelIdentityRejection(response)) {
+          setProfileError(response.message);
+          return;
+        }
         setLastNavigation({
           tabId: response.tabId ?? null,
           url: response.address.url,
@@ -1565,6 +1573,10 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
         direction,
       })
       .then((response) => {
+        if (isPanelIdentityRejection(response)) {
+          setProfileError(response.message);
+          return;
+        }
         setLastNavigation({
           tabId: response.tabId ?? null,
           url: response.address.url,
@@ -1697,7 +1709,13 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
         action,
         ...(tabId === undefined ? {} : { tabId }),
       })
-      .then(setTabStrip)
+      .then((response) => {
+        if (isPanelIdentityRejection(response)) {
+          setProfileError(response.message);
+          return;
+        }
+        setTabStrip(response);
+      })
       .catch((error: unknown) =>
         setProfileError(administrationErrorMessage(error)),
       );
@@ -1883,12 +1901,6 @@ function omniboxAddress(
     lastNavigation.tabId !== null &&
     lastNavigation.tabId !== activeTab.tabId;
   return belongsToAnotherTab ? "" : lastNavigation.url;
-}
-
-function isPanelIdentityRejection(
-  value: BrowserPanelVisibilityResponse,
-): value is PanelIdentityRejection {
-  return "outcome" in value && value.outcome === "rejected";
 }
 
 function administrationErrorMessage(error: unknown) {

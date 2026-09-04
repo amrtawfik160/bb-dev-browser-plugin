@@ -34,7 +34,7 @@ import {
   browserPanelControlResponseSchema,
   browserPanelTakeControlRequestSchema,
   browserPanelReclaimControlRequestSchema,
-  browserPanelReleaseControlRequestSchema,
+  browserHostReleaseControlRequestSchema,
   browserProfileCreateRequestSchema,
   browserProfileDeleteRequestSchema,
   browserProfileExpiryResponseSchema,
@@ -168,7 +168,7 @@ export const browserHostContract = defineRpcContract({
     output: browserPanelControlResponseSchema,
   },
   releaseControl: {
-    input: browserPanelReleaseControlRequestSchema,
+    input: browserHostReleaseControlRequestSchema,
     output: browserPanelControlResponseSchema,
   },
   activityOutbox: {

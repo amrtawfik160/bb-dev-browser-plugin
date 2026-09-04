@@ -856,6 +856,7 @@ export async function createPublicPanelLifecycleHarness(options?: {
     get hostRpcCalls() {
       return browser.hostRpcCalls;
     },
+    rpc: browser.rpc,
     get panelCapabilityRequests() {
       return browser.panelCapabilityRequests;
     },
@@ -902,6 +903,7 @@ export async function createPublicPanelLifecycleHarness(options?: {
         hostId: panel.hostId,
         profileId: panel.profileId,
         panelId: panel.panelId,
+        ownerSessionId: panel.ownerSessionId,
       }),
     reclaimControl: (
       panel: LifecyclePanel,

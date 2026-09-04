@@ -1,4 +1,10 @@
 /**
+ * Project identity used when a Browser Panel has no BB project, such as the
+ * Settings or compose surface. Loopback aliases still need a stable project.
+ */
+export const BROWSER_SETTINGS_PROJECT_ID = "__browser_settings__";
+
+/**
  * Derive the owner session identity that a Browser Panel binds its Panel
  * Capability to from the BB app context, rather than a hardcoded literal.
  * The capability binds to one owner session, panel instance, host, and
