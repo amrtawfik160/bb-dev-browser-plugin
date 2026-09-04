@@ -2343,14 +2343,8 @@ export function createBrowserHostEntry(
     },
     dispose: async () => {
       try {
-        const remainingTransports = boundPanelTransports();
         controlLeases.dispose();
-        panelSessions.dispose();
-        await Promise.all(
-          remainingTransports.map((transport) =>
-            transport.stop().catch(() => undefined),
-          ),
-        );
+        await panelSessions.dispose();
         panelGateways.dispose();
         panelCapabilities.dispose();
         await disposeRuntime();

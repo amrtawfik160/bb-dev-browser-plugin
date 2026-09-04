@@ -20,7 +20,11 @@ import type { ScreencastFrame, ScreencastSource } from "./panel-transport.js";
  * (ADR 0012).
  */
 
-export type PanelSessionClock = { now(): number };
+export type PanelSessionClock = {
+  now(): number;
+  setTimeout?: (callback: () => void, delayMs: number) => unknown;
+  clearTimeout?: (id: unknown) => void;
+};
 
 export type PanelSessionConnection = "connected" | "disconnected";
 
@@ -194,6 +198,7 @@ export function createPanelSession(options: PanelSessionOptions = {}) {
   let controllerViewport: PanelViewport | null = null;
   let reclaimOwnerPanelId: string | null = null;
   let reclaimDeadline: number | null = null;
+  let cancelReclaimExpiry: (() => void) | undefined;
   // Identities whose reclaim membership expired. A later join of the same
   // panel restores observation only; vacant control is not granted again.
   const expiredPanelIds = new Set<string>();
@@ -214,6 +219,51 @@ export function createPanelSession(options: PanelSessionOptions = {}) {
   function clearControlReclaim() {
     reclaimOwnerPanelId = null;
     reclaimDeadline = null;
+  }
+
+  function scheduleWithClock(callback: () => void, delayMs: number) {
+    if (clock.setTimeout !== undefined) {
+      const id = clock.setTimeout(callback, delayMs);
+      return () => clock.clearTimeout?.(id);
+    }
+    const id = setTimeout(callback, delayMs);
+    return () => clearTimeout(id);
+  }
+
+  function nextDisconnectedReclaimDeadline() {
+    let nextDeadline: number | null = null;
+    for (const member of panels.values()) {
+      if (
+        member.connection !== "disconnected" ||
+        member.reclaimUntil === null
+      ) {
+        continue;
+      }
+      if (nextDeadline === null || member.reclaimUntil < nextDeadline) {
+        nextDeadline = member.reclaimUntil;
+      }
+    }
+    return nextDeadline;
+  }
+
+  function armReclaimExpiry() {
+    cancelReclaimExpiry?.();
+    cancelReclaimExpiry = undefined;
+    const nextDeadline = nextDisconnectedReclaimDeadline();
+    if (nextDeadline === null) return;
+    // expireReclaim keeps membership until now is strictly after reclaimUntil.
+    cancelReclaimExpiry = scheduleWithClock(
+      onReclaimDeadline,
+      Math.max(0, nextDeadline - clock.now() + 1),
+    );
+  }
+
+  function onReclaimDeadline() {
+    cancelReclaimExpiry = undefined;
+    expireReclaim();
+    armReclaimExpiry();
+    emit();
+    void releaseIfIdle();
   }
 
   function leaseState(): BrowserControlLease | undefined {
@@ -237,6 +287,9 @@ export function createPanelSession(options: PanelSessionOptions = {}) {
         if (reclaimOwnerPanelId === panelId) clearControlReclaim();
         expiredPanelIds.add(panelId);
         panels.delete(panelId);
+        // A dropped socket never unmounts, so leftover visibility must not
+        // keep the session pinned after membership is gone.
+        visiblePanelIds.delete(panelId);
       }
     }
     if (
@@ -342,12 +395,14 @@ export function createPanelSession(options: PanelSessionOptions = {}) {
       existing.connection = "connected";
       existing.reclaimUntil = null;
       emit();
+      armReclaimExpiry();
       return { generation: existing.pendingGeneration };
     }
     const member = addPanel(panelId, ownerSessionId);
     member.pendingGeneration = 1;
     member.nextGeneration = 1;
     emit();
+    armReclaimExpiry();
     return { generation: 1 };
   }
 
@@ -363,10 +418,12 @@ export function createPanelSession(options: PanelSessionOptions = {}) {
       existing.ownerSessionId = ownerSessionId;
       existing.reclaimUntil = null;
       emit();
+      armReclaimExpiry();
       return existing.role;
     }
     const member = addPanel(panelId, ownerSessionId, viewport);
     emit();
+    armReclaimExpiry();
     return member.role;
   }
 
@@ -416,6 +473,7 @@ export function createPanelSession(options: PanelSessionOptions = {}) {
       dropController(panelId);
     }
     emit();
+    armReclaimExpiry();
     return true;
   }
 
@@ -541,6 +599,7 @@ export function createPanelSession(options: PanelSessionOptions = {}) {
     if (reclaimOwnerPanelId === panelId) clearControlReclaim();
     panels.delete(panelId);
     emit();
+    armReclaimExpiry();
     return true;
   }
 
@@ -629,7 +688,9 @@ export function createPanelSession(options: PanelSessionOptions = {}) {
     return boundTransports.get(panelId) ?? [];
   }
 
-  function dispose() {
+  async function dispose() {
+    cancelReclaimExpiry?.();
+    cancelReclaimExpiry = undefined;
     listeners.clear();
     panels.clear();
     expiredPanelIds.clear();
@@ -638,8 +699,8 @@ export function createPanelSession(options: PanelSessionOptions = {}) {
     controllerViewport = null;
     clearControlReclaim();
     tabStrip.dispose();
-    boundTransports.clear();
-    void streamFanout.release();
+    await stopAllTransports();
+    await streamFanout.release();
   }
 
   return {
@@ -719,24 +780,25 @@ export function createPanelSessionRegistry(
     }
   }
 
-  function dropIdle(target: PanelSessionTarget) {
+  async function dropIdle(target: PanelSessionTarget) {
     const key = panelSessionKey(target);
     const session = sessions.get(key);
     if (session === undefined || !session.isIdle()) return;
-    session.dispose();
     sessions.delete(key);
+    await session.dispose();
   }
 
   async function releaseIfIdle(target: PanelSessionTarget) {
     const session = sessions.get(panelSessionKey(target));
     if (session === undefined) return;
     await session.releaseIfIdle();
-    dropIdle(target);
+    await dropIdle(target);
   }
 
-  function dispose() {
-    for (const session of sessions.values()) session.dispose();
+  async function dispose() {
+    const disposing = [...sessions.values()];
     sessions.clear();
+    await Promise.all(disposing.map((session) => session.dispose()));
   }
 
   return { sessionFor, forEach, dropIdle, releaseIfIdle, dispose };

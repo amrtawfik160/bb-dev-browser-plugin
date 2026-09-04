@@ -446,4 +446,82 @@ describe("host-owned Panel session", () => {
       await rm(dataDir, { recursive: true, force: true });
     }
   });
+
+  it("waits for the shared screencast source to stop during worker shutdown", async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), "host-panel-dispose-"));
+    let releaseSourceStop: (() => void) | undefined;
+    const heldSource: ScreencastSource = {
+      async start(_onFrame, signal) {
+        await new Promise<void>((resolve) => {
+          if (signal.aborted) {
+            resolve();
+            return;
+          }
+          signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+      },
+      input() {},
+      async stop() {
+        await new Promise<void>((resolve) => {
+          releaseSourceStop = resolve;
+        });
+      },
+    };
+    const host = experimental_createHostEntryHarness(
+      createBrowserHostEntry(
+        {
+          inspect: healthyStatus,
+          diagnostics: () => {
+            throw new Error("not used");
+          },
+        },
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { frameSource: () => heldSource },
+      ),
+      {
+        experimental_paths: {
+          dataDir,
+          tempDir: join(dataDir, "tmp"),
+        },
+      },
+    );
+    let socket: WebSocket | undefined;
+    let disposing: Promise<void> | undefined;
+    try {
+      const opened = await host.experimental_call("panelTransport", {
+        hostId: HOST_ID,
+        profileId: DEFAULT_PROFILE_ID,
+        panelId: "panel-dispose-wait",
+        ownerSessionId: "owner-session-dispose",
+      });
+      expect(opened).toMatchObject({ outcome: "opened" });
+      if (opened.outcome !== "opened") return;
+      const connected = await connectAndRedeem(opened, {
+        panelId: "panel-dispose-wait",
+        ownerSessionId: "owner-session-dispose",
+      });
+      socket = connected.socket;
+
+      let disposeSettled = false;
+      disposing = host.experimental_dispose().then(() => {
+        disposeSettled = true;
+      });
+      await waitFor(() => releaseSourceStop !== undefined);
+      expect(disposeSettled).toBe(false);
+      releaseSourceStop?.();
+      await disposing;
+      expect(disposeSettled).toBe(true);
+    } finally {
+      releaseSourceStop?.();
+      socket?.close();
+      await disposing?.catch(() => undefined);
+      await host.experimental_dispose().catch(() => undefined);
+      await rm(dataDir, { recursive: true, force: true });
+    }
+  });
 });

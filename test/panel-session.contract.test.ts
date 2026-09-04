@@ -3,6 +3,7 @@ import { PANEL_RECLAIM_WINDOW_MS } from "../contracts.js";
 import { createControlLeaseManager } from "../control-lease.js";
 import { createPanelSessionRegistry } from "../panel-session.js";
 import type { ScreencastSource } from "../panel-transport.js";
+import { waitFor } from "./wait.js";
 
 const HOST_ID = "host-session";
 const PROFILE_A = "profile-a";
@@ -13,7 +14,23 @@ function setup(options?: {
   controlLeases?: ReturnType<typeof createControlLeaseManager>;
 }) {
   let now = 0;
-  const clock = { now: () => now };
+  let nextTimerId = 1;
+  const timers = new Map<
+    unknown,
+    { id: number; due: number; callback: () => void }
+  >();
+  const clock = {
+    now: () => now,
+    setTimeout(callback: () => void, delayMs: number) {
+      const id = nextTimerId;
+      nextTimerId += 1;
+      timers.set(id, { id, due: now + delayMs, callback });
+      return id;
+    },
+    clearTimeout(id: unknown) {
+      timers.delete(id);
+    },
+  };
   const sessions = createPanelSessionRegistry({
     clock,
     reclaimWindowMs: options?.reclaimWindowMs ?? PANEL_RECLAIM_WINDOW_MS,
@@ -26,6 +43,15 @@ function setup(options?: {
     clock,
     advanceTime(milliseconds: number) {
       now += milliseconds;
+      for (;;) {
+        const due = [...timers.values()]
+          .filter((timer) => timer.due <= now)
+          .sort((left, right) => left.due - right.due || left.id - right.id);
+        const timer = due[0];
+        if (timer === undefined) break;
+        timers.delete(timer.id);
+        timer.callback();
+      }
     },
   };
 }
@@ -519,6 +545,97 @@ describe("shared Panel session per Browser Profile", () => {
     await reconnecting.releaseIfIdle();
     expect(reconnecting.isIdle()).toBe(true);
     expect(reconnecting.hasLiveStream()).toBe(false);
+    sessions.dispose();
+  });
+
+  it("releases the shared stream when last-panel reclaim expires without a later session call", async () => {
+    const { sessions, advanceTime } = setup();
+    const session = sessions.sessionFor({
+      hostId: HOST_ID,
+      profileId: PROFILE_A,
+    });
+    let stops = 0;
+    const source: ScreencastSource = {
+      async start(_onFrame, signal) {
+        await new Promise<void>((resolve) => {
+          if (signal.aborted) {
+            resolve();
+            return;
+          }
+          signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+      },
+      input() {},
+      async stop() {
+        stops += 1;
+      },
+    };
+    session.joinPanel("panel-1", "owner-session-1");
+    session.setVisibility("panel-1", "visible");
+    const attached = session.attachStreamSource(() => source);
+    void attached.start(() => undefined, new AbortController().signal);
+    await Promise.resolve();
+    session.disconnectPanel("panel-1");
+    expect(session.hasLiveStream()).toBe(true);
+    expect(stops).toBe(0);
+
+    advanceTime(PANEL_RECLAIM_WINDOW_MS + 1);
+
+    expect(stops).toBe(1);
+    expect(session.hasLiveStream()).toBe(false);
+    expect(session.visiblePanelIds()).toEqual([]);
+    sessions.dispose();
+  });
+
+  it("waits for the shared screencast source to stop during session dispose", async () => {
+    const { sessions } = setup();
+    const session = sessions.sessionFor({
+      hostId: HOST_ID,
+      profileId: PROFILE_A,
+    });
+    let releaseSourceStop: (() => void) | undefined;
+    let transportStops = 0;
+    const source: ScreencastSource = {
+      async start(_onFrame, signal) {
+        await new Promise<void>((resolve) => {
+          if (signal.aborted) {
+            resolve();
+            return;
+          }
+          signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+      },
+      input() {},
+      async stop() {
+        await new Promise<void>((resolve) => {
+          releaseSourceStop = resolve;
+        });
+      },
+    };
+    session.joinPanel("panel-1", "owner-session-1");
+    const attached = session.attachStreamSource(() => source);
+    void attached.start(() => undefined, new AbortController().signal);
+    await Promise.resolve();
+    session.bindTransport("panel-1", {
+      generation: 1,
+      async stop() {
+        transportStops += 1;
+      },
+      dismissOpenDialogs() {},
+    });
+
+    let disposeSettled = false;
+    const disposing = Promise.resolve(session.dispose()).then(() => {
+      disposeSettled = true;
+    });
+    await waitFor(() => releaseSourceStop !== undefined);
+    expect(transportStops).toBe(1);
+    expect(disposeSettled).toBe(false);
+
+    releaseSourceStop?.();
+    await disposing;
+    expect(disposeSettled).toBe(true);
+    expect(session.boundTransports()).toEqual([]);
     sessions.dispose();
   });
 
