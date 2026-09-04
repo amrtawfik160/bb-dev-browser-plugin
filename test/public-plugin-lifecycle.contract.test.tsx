@@ -14,6 +14,7 @@ import {
 import { waitForSettled } from "./wait.js";
 import { ownerSessionIdFromContext } from "../panel-owner-session.js";
 import { createPublicPanelLifecycleHarness } from "./public-plugin-lifecycle-harness.js";
+import { createTabInventoryRuntime } from "./public-plugin-harness.js";
 
 const LIFECYCLE_HOST_COMMANDS = new Set([
   "panelTransport",
@@ -1134,5 +1135,172 @@ describe("public Browser Panel lifecycle seam", () => {
     } finally {
       await browser.dispose();
     }
+  });
+
+  it("lets two panels observe the same ordered Browser Tabs through shared-session updates", async () => {
+    const browser = await createPublicPanelLifecycleHarness({
+      browserRuntime: createTabInventoryRuntime(),
+    });
+    try {
+      await browser.createBrowserProfile({
+        hostId: browser.hostId,
+        name: "Shared tab strip",
+      });
+      const [first, second] = await browser.openTwoPanels();
+      const opened = await browser.openTab(first);
+      expect(opened.tabs).toHaveLength(1);
+      const firstTab = opened.tabs[0]!.tabId;
+      await waitFor(() => {
+        expect(browser.latestTabs(first)).toEqual(opened);
+        expect(browser.latestTabs(second)).toEqual(opened);
+      });
+
+      const secondOpened = await browser.openTab(first);
+      const secondTab = secondOpened.tabs[1]!.tabId;
+      expect(secondOpened.activeTabId).toBe(secondTab);
+      await waitFor(() => {
+        expect(browser.latestTabs(first)?.activeTabId).toBe(secondTab);
+        expect(browser.latestTabs(second)?.activeTabId).toBe(secondTab);
+        expect(browser.latestTabs(first)?.tabs.map((tab) => tab.tabId)).toEqual(
+          [firstTab, secondTab],
+        );
+        expect(
+          browser.latestTabs(second)?.tabs.map((tab) => tab.tabId),
+        ).toEqual([firstTab, secondTab]);
+      });
+
+      const activated = await browser.activateTab(first, firstTab);
+      expect(activated.activeTabId).toBe(firstTab);
+      await waitFor(() => {
+        expect(browser.latestTabs(first)?.activeTabId).toBe(firstTab);
+        expect(browser.latestTabs(second)?.activeTabId).toBe(firstTab);
+      });
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("keeps the other panel streaming after one connection is replaced or disconnected", async () => {
+    const browser = await createPublicPanelLifecycleHarness();
+    try {
+      const [first, second] = await browser.openTwoPanels();
+      await first.findByText("The page is live.");
+      await second.findByText("The page is live.");
+      const secondFramesBefore = second.framesReceived;
+      browser.sendAuthorizedInput(first, { kind: "click", generation: "keep" });
+      await waitFor(() => {
+        expect(browser.receivedInputs).toContainEqual({
+          kind: "click",
+          generation: "keep",
+        });
+      });
+
+      await browser.forcePhysicalSocketLoss(first);
+      await first.findByText("Reconnecting to the browser…");
+      await second.findByText("The page is live.");
+      expect(second.framesReceived).toBeGreaterThanOrEqual(secondFramesBefore);
+
+      const replacement = await browser.issuePanelCapability({
+        hostId: first.hostId,
+        profileId: first.profileId,
+        panelId: first.panelId,
+        ownerSessionId: first.ownerSessionId,
+      });
+      if (replacement.outcome !== "issued") {
+        throw new Error("expected a replacement Panel Capability");
+      }
+      const nextSocket = await browser.redeemIssuedCapability({
+        ...replacement,
+        hostId: first.hostId,
+        profileId: first.profileId,
+        panelId: first.panelId,
+        ownerSessionId: first.ownerSessionId,
+      });
+      await second.findByText("The page is live.");
+      expect(second.framesReceived).toBeGreaterThanOrEqual(secondFramesBefore);
+      expect(browser.receivedInputs).toEqual([
+        { kind: "click", generation: "keep" },
+      ]);
+      nextSocket.close();
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("revokes the old generation on close or profile switch so frames and input cannot cross profiles", async () => {
+    const browser = await createPublicPanelLifecycleHarness();
+    try {
+      const created = await browser.createBrowserProfile({
+        hostId: browser.hostId,
+        name: "Switch isolation",
+      });
+      const [first, second] = await browser.openTwoPanels();
+      await first.findByText("The page is live.");
+      await second.findByText("The page is live.");
+      const originalPort = second.gatewayPort;
+      browser.sendAuthorizedInput(first, { kind: "click", generation: 1 });
+      await waitFor(() => {
+        expect(browser.receivedInputs).toEqual([
+          { kind: "click", generation: 1 },
+        ]);
+      });
+
+      await browser.closePanel(first);
+      expect(first.container.innerHTML).toBe("");
+      await second.findByText("The page is live.");
+
+      const switched = await browser.switchBrowserProfile(
+        second,
+        created.profileId,
+      );
+      expect(switched.selectedProfileId).toBe(created.profileId);
+      await waitFor(() => {
+        expect(browser.portHasOpenSocket(originalPort)).toBe(false);
+      });
+      const inputsAfterSwitch = browser.receivedInputs.length;
+      await waitForSettled(
+        () => browser.receivedInputs.length === inputsAfterSwitch,
+      );
+      expect(browser.portHasOpenSocket(originalPort)).toBe(false);
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("removes panel-only stream resources after the final panel closes", async () => {
+    const browser = await createPublicPanelLifecycleHarness();
+    const ports: number[] = [];
+    try {
+      const [first, second] = await browser.openTwoPanels();
+      ports.push(first.gatewayPort, second.gatewayPort);
+      await browser.closePanel(first);
+      await waitFor(() => {
+        expect(browser.portHasOpenSocket(first.gatewayPort)).toBe(false);
+      });
+      await second.findByText("The page is live.");
+      await browser.closePanel(second);
+      await waitFor(() => {
+        expect(browser.portHasOpenSocket(second.gatewayPort)).toBe(false);
+      });
+    } finally {
+      await browser.dispose();
+    }
+    await Promise.all(
+      ports.map(
+        (port) =>
+          new Promise<void>((resolve, reject) => {
+            const socket = new WebSocket(`ws://127.0.0.1:${port}`);
+            socket.once("open", () => {
+              socket.close();
+              reject(
+                new Error(
+                  `loopback port ${port} still accepted a Browser Panel connection`,
+                ),
+              );
+            });
+            socket.once("error", () => resolve());
+          }),
+      ),
+    );
   });
 });

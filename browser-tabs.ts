@@ -33,12 +33,45 @@ export type BrowserTabStrip = {
 
 export type BrowserTabStripListener = (strip: BrowserTabStrip) => void;
 
+export type BrowserTabStripStore = {
+  resetInstance(): void;
+  openTab(url: string, title?: string, tabId?: string): string;
+  normalizePopup(
+    url: string,
+    title: string,
+    openerTabId: string | null,
+    tabId?: string,
+  ): string;
+  syncPages(
+    pages: ReadonlyArray<{
+      id: string;
+      url: string;
+      title?: string;
+      origin?: BrowserTabOrigin;
+      openerTabId?: string | null;
+    }>,
+    preferredActiveTabId?: string,
+  ): void;
+  activateTab(tabId: string): boolean;
+  closeTab(tabId: string): boolean;
+  takeEvictedTabIds(): string[];
+  tab(tabId: string): BrowserTab | undefined;
+  isValidTabId(tabId: string): boolean;
+  snapshot(): BrowserTabStrip;
+  subscribe(listener: BrowserTabStripListener): () => void;
+  dispose(): void;
+  readonly generation: number;
+};
+
 export type BrowserTabStripOptions = {
   /** Maximum number of tabs retained in the shared strip. */
   maxTabs?: number;
+  /**
+   * Compatibility adapter: when a shared Panel session is supplied, the
+   * former Browser Tab registry delegates to that session's strip.
+   */
+  session?: { tabStrip(): BrowserTabStripStore };
 };
-
-export type BrowserTabStripStore = ReturnType<typeof createBrowserTabStrip>;
 
 export const TAB_STRIP_DEFAULT_MAX_TABS = 64;
 
@@ -51,7 +84,10 @@ export function newTabId(): string {
   return `bb-tab-${randomUUID()}`;
 }
 
-export function createBrowserTabStrip(options: BrowserTabStripOptions = {}) {
+export function createBrowserTabStrip(
+  options: BrowserTabStripOptions = {},
+): BrowserTabStripStore {
+  if (options.session !== undefined) return options.session.tabStrip();
   const maxTabs = Math.max(1, options.maxTabs ?? TAB_STRIP_DEFAULT_MAX_TABS);
   let generation = 0;
   let tabs = new Map<string, BrowserTab>();

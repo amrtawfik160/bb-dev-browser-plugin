@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import { PANEL_RECLAIM_WINDOW_MS } from "../contracts.js";
 import { createControlLeaseManager } from "../control-lease.js";
 import { createPanelSessionRegistry } from "../panel-session.js";
+import type { ScreencastSource } from "../panel-transport.js";
+import { waitFor } from "./wait.js";
 
 const HOST_ID = "host-session";
 const PROFILE_A = "profile-a";
@@ -12,7 +14,23 @@ function setup(options?: {
   controlLeases?: ReturnType<typeof createControlLeaseManager>;
 }) {
   let now = 0;
-  const clock = { now: () => now };
+  let nextTimerId = 1;
+  const timers = new Map<
+    unknown,
+    { id: number; due: number; callback: () => void }
+  >();
+  const clock = {
+    now: () => now,
+    setTimeout(callback: () => void, delayMs: number) {
+      const id = nextTimerId;
+      nextTimerId += 1;
+      timers.set(id, { id, due: now + delayMs, callback });
+      return id;
+    },
+    clearTimeout(id: unknown) {
+      timers.delete(id);
+    },
+  };
   const sessions = createPanelSessionRegistry({
     clock,
     reclaimWindowMs: options?.reclaimWindowMs ?? PANEL_RECLAIM_WINDOW_MS,
@@ -25,6 +43,15 @@ function setup(options?: {
     clock,
     advanceTime(milliseconds: number) {
       now += milliseconds;
+      for (;;) {
+        const due = [...timers.values()]
+          .filter((timer) => timer.due <= now)
+          .sort((left, right) => left.due - right.due || left.id - right.id);
+        const timer = due[0];
+        if (timer === undefined) break;
+        timers.delete(timer.id);
+        timer.callback();
+      }
     },
   };
 }
@@ -340,6 +367,324 @@ describe("shared Panel session per Browser Profile", () => {
     expect(lease.signal.aborted).toBe(true);
     expect(session.state().agentPurpose).toBeNull();
     controlLeases.dispose();
+    sessions.dispose();
+  });
+
+  it("broadcasts one ordered Browser Tab strip and active tab to every panel", () => {
+    const { sessions } = setup();
+    const session = sessions.sessionFor({
+      hostId: HOST_ID,
+      profileId: PROFILE_A,
+    });
+    const isolated = sessions.sessionFor({
+      hostId: HOST_ID,
+      profileId: PROFILE_B,
+    });
+    const seen: Array<{ tabs: string[]; activeTabId: string | null }> = [];
+    session.subscribe(() => {
+      const strip = session.snapshot().tabs;
+      seen.push({
+        tabs: strip.tabs.map((tab) => tab.tabId),
+        activeTabId: strip.activeTabId,
+      });
+    });
+    session.joinPanel("panel-1", "owner-session-1");
+    session.joinPanel("panel-2", "owner-session-2");
+    const first = session.tabStrip().openTab("https://example.test/a", "A");
+    const second = session.tabStrip().openTab("https://example.test/b", "B");
+    session.tabStrip().activateTab(first);
+
+    expect(session.snapshot().tabs).toEqual(session.tabStrip().snapshot());
+    expect(session.snapshot().tabs.tabs.map((tab) => tab.tabId)).toEqual([
+      first,
+      second,
+    ]);
+    expect(session.snapshot().tabs.activeTabId).toBe(first);
+    expect(isolated.snapshot().tabs).toEqual({ tabs: [], activeTabId: null });
+    expect(seen.at(-1)).toEqual({
+      tabs: [first, second],
+      activeTabId: first,
+    });
+    sessions.dispose();
+  });
+
+  it("keeps a shared stream live when one panel connection is replaced or disconnected", async () => {
+    const { sessions } = setup();
+    const session = sessions.sessionFor({
+      hostId: HOST_ID,
+      profileId: PROFILE_A,
+    });
+    const frames: number[] = [];
+    let starts = 0;
+    let stops = 0;
+    const stopWaiters: Array<() => void> = [];
+    const source: ScreencastSource = {
+      async start(onFrame, signal) {
+        starts += 1;
+        onFrame({
+          sequence: starts,
+          mimeType: "image/png",
+          data: new Uint8Array([1]),
+        });
+        await new Promise<void>((resolve) => {
+          const finish = () => resolve();
+          stopWaiters.push(finish);
+          if (signal.aborted) {
+            finish();
+            return;
+          }
+          signal.addEventListener("abort", finish, { once: true });
+        });
+      },
+      input() {},
+      async stop() {
+        stops += 1;
+        for (const finish of stopWaiters.splice(0)) finish();
+      },
+    };
+    session.joinPanel("panel-1", "owner-session-1");
+    session.joinPanel("panel-2", "owner-session-2");
+    const first = session.attachStreamSource(() => source);
+    const second = session.attachStreamSource(() => source);
+    const firstAbort = new AbortController();
+    const secondAbort = new AbortController();
+    void first.start((frame) => frames.push(frame.sequence), firstAbort.signal);
+    void second.start(
+      (frame) => frames.push(frame.sequence + 10),
+      secondAbort.signal,
+    );
+    await Promise.resolve();
+    expect(starts).toBe(1);
+    expect(frames).toEqual([1, 11]);
+
+    firstAbort.abort();
+    await first.stop();
+    session.closePanel("panel-1");
+    await session.releaseIfIdle();
+    expect(stops).toBe(0);
+    expect(session.hasLiveStream()).toBe(true);
+
+    source.input({});
+    expect(stops).toBe(0);
+    secondAbort.abort();
+    await second.stop();
+    session.closePanel("panel-2");
+    await session.releaseIfIdle();
+    expect(stops).toBe(1);
+    expect(session.hasLiveStream()).toBe(false);
+    sessions.dispose();
+  });
+
+  it("releases stream resources when the final panel closes or reclaim expires", async () => {
+    const { sessions, advanceTime } = setup();
+    const session = sessions.sessionFor({
+      hostId: HOST_ID,
+      profileId: PROFILE_A,
+    });
+    let stops = 0;
+    const source: ScreencastSource = {
+      async start(_onFrame, signal) {
+        await new Promise<void>((resolve) => {
+          if (signal.aborted) {
+            resolve();
+            return;
+          }
+          signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+      },
+      input() {},
+      async stop() {
+        stops += 1;
+      },
+    };
+    session.joinPanel("panel-1", "owner-session-1");
+    session.joinPanel("panel-2", "owner-session-2");
+    const first = session.attachStreamSource(() => source);
+    void first.start(() => undefined, new AbortController().signal);
+    await Promise.resolve();
+    session.closePanel("panel-1");
+    await session.releaseIfIdle();
+    expect(stops).toBe(0);
+    expect(session.hasLiveStream()).toBe(true);
+
+    session.closePanel("panel-2");
+    await session.releaseIfIdle();
+    expect(session.snapshot().panels).toEqual([]);
+    expect(session.isIdle()).toBe(true);
+    expect(stops).toBe(1);
+    expect(session.hasLiveStream()).toBe(false);
+
+    const reconnecting = sessions.sessionFor({
+      hostId: HOST_ID,
+      profileId: PROFILE_A,
+    });
+    reconnecting.joinPanel("panel-3", "owner-session-3");
+    const reconnectSource: ScreencastSource = {
+      async start(_onFrame, signal) {
+        await new Promise<void>((resolve) => {
+          if (signal.aborted) {
+            resolve();
+            return;
+          }
+          signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+      },
+      input() {},
+      async stop() {
+        stops += 1;
+      },
+    };
+    const reconnect = reconnecting.attachStreamSource(() => reconnectSource);
+    void reconnect.start(() => undefined, new AbortController().signal);
+    await Promise.resolve();
+    reconnecting.disconnectPanel("panel-3");
+    await reconnecting.releaseIfIdle();
+    expect(reconnecting.hasLiveStream()).toBe(true);
+    advanceTime(PANEL_RECLAIM_WINDOW_MS + 1);
+    expect(reconnecting.snapshot().panels).toEqual([]);
+    await reconnecting.releaseIfIdle();
+    expect(reconnecting.isIdle()).toBe(true);
+    expect(reconnecting.hasLiveStream()).toBe(false);
+    sessions.dispose();
+  });
+
+  it("releases the shared stream when last-panel reclaim expires without a later session call", async () => {
+    const { sessions, advanceTime } = setup();
+    const session = sessions.sessionFor({
+      hostId: HOST_ID,
+      profileId: PROFILE_A,
+    });
+    let stops = 0;
+    const source: ScreencastSource = {
+      async start(_onFrame, signal) {
+        await new Promise<void>((resolve) => {
+          if (signal.aborted) {
+            resolve();
+            return;
+          }
+          signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+      },
+      input() {},
+      async stop() {
+        stops += 1;
+      },
+    };
+    session.joinPanel("panel-1", "owner-session-1");
+    session.setVisibility("panel-1", "visible");
+    const attached = session.attachStreamSource(() => source);
+    void attached.start(() => undefined, new AbortController().signal);
+    await Promise.resolve();
+    session.disconnectPanel("panel-1");
+    expect(session.hasLiveStream()).toBe(true);
+    expect(stops).toBe(0);
+
+    advanceTime(PANEL_RECLAIM_WINDOW_MS + 1);
+
+    expect(stops).toBe(1);
+    expect(session.hasLiveStream()).toBe(false);
+    expect(session.visiblePanelIds()).toEqual([]);
+    sessions.dispose();
+  });
+
+  it("waits for the shared screencast source to stop during session dispose", async () => {
+    const { sessions } = setup();
+    const session = sessions.sessionFor({
+      hostId: HOST_ID,
+      profileId: PROFILE_A,
+    });
+    let releaseSourceStop: (() => void) | undefined;
+    let transportStops = 0;
+    const source: ScreencastSource = {
+      async start(_onFrame, signal) {
+        await new Promise<void>((resolve) => {
+          if (signal.aborted) {
+            resolve();
+            return;
+          }
+          signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+      },
+      input() {},
+      async stop() {
+        await new Promise<void>((resolve) => {
+          releaseSourceStop = resolve;
+        });
+      },
+    };
+    session.joinPanel("panel-1", "owner-session-1");
+    const attached = session.attachStreamSource(() => source);
+    void attached.start(() => undefined, new AbortController().signal);
+    await Promise.resolve();
+    session.bindTransport("panel-1", {
+      generation: 1,
+      async stop() {
+        transportStops += 1;
+      },
+      dismissOpenDialogs() {},
+    });
+
+    let disposeSettled = false;
+    const disposing = Promise.resolve(session.dispose()).then(() => {
+      disposeSettled = true;
+    });
+    await waitFor(() => releaseSourceStop !== undefined);
+    expect(transportStops).toBe(1);
+    expect(disposeSettled).toBe(false);
+
+    releaseSourceStop?.();
+    await disposing;
+    expect(disposeSettled).toBe(true);
+    expect(session.boundTransports()).toEqual([]);
+    sessions.dispose();
+  });
+
+  it("tracks panel visibility on the shared session instead of a parallel registry", () => {
+    const { sessions } = setup();
+    const session = sessions.sessionFor({
+      hostId: HOST_ID,
+      profileId: PROFILE_A,
+    });
+    session.joinPanel("panel-1", "owner-session-1");
+    expect(session.setVisibility("panel-1", "visible")).toBe(true);
+    expect(session.visiblePanelIds()).toEqual(["panel-1"]);
+    expect(session.isIdle()).toBe(false);
+    session.closePanel("panel-1");
+    expect(session.isIdle()).toBe(false);
+    expect(session.setVisibility("panel-1", "hidden")).toBe(true);
+    expect(session.visiblePanelIds()).toEqual([]);
+    expect(session.isIdle()).toBe(true);
+    sessions.dispose();
+  });
+
+  it("binds and stops panel transports on the shared session", async () => {
+    const { sessions } = setup();
+    const session = sessions.sessionFor({
+      hostId: HOST_ID,
+      profileId: PROFILE_A,
+    });
+    const stopped: number[] = [];
+    session.bindTransport("panel-1", {
+      generation: 1,
+      async stop() {
+        stopped.push(1);
+      },
+      dismissOpenDialogs() {},
+    });
+    session.bindTransport("panel-1", {
+      generation: 2,
+      async stop() {
+        stopped.push(2);
+      },
+      dismissOpenDialogs() {},
+    });
+    await session.stopTransports("panel-1", [1]);
+    expect(stopped).toEqual([1]);
+    expect(session.boundTransports().map((entry) => entry.generation)).toEqual([
+      2,
+    ]);
+    session.dispose();
+    expect(session.boundTransports()).toEqual([]);
     sessions.dispose();
   });
 });

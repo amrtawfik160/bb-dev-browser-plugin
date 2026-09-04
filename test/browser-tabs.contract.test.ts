@@ -4,6 +4,7 @@ import {
   newTabId,
   type BrowserTabStrip,
 } from "../browser-tabs.js";
+import { createPanelSession } from "../panel-session.js";
 
 function stripIds(strip: BrowserTabStrip) {
   return strip.tabs.map((tab) => tab.tabId);
@@ -197,5 +198,16 @@ describe("Browser Tab strip", () => {
     // Those ids belong to a browser that no longer exists.
     expect(strip.takeEvictedTabIds()).toEqual([]);
     strip.dispose();
+  });
+
+  it("delegates a session-backed strip to the shared Panel session", () => {
+    const session = createPanelSession();
+    const adapter = createBrowserTabStrip({ session });
+    const tabId = adapter.openTab("https://example.test/a", "A");
+
+    expect(adapter).toBe(session.tabStrip());
+    expect(session.snapshot().tabs).toEqual(adapter.snapshot());
+    expect(session.snapshot().tabs.activeTabId).toBe(tabId);
+    session.dispose();
   });
 });
