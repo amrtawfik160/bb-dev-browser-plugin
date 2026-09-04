@@ -4,9 +4,9 @@ This is the handoff documentation for the **Browser** plugin (`bb-plugin-browser
 v0.1.0, MIT): a host-local Workspace Browser shared by a BB owner and
 explicitly authorized agents across repositories on the same enrolled host.
 
-The plugin is locally installed from its path in version one and is not
-submitted to a marketplace. Everything below describes verified behavior from
-the implemented tickets (#2–#21) plus the version-one limitations they record.
+The plugin is locally installed from its path in version 0.1.0 and is not
+submitted to a marketplace. Everything below describes verified behavior plus
+the version-one limitations they record.
 Where a behavior cannot yet be exercised in this environment it is stated as a
 **limitation** with its evidence status rather than as a working feature.
 
