@@ -143,13 +143,32 @@ type NavigationClassification =
   | { kind: "safe-internal" }
   | { kind: "non-web" };
 
+const IDLE_CHROME_HOSTS = new Set([
+  "newtab",
+  "new-tab-page",
+  "new-tab-page-third-party",
+]);
+
+function isIdleInternalDocument(url: URL): boolean {
+  if (url.protocol === "chrome:" && IDLE_CHROME_HOSTS.has(url.hostname)) {
+    return true;
+  }
+  if (url.protocol === "chrome-untrusted:" && url.hostname === "new-tab-page") {
+    return true;
+  }
+  return url.protocol === "chrome-error:" && url.hostname === "chromewebdata";
+}
+
 /**
  * Classify document navigations before matching a web Origin Scope. Exact
- * about:blank is the only internal page that does not carry host browsing
- * data; every other non-web location is denied, while blob URLs inherit an
- * exposed HTTP(S) origin.
+ * about:blank is the only safe internal document. Restored Chrome new-tab and
+ * error pages are cleared before installing this guard because they can expose
+ * profile history. Blob URLs inherit an exposed HTTP(S) origin.
  */
 function classifyNavigation(address: string): NavigationClassification {
+  if (typeof address !== "string" || address.length === 0) {
+    return { kind: "safe-internal" };
+  }
   let url: URL;
   try {
     url = new URL(address);
@@ -182,7 +201,9 @@ function deniedExistingPages(
   const denied: { denial: BrowserOriginScopeDeniedError; page: Page }[] = [];
   for (const context of contexts) {
     for (const page of context.pages()) {
-      const classification = classifyNavigation(page.url());
+      const address = page.url();
+      if (address.length === 0) continue;
+      const classification = classifyNavigation(address);
       if (
         classification.kind === "non-web" ||
         (classification.kind === "web" &&
@@ -504,11 +525,7 @@ export async function installHostOriginScopeGuard(
     if (pageChannel !== null) {
       const observePage = (event: BrowserPageChannelEvent) => {
         const page = event.page._object;
-        if (page === undefined) {
-          denial ??= new BrowserOriginScopeDeniedError(null);
-          observeBrowserClose();
-          return;
-        }
+        if (page === undefined) return;
         trackPageInstallation(installPage(context, page));
       };
       pageObservers.set(context, observePage);
@@ -546,11 +563,7 @@ export async function installHostOriginScopeGuard(
   )._channel;
   const observeBrowserContext = async (event: BrowserContextChannelEvent) => {
     const context = event.context._object;
-    if (context === undefined) {
-      denial ??= new BrowserOriginScopeDeniedError(null);
-      observeBrowserClose();
-      return;
-    }
+    if (context === undefined) return;
     await observeContext(context);
   };
   const disposeResources = async () => {
@@ -585,6 +598,21 @@ export async function installHostOriginScopeGuard(
   try {
     contextEmitter.prependListener("context", observeBrowserContext);
     const contexts = browser.contexts();
+    await Promise.all(
+      contexts
+        .flatMap((context) => context.pages())
+        .map(async (page) => {
+          let address: URL;
+          try {
+            address = new URL(page.url());
+          } catch {
+            return;
+          }
+          if (isIdleInternalDocument(address)) {
+            await page.goto("about:blank", { timeout: policy.timeoutMs });
+          }
+        }),
+    );
     await Promise.all(contexts.map((context) => installContext(context)));
     await settlePendingInstallations(pendingContextInstallations);
     await settlePendingInstallations(pendingPageInstallations);

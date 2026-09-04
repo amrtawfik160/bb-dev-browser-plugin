@@ -42,6 +42,10 @@ class SimulatedPage {
     return this.closed;
   }
 
+  async goto(address: string) {
+    this.currentUrl = address;
+  }
+
   async close() {
     await this.closeBarrier;
     this.closed = true;
@@ -363,6 +367,45 @@ describe("host-owned Origin Scope guard", () => {
     );
 
     expect(guard.deniedOrigin()).toBeNull();
+    await guard.dispose();
+  });
+
+  it.each([
+    "chrome://newtab/",
+    "chrome://new-tab-page/",
+    "chrome-untrusted://new-tab-page/one-google-bar",
+    "chrome-error://chromewebdata/",
+  ])(
+    "clears an existing Chrome idle tab before agent access: %s",
+    async (url) => {
+      const page = new SimulatedPage("idle", url);
+      const boundary = simulatedBrowser([page]);
+
+      const guard = await installHostOriginScopeGuard(
+        "ws://127.0.0.1/devtools/browser/test",
+        policy(),
+        boundary.connect,
+      );
+
+      expect(guard.deniedError()).toBeNull();
+      expect(boundary.context.page("idle")?.url()).toBe("about:blank");
+      expect(await boundary.context.navigate(page, url)).toBe("aborted");
+      expect(guard.deniedError()).toBeInstanceOf(BrowserOriginScopeDeniedError);
+      await guard.dispose();
+    },
+  );
+
+  it("does not treat an empty CDP navigation URL as a non-web denial", async () => {
+    const page = new SimulatedPage("main", "chrome://newtab/");
+    const boundary = simulatedBrowser([page]);
+    const guard = await installHostOriginScopeGuard(
+      "ws://127.0.0.1/devtools/browser/test",
+      policy(),
+      boundary.connect,
+    );
+
+    expect(await boundary.context.navigate(page, "")).toBe("continued");
+    expect(guard.deniedError()).toBeNull();
     await guard.dispose();
   });
 

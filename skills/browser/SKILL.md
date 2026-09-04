@@ -100,15 +100,15 @@ await Promise.all([page.waitForURL(/\/search\?/), box.press("Enter")]);
 
 ## Failures and what to do
 
-| Code                | Meaning                                | Do                                                                 |
-| ------------------- | -------------------------------------- | ------------------------------------------------------------------ |
-| `origin_denied`     | Grant missing or navigation is non-web | Surface any Grant Request; retry web origins only after approval   |
-| `browser_busy`      | Someone else holds control             | Wait and retry once; queued work is not kept                       |
-| `browser_timeout`   | Script hit its deadline                | Split the work or wait on a condition instead of a timer           |
-| `script_failed`     | Playwright error                       | Read the call log at the end of the message — it names the reason  |
-| `tab_invalid`       | Tab belongs to a previous runtime      | `browser.listPages()` again                                        |
-| `setup_required`    | Host is not provisioned                | Report it. Do not retry, install packages, or find another browser |
-| `safe_login_denied` | Owner-only Safe Login is active        | Wait for the owner; you cannot see or drive the browser            |
+| Code                | Meaning                                         | Do                                                                      |
+| ------------------- | ----------------------------------------------- | ----------------------------------------------------------------------- |
+| `origin_denied`     | Grant missing or navigation is non-web          | Surface any Grant Request; retry web origins only after approval        |
+| `browser_busy`      | Owner control or a 30-second agent wait expired | This call did not run; let the active operation finish, then retry once |
+| `browser_timeout`   | Script hit its deadline                         | Split the work or wait on a condition instead of a timer                |
+| `script_failed`     | Playwright error                                | Read the call log at the end of the message — it names the reason       |
+| `tab_invalid`       | Tab belongs to a previous runtime               | `browser.listPages()` again                                             |
+| `setup_required`    | Host is not provisioned                         | Report it. Do not retry, install packages, or find another browser      |
+| `safe_login_denied` | Owner-only Safe Login is active                 | Wait for the owner; you cannot see or drive the browser                 |
 
 `bb browser status` reports host readiness and live control state; `bb browser
 diagnostics` adds repair detail.
@@ -139,7 +139,9 @@ can reuse it. Pinned Chromium may report a precommit event for a raw direct
 `data:` loader that cannot be canceled; the public result is still a typed denial
 and the denied page is cleaned up.
 The guard registers contexts emitted after its initial browser snapshot as
-well. Exact `about:blank` is the only safe internal page exception. A `blob:`
+well. Exact `about:blank` is the only safe internal page. Restored Chrome
+new-tab / error documents are cleared to `about:blank` before agent access;
+direct navigation to them is denied. A `blob:`
 page uses its embedded HTTP(S) origin when the browser exposes one. An
 invalid-certificate elevation applies only to its explicitly approved origin.
 
@@ -151,8 +153,11 @@ creates a page in the guarded context.
 ## Control, profiles, and records
 
 Every script holds one atomic Control Lease per host and profile. Owner
-navigation wins immediately. A competing agent waits at most five seconds, then
-gets `browser_busy`. Your purpose and identity are visible in status,
+navigation wins immediately. Competing agents wait in arrival order for up to
+30 seconds before `browser_busy`; cancelled or expired waiting calls never run.
+The wait is separate from the script's execution timeout. Use sequential calls
+when working with one profile. Switching to the CLI uses the same Control Lease.
+Your purpose and identity are visible in status,
 diagnostics, and the Browser Panel only while the lease is live.
 
 Activity Records keep metadata and interruption status — never your purpose,

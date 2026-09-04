@@ -115,6 +115,53 @@ describe("Browser panel reduced-motion hook (issue #17)", () => {
 });
 
 describe("Browser panel dialog chrome (issue #17)", () => {
+  it("leaves Enter on Cancel to the button instead of accepting the dialog", () => {
+    const onRespond = vi.fn();
+    render(
+      <PanelDialogLayer
+        dialog={promptDialog()}
+        isController={true}
+        reducedMotion={true}
+        onRespond={onRespond}
+        onClose={vi.fn()}
+      />,
+    );
+    const cancel = screen.getByRole("button", { name: "Cancel" });
+    cancel.focus();
+    fireEvent.keyDown(cancel, { key: "Enter" });
+    expect(onRespond).not.toHaveBeenCalled();
+    fireEvent.click(cancel);
+    expect(onRespond).toHaveBeenCalledExactlyOnceWith(false);
+  });
+
+  it("uses the new default answer when another prompt replaces the current dialog", () => {
+    const props = {
+      isController: true,
+      reducedMotion: true,
+      onRespond: vi.fn(),
+      onClose: vi.fn(),
+    };
+    const panel = render(
+      <PanelDialogLayer {...props} dialog={promptDialog()} />,
+    );
+    fireEvent.change(screen.getByRole("textbox"), {
+      target: { value: "Edited" },
+    });
+    panel.rerender(
+      <PanelDialogLayer
+        {...props}
+        dialog={{
+          ...promptDialog(),
+          dialogId: "next-prompt",
+          defaultValue: "Next answer",
+        }}
+      />,
+    );
+    expect((screen.getByRole("textbox") as HTMLInputElement).value).toBe(
+      "Next answer",
+    );
+  });
+
   it("renders an alert dialog as an accessible modal with OK and Cancel", () => {
     const onRespond = vi.fn();
     render(

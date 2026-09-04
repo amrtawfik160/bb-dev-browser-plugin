@@ -41,7 +41,7 @@ returns a typed error and can raise a Grant Request. A non-web navigation
 returns the same typed error and does not raise a request.
 
 **Origin Scope.** Exact `scheme://host:port`, optional subdomain patterns.
-Denied pages are removed. Exact `about:blank` is the only safe internal page.
+Denied pages are removed. Exact `about:blank` is the safe internal page. Restored Chrome new-tab / error documents are cleared to `about:blank` before agent access.
 
 **Control Lease.** One owner client or one agent sends input at a time. You
 can take it back.

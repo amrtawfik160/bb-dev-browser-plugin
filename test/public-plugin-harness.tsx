@@ -555,6 +555,12 @@ export async function createPublicPluginHarness(options?: {
       installationId: "installation-public-test",
       lifecycle: { stopProfile: async () => undefined },
     });
+  if (
+    options?.browserRuntime !== undefined &&
+    options.profileStore === undefined
+  ) {
+    await profileStore.initialize(configuredHostId);
+  }
   const profileRecovery =
     options?.profileRecovery ??
     createFileBrowserProfileRecovery({

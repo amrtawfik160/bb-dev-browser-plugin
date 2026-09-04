@@ -720,9 +720,8 @@ export function BrowserNewTabSurface({
         signed in on that host, and never leave it.
       </p>
       <p className="max-w-md text-sm text-muted-foreground">
-        Agents in this project cannot use this browser until you let them. Run{" "}
-        <code>bb browser trust</code> to allow it, or approve a single site when
-        an agent asks.
+        Manage agent access in Browser Settings, or approve a single site when
+        an agent asks to use it.
       </p>
     </section>
   );

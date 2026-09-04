@@ -79,7 +79,8 @@ See [safe-login.md](safe-login.md) for the full workflow.
   any time. (ADR 0005)
 - Agent scripts receive visible, interruptible, atomic leases of at most 30
   seconds. Agent calls fail immediately while an owner has control and wait at
-  most 5 seconds behind another agent before returning `browser_busy`.
+  most 30 seconds behind other agents before returning `browser_busy`. Waiting
+  calls run in arrival order and are removed on cancellation or owner takeover.
 - Agents are denied by default. A persistent **Profile Grant** authorizes one BB
   project to use one profile at explicit web origins. (ADR 0004)
 - Agent access is exposed through a native `browser_script` tool, an equivalent

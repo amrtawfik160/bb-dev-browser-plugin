@@ -93,8 +93,11 @@ Connect session, panel capability redemption) and reconnect behavior.
   If the message asks for `destinationOrigin`, pass `--origin https://example.com`
   (or the tool parameter) as an exact origin. A Grant Request is only created
   for a real origin.
-- **Agent contention** — `browser_busy`: an owner has control, or 5 s elapsed
-  waiting behind another agent. Do not queue; surface and let the owner act.
+- **Agent contention** — `browser_busy`: an owner has control, or the call
+  waited 30 seconds behind other agents. The waiting call did not run. If
+  another agent is active, let it finish before retrying once. If the owner is
+  controlling the page, wait for them to release control. The CLI uses the same
+  lease and cannot bypass contention.
 - **Tab not found** — `tab_invalid`: tab IDs are runtime-only. List tabs again
   after any browser or worker restart and retry with a fresh ID.
 - **Disk pressure** — new instances and downloads are refused below 5 GiB host

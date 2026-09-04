@@ -404,6 +404,7 @@ async function browserArguments(
     `--renderer-process-limit=${RENDERER_PROCESS_LIMIT}`,
     `--js-flags=--max-old-space-size=${RENDERER_HEAP_LIMIT_MB}`,
     `--lang=${target.locale}`,
+    `--accept-lang=${target.locale}`,
     "--restore-last-session",
   ];
   if (!(await fileExists(join(profileDirectory, "Local State")))) {

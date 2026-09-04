@@ -3047,23 +3047,23 @@ describe("Browser public plugin contract", () => {
     }
   });
 
-  it("waits behind another agent briefly and reports browser_busy without queuing work", async () => {
+  it("serializes overlapping browser tools when the first operation takes longer than five seconds", async () => {
     let executionStarted!: () => void;
     const started = new Promise<void>((resolve) => {
       executionStarted = resolve;
     });
-    const runtime = publicRuntime(
-      async (_target, _code, _timeoutMs, options) => {
-        await new Promise<void>((resolve, reject) => {
-          const abort = () => reject(new Error("agent lease revoked"));
-          options?.leaseSignal?.addEventListener("abort", abort, {
-            once: true,
-          });
-          executionStarted();
-        });
-        return "never reached";
-      },
-    );
+    const executions: string[] = [];
+    let calls = 0;
+    const runtime = publicRuntime(async () => {
+      const call = ++calls;
+      executions.push(`start-${call}`);
+      if (call === 1) {
+        executionStarted();
+        await new Promise((resolve) => setTimeout(resolve, 6_500));
+      }
+      executions.push(`finish-${call}`);
+      return `completed-${call}`;
+    });
     const browser = await createPublicPluginHarness({
       snapshot: preparedSnapshot,
       browserRuntime: runtime,
@@ -3082,15 +3082,17 @@ describe("Browser public plugin contract", () => {
         code: "second",
         destinationOrigin: "https://example.com",
       });
-      const busy = await second;
-      expect(
-        browserScriptFailureSchema.parse(JSON.parse(busy.content[0]!.text))
-          .error,
-      ).toMatchObject({ state: "runtime-error", code: "browser_busy" });
-      await expect(
-        browser.runBrowserNavigation("https://example.com/release"),
-      ).resolves.toBeTruthy();
-      await expect(first).resolves.toMatchObject({ isError: true });
+      const responses = await Promise.all([first, second]);
+      expect(responses.map((response) => response.content[0]!.text)).toEqual([
+        "completed-1",
+        "completed-2",
+      ]);
+      expect(executions).toEqual([
+        "start-1",
+        "finish-1",
+        "start-2",
+        "finish-2",
+      ]);
     } finally {
       await browser.dispose();
     }

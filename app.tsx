@@ -75,6 +75,7 @@ import {
   type BrowserPanelOptionDescriptor,
 } from "./panel-presentation.js";
 import { ownerSessionIdFromContext } from "./panel-owner-session.js";
+import { browserPagePoint, useBrowserPageInput } from "./panel-input.js";
 import {
   PANEL_PROTOCOL_VERSION,
   decodePanelProtocolMessage,
@@ -84,6 +85,7 @@ import {
 import {
   clearPanelTimeout,
   isTestLoopbackPanelTransport,
+  isTestPanelTransportEnabled,
   schedulePanelTimeout,
 } from "./panel-test-loopback.js";
 import { SAFE_LOGIN_LIMITATIONS_NOTICE } from "./safe-login-notice.js";
@@ -98,7 +100,7 @@ let nextBrowserPanelId = 1;
 
 function shouldOpenAuthenticatedPanelStream() {
   if (!isTestEnvironment()) return true;
-  return isTestLoopbackPanelTransport();
+  return isTestPanelTransportEnabled();
 }
 
 function isTestEnvironment() {
@@ -295,10 +297,12 @@ function PanelStreamSurface({
   } | null>(null);
   const ownerSessionId = ownerSessionIdFromContext(bbContext);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const textInputRef = useRef<HTMLTextAreaElement | null>(null);
   const streamRef = useRef<PanelStreamAdapter | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
   const reducedMotion = usePrefersReducedMotion();
   const [dialog, setDialog] = useState<BrowserDialogEvent | null>(null);
+  const [contextError, setContextError] = useState<string | null>(null);
   const [contextMenu, setContextMenu] = useState<{
     queryId: string;
     point: { x: number; y: number };
@@ -352,9 +356,7 @@ function PanelStreamSurface({
         // The capability is redeemed in the first WebSocket message rather than
         // placed in a URL. The panel never opens the loopback gateway directly;
         // BB Connect's owner-session gate carries the opaque single-use secret.
-        // The public lifecycle seam keeps connecting until that redeem produces
-        // a ready state over the real loopback transport.
-        if (!isTestLoopbackPanelTransport()) setStreamState("streaming");
+        // Keep connecting until the gateway confirms the stream is ready.
       })
       .catch(() => {
         if (disposed) return;
@@ -455,7 +457,7 @@ function PanelStreamSurface({
       // so tests redeem a real Panel Capability without a Connect daemon.
       return isTestLoopbackPanelTransport()
         ? `ws://127.0.0.1:${issued.gatewayPort}`
-        : `wss://${issued.tunnel.label}.${issued.tunnel.baseDomain}`;
+        : `wss://${issued.tunnel.label}--${issued.gatewayPort}.${issued.tunnel.baseDomain}`;
     }
 
     function redeemOnOpen(
@@ -792,11 +794,9 @@ function PanelStreamSurface({
     if (!isController) return;
     const canvas = canvasRef.current;
     if (canvas === null) return;
-    const rect = canvas.getBoundingClientRect();
-    const scaleX = canvas.width / rect.width;
-    const scaleY = canvas.height / rect.height;
-    const x = (event.clientX - rect.left) * scaleX;
-    const y = (event.clientY - rect.top) * scaleY;
+    const point = browserPagePoint(canvas, event.clientX, event.clientY);
+    if (point === null) return;
+    const { x, y } = point;
     const queryId = `ctx-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
     sendStream({
       protocolVersion: PANEL_PROTOCOL_VERSION,
@@ -819,13 +819,25 @@ function PanelStreamSurface({
     setDialog(null);
   }
 
-  function chooseContextAction(action: BrowserContextAction) {
+  async function chooseContextAction(action: BrowserContextAction) {
+    if (!isController || !livePush) return;
+    setContextMenu(null);
+    setContextError(null);
+    if (action.kind === "copy-link" || action.kind === "copy-image-address") {
+      try {
+        await navigator.clipboard.writeText(action.targetUrl);
+      } catch {
+        setContextError(
+          "Could not copy the address. Check this site's clipboard permission in your browser.",
+        );
+      }
+      return;
+    }
     sendStream({
       protocolVersion: PANEL_PROTOCOL_VERSION,
       type: "context_action",
       actionId: action.actionId,
     });
-    setContextMenu(null);
   }
 
   /**
@@ -879,6 +891,18 @@ function PanelStreamSurface({
     onLiveChange?.(livePush);
   }, [livePush, onLiveChange]);
 
+  const inputSequence = useRef(1);
+  const inputEnabled = isController && livePush && streamState === "streaming";
+  useBrowserPageInput(canvasRef, textInputRef, inputEnabled, (payload) => {
+    if (!isController) return;
+    sendStream({
+      protocolVersion: PANEL_PROTOCOL_VERSION,
+      type: "input",
+      sequence: inputSequence.current++,
+      payload,
+    });
+  });
+
   // The page fills the panel. What used to sit around it — the streaming
   // policy and the version-one screen-reader limitation — is still announced,
   // but only to assistive technology: it is a disclosure the owner needs once,
@@ -887,7 +911,7 @@ function PanelStreamSurface({
   return (
     <section
       aria-label="Browser page"
-      className="relative h-full min-h-0 w-full"
+      className="relative h-full min-h-0 w-full focus-within:outline focus-within:outline-2 focus-within:-outline-offset-2 focus-within:outline-ring"
       style={
         agentDriven
           ? { boxShadow: `inset 0 0 0 3px ${BROWSER_PANEL_ACCENT_CONTRAST}` }
@@ -898,23 +922,43 @@ function PanelStreamSurface({
         This browser streams the page as pixels between 5 and 15 frames per
         second, up to 1920×1080. Input is owner-gated and freezes immediately on
         disconnect. {BROWSER_PANEL_STREAM_DISCLOSURE}
+        Click the page to type. Press Shift+Escape to leave page input.
       </p>
+      <textarea
+        ref={textInputRef}
+        aria-label="Browser page keyboard input"
+        tabIndex={-1}
+        disabled={!inputEnabled}
+        className="absolute left-0 top-0 h-px w-px opacity-0"
+        autoComplete="off"
+        autoCapitalize="off"
+        spellCheck={false}
+      />
       {capability?.outcome === "issued" ? (
         <canvas
           ref={canvasRef}
           aria-label="Browser page view"
           role="img"
+          tabIndex={inputEnabled ? 0 : -1}
           width={controllerViewport?.width ?? PANEL_MAX_VIEWPORT_WIDTH}
           height={controllerViewport?.height ?? PANEL_MAX_VIEWPORT_HEIGHT}
           className="h-full w-full bg-muted object-contain"
           onContextMenu={handleContext}
         />
       ) : null}
-      <p className="sr-only" aria-live="polite">
+      <p
+        className={
+          streamState === "streaming"
+            ? "sr-only"
+            : "absolute inset-x-0 top-0 border-b bg-background p-2 text-sm"
+        }
+        aria-live="polite"
+      >
         {browserPanelRecoveryAnnouncement(streamState)}
       </p>
       {dialog === null ? null : (
         <PanelDialogLayer
+          key={dialog.dialogId}
           dialog={dialog}
           isController={isController}
           reducedMotion={reducedMotion}
@@ -931,6 +975,14 @@ function PanelStreamSurface({
           onChoose={chooseContextAction}
           onClose={() => setContextMenu(null)}
         />
+      )}
+      {contextError === null ? null : (
+        <p
+          role="alert"
+          className="absolute inset-x-0 top-0 border-b bg-background p-2 text-sm"
+        >
+          {contextError}
+        </p>
       )}
       {downloads.length === 0 ? null : (
         // Downloads appear only once there is one, the way a browser reveals

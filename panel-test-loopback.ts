@@ -19,12 +19,17 @@ function testPanelLifecycleClock() {
     PanelLifecycleTestClock | undefined;
 }
 
-export function setTestLoopbackPanelTransport(enabled: boolean) {
-  (globalThis as Record<string, unknown>)[LOOPBACK_FLAG] = enabled;
+export function setTestPanelTransport(mode: "loopback" | "tunnel" | undefined) {
+  (globalThis as Record<string, unknown>)[LOOPBACK_FLAG] = mode;
+}
+
+export function isTestPanelTransportEnabled() {
+  const mode = (globalThis as Record<string, unknown>)[LOOPBACK_FLAG];
+  return mode === "loopback" || mode === "tunnel";
 }
 
 export function isTestLoopbackPanelTransport() {
-  return (globalThis as Record<string, unknown>)[LOOPBACK_FLAG] === true;
+  return (globalThis as Record<string, unknown>)[LOOPBACK_FLAG] === "loopback";
 }
 
 export function setTestPanelLifecycleClock(

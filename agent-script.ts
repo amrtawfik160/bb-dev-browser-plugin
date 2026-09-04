@@ -126,11 +126,18 @@ const __bbAgentBrowserBoundary = (() => {
     );
   };
 
+  const __bbNavigationAddress = (address) => {
+    if (typeof address === "string" || address instanceof String) return String(address);
+    if (address != null && typeof address.href === "string") return address.href;
+    return address == null ? "" : String(address);
+  };
   const __bbIsAllowedNavigationAddress = (address) => {
-    if (typeof address !== "string" && !(address instanceof String)) return false;
+    const raw = __bbNavigationAddress(address);
+    if (raw.length === 0 || raw === "about:blank") return true;
+    if (raw.indexOf("http://") === 0 || raw.indexOf("https://") === 0) return true;
     let url;
     try {
-      url = new URL(String(address));
+      url = new URL(raw);
     } catch {
       return false;
     }

@@ -36,6 +36,51 @@ async function close(server: Server): Promise<void> {
 }
 
 describe("pinned Chromium Origin Scope runtime", () => {
+  it("clears restored new-tab shortcuts before scoped access and denies returning", async () => {
+    const context = await chromium.launchPersistentContext("", {
+      headless: true,
+      channel: "chromium",
+    });
+    let guard:
+      Awaited<ReturnType<typeof installHostOriginScopeGuard>> | undefined;
+    try {
+      const page = context.pages()[0]!;
+      await page.goto("chrome://newtab/");
+      await page.getByRole("button", { name: "Add shortcut" }).click();
+      await page.locator("input[type=text]").fill("Private project");
+      await page
+        .locator("input[type=url]")
+        .fill("https://private.example.test/secret");
+      await page.getByRole("button", { name: "Done", exact: true }).click();
+      await expect
+        .poll(() =>
+          page
+            .locator("cr-most-visited a")
+            .evaluateAll((links) =>
+              links.map((link) => link.getAttribute("href")),
+            ),
+        )
+        .toContain("https://private.example.test/secret");
+      const browser = context.browser()!;
+      guard = await installHostOriginScopeGuard(
+        "unused",
+        policy(),
+        async () => browser,
+      );
+      expect(page.url()).toBe("about:blank");
+      expect(await page.content()).not.toContain("private.example.test");
+      expect(guard.deniedError()).toBeNull();
+      await page.goto("chrome://newtab/").catch(() => null);
+      await vi.waitFor(() => expect(page.isClosed()).toBe(true));
+      expect(guard.deniedError()).toEqual(
+        new BrowserOriginScopeDeniedError(null),
+      );
+    } finally {
+      await guard?.dispose();
+      await context.close();
+    }
+  });
+
   it("denies a data document that produces no Playwright route request", async () => {
     const browser = await chromium.launch({ headless: true });
     const context = await browser.newContext();

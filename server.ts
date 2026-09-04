@@ -2184,7 +2184,7 @@ function registerAgentTool(bb: BbPluginApi, browser: BrowserService) {
     description:
       "Run Playwright code in the host-local Workspace Browser. Pass destinationOrigin as an exact origin such as https://example.com. The script gets `page` for the active tab; returned values become the tool result.",
     instructions:
-      "Provide a purpose, an exact destinationOrigin, and QuickJS Playwright code. `page` is the active tab. `return` values become the result. Report typed failures without retrying setup.",
+      "Provide a purpose, an exact destinationOrigin, and QuickJS Playwright code. `page` is the active tab. `return` values become the result. Calls sharing a profile wait in order for up to 30 seconds before browser_busy; that call has not run. Let the active operation finish before retrying once. The CLI uses the same lease. Report typed failures without retrying setup.",
     presentation: {
       label: {
         pending: "Running browser script",

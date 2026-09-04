@@ -98,10 +98,12 @@ Request.
 Enforcement is host-owned and layered. Before the QuickJS helper starts, the
 host connects independently to the profile's Playwright context, rejects and
 closes any existing out-of-scope web or non-web document, installs the web
-grant-matching route, and attaches a CDP guard to each page. Exact
-`about:blank` is the only safe internal exception; `blob:` navigation is
-classified by its embedded HTTP(S) origin when exposed. The agent sandbox
-supplies no callback and cannot remove these controls.
+grant-matching route, and attaches a CDP guard to each page. Restored Chrome
+new-tab / error documents are cleared to `about:blank` before agent access because
+they can expose profile history or failed addresses. Exact `about:blank` is the
+only safe internal exception; `blob:` navigation is classified by its embedded HTTP(S) origin
+when exposed. The agent sandbox supplies no callback and cannot remove these
+controls.
 
 For an active Origin Scope, the generated agent boundary also rejects a direct
 Playwright `Frame.goto` whose address is not exact `about:blank`, HTTP(S), or an
@@ -143,9 +145,10 @@ origins use normal certificate validation; unrelated origins receive no bypass.
 Input is serialized through a **Control Lease** (ADR 0005). Owner interaction
 has priority and may interrupt an agent at any time. An agent script receives a
 visible, interruptible atomic lease of **at most 30 seconds**. Agent calls fail
-immediately while an owner has control and wait at most **5 seconds**
+immediately while an owner has control and wait at most **30 seconds**
 (`CONTROL_LEASE_AGENT_WAIT_MS`) behind another agent before returning a typed
-`browser_busy` error; queued work is never retained. On disconnect, the same
+`browser_busy` error. Cancelled, expired, and owner-interrupted waiting calls
+are discarded without execution. On disconnect, the same
 panel has **10 seconds** (`PANEL_RECLAIM_WINDOW_MS`) to reclaim its lease before
 release.
 

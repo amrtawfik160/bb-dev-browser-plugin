@@ -112,7 +112,7 @@ The `error` is one of:
 
    | code                | meaning                                                            |
    | ------------------- | ------------------------------------------------------------------ |
-   | `browser_busy`      | An owner has control, or 5 s elapsed waiting behind another agent. |
+   | `browser_busy`      | An owner has control, or 30 s elapsed waiting behind other agents. |
    | `browser_timeout`   | The script exceeded its timeout.                                   |
    | `result_too_large`  | Output exceeded 256 KiB.                                           |
    | `lease_revoked`     | The owner revoked the lease.                                       |
@@ -152,9 +152,12 @@ Every script holds one atomic **Control Lease** for its host and profile.
 
 - **Owner has priority**: owner navigation interrupts an agent immediately; the
   agent receives a typed error (the lease is revoked or busy).
-- **Two agents**: a competing agent waits at most **5 seconds**
-  (`CONTROL_LEASE_AGENT_WAIT_MS`), then receives `browser_busy`. Queued work is
-  **never** retained for later execution.
+- **Two agents**: a competing agent waits in arrival order for at most
+  **30 seconds** (`CONTROL_LEASE_AGENT_WAIT_MS`), then receives `browser_busy`
+  without running. This wait is separate from `timeoutMs`, which bounds script
+  execution. Cancelled, expired, and owner-interrupted waiting calls are removed.
+- If another agent still has control after the wait, let that operation finish
+  before retrying once. Switching from the tool to the CLI uses the same lease.
 - Commands are never replayed automatically after a denial, revocation, or
   timeout.
 

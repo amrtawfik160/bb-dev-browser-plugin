@@ -426,10 +426,18 @@ export function createPanelTransportServer(
     streamAbort?.abort();
     const subscriptionAbort = new AbortController();
     streamAbort = subscriptionAbort;
-    void source.start(
-      (frame) => deliverFrame(socket, frame),
-      subscriptionAbort.signal,
-    );
+    void source
+      .start((frame) => deliverFrame(socket, frame), subscriptionAbort.signal)
+      .then(
+        () => {
+          if (!subscriptionAbort.signal.aborted)
+            socket.close(1011, "Browser stream stopped");
+        },
+        () => {
+          if (!subscriptionAbort.signal.aborted)
+            socket.close(1011, "Browser stream failed");
+        },
+      );
     if (source.subscribeDialogs !== undefined) {
       unsubscribeDialogs?.();
       // subscribeDialogs re-emits every still-open dialog exactly once, so it

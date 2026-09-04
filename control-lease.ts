@@ -3,7 +3,9 @@ import {
   type BrowserControlLease,
 } from "./contracts.js";
 
-export const CONTROL_LEASE_AGENT_WAIT_MS = 5_000;
+// A normal script can hold control for 30 seconds. Let the next caller wait
+// for that script, while cancellation and owner takeover still remove it.
+export const CONTROL_LEASE_AGENT_WAIT_MS = BROWSER_SCRIPT_MAX_TIMEOUT_MS;
 
 export type ControlLease = BrowserControlLease & {
   signal: AbortSignal;
@@ -150,7 +152,9 @@ export function createControlLeaseManager() {
       const timer = setTimeout(() => {
         removePending(pending);
         reject(
-          leaseBusy("Another Browser operation still holds the Control Lease."),
+          leaseBusy(
+            "Another agent still holds browser control after 30 seconds. This call did not run. Wait for the other operation to finish, then retry once.",
+          ),
         );
       }, CONTROL_LEASE_AGENT_WAIT_MS);
       timer.unref?.();

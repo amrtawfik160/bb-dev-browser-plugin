@@ -66,6 +66,7 @@ export function PanelDialogLayer({
   const [promptText, setPromptText] = useState(dialog.defaultValue);
 
   useEffect(() => {
+    setPromptText(dialog.defaultValue);
     previouslyFocused.current =
       (document.activeElement as HTMLElement | null) ?? null;
     // Focus the prompt input for prompts, else the primary action.
@@ -77,7 +78,7 @@ export function PanelDialogLayer({
     return () => {
       previouslyFocused.current?.focus?.();
     };
-  }, [dialog.dialogId, dialog.type]);
+  }, [dialog.dialogId, dialog.type, dialog.defaultValue]);
 
   function handleKeyDown(event: React.KeyboardEvent<HTMLDivElement>) {
     if (isBbGlobalShortcut(event.nativeEvent)) return;
@@ -89,6 +90,9 @@ export function PanelDialogLayer({
     }
     if (event.key === "Enter") {
       event.stopPropagation();
+      if (event.target instanceof HTMLElement && event.target.closest("button"))
+        return;
+      event.preventDefault();
       if (!isController) return;
       if (dialog.type === "prompt") onRespond(true, promptText);
       else onRespond(true);

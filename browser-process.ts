@@ -156,7 +156,10 @@ async function chownTree(path: string, userId: number, groupId: number) {
   }
 }
 
-function helperRuntimeHome(runtimeDirectory: string, browserName: string) {
+export function helperRuntimeHome(
+  runtimeDirectory: string,
+  browserName: string,
+) {
   const nested = join(runtimeDirectory, browserName);
   const socketPath = join(nested, ".dev-browser", "daemon.sock");
   if (Buffer.byteLength(socketPath) <= UNIX_SOCKET_PATH_MAX_BYTES) {
@@ -372,11 +375,14 @@ async function processIdentity(pid: number): Promise<BrowserProcessIdentity> {
 type ProcessSnapshot = {
   pid: number;
   parentId: number;
-  isRenderer: boolean;
 };
 
 function processHasGone(error: unknown) {
-  return error instanceof Error && "code" in error && error.code === "ENOENT";
+  return (
+    error instanceof Error &&
+    "code" in error &&
+    (error.code === "ENOENT" || error.code === "ESRCH")
+  );
 }
 
 function processParentId(statContents: string) {
@@ -401,14 +407,10 @@ async function readProcessSnapshot(
   pid: number,
 ): Promise<ProcessSnapshot | null> {
   try {
-    const [statContents, commandLine] = await Promise.all([
-      readFile(`/proc/${pid}/stat`, "utf8"),
-      readFile(`/proc/${pid}/cmdline`, "utf8"),
-    ]);
+    const statContents = await readFile(`/proc/${pid}/stat`, "utf8");
     return {
       pid,
       parentId: processParentId(statContents),
-      isRenderer: isRendererProcess(commandLine),
     };
   } catch (error) {
     if (processHasGone(error)) return null;
@@ -460,9 +462,19 @@ function processDescendants(
 async function rendererProcessCount(browserPid: number) {
   const liveProcesses = await liveProcessSnapshots();
   const descendants = processDescendants(browserPid, liveProcesses);
-  return liveProcesses.filter(
-    (process_) => process_.isRenderer && descendants.has(process_.pid),
-  ).length;
+  const renderers = await Promise.all(
+    [...descendants].map(async (pid) => {
+      try {
+        return isRendererProcess(
+          await readFile(`/proc/${pid}/cmdline`, "utf8"),
+        );
+      } catch (error) {
+        if (pid !== browserPid && processHasGone(error)) return false;
+        throw error;
+      }
+    }),
+  );
+  return renderers.filter(Boolean).length;
 }
 
 async function assertRendererProcessLimit(browserPid: number) {

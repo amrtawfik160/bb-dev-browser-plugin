@@ -140,6 +140,14 @@ describe("Browser host runtime boundary", () => {
           visibility: "hidden",
         }),
       ).resolves.toMatchObject({ state: "sleeping" });
+      await expect(
+        host.experimental_call("panelVisibility", {
+          hostId: HOST_ID,
+          profileId: "missing-profile",
+          panelId: "panel-missing",
+          visibility: "hidden",
+        }),
+      ).resolves.toMatchObject({ state: "repair-required" });
     } finally {
       await host.experimental_dispose();
       await rm(rootDirectory, { recursive: true, force: true });

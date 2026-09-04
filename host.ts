@@ -1255,7 +1255,11 @@ export function createBrowserHostEntry(
       return readiness;
     }
     const target = await panelRuntimeTarget(request, dataDir);
-    if (target === null) return browserProfileUnavailableStatus(request);
+    if (target === null)
+      return browserProfileUnavailableStatus({
+        hostId: request.hostId,
+        profileId: request.profileId,
+      });
     panelControlSession({
       hostId: request.hostId,
       profileId: request.profileId,
@@ -1575,6 +1579,7 @@ export function createBrowserHostEntry(
       });
       return startBoundPanelTransport(request, dataDir, opened, () =>
         createCdpScreencastSource({
+          tabs: strip,
           resolveEndpoint: async () =>
             (await browserRuntime.start(target)).automationEndpoint,
           // The controller's logical viewport drives the screencast capture size;

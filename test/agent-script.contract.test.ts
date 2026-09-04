@@ -321,6 +321,12 @@ const attempts = await Promise.all([
     .then(() => "forwarded", () => "blocked"),
   connection.sendMessageToServer(frame, new String("goto"), { url: new String("blob:https://app.example.test/blob-id") }, {})
     .then(() => "forwarded", () => "blocked"),
+  connection.sendMessageToServer(frame, new String("goto"), { url: new String("chrome://newtab/") }, {})
+    .then(() => "forwarded", () => "blocked"),
+  connection.sendMessageToServer(frame, new String("goto"), { url: new String("chrome-untrusted://new-tab-page/one-google-bar") }, {})
+    .then(() => "forwarded", () => "blocked"),
+  connection.sendMessageToServer(frame, "goto", { url: { href: "https://example.com/", toString() { return this.href; } } }, {})
+    .then(() => "forwarded", () => "blocked"),
 ]);
 console.log(JSON.stringify({ attempts, sentMethods: connection.sentMethods }));
 return "completed";`,
@@ -328,8 +334,15 @@ return "completed";`,
       true,
     );
     expect(JSON.parse(logs[0] ?? "{}")).toEqual({
-      attempts: ["blocked", "forwarded", "forwarded"],
-      sentMethods: ["goto", "goto"],
+      attempts: [
+        "blocked",
+        "forwarded",
+        "forwarded",
+        "blocked",
+        "blocked",
+        "forwarded",
+      ],
+      sentMethods: ["goto", "goto", "goto"],
     });
     expect(logs[1]).toContain("non-web URL");
   });

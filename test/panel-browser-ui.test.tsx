@@ -279,7 +279,7 @@ describe("Browser Panel", () => {
       // The owner learns where this browser runs and how agents get to use it,
       // rather than staring at a blank canvas that reads as a failed load.
       expect(landing.textContent).toMatch(/runs on/iu);
-      expect(landing.textContent).toMatch(/bb browser trust/u);
+      expect(landing.textContent).toMatch(/Browser Settings/u);
       const address = await panel.findByLabelText("Address or search");
       await waitFor(() => expect(document.activeElement).toBe(address));
     } finally {
