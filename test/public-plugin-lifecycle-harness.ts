@@ -4,6 +4,10 @@ import { expect } from "vitest";
 import { WebSocket as NodeWebSocket } from "ws";
 import type { ScreencastFrame, ScreencastSource } from "../panel-transport.js";
 import {
+  PANEL_PROTOCOL_VERSION,
+  encodePanelProtocolMessage,
+} from "../panel-protocol.js";
+import {
   setTestLoopbackPanelTransport,
   setTestPanelLifecycleClock,
 } from "../panel-test-loopback.js";
@@ -48,7 +52,9 @@ const FIRST_FRAME_PNG = Buffer.from(
 
 type TrackedSocket = NodeWebSocket & { url: string };
 
-function createDeterministicPanelFrameSource(): ScreencastSource {
+function createDeterministicPanelFrameSource(
+  receivedInputs: unknown[],
+): ScreencastSource {
   return {
     async start(onFrame, signal) {
       const frame: ScreencastFrame = {
@@ -65,7 +71,9 @@ function createDeterministicPanelFrameSource(): ScreencastSource {
         signal.addEventListener("abort", () => resolve(), { once: true });
       });
     },
-    input() {},
+    input(payload) {
+      receivedInputs.push(payload);
+    },
     async stop() {},
   };
 }
@@ -115,6 +123,7 @@ export async function createPublicPanelLifecycleHarness() {
     { callback: () => void; due: number }
   >();
   let nextReconnectTimerId = 1;
+  const receivedInputs: unknown[] = [];
 
   function recordSocketMessage(socket: TrackedSocket, data: unknown) {
     const port = socketPort(socket);
@@ -198,7 +207,7 @@ export async function createPublicPanelLifecycleHarness() {
     snapshot: HEALTHY_SNAPSHOT,
     panelContext: { projectId: PROJECT_ID, threadId: THREAD_ID },
     clock,
-    panelFrameSource: () => createDeterministicPanelFrameSource(),
+    panelFrameSource: () => createDeterministicPanelFrameSource(receivedInputs),
   });
   const ownerSessionId = ownerSessionIdFromContext({
     projectId: PROJECT_ID,
@@ -379,6 +388,31 @@ export async function createPublicPanelLifecycleHarness() {
     return browser.rpc.browser_panel_capability(input);
   }
 
+  function liveSocketFor(panel: LifecyclePanel) {
+    return [...sockets].find(
+      (socket) =>
+        socketPort(socket) === String(panel.gatewayPort) &&
+        socket.readyState === NodeWebSocket.OPEN,
+    );
+  }
+
+  function sendAuthorizedInput(panel: LifecyclePanel, payload: unknown) {
+    const socket = liveSocketFor(panel);
+    if (socket === undefined) {
+      throw new Error("Browser Panel has no live stream connection.");
+    }
+    const encoded = encodePanelProtocolMessage({
+      protocolVersion: PANEL_PROTOCOL_VERSION,
+      type: "input",
+      sequence: receivedInputs.length + 1,
+      payload,
+    });
+    if (encoded.outcome !== "encoded") {
+      throw new Error("Browser Panel input failed protocol encoding.");
+    }
+    socket.send(encoded.raw);
+  }
+
   async function dispose() {
     setTestLoopbackPanelTransport(false);
     setTestPanelLifecycleClock(undefined);
@@ -406,7 +440,11 @@ export async function createPublicPanelLifecycleHarness() {
     get panelCapabilityRequests() {
       return browser.panelCapabilityRequests;
     },
+    get receivedInputs() {
+      return receivedInputs;
+    },
     openTwoPanels,
+    sendAuthorizedInput,
     forcePhysicalSocketLoss,
     advanceTime,
     closePanel,
