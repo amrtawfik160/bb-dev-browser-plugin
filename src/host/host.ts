@@ -716,13 +716,21 @@ export function createBrowserHostEntry(
   ) {
     const pages = await browserRuntime.listPages(target);
     let protectedTabId = requestedActiveTabId;
-    if (protectedTabId === undefined && pages.length > 0) {
-      // The active-tab read fails when the browser has no front page. The
-      // inventory is still authoritative: syncing it drops tabs the browser no
-      // longer has, which is what keeps stale ids out of the strip.
-      protectedTabId = await browserRuntime
-        .activeTabId?.(target)
-        .catch(() => undefined);
+    if (protectedTabId === undefined) {
+      const current = strip.snapshot().activeTabId;
+      if (current !== null && pages.some((page) => page.id === current)) {
+        // The owner (or a prior operation) already picked this tab. Headless
+        // Chromium can still report a different page as visible, and using
+        // that read here would undo the switch the strip just made.
+        protectedTabId = current;
+      } else if (pages.length > 0) {
+        // The active-tab read fails when the browser has no front page. The
+        // inventory is still authoritative: syncing it drops tabs the browser
+        // no longer has, which is what keeps stale ids out of the strip.
+        protectedTabId = await browserRuntime
+          .activeTabId?.(target)
+          .catch(() => undefined);
+      }
     }
     strip.syncPages(
       pages.map((page) => ({

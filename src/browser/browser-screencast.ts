@@ -134,45 +134,71 @@ export function createCdpScreencastSource(
     finishStream?.();
   }
 
-  async function attachToPage(): Promise<string | undefined> {
+  function screencastTarget(
+    infos: ReadonlyArray<{ type: string; targetId: string }>,
+    selected: string | null,
+  ) {
+    if (selected == null) {
+      return infos.find(
+        (entry) => entry.type === "page" || entry.type === "tab",
+      );
+    }
+    return infos.find((entry) => entry.targetId === selected);
+  }
+
+  async function attachToPage(): Promise<
+    { sessionId: string; targetId: string } | undefined
+  > {
     const targets = (await send("Target.getTargets", {})) as {
       targetInfos?: Array<{ type: string; targetId: string }>;
     };
-    const selected = options.tabs?.snapshot().activeTabId;
-    const page = targets?.targetInfos?.find(
-      (entry) =>
-        entry.type === "page" &&
-        (selected == null || entry.targetId === selected),
-    );
+    const selected = options.tabs?.snapshot().activeTabId ?? null;
+    const page = screencastTarget(targets?.targetInfos ?? [], selected);
     if (page === undefined) return undefined;
-    activeTargetId = page.targetId;
     const attached = (await send("Target.attachToTarget", {
       targetId: page.targetId,
       flatten: true,
     })) as { sessionId?: string };
-    if (attached?.sessionId !== undefined) {
-      await send("Page.enable", {}, attached.sessionId);
-      await send("Page.bringToFront", {}, attached.sessionId);
+    if (attached?.sessionId === undefined) return undefined;
+    await send("Page.enable", {}, attached.sessionId);
+    await send("Page.bringToFront", {}, attached.sessionId);
+    return { sessionId: attached.sessionId, targetId: page.targetId };
+  }
+
+  async function detachSession(previous: string | undefined) {
+    if (previous === undefined) return;
+    if (captureTimer !== undefined) {
+      clearTimeout(captureTimer);
+      captureTimer = undefined;
     }
-    return attached?.sessionId;
+    await send("Target.detachFromTarget", { sessionId: previous }).catch(
+      () => undefined,
+    );
   }
 
   async function switchPage() {
     const selected = options.tabs?.snapshot().activeTabId;
     if (stopped || selected === activeTargetId) return;
-    const previous = sessionId;
-    sessionId = undefined;
-    activeTargetId = undefined;
-    screencastStarted = false;
-    if (captureTimer !== undefined) clearTimeout(captureTimer);
-    if (previous !== undefined) {
-      await send("Target.detachFromTarget", { sessionId: previous }).catch(
-        () => undefined,
-      );
+    if (selected === null) {
+      const previous = sessionId;
+      sessionId = undefined;
+      activeTargetId = undefined;
+      screencastStarted = false;
+      await detachSession(previous);
+      return;
     }
-    if (selected === null) return;
-    sessionId = await attachToPage();
-    if (sessionId !== undefined && !stopped) {
+    let next: { sessionId: string; targetId: string } | undefined;
+    try {
+      next = await attachToPage();
+    } catch {
+      return;
+    }
+    if (next === undefined || stopped) return;
+    const previous = sessionId;
+    sessionId = next.sessionId;
+    activeTargetId = next.targetId;
+    await detachSession(previous === next.sessionId ? undefined : previous);
+    if (!stopped) {
       await startScreencast(sessionId);
       screencastStarted = true;
     }
@@ -470,15 +496,18 @@ export function createCdpScreencastSource(
             handleDialogOpening(message.params);
           }
         });
-        sessionId = await attachToPage();
-        if (sessionId !== undefined) {
+        await send("Target.setDiscoverTargets", { discover: true }).catch(
+          () => undefined,
+        );
+        const attached = await attachToPage();
+        if (attached !== undefined) {
+          sessionId = attached.sessionId;
+          activeTargetId = attached.targetId;
           await startScreencast(sessionId);
           screencastStarted = true;
         }
         unsubscribeTabs = options.tabs?.subscribe(() => {
-          switching = switching.then(switchPage).catch(() => {
-            socket?.close();
-          });
+          switching = switching.then(switchPage).catch(() => undefined);
         });
         if (options.tabs !== undefined) await switchPage();
         await ended;

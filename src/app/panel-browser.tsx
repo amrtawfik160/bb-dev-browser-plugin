@@ -646,7 +646,6 @@ export function BrowserTabStripView({
                     : "text-muted-foreground"
                 }`}
                 title={tab.url}
-                disabled={!canDrive}
                 onClick={() => onSelect(tab.tabId)}
               >
                 {tab.origin === "popup" ? (
