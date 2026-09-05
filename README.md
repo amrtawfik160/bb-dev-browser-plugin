@@ -182,22 +182,38 @@ npm run test:real-browser
 
 That runs `test/browser-auth.integration.test.ts` only.
 
+Inside a BB session, `BB_CLI` may override the locally installed CLI. To build
+with this project's pinned BB and SDK versions, run
+`env -u BB_CLI npm run build` before the release checks.
+
 ## Layout
 
 ```
-app.tsx, panel-*.ts(x)   Browser Panel UI, protocol, and shared session
-panel-primitives.tsx     Buttons, fields, notices, glyphs, and list states
-settings-*.ts(x)         Browser Settings sections and selected-profile store
-host.ts                  Workspace-host browser runtime
-server.ts                Plugin RPC and bb browser CLI
-authorization.ts         Profile Grants, Default Access, and Origin Scope
-docs/browser/            Owner, operator, agent, and security guides
-docs/adr/                Architecture decisions
-test/                    Contract, evidence, and integration tests
-scripts/                 release-gate.sh and owner wizards
-skills/browser/          Bundled agent skill
-CONTEXT.md               Glossary
+src/app/         Browser Panel and Browser Settings UI
+src/server/      Plugin registration, RPC, CLI, and dispatch to hosts
+src/host/        Host entry, provisioning, profiles, downloads, and staging
+src/browser/     Browser processes, automation, Origin Scope, and Control Leases
+src/panel/       Shared panel sessions, gateways, streams, and transport
+src/access/      Profile Grants, Default Access, and Grant Requests
+src/activity/    Server Activity Records, host outbox, and reconciliation
+src/shared/      Wire contracts, shared constants, and owner-session identity
+docs/browser/    Owner, operator, agent, and security guides
+docs/adr/        Architecture decisions
+test/            Contract, evidence, and integration tests
+scripts/         Release gate and owner wizards
+skills/browser/  Bundled agent skill
+CONTEXT.md       Domain glossary
 ```
+
+The manifest points directly to the app, server, and host entries under `src/`.
+Imports name the owning module directly. Activity persistence remains split:
+`activity-records.ts` uses the server database, while `activity-outbox.ts` uses
+host storage. `activity-sync.ts` reconciles them through typed host RPC and
+commits expired-profile authority changes with event ingestion in one transaction.
+
+`panel-session.ts` owns connection generations. Each joined connection exposes
+activation, active-state inspection, disconnect, and transport binding; host
+callers do not select generations or coordinate replacement cleanup.
 
 ## Security and privacy
 

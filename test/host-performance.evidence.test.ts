@@ -35,7 +35,7 @@ import {
   skipIfNotProvisioned,
   type ProvisionedHostContext,
 } from "./fixtures/host-provisioning.js";
-import { projectLoopbackAddress } from "../browser-navigation.js";
+import { projectLoopbackAddress } from "../src/browser/browser-navigation.js";
 import { WebSocket } from "ws";
 
 /** A captured performance sample with its host-side and remote-RTT split. */

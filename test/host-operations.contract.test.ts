@@ -23,9 +23,9 @@ import {
   setupRequiredStatus,
   type BrowserHostTarget,
   type BrowserStatus,
-} from "../contracts.js";
-import { fallbackBrowserPaths } from "../browser-fallback.js";
-import { createBrowserHostEntry } from "../host.js";
+} from "../src/shared/contracts.js";
+import { fallbackBrowserPaths } from "../src/host/browser-fallback.js";
+import { createBrowserHostEntry } from "../src/host/host.js";
 import {
   BROWSER_SYSTEM_PACKAGES,
   BROWSER_USER,
@@ -43,8 +43,8 @@ import {
   type HostAdministrationStateStore,
   type PrivilegedOperation,
   validateBrowserRuntimePolicy,
-} from "../host-operations.js";
-import type { HostReadinessBoundary } from "../readiness.js";
+} from "../src/host/host-operations.js";
+import type { HostReadinessBoundary } from "../src/host/readiness.js";
 
 const target: BrowserHostTarget = {
   hostId: "host-operations-test",

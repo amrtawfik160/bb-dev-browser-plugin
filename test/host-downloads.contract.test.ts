@@ -3,7 +3,7 @@ import {
   BROWSER_DOWNLOAD_MAX_FILE_BYTES,
   BROWSER_DOWNLOAD_MAX_PROFILE_BYTES,
   BROWSER_DOWNLOAD_TTL_MS,
-} from "../contracts.js";
+} from "../src/shared/contracts.js";
 import {
   authorizeDownloadExport,
   createHostDownloadsManager,
@@ -11,7 +11,7 @@ import {
   resolveHostDownloadsRoot,
   type HostDownloadFilesystem,
   type TransferStagingStat,
-} from "../host-downloads.js";
+} from "../src/host/host-downloads.js";
 
 /**
  * In-memory Host Downloads filesystem. Resolves realpaths, reports narrow

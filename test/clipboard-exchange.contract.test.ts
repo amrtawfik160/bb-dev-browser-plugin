@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createClipboardExchange } from "../clipboard-exchange.js";
+import { createClipboardExchange } from "../src/panel/clipboard-exchange.js";
 
 function createEffects(
   options: {

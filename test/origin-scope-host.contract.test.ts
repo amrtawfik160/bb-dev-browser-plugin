@@ -8,13 +8,13 @@ import type {
   Route,
 } from "playwright";
 import { describe, expect, it, vi } from "vitest";
-import { originScopeMatcher } from "../authorization.js";
+import { originScopeMatcher } from "../src/access/authorization.js";
 import {
   BrowserOriginScopeDeniedError,
   installHostOriginScopeGuard,
   preferOriginScopeDenial,
   type BrowserOriginScopePolicy,
-} from "../origin-scope.js";
+} from "../src/browser/origin-scope.js";
 
 // This boundary double models the external Playwright/CDP contract directly:
 // route decisions, committed page URLs, popup lifecycle, and certificate

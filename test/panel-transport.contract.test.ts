@@ -12,24 +12,24 @@ import {
   PANEL_MIN_FRAMES_PER_SECOND,
   PANEL_RECLAIM_WINDOW_MS,
   PANEL_RECONNECT_INITIAL_BACKOFF_MS,
-} from "../contracts.js";
-import { createPanelCapabilityStore } from "../panel-capability.js";
-import { createPanelGateway } from "../panel-gateway.js";
-import { createClipboardExchange } from "../clipboard-exchange.js";
+} from "../src/shared/contracts.js";
+import { createPanelCapabilityStore } from "../src/panel/panel-capability.js";
+import { createPanelGateway } from "../src/panel/panel-gateway.js";
+import { createClipboardExchange } from "../src/panel/clipboard-exchange.js";
 import {
   PANEL_PROTOCOL_VERSION,
   decodePanelProtocolMessage,
   encodePanelProtocolMessage,
-} from "../panel-protocol.js";
+} from "../src/shared/panel-protocol.js";
 import {
   createAutomationStreamAdapter,
   frameIntervalMs,
-} from "../panel-stream.js";
+} from "../src/panel/panel-stream.js";
 import {
   createPanelTransportServer,
   type ScreencastFrame,
   type ScreencastSource,
-} from "../panel-transport.js";
+} from "../src/panel/panel-transport.js";
 import { waitFor, waitForSettled } from "./wait.js";
 
 const hostId = "host-transport";

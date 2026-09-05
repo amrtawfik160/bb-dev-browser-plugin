@@ -13,38 +13,38 @@ import { createRequire } from "node:module";
 import {
   createProductionBrowserProcessBoundary,
   helperRuntimeHome,
-} from "../../browser-process.js";
+} from "../../src/browser/browser-process.js";
 import {
   BrowserOriginScopeDeniedError,
   createBrowserInstanceRuntime,
-} from "../../browser-runtime.js";
+} from "../../src/browser/browser-runtime.js";
 import {
   createBrowserUserProfileOwnershipBoundary,
   profileManifest,
   profileStoragePaths,
-} from "../../profile-storage.js";
-import { createPanelCapabilityStore } from "../../panel-capability.js";
-import { createPanelGateway } from "../../panel-gateway.js";
-import { createAutomationStreamAdapter } from "../../panel-stream.js";
-import { createCdpScreencastSource } from "../../browser-screencast.js";
-import { createPanelTransportServer } from "../../panel-transport.js";
-import { createSafeLoginMode } from "../../safe-login.js";
+} from "../../src/host/profile-storage.js";
+import { createPanelCapabilityStore } from "../../src/panel/panel-capability.js";
+import { createPanelGateway } from "../../src/panel/panel-gateway.js";
+import { createAutomationStreamAdapter } from "../../src/panel/panel-stream.js";
+import { createCdpScreencastSource } from "../../src/browser/browser-screencast.js";
+import { createPanelTransportServer } from "../../src/panel/panel-transport.js";
+import { createSafeLoginMode } from "../../src/browser/safe-login.js";
 import {
   createTransferStagingManager,
   resolveTransferStagingRoot,
-} from "../../transfer-staging.js";
-import { createNodeTransferStagingFilesystem } from "../../transfer-staging-filesystem.js";
+} from "../../src/host/transfer-staging.js";
+import { createNodeTransferStagingFilesystem } from "../../src/host/transfer-staging-filesystem.js";
 import {
   createHostDownloadsManager,
   resolveHostDownloadsRoot,
-} from "../../host-downloads.js";
-import { createNodeHostDownloadsFilesystem } from "../../host-downloads-filesystem.js";
+} from "../../src/host/host-downloads.js";
+import { createNodeHostDownloadsFilesystem } from "../../src/host/host-downloads-filesystem.js";
 import { WebSocket } from "ws";
 import {
   PANEL_MAX_VIEWPORT_HEIGHT,
   PANEL_MAX_VIEWPORT_WIDTH,
   PANEL_RECLAIM_WINDOW_MS,
-} from "../../contracts.js";
+} from "../../src/shared/contracts.js";
 
 function requiredEnvironment(name: string) {
   const setting = process.env[name];

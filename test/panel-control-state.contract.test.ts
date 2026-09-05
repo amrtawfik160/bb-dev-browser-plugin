@@ -1,11 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { createControlLeaseManager } from "../control-lease.js";
+import { createControlLeaseManager } from "../src/browser/control-lease.js";
 import {
   clampPanelViewport,
   createPanelSession,
   DEFAULT_PANEL_VIEWPORT,
   type PanelControlState,
-} from "../panel-session.js";
+} from "../src/panel/panel-session.js";
 
 function setup(options?: { reclaimWindowMs?: number }) {
   const clock = { now: () => 0 };

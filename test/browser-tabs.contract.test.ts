@@ -3,7 +3,7 @@ import {
   createBrowserTabStrip,
   newTabId,
   type BrowserTabStrip,
-} from "../browser-tabs.js";
+} from "../src/browser/browser-tabs.js";
 
 function stripIds(strip: BrowserTabStrip) {
   return strip.tabs.map((tab) => tab.tabId);

@@ -1,13 +1,16 @@
 import { describe, expect, it, vi } from "vitest";
 import { WebSocket } from "ws";
-import { createPanelCapabilityStore } from "../panel-capability.js";
-import { createPanelGateway } from "../panel-gateway.js";
-import { createAutomationStreamAdapter } from "../panel-stream.js";
+import { createPanelCapabilityStore } from "../src/panel/panel-capability.js";
+import { createPanelGateway } from "../src/panel/panel-gateway.js";
+import { createAutomationStreamAdapter } from "../src/panel/panel-stream.js";
 import {
   createPanelTransportServer,
   type ScreencastSource,
-} from "../panel-transport.js";
-import type { BrowserContextAction, BrowserDialogEvent } from "../contracts.js";
+} from "../src/panel/panel-transport.js";
+import type {
+  BrowserContextAction,
+  BrowserDialogEvent,
+} from "../src/shared/contracts.js";
 import { waitFor, waitForSettled } from "./wait.js";
 
 const hostId = "host-dialog-transport";

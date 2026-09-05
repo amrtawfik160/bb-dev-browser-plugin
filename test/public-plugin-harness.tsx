@@ -117,32 +117,35 @@ import {
   type BrowserStatusInput,
   type rpcContract,
   type BrowserScriptResponse,
-} from "../contracts.js";
-import { ownerSessionIdFromContext } from "../panel-owner-session.js";
-import { createBrowserHostEntry, type HostSetupBoundary } from "../host.js";
-import type { ScreencastSource } from "../panel-transport.js";
+} from "../src/shared/contracts.js";
+import { ownerSessionIdFromContext } from "../src/shared/panel-owner-session.js";
+import {
+  createBrowserHostEntry,
+  type HostSetupBoundary,
+} from "../src/host/host.js";
+import type { ScreencastSource } from "../src/panel/panel-transport.js";
 import type {
   BrowserInstanceRuntime,
   RuntimeBrowserPage,
-} from "../browser-runtime.js";
+} from "../src/browser/browser-runtime.js";
 import {
   createHostAdministrationBoundary,
   type HostAdministrationStateStore,
   type PrivilegedExecutor,
-} from "../host-operations.js";
+} from "../src/host/host-operations.js";
 import {
   createFileBrowserProfileStore,
   type BrowserProfileStore,
-} from "../profile-storage.js";
+} from "../src/host/profile-storage.js";
 import {
   createFileBrowserProfileRecovery,
   type BrowserProfileRecovery,
-} from "../profile-recovery.js";
+} from "../src/host/profile-recovery.js";
 import {
   createHostReadinessBoundary,
   type HostProbeSnapshot,
-} from "../readiness.js";
-import plugin from "../server.js";
+} from "../src/host/readiness.js";
+import plugin from "../src/server/server.js";
 
 const HOST_ID = "host-browser-test";
 const PROJECT_ID = "project-browser-test";
@@ -381,7 +384,7 @@ export async function createPublicPluginHarness(options?: {
   hostConnection?: HostConnectionStatus;
   browserScriptResponse?: BrowserScriptResponse;
   browserRuntime?: BrowserInstanceRuntime;
-  safeLoginMode?: import("../safe-login.js").SafeLoginModeManager;
+  safeLoginMode?: import("../src/browser/safe-login.js").SafeLoginModeManager;
   browserScriptDelayMs?: number;
   browserScriptStarted?: () => void;
   navigationResponse?: {
@@ -1020,7 +1023,7 @@ export async function createPublicPluginHarness(options?: {
     },
   });
   await plugin(backend.bb);
-  const app = await loadPluginApp(() => import("../app.js"));
+  const app = await loadPluginApp(() => import("../src/app/app.js"));
   const threadPanels = new Map<string, RenderedSlot>();
   const newThreadPanels = new Map<string, RenderedSlot>();
   const settingsPanels: RenderedSlot[] = [];

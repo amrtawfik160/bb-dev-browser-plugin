@@ -34,8 +34,8 @@ import {
   RESET_PROFILE_CONFIRMATION,
   setupRequiredStatus,
   type BrowserGrantRequest,
-} from "../contracts.js";
-import { ownerSessionIdFromContext } from "../panel-owner-session.js";
+} from "../src/shared/contracts.js";
+import { ownerSessionIdFromContext } from "../src/shared/panel-owner-session.js";
 import {
   createPublicPluginHarness,
   createTabInventoryRuntime,
@@ -44,21 +44,21 @@ import {
 import {
   projectLoopbackAlias,
   AGENT_EXACT_ORIGIN_REQUIRED,
-} from "../authorization.js";
-import { createSimulatedPrivilegedExecutor } from "../host-operations.js";
+} from "../src/access/authorization.js";
+import { createSimulatedPrivilegedExecutor } from "../src/host/host-operations.js";
 import {
   createFileBrowserProfileStore,
   profileStoragePaths,
-} from "../profile-storage.js";
-import type { HostProbeSnapshot } from "../readiness.js";
-import type { BrowserInstanceRuntime } from "../browser-runtime.js";
-import { BrowserScriptExecutionError } from "../browser-runtime.js";
+} from "../src/host/profile-storage.js";
+import type { HostProbeSnapshot } from "../src/host/readiness.js";
+import type { BrowserInstanceRuntime } from "../src/browser/browser-runtime.js";
+import { BrowserScriptExecutionError } from "../src/browser/browser-runtime.js";
 import type {
   BrowserProfileBackupResult,
   BrowserProfileRecovery,
-} from "../profile-recovery.js";
-import type { BrowserScriptResponse } from "../contracts.js";
-import { createSafeLoginMode } from "../safe-login.js";
+} from "../src/host/profile-recovery.js";
+import type { BrowserScriptResponse } from "../src/shared/contracts.js";
+import { createSafeLoginMode } from "../src/browser/safe-login.js";
 
 const preparedSnapshot: HostProbeSnapshot = {
   operatingSystem: {

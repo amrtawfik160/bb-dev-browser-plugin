@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { WebSocketServer, type WebSocket } from "ws";
-import { createCdpScreencastSource } from "../browser-screencast.js";
+import { createCdpScreencastSource } from "../src/browser/browser-screencast.js";
 import { waitFor } from "./wait.js";
 
 /**

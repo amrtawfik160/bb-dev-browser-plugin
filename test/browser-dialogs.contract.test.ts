@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { createPanelCapabilityStore } from "../panel-capability.js";
-import { createPanelGateway } from "../panel-gateway.js";
-import type { BrowserDialogEvent } from "../contracts.js";
+import { createPanelCapabilityStore } from "../src/panel/panel-capability.js";
+import { createPanelGateway } from "../src/panel/panel-gateway.js";
+import type { BrowserDialogEvent } from "../src/shared/contracts.js";
 
 const hostId = "host-dialogs";
 const profileId = "profile-dialogs";

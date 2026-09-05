@@ -11,16 +11,16 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { DEFAULT_PROFILE_ID } from "../contracts.js";
+import { DEFAULT_PROFILE_ID } from "../src/shared/contracts.js";
 import {
   BrowserProfileRecoveryError,
   createFileBrowserProfileRecovery,
   type BrowserProfileRecoveryState,
-} from "../profile-recovery.js";
+} from "../src/host/profile-recovery.js";
 import {
   createFileBrowserProfileStore,
   profileStoragePaths,
-} from "../profile-storage.js";
+} from "../src/host/profile-storage.js";
 
 describe("Browser Profile recovery", () => {
   it("requires a stopped profile and restores a credential-equivalent backup", async () => {

@@ -10,9 +10,9 @@ import {
   PANEL_MAX_VIEWPORT_WIDTH,
   PANEL_RECLAIM_WINDOW_MS,
   PANEL_RECONNECT_INITIAL_BACKOFF_MS,
-} from "../contracts.js";
+} from "../src/shared/contracts.js";
 import { waitForSettled } from "./wait.js";
-import { ownerSessionIdFromContext } from "../panel-owner-session.js";
+import { ownerSessionIdFromContext } from "../src/shared/panel-owner-session.js";
 import { createPublicPanelLifecycleHarness } from "./public-plugin-lifecycle-harness.js";
 import { createTabInventoryRuntime } from "./public-plugin-harness.js";
 

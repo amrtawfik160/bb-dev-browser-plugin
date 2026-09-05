@@ -18,8 +18,8 @@ import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { DEFAULT_PROFILE_ID } from "../contracts.js";
-import { createFileBrowserProfileStore } from "../profile-storage.js";
+import { DEFAULT_PROFILE_ID } from "../src/shared/contracts.js";
+import { createFileBrowserProfileStore } from "../src/host/profile-storage.js";
 import {
   cleanupFixtureProfiles,
   closeFixture,
@@ -33,7 +33,7 @@ import {
   type MissingHostCapability,
   type ProvisionedHostContext,
 } from "./fixtures/host-provisioning.js";
-import { projectLoopbackAddress } from "../browser-navigation.js";
+import { projectLoopbackAddress } from "../src/browser/browser-navigation.js";
 
 function skipIfNotProvisioned(
   ctx: { skip: () => void },

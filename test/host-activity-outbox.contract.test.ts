@@ -8,9 +8,9 @@ import {
   DEFAULT_PROFILE_ID,
   setupRequiredStatus,
   type BrowserStatus,
-} from "../contracts.js";
-import { createBrowserHostEntry } from "../host.js";
-import { createFileBrowserProfileStore } from "../profile-storage.js";
+} from "../src/shared/contracts.js";
+import { createBrowserHostEntry } from "../src/host/host.js";
+import { createFileBrowserProfileStore } from "../src/host/profile-storage.js";
 import { experimental_createHostEntryHarness } from "@get-bb/plugin-sdk/testing/host";
 
 const HOST_ID = "host-activity-outbox";

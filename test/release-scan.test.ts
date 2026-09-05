@@ -5,7 +5,7 @@
  * sources). The scan fails on any hit outside a documented allow-list.
  *
  * The scan surface is:
- *   - shipped plugin source code: root .ts/.tsx modules (excluding test/), and
+ *   - shipped plugin source code: TypeScript modules under src/ (excluding test/), and
  *   - the built bundles: dist/ .js and .css, and
  *   - shipped documentation: docs/browser/ .md and the bundled skill.
  *
@@ -16,8 +16,9 @@
  */
 import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { basename, join, relative } from "node:path";
+import { join, relative } from "node:path";
 import { describe, expect, it } from "vitest";
+import { productionSources } from "./production-sources.js";
 
 const ROOT = process.cwd();
 const DIST = join(ROOT, "dist");
@@ -27,12 +28,6 @@ interface Hit {
   line: string;
   lineNumber: number;
   match: string;
-}
-
-function listCodeFiles(): string[] {
-  return readdirSync(ROOT)
-    .filter((name) => /\.(?:ts|tsx)$/u.test(name))
-    .map((name) => join(ROOT, name));
 }
 
 function listDistFiles(): string[] {
@@ -77,14 +72,18 @@ function scan(files: string[], pattern: RegExp): Hit[] {
  * Scan only the plugin's OWN code in the built dist/*.js bundles for a pattern.
  *
  * The bundler marks each bundled module with a `// <source-path>` comment;
- * root .ts/.tsx modules are the plugin's own code, while `node_modules/...`
+ * TypeScript modules under src/ are the plugin's own code, while `node_modules/...`
  * segments are bundled third-party code (ws, zod). This walks those segments
  * and applies the pattern only to the plugin-owned ones, so the credential and
  * telemetry scans prove "no debug credential/telemetry in the production
  * build" against the plugin's own built code without third-party noise.
  */
 function scanPluginOwnedDist(pattern: RegExp): Hit[] {
-  const pluginSources = new Set(listCodeFiles().map((path) => basename(path)));
+  const pluginSources = new Set(
+    productionSources().map((path) =>
+      relative(ROOT, path).replace(/\\/gu, "/"),
+    ),
+  );
   const moduleMarker = /^\/\/\s+([a-zA-Z0-9_./-]+\.(?:ts|tsx|js))$/u;
   const hits: Hit[] = [];
   for (const file of listDistFiles()) {
@@ -94,7 +93,7 @@ function scanPluginOwnedDist(pattern: RegExp): Hit[] {
       const marker = line.match(moduleMarker);
       if (marker !== null) {
         // Entering a new bundled module segment; own it only if the marker
-        // names one of the plugin's root source files (not node_modules/).
+        // names one of the plugin's source files (not node_modules/).
         owned = pluginSources.has(marker[1]!);
         return;
       }
@@ -119,11 +118,18 @@ function ensureBuilt() {
 }
 
 describe("release scan (issue #23 AC3)", () => {
-  const code = listCodeFiles();
+  const code = productionSources();
   const docs = listDocFiles();
 
   it("builds dist/ so the scan covers the production bundles", async () => {
     ensureBuilt();
+    expect(code).toEqual(
+      expect.arrayContaining([
+        join(ROOT, "src/server/server.ts"),
+        join(ROOT, "src/host/host.ts"),
+        join(ROOT, "src/app/app.tsx"),
+      ]),
+    );
     expect(
       existsSync(join(DIST, "server.js")),
       "dist/server.js was built",
@@ -132,7 +138,7 @@ describe("release scan (issue #23 AC3)", () => {
 
   it("forbids unsafe Chrome flags except the documented rejection guard", () => {
     ensureBuilt();
-    const surfaces = [...listCodeFiles(), ...listDistFiles()];
+    const surfaces = [...productionSources(), ...listDistFiles()];
     const unsafeFlagPattern =
       /--no-sandbox|--disable-web-security|--disable-site-isolation-trials|--ignore-certificate-errors(?:-spki-list)?/gu;
     const hits = scan(surfaces, unsafeFlagPattern);
@@ -144,7 +150,8 @@ describe("release scan (issue #23 AC3)", () => {
     const violations = hits.filter((hit) => {
       if (hit.match !== "--no-sandbox") return true;
       const isGuard =
-        (hit.file === "browser-runtime.ts" || hit.file === "dist/host.js") &&
+        (hit.file === "src/browser/browser-runtime.ts" ||
+          hit.file === "dist/host.js") &&
         hit.line.includes("no-sandbox") &&
         (hit.line.includes("includes") || hit.line.includes("forbidden"));
       return !isGuard;
@@ -180,7 +187,7 @@ describe("release scan (issue #23 AC3)", () => {
     // the RAW_LOCALHOST_HOSTS grant-list literal in authorization.ts.
     const pattern = /0\.0\.0\.0|\[::\]/u;
     const otherCode = scan(code, pattern).filter(
-      (hit) => hit.file !== "authorization.ts",
+      (hit) => hit.file !== "src/access/authorization.ts",
     );
     // No 0.0.0.0/[::] in any shipped source other than authorization.ts.
     expect(otherCode, `unexpected 0.0.0.0/[::] in shipped source`).toEqual([]);
@@ -190,7 +197,7 @@ describe("release scan (issue #23 AC3)", () => {
     // inside its `new Set([...])` body), not any other occurrence in the
     // file. A future non-loopback use added anywhere else in the file would
     // fail this assertion.
-    const authPath = join(ROOT, "authorization.ts");
+    const authPath = join(ROOT, "src/access/authorization.ts");
     const authLines = readFileSync(authPath, "utf8").split("\n");
     const setStart = authLines.findIndex((line) =>
       /RAW_LOCALHOST_HOSTS\s*=\s*new\s+Set\(\[/u.test(line),
@@ -208,7 +215,7 @@ describe("release scan (issue #23 AC3)", () => {
       setEnd += 1;
     }
     const grantListHits = scan(code, pattern).filter(
-      (hit) => hit.file === "authorization.ts",
+      (hit) => hit.file === "src/access/authorization.ts",
     );
     expect(
       grantListHits.length,

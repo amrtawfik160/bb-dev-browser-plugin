@@ -19,7 +19,7 @@ import { describe, expect, it } from "vitest";
 import {
   dependencyInventory,
   PINNED_BROWSER_RUNTIME,
-} from "../dependency-inventory.js";
+} from "../src/shared/dependency-inventory.js";
 
 const ROOT = process.cwd();
 const DIST = join(ROOT, "dist");
@@ -92,12 +92,12 @@ describe("release artifact (issue #23 AC2)", () => {
     const required = [
       "package.json",
       "LICENSE",
-      "dependency-inventory.ts",
-      "server.ts",
-      "app.tsx",
-      "host.ts",
-      "contracts.ts",
-      "activity-records.ts",
+      "src/shared/dependency-inventory.ts",
+      "src/server/server.ts",
+      "src/app/app.tsx",
+      "src/host/host.ts",
+      "src/shared/contracts.ts",
+      "src/activity/activity-records.ts",
       "skills/browser/SKILL.md",
       "dist/server.js",
       "dist/app.js",
@@ -158,11 +158,11 @@ describe("release artifact (issue #23 AC2)", () => {
     // / activity-records.ts) and shipped as the built dist/server.js; assert
     // those implementing modules ship so the surface is auditable.
     const implementingModules = [
-      "server.ts",
-      "browser-service.ts",
-      "activity-records.ts",
-      "host.ts",
-      "app.tsx",
+      "src/server/server.ts",
+      "src/server/browser-service.ts",
+      "src/activity/activity-records.ts",
+      "src/host/host.ts",
+      "src/app/app.tsx",
     ];
     for (const module of implementingModules) {
       expect(

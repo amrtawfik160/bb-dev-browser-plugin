@@ -3,9 +3,10 @@
  * paths must have no production callers. This search is the architecture
  * completion evidence required by spec #51.
  */
-import { readdirSync, readFileSync } from "node:fs";
-import { join, relative } from "node:path";
+import { readFileSync } from "node:fs";
+import { relative } from "node:path";
 import { describe, expect, it } from "vitest";
+import { productionSources } from "./production-sources.js";
 
 const ROOT = process.cwd();
 
@@ -14,12 +15,6 @@ type Hit = {
   lineNumber: number;
   line: string;
 };
-
-function productionSources() {
-  return readdirSync(ROOT)
-    .filter((name) => /\.(?:ts|tsx)$/u.test(name))
-    .map((name) => join(ROOT, name));
-}
 
 function scan(pattern: RegExp): Hit[] {
   const hits: Hit[] = [];
@@ -70,7 +65,7 @@ describe("contracted Browser Panel compatibility paths", () => {
 
     const routeWording = scan(
       /"(?:Connecting to the browser|Reconnecting to the browser|Take control|Let another panel take over)/u,
-    ).filter((hit) => hit.file === "app.tsx");
+    ).filter((hit) => hit.file === "src/app/app.tsx");
     expect(
       routeWording,
       "the app route still derives owner-facing Panel wording",
@@ -91,7 +86,7 @@ describe("contracted Browser Panel compatibility paths", () => {
     ];
     const relayHits = scan(
       new RegExp(`host\\.call\\("(?:${panelRelays.join("|")})"`, "u"),
-    ).filter((hit) => hit.file === "browser-service.ts");
+    ).filter((hit) => hit.file === "src/server/browser-service.ts");
     expect(
       relayHits,
       "Browser Panel operations still relay through browser-service instead of the typed dispatch module",

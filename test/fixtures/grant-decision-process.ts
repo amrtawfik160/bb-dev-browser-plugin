@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { createGrantRequestStore } from "../../grant-requests.js";
+import { createGrantRequestStore } from "../../src/access/grant-requests.js";
 
 const databasePath = process.env.R9_DECISION_DATABASE_PATH;
 const requestId = process.env.R9_DECISION_REQUEST_ID;

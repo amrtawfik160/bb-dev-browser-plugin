@@ -21,11 +21,11 @@
 import { mkdtemp, writeFile, chmod } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createBrowserInstanceRuntime } from "../../browser-runtime.js";
-import type { BrowserInstanceRuntime } from "../../browser-runtime.js";
-import type { HostProbeSnapshot } from "../../readiness.js";
-import type { BrowserProfileStore } from "../../profile-storage.js";
-import { DEFAULT_PROFILE_ID } from "../../contracts.js";
+import { createBrowserInstanceRuntime } from "../../src/browser/browser-runtime.js";
+import type { BrowserInstanceRuntime } from "../../src/browser/browser-runtime.js";
+import type { HostProbeSnapshot } from "../../src/host/readiness.js";
+import type { BrowserProfileStore } from "../../src/host/profile-storage.js";
+import { DEFAULT_PROFILE_ID } from "../../src/shared/contracts.js";
 import { createPublicPluginHarness } from "../public-plugin-harness";
 
 export { createPublicPluginHarness };

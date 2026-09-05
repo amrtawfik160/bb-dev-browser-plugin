@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createActivityRecordStore,
   BROWSER_DATABASE_MIGRATIONS,
-} from "../activity-records.js";
+} from "../src/activity/activity-records.js";
 import {
   SAFE_LOGIN_EXPIRY_WARNING_MS,
   SAFE_LOGIN_LEASE_MS,
@@ -19,7 +19,7 @@ import {
   type SafeLoginPersistedIntent,
   type SafeLoginProfileTarget,
   type SafeLoginRelaunchEffects,
-} from "../safe-login.js";
+} from "../src/browser/safe-login.js";
 import {
   deterministicLoginFixture,
   type DeterministicLoginRelaunch,

@@ -12,11 +12,11 @@ import { describe, expect, it } from "vitest";
 import {
   RESET_PROFILE_CONFIRMATION,
   type BrowserProfileLifecycleProgress,
-} from "../contracts.js";
+} from "../src/shared/contracts.js";
 import {
   createFileBrowserProfileStore,
   profileStoragePaths,
-} from "../profile-storage.js";
+} from "../src/host/profile-storage.js";
 
 const RETENTION_START = new Date("2026-08-28T00:00:00.000Z");
 const AFTER_RETENTION = new Date("2026-09-27T00:00:00.001Z");

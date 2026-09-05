@@ -3,8 +3,8 @@ import {
   matcherPermitsOrigin,
   originScopeMatcher,
   scopeMatchesOrigin,
-} from "../authorization.js";
-import { originRequiresCertificateBypass } from "../origin-scope.js";
+} from "../src/access/authorization.js";
+import { originRequiresCertificateBypass } from "../src/browser/origin-scope.js";
 
 const scopeMatrix = [
   ["https://app.example.test", "https://app.example.test", true],

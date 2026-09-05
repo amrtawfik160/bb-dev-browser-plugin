@@ -3,14 +3,14 @@ import { access, readFile, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { expect, it } from "vitest";
-import { projectLoopbackAddress } from "../browser-navigation.js";
-import { profileStoragePaths } from "../profile-storage.js";
+import { projectLoopbackAddress } from "../src/browser/browser-navigation.js";
+import { profileStoragePaths } from "../src/host/profile-storage.js";
 import {
   createDefaultHostSnapshotReader,
   createHostReadinessBoundary,
   hostInstallationId,
   provisionedBrowserStorageRoot,
-} from "../readiness.js";
+} from "../src/host/readiness.js";
 import {
   closeLoopbackFixture,
   createLoopbackAuthFixture,

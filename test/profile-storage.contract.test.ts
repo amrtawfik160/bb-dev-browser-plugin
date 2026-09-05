@@ -10,13 +10,16 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { DEFAULT_PROFILE_ID, PROFILE_MANIFEST_VERSION } from "../contracts.js";
+import {
+  DEFAULT_PROFILE_ID,
+  PROFILE_MANIFEST_VERSION,
+} from "../src/shared/contracts.js";
 import {
   createProfileStorageOwnershipBoundary,
   createBrowserUserProfileOwnershipBoundary,
   createFileBrowserProfileStore,
   profileStoragePaths,
-} from "../profile-storage.js";
+} from "../src/host/profile-storage.js";
 
 describe("host-local Browser Profile storage", () => {
   it("lists an uninitialized host without creating Browser Profile storage", async () => {

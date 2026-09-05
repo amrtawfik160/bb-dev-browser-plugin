@@ -38,7 +38,7 @@ import {
   type MissingHostCapability,
   type ProvisionedHostContext,
 } from "./fixtures/host-provisioning.js";
-import { projectLoopbackAddress } from "../browser-navigation.js";
+import { projectLoopbackAddress } from "../src/browser/browser-navigation.js";
 
 function skipIfNotProvisioned(
   ctx: { skip: () => void },

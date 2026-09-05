@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
 import { waitFor } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
-import { DEFAULT_PROFILE_ID } from "../contracts.js";
-import { ownerSessionIdFromContext } from "../panel-owner-session.js";
+import { DEFAULT_PROFILE_ID } from "../src/shared/contracts.js";
+import { ownerSessionIdFromContext } from "../src/shared/panel-owner-session.js";
 import {
   createPublicPluginHarness,
   healthyBrowserStatus as healthyStatus,

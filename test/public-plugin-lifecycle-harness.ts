@@ -2,19 +2,25 @@ import { act, fireEvent, waitFor, within } from "@testing-library/react";
 import type { RenderedSlot } from "@get-bb/plugin-sdk/testing/app";
 import { expect } from "vitest";
 import { WebSocket as NodeWebSocket } from "ws";
-import type { ScreencastFrame, ScreencastSource } from "../panel-transport.js";
+import type {
+  ScreencastFrame,
+  ScreencastSource,
+} from "../src/panel/panel-transport.js";
 import {
   PANEL_PROTOCOL_VERSION,
   encodePanelProtocolMessage,
-} from "../panel-protocol.js";
+} from "../src/shared/panel-protocol.js";
 import {
   setTestPanelTransport,
   setTestPanelLifecycleClock,
-} from "../panel-test-loopback.js";
-import { DEFAULT_PROFILE_ID, type BrowserContextAction } from "../contracts.js";
-import { ownerSessionIdFromContext } from "../panel-owner-session.js";
-import type { HostProbeSnapshot } from "../readiness.js";
-import type { BrowserInstanceRuntime } from "../browser-runtime.js";
+} from "../src/app/panel-test-loopback.js";
+import {
+  DEFAULT_PROFILE_ID,
+  type BrowserContextAction,
+} from "../src/shared/contracts.js";
+import { ownerSessionIdFromContext } from "../src/shared/panel-owner-session.js";
+import type { HostProbeSnapshot } from "../src/host/readiness.js";
+import type { BrowserInstanceRuntime } from "../src/browser/browser-runtime.js";
 import { createPublicPluginHarness } from "./public-plugin-harness.js";
 
 const HOST_ID = "host-browser-test";

@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { BrowserDownloadListingEntry } from "../contracts.js";
-import { PanelDownloadsSurface } from "../panel-chrome.js";
+import type { BrowserDownloadListingEntry } from "../src/shared/contracts.js";
+import { PanelDownloadsSurface } from "../src/app/panel-chrome.js";
 
 /**
  * Host Downloads quarantine surface (issue #20 findings, P2). The export

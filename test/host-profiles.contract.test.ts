@@ -2,9 +2,12 @@ import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { setupRequiredStatus, DEFAULT_PROFILE_ID } from "../contracts.js";
-import { createBrowserHostEntry } from "../host.js";
-import { createFileBrowserProfileStore } from "../profile-storage.js";
+import {
+  setupRequiredStatus,
+  DEFAULT_PROFILE_ID,
+} from "../src/shared/contracts.js";
+import { createBrowserHostEntry } from "../src/host/host.js";
+import { createFileBrowserProfileStore } from "../src/host/profile-storage.js";
 import { experimental_createHostEntryHarness } from "@get-bb/plugin-sdk/testing/host";
 
 describe("Browser Profile host boundary", () => {

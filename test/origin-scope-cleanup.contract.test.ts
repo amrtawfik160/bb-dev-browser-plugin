@@ -1,11 +1,11 @@
 import type { Browser, BrowserContext, CDPSession, Page } from "playwright";
 import { describe, expect, it, vi } from "vitest";
-import { originScopeMatcher } from "../authorization.js";
+import { originScopeMatcher } from "../src/access/authorization.js";
 import {
   BrowserOriginScopeDeniedError,
   installHostOriginScopeGuard,
-} from "../origin-scope.js";
-import { installPageNavigationGuard } from "../origin-scope-cdp.js";
+} from "../src/browser/origin-scope.js";
+import { installPageNavigationGuard } from "../src/browser/origin-scope-cdp.js";
 
 type CleanupFailure = {
   close?: Error;

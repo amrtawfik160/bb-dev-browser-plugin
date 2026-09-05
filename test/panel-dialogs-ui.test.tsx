@@ -7,7 +7,10 @@ import {
   screen,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { BrowserContextAction, BrowserDialogEvent } from "../contracts.js";
+import type {
+  BrowserContextAction,
+  BrowserDialogEvent,
+} from "../src/shared/contracts.js";
 
 /**
  * The panel dialog and context-action chrome (issue #17) are pure presentational
@@ -49,7 +52,7 @@ afterEach(() => {
 // Import the SDK-free chrome module directly so the presentational components
 // can be exercised without the plugin app host.
 const { PanelDialogLayer, PanelContextMenu } =
-  await import("../panel-chrome.js");
+  await import("../src/app/panel-chrome.js");
 
 function alertDialog(): BrowserDialogEvent {
   return {
@@ -101,7 +104,8 @@ function linkActions(): BrowserContextAction[] {
 describe("Browser panel reduced-motion hook (issue #17)", () => {
   it("reads the prefers-reduced-motion media query at mount", async () => {
     observedMatches = true;
-    const { usePrefersReducedMotion } = await import("../panel-chrome.js");
+    const { usePrefersReducedMotion } =
+      await import("../src/app/panel-chrome.js");
     function Probe() {
       const reduced = usePrefersReducedMotion();
       return <span data-testid="reduced">{reduced ? "on" : "off"}</span>;

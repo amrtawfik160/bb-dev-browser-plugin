@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
-import { createControlLeaseManager } from "../control-lease.js";
-import { BROWSER_SCRIPT_MAX_TIMEOUT_MS } from "../contracts.js";
+import { createControlLeaseManager } from "../src/browser/control-lease.js";
+import { BROWSER_SCRIPT_MAX_TIMEOUT_MS } from "../src/shared/contracts.js";
 
 describe("Browser Control Lease", () => {
   it("waits for a normal 20-second agent operation instead of returning browser_busy after five seconds", async () => {

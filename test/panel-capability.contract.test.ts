@@ -3,8 +3,8 @@ import {
   PANEL_CAPABILITY_TTL_MS,
   PANEL_AUTH_ROTATION_MS,
   PANEL_RECLAIM_WINDOW_MS,
-} from "../contracts.js";
-import { createPanelCapabilityStore } from "../panel-capability.js";
+} from "../src/shared/contracts.js";
+import { createPanelCapabilityStore } from "../src/panel/panel-capability.js";
 
 const binding = {
   ownerSessionId: "owner-session-1",

@@ -35,7 +35,7 @@ Where a behavior cannot yet be exercised in this environment it is stated as a
   Scope, Control Lease, Safe Login Mode, Host Download, Transfer Staging,
   Activity Record, Restorable Session) rather than rejected synonyms.
 - **CLI examples** are the exact flags accepted by the registered commands in
-  [`server.ts`](../../server.ts). They were verified against the source; do not
+  [`server.ts`](../../src/server/server.ts). They were verified against the source; do not
   substitute alternative flag names (for example, `transfer` uses
   `--environment <id> --path <relative-path>`, not `--source`).
 - **`--json`** is accepted wherever shown; without it, commands print
