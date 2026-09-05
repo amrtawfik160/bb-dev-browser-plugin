@@ -13,13 +13,13 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { X509Certificate, generateKeyPairSync, createSign } from "node:crypto";
 import { expect, it } from "vitest";
-import { projectLoopbackAlias } from "../authorization.js";
-import { profileStoragePaths } from "../profile-storage.js";
+import { projectLoopbackAlias } from "../src/access/authorization.js";
+import { profileStoragePaths } from "../src/host/profile-storage.js";
 import {
   createDefaultHostSnapshotReader,
   hostInstallationId,
   provisionedBrowserStorageRoot,
-} from "../readiness.js";
+} from "../src/host/readiness.js";
 
 /**
  * Real-browser Origin Scope enforcement against a local malicious fixture.

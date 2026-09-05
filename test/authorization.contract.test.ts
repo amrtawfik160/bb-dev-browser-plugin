@@ -4,15 +4,15 @@ import {
   createProfileGrantStore,
   projectLoopbackAlias,
   AGENT_EXACT_ORIGIN_REQUIRED,
-} from "../authorization.js";
-import { createBrowserService } from "../browser-service.js";
-import { BROWSER_DATABASE_MIGRATIONS } from "../activity-records.js";
+} from "../src/access/authorization.js";
+import { createBrowserService } from "../src/server/browser-service.js";
+import { BROWSER_DATABASE_MIGRATIONS } from "../src/activity/activity-records.js";
 import {
   browserProfileGrantCreateRequestSchema,
   browserOriginScopeSchema,
   normalizeBrowserOrigin,
   type BrowserProfileGrant,
-} from "../contracts.js";
+} from "../src/shared/contracts.js";
 
 const NOW = new Date("2026-08-28T00:00:00.000Z");
 

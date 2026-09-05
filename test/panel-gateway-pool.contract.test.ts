@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { createPanelCapabilityStore } from "../panel-capability.js";
-import { createPanelGatewayPool } from "../panel-gateway-pool.js";
+import { createPanelCapabilityStore } from "../src/panel/panel-capability.js";
+import { createPanelGatewayPool } from "../src/panel/panel-gateway-pool.js";
 
 const hostId = "host-pool";
 const profileId = "profile-pool";

@@ -3,7 +3,7 @@ import type {
   SafeLoginPanelBinding,
   SafeLoginProfileTarget,
   SafeLoginRelaunchEffects,
-} from "../../safe-login.js";
+} from "../../src/browser/safe-login.js";
 
 /**
  * A deterministic Safe Login fixture: the policy-level analog of the real

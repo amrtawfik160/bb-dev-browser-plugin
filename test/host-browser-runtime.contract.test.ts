@@ -7,18 +7,18 @@ import {
   DEFAULT_PROFILE_ID,
   setupRequiredStatus,
   type BrowserStatus,
-} from "../contracts.js";
-import { createBrowserHostEntry } from "../host.js";
-import { createFileBrowserProfileStore } from "../profile-storage.js";
-import { TAB_STRIP_DEFAULT_MAX_TABS } from "../browser-tabs.js";
+} from "../src/shared/contracts.js";
+import { createBrowserHostEntry } from "../src/host/host.js";
+import { createFileBrowserProfileStore } from "../src/host/profile-storage.js";
+import { TAB_STRIP_DEFAULT_MAX_TABS } from "../src/browser/browser-tabs.js";
 import {
   BrowserOriginScopeDeniedError,
   createBrowserInstanceRuntime,
-} from "../browser-runtime.js";
+} from "../src/browser/browser-runtime.js";
 import {
   createSafeLoginMode,
   type SafeLoginRelaunchEffects,
-} from "../safe-login.js";
+} from "../src/browser/safe-login.js";
 
 const HOST_ID = "host-runtime";
 

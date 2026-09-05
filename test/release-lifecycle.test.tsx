@@ -25,14 +25,14 @@ import {
   browserLifecycleResponseSchema,
   browserPurgePlanSchema,
   browserPurgeResponseSchema,
-} from "../contracts.js";
+} from "../src/shared/contracts.js";
 import { createPublicPluginHarness } from "./public-plugin-harness.js";
 import { createInMemoryBrowserRuntime } from "./fixtures/evidence-helpers.js";
-import { createSimulatedPrivilegedExecutor } from "../host-operations.js";
-import { createFileBrowserProfileStore } from "../profile-storage.js";
-import { createMemoryHostAdministrationStateStore } from "../host-operations.js";
-import type { HostProbeSnapshot } from "../readiness.js";
-import type { BrowserInstanceRuntime } from "../browser-runtime.js";
+import { createSimulatedPrivilegedExecutor } from "../src/host/host-operations.js";
+import { createFileBrowserProfileStore } from "../src/host/profile-storage.js";
+import { createMemoryHostAdministrationStateStore } from "../src/host/host-operations.js";
+import type { HostProbeSnapshot } from "../src/host/readiness.js";
+import type { BrowserInstanceRuntime } from "../src/browser/browser-runtime.js";
 
 const preparedSnapshot: HostProbeSnapshot = {
   operatingSystem: { id: "ubuntu", version: "24.04", name: "Ubuntu 24.04 LTS" },

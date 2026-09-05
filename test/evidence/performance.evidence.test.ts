@@ -30,7 +30,7 @@
  * against flaky host-dependent numbers or policy constants.
  */
 import { describe, expect, it } from "vitest";
-import { DEFAULT_PROFILE_ID } from "../../contracts.js";
+import { DEFAULT_PROFILE_ID } from "../../src/shared/contracts.js";
 import {
   createEvidenceHarness,
   integrationEnabled,

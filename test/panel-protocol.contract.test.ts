@@ -7,13 +7,13 @@ import {
   PANEL_MAX_FRAMES_PER_SECOND,
   PANEL_MAX_VIEWPORT_HEIGHT,
   PANEL_MAX_VIEWPORT_WIDTH,
-} from "../contracts.js";
+} from "../src/shared/contracts.js";
 import {
   PANEL_PROTOCOL_VERSION,
   decodePanelProtocolMessage,
   encodePanelProtocolMessage,
   type PanelProtocolMessage,
-} from "../panel-protocol.js";
+} from "../src/shared/panel-protocol.js";
 
 const secret = "capability-secret-must-never-leak";
 const pixelData = Buffer.from("frame-pixels").toString("base64");

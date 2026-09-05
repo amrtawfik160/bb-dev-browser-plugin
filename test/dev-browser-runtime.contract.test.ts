@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   requireDevBrowserRuntime,
   resolveDevBrowserRuntime,
-} from "../dev-browser-runtime.js";
+} from "../src/browser/dev-browser-runtime.js";
 
 const isolatedEnv = { PATH: process.env.PATH ?? "/usr/bin" };
 

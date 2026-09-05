@@ -4,11 +4,11 @@ import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { originScopeMatcher } from "../authorization.js";
+import { originScopeMatcher } from "../src/access/authorization.js";
 import {
   BrowserOriginScopeDeniedError,
   installHostOriginScopeGuard,
-} from "../origin-scope.js";
+} from "../src/browser/origin-scope.js";
 
 function policy(scope = "https://app.example.test") {
   return {

@@ -1,6 +1,6 @@
 import * as filesystem from "node:fs/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createProductionBrowserProcessBoundary } from "../browser-process.js";
+import { createProductionBrowserProcessBoundary } from "../src/browser/browser-process.js";
 
 vi.mock("node:fs/promises", async (original) => ({
   ...(await original<typeof filesystem>()),

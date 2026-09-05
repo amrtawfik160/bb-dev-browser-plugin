@@ -1,12 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { BROWSER_TRANSFER_MAX_FILE_BYTES } from "../contracts.js";
+import { BROWSER_TRANSFER_MAX_FILE_BYTES } from "../src/shared/contracts.js";
 import {
   authorizeFileTransfer,
   createTransferStagingManager,
   resolveTransferStagingRoot,
   type TransferStagingFilesystem,
   type TransferStagingStat,
-} from "../transfer-staging.js";
+} from "../src/host/transfer-staging.js";
 
 /**
  * In-memory Transfer Staging filesystem. Resolves realpaths (canonicalizing

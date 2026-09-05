@@ -18,8 +18,8 @@ import { describe, expect, it } from "vitest";
 import {
   dependencyInventory,
   PINNED_BROWSER_RUNTIME,
-} from "../dependency-inventory.js";
-import { fallbackBrowserManifestSchema } from "../browser-fallback.js";
+} from "../src/shared/dependency-inventory.js";
+import { fallbackBrowserManifestSchema } from "../src/host/browser-fallback.js";
 
 const ROOT = process.cwd();
 const DIST = join(ROOT, "dist");
@@ -78,15 +78,19 @@ describe("release compatibility (issue #23 AC7)", () => {
     expect(pkg.bb).toEqual({
       name: "Browser",
       description: "Open a host-local Workspace Browser from BB threads.",
-      server: "./server.ts",
-      app: "./app.tsx",
-      host: "./host.ts",
+      server: "./src/server/server.ts",
+      app: "./src/app/app.tsx",
+      host: "./src/host/host.ts",
       skills: ["skills"],
       branding: { icon: "Globe" },
     });
     expect(pkg.engines.bb).toMatch(/^>=\d/u);
     // Every declared entry point ships in the production package.
-    for (const entry of ["server.ts", "app.tsx", "host.ts"]) {
+    for (const entry of [
+      "src/server/server.ts",
+      "src/app/app.tsx",
+      "src/host/host.ts",
+    ]) {
       expect(existsSync(join(ROOT, entry)), `${entry} ships`).toBe(true);
     }
     expect(existsSync(join(ROOT, "skills", "browser", "SKILL.md"))).toBe(true);

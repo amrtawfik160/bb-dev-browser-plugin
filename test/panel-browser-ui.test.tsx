@@ -2,7 +2,10 @@
 import { act, fireEvent, waitFor, within } from "@testing-library/react";
 import type { RenderedSlot } from "@get-bb/plugin-sdk/testing/app";
 import { describe, expect, it } from "vitest";
-import { browserStatusSchema, DEFAULT_PROFILE_ID } from "../contracts.js";
+import {
+  browserStatusSchema,
+  DEFAULT_PROFILE_ID,
+} from "../src/shared/contracts.js";
 import {
   createPublicPluginHarness,
   createTabInventoryRuntime,

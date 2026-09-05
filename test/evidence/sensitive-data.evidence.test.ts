@@ -15,10 +15,10 @@ import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { DEFAULT_PROFILE_ID } from "../../contracts.js";
-import { createPanelCapabilityStore as createStore } from "../../panel-capability.js";
-import { createPanelGateway as createGateway } from "../../panel-gateway.js";
-import { createFileBrowserProfileStore } from "../../profile-storage.js";
+import { DEFAULT_PROFILE_ID } from "../../src/shared/contracts.js";
+import { createPanelCapabilityStore as createStore } from "../../src/panel/panel-capability.js";
+import { createPanelGateway as createGateway } from "../../src/panel/panel-gateway.js";
+import { createFileBrowserProfileStore } from "../../src/host/profile-storage.js";
 import { deterministicLoginFixture } from "../fixtures/safe-login-fixture.js";
 import {
   createEvidenceHarness,

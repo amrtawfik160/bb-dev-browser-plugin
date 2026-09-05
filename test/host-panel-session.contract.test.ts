@@ -4,13 +4,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { WebSocket } from "ws";
-import { DEFAULT_PROFILE_ID, setupRequiredStatus } from "../contracts.js";
-import { createBrowserHostEntry } from "../host.js";
+import {
+  DEFAULT_PROFILE_ID,
+  setupRequiredStatus,
+} from "../src/shared/contracts.js";
+import { createBrowserHostEntry } from "../src/host/host.js";
 import {
   PANEL_PROTOCOL_VERSION,
   encodePanelProtocolMessage,
-} from "../panel-protocol.js";
-import type { ScreencastSource } from "../panel-transport.js";
+} from "../src/shared/panel-protocol.js";
+import type { ScreencastSource } from "../src/panel/panel-transport.js";
 import { waitFor, waitForSettled } from "./wait.js";
 
 const HOST_ID = "host-panel-session";

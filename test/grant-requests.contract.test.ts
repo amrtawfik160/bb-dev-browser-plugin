@@ -5,18 +5,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
-import { BROWSER_DATABASE_MIGRATIONS } from "../activity-records.js";
-import { createProfileGrantStore } from "../authorization.js";
+import { BROWSER_DATABASE_MIGRATIONS } from "../src/activity/activity-records.js";
+import { createProfileGrantStore } from "../src/access/authorization.js";
 import {
   createGrantRequestStore,
   GRANT_REQUEST_MIGRATION,
-} from "../grant-requests.js";
+} from "../src/access/grant-requests.js";
 import {
   browserGrantRequestDecisionResponseSchema,
   browserGrantRequestSchema,
   browserTemporaryGrantSchema,
   type BrowserAuthorizationRequest,
-} from "../contracts.js";
+} from "../src/shared/contracts.js";
 
 const NOW = new Date("2026-08-28T00:00:00.000Z");
 

@@ -12,7 +12,7 @@ The plugin is licensed under the **MIT License**
 ## Runtime dependencies
 
 Pinned in `package.json` and surfaced by `dependencyInventory()` in
-[`dependency-inventory.ts`](../../dependency-inventory.ts):
+[`dependency-inventory.ts`](../../src/shared/dependency-inventory.ts):
 
 | Package              | Pinned version | Role                                                                                            |
 | -------------------- | -------------- | ----------------------------------------------------------------------------------------------- |

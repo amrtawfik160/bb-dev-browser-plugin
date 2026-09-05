@@ -7,14 +7,14 @@ import {
   DEFAULT_PROFILE_ID,
   setupRequiredStatus,
   type BrowserStatus,
-} from "../contracts.js";
-import { createBrowserHostEntry } from "../host.js";
-import { createFileBrowserProfileStore } from "../profile-storage.js";
+} from "../src/shared/contracts.js";
+import { createBrowserHostEntry } from "../src/host/host.js";
+import { createFileBrowserProfileStore } from "../src/host/profile-storage.js";
 import {
   createHostDownloadsManager,
   resolveHostDownloadsRoot,
-} from "../host-downloads.js";
-import { createNodeHostDownloadsFilesystem } from "../host-downloads-filesystem.js";
+} from "../src/host/host-downloads.js";
+import { createNodeHostDownloadsFilesystem } from "../src/host/host-downloads-filesystem.js";
 
 const HOST_ID = "host-downloads-reconnect";
 

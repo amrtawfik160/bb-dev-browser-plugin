@@ -5,14 +5,14 @@ import {
   browserActivityExportSchema,
   DEFAULT_PROFILE_ID,
   type BrowserActivityEvent,
-} from "../contracts.js";
+} from "../src/shared/contracts.js";
 import {
   BROWSER_DATABASE_MIGRATIONS,
   createBrowserDatabaseMigrationPlan,
   createActivityRecordProducers,
   createActivityRecordStore,
-} from "../activity-records.js";
-import { GRANT_REQUEST_MIGRATION } from "../grant-requests.js";
+} from "../src/activity/activity-records.js";
+import { GRANT_REQUEST_MIGRATION } from "../src/access/grant-requests.js";
 
 const HOST_ID = "host-activity-test";
 const PROFILE_ID = DEFAULT_PROFILE_ID;

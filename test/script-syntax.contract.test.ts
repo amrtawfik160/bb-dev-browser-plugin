@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   describeScriptSyntaxError,
   withScriptSyntaxHint,
-} from "../script-syntax.js";
+} from "../src/browser/script-syntax.js";
 
 describe("browser script syntax hints", () => {
   it("accepts a script that uses top-level await and return", () => {

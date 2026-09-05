@@ -2,8 +2,8 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import type { BrowserActivityEvent } from "../contracts.js";
-import { createActivityOutbox } from "../activity-outbox.js";
+import type { BrowserActivityEvent } from "../src/shared/contracts.js";
+import { createActivityOutbox } from "../src/activity/activity-outbox.js";
 
 const NOW = new Date("2026-08-27T00:00:00.000Z");
 const GRANT_METADATA = {

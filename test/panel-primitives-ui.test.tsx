@@ -12,7 +12,7 @@ import {
   LoadingState,
   Notice,
   StatusDot,
-} from "../panel-primitives.js";
+} from "../src/app/panel-primitives.js";
 
 describe("panel primitives", () => {
   it("keeps a visible focus ring on every button variant", () => {

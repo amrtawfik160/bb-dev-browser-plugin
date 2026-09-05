@@ -4,12 +4,12 @@ import { rm } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { expect, it } from "vitest";
-import { projectLoopbackAddress } from "../browser-navigation.js";
-import { profileStoragePaths } from "../profile-storage.js";
+import { projectLoopbackAddress } from "../src/browser/browser-navigation.js";
+import { profileStoragePaths } from "../src/host/profile-storage.js";
 import {
   hostInstallationId,
   provisionedBrowserStorageRoot,
-} from "../readiness.js";
+} from "../src/host/readiness.js";
 
 const integrationEnabled = process.env.BB_BROWSER_REAL_INTEGRATION === "1";
 const integrationRequired =

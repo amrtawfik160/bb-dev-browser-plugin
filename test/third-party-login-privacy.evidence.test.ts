@@ -56,7 +56,7 @@ import {
   type ProvisionedHostContext,
   type WorkerReport,
 } from "./fixtures/host-provisioning.js";
-import { projectLoopbackAddress } from "../browser-navigation.js";
+import { projectLoopbackAddress } from "../src/browser/browser-navigation.js";
 
 /**
  * The high-level compatibility outcome the owner records for the smoke test

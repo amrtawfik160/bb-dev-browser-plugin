@@ -3,13 +3,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { chromium } from "playwright";
 import { expect, it } from "vitest";
-import { createCdpScreencastSource } from "../browser-screencast.js";
+import { createCdpScreencastSource } from "../src/browser/browser-screencast.js";
 import { waitFor } from "./wait.js";
 import {
   encodePanelProtocolMessage,
   PANEL_PROTOCOL_VERSION,
-} from "../panel-protocol.js";
-import { createBrowserTabStrip } from "../browser-tabs.js";
+} from "../src/shared/panel-protocol.js";
+import { createBrowserTabStrip } from "../src/browser/browser-tabs.js";
 
 it("delivers page input, viewport changes, and frames from real Chromium", async () => {
   const profile = await mkdtemp(join(tmpdir(), "browser-screencast-audit-"));

@@ -3,7 +3,7 @@ import {
   activeBrowserTabScript,
   projectLoopbackAddress,
   resolveBrowserAddress,
-} from "../browser-navigation.js";
+} from "../src/browser/browser-navigation.js";
 
 type FakeTabBrowser = {
   listPages: () => Promise<{ id: string; url: string }[]>;

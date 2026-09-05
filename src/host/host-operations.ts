@@ -1,0 +1,1582 @@
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rename,
+  rm,
+  writeFile,
+} from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
+import { promisify } from "node:util";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { z } from "zod";
+import {
+  BROWSER_CONFIGURATION_ROOT,
+  BROWSER_STORAGE_ROOT,
+  SETUP_STEP_DEFINITIONS,
+  STOP_BROWSER_CONFIRMATION,
+  browserHostStorageSegment,
+  browserPurgePlanSchema,
+  browserSetupPlanSchema,
+  type BrowserHostTarget,
+  type BrowserLifecycleRequest,
+  type BrowserLifecycleResponse,
+  type BrowserPurgePlan,
+  type BrowserPurgeRequest,
+  type BrowserPurgeResponse,
+  type BrowserSetupPlan,
+  type BrowserSetupRequest,
+  type BrowserSetupResponse,
+  type BrowserStatus,
+  type SetupStepId,
+} from "../shared/contracts.js";
+import type { HostReadinessBoundary } from "./readiness.js";
+import { fallbackBrowserPaths } from "./browser-fallback.js";
+import { PINNED_BROWSER_RUNTIME } from "../shared/dependency-inventory.js";
+import {
+  stageFallbackPack,
+  type StagedFallbackPack,
+} from "./fallback-ingestion.js";
+
+export const BROWSER_USER = "bb-browser";
+export const BROWSER_USER_HOME = BROWSER_STORAGE_ROOT;
+export const BROWSER_USER_SHELL = "/usr/sbin/nologin";
+
+export const BROWSER_SYSTEM_PACKAGES = [
+  {
+    name: "google-chrome-stable",
+    purpose: "Official Chrome Stable for compatible owner login flows.",
+  },
+  {
+    name: "xvfb",
+    purpose: "Owner-only Safe Login display isolation.",
+  },
+  {
+    name: "x11vnc",
+    purpose: "Owner-only Safe Login display transport.",
+  },
+  {
+    name: "novnc",
+    purpose: "Owner-only Safe Login browser stream.",
+  },
+] as const;
+
+export interface BrowserRuntimePolicy {
+  runAsUser: string;
+  homeDirectory: string;
+  shell: string;
+  sandbox: "required" | "disabled";
+  noSandbox: boolean;
+}
+
+export function browserRuntimePolicy(): BrowserRuntimePolicy {
+  return {
+    runAsUser: BROWSER_USER,
+    homeDirectory: BROWSER_USER_HOME,
+    shell: BROWSER_USER_SHELL,
+    sandbox: "required",
+    noSandbox: false,
+  };
+}
+
+export function validateBrowserRuntimePolicy(
+  policy: BrowserRuntimePolicy,
+): void {
+  if (
+    policy.runAsUser !== BROWSER_USER ||
+    policy.homeDirectory !== BROWSER_USER_HOME ||
+    policy.shell !== BROWSER_USER_SHELL ||
+    policy.sandbox !== "required" ||
+    policy.noSandbox
+  ) {
+    throw new Error(
+      "Browser runtime must use bb-browser with Chrome sandboxing enabled.",
+    );
+  }
+}
+
+export type PrivilegedOperation =
+  | {
+      kind: "create-dedicated-user";
+      username: typeof BROWSER_USER;
+      homeDirectory: typeof BROWSER_USER_HOME;
+      shell: typeof BROWSER_USER_SHELL;
+      privilege: "unprivileged";
+      confirmation: string;
+    }
+  | {
+      kind: "install-system-packages";
+      packages: readonly string[];
+      repository: "signed-system-repository";
+      confirmation: string;
+    }
+  | {
+      kind: "configure-protected-storage";
+      path: string;
+      owner: typeof BROWSER_USER;
+      mode: 0o700;
+      installationId: string;
+      hostId: string;
+      confirmation: string;
+      fallback: {
+        sourcePath: string;
+        directory: string;
+        executablePath: string;
+        manifestPath: string;
+      };
+    }
+  | {
+      kind: "stop-profile-processes";
+      owner: typeof BROWSER_USER;
+      hostId: string;
+      installationId: string;
+      profileId: string;
+      profilePath: string;
+      confirmation: "Authenticated owner profile lifecycle";
+    }
+  | {
+      kind: "stop-owned-processes";
+      owner: typeof BROWSER_USER;
+      hostId: string;
+      installationId: string;
+      confirmation: string;
+    }
+  | {
+      kind: "remove-browser-data";
+      path: string;
+      installationId: string;
+      hostId: string;
+      confirmation: string;
+    }
+  | {
+      kind: "remove-installation-configuration";
+      path: string;
+      installationId: string;
+      confirmation: string;
+    }
+  | {
+      kind: "remove-dedicated-user";
+      username: typeof BROWSER_USER;
+      hostId: string;
+      installationId: string;
+      guard: {
+        type: "last-installation-only";
+        hostId: string;
+        installationId: string;
+      };
+      confirmation: string;
+    };
+
+export interface PrivilegedExecutor {
+  execute(operation: PrivilegedOperation): void | Promise<void>;
+}
+
+export interface SimulatedPrivilegedExecutor extends PrivilegedExecutor {
+  failNext(kind: PrivilegedOperation["kind"], message?: string): void;
+  readonly attemptedOperations: readonly PrivilegedOperation[];
+  readonly successfulOperations: readonly PrivilegedOperation[];
+}
+
+interface SimulationState {
+  attemptedOperations: PrivilegedOperation[];
+  successfulOperations: PrivilegedOperation[];
+  queuedFailures: Map<PrivilegedOperation["kind"], string[]>;
+}
+
+export function createSimulatedPrivilegedExecutor(): SimulatedPrivilegedExecutor {
+  const simulationState: SimulationState = {
+    attemptedOperations: [],
+    successfulOperations: [],
+    queuedFailures: new Map(),
+  };
+
+  function failNext(
+    kind: PrivilegedOperation["kind"],
+    message = `Simulated failure for ${kind}.`,
+  ) {
+    const failures = simulationState.queuedFailures.get(kind) ?? [];
+    failures.push(message);
+    simulationState.queuedFailures.set(kind, failures);
+  }
+
+  async function execute(operation: PrivilegedOperation) {
+    simulationState.attemptedOperations.push(operation);
+    const failures = simulationState.queuedFailures.get(operation.kind);
+    const failure = failures?.shift();
+    if (failure !== undefined) throw new Error(failure);
+    simulationState.successfulOperations.push(operation);
+  }
+
+  return {
+    execute,
+    failNext,
+    get attemptedOperations() {
+      return [...simulationState.attemptedOperations];
+    },
+    get successfulOperations() {
+      return [...simulationState.successfulOperations];
+    },
+  };
+}
+
+export function createUnavailablePrivilegedExecutor(): PrivilegedExecutor {
+  return {
+    execute: async () => {
+      throw new Error("No privileged Browser executor is configured.");
+    },
+  };
+}
+
+type ExecuteFile = (
+  file: string,
+  arguments_: readonly string[],
+) => Promise<void>;
+
+const executeFile: ExecuteFile = async (file, arguments_) => {
+  await promisify(execFile)(file, [...arguments_]);
+};
+
+async function stopMatchingProcesses(
+  run: ExecuteFile,
+  arguments_: readonly string[],
+) {
+  try {
+    await run("/usr/bin/pkill", arguments_);
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === 1) return;
+    throw error;
+  }
+}
+
+function escapedProcessPattern(literal: string) {
+  return literal.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+}
+
+function profileStopArguments(
+  operation: Extract<PrivilegedOperation, { kind: "stop-profile-processes" }>,
+) {
+  return [
+    "--signal",
+    "TERM",
+    "--uid",
+    operation.owner,
+    "--full",
+    escapedProcessPattern(operation.profilePath),
+  ];
+}
+
+function ownedProcessStopArguments() {
+  return ["--signal", "TERM", "--uid", BROWSER_USER, "--full", ".*"];
+}
+
+async function installConfigurationFile(
+  run: ExecuteFile,
+  sourcePath: string,
+  targetPath: string,
+) {
+  await run("/usr/bin/install", [
+    "-m",
+    "0600",
+    "-o",
+    BROWSER_USER,
+    "-g",
+    BROWSER_USER,
+    sourcePath,
+    targetPath,
+  ]);
+}
+
+async function installOwnedDirectory(run: ExecuteFile, path: string) {
+  await run("/usr/bin/install", [
+    "-d",
+    "-m",
+    "0700",
+    "-o",
+    BROWSER_USER,
+    "-g",
+    BROWSER_USER,
+    path,
+  ]);
+}
+
+async function installFallbackPack(
+  run: ExecuteFile,
+  fallback: Extract<
+    PrivilegedOperation,
+    { kind: "configure-protected-storage" }
+  >["fallback"],
+  stagedPack: StagedFallbackPack,
+) {
+  // Playwright's cache is mutable. Only the private, regular-file staging tree
+  // crosses into the privileged setup boundary.
+  await run("/usr/bin/cp", [
+    "-a",
+    "--no-preserve=ownership",
+    "--remove-destination",
+    `${stagedPack.packDirectory}/.`,
+    fallback.directory,
+  ]);
+  await run("/usr/bin/chown", [
+    "-R",
+    "--no-dereference",
+    `${BROWSER_USER}:${BROWSER_USER}`,
+    fallback.directory,
+  ]);
+}
+
+async function writeSetupEvidence(
+  directory: string,
+  operation: Extract<
+    PrivilegedOperation,
+    { kind: "configure-protected-storage" }
+  >,
+  executablePath: string,
+) {
+  const executable = await readFile(executablePath);
+  const hostStatePath = join(directory, "host-state.json");
+  const manifestPath = join(directory, "version.json");
+  await writeFile(
+    hostStatePath,
+    JSON.stringify({
+      schemaVersion: 1,
+      installationId: operation.installationId,
+      hostId: operation.hostId,
+    }),
+  );
+  await writeFile(
+    manifestPath,
+    JSON.stringify({
+      ...PINNED_BROWSER_RUNTIME,
+      executableSha256: createHash("sha256").update(executable).digest("hex"),
+    }),
+  );
+  return { hostStatePath, manifestPath };
+}
+
+async function configureProtectedStorage(
+  run: ExecuteFile,
+  operation: Extract<
+    PrivilegedOperation,
+    { kind: "configure-protected-storage" }
+  >,
+) {
+  const stagedPack = await stageFallbackPack(operation.fallback.sourcePath);
+  try {
+    for (const directory of [operation.path, operation.fallback.directory]) {
+      await installOwnedDirectory(run, directory);
+    }
+    await installFallbackPack(run, operation.fallback, stagedPack);
+    const temporaryDirectory = await mkdtemp(
+      join(tmpdir(), "bb-browser-setup-"),
+    );
+    try {
+      const { hostStatePath, manifestPath } = await writeSetupEvidence(
+        temporaryDirectory,
+        operation,
+        stagedPack.executablePath,
+      );
+      await installConfigurationFile(
+        run,
+        hostStatePath,
+        join(operation.path, "host-state.json"),
+      );
+      await installConfigurationFile(
+        run,
+        manifestPath,
+        operation.fallback.manifestPath,
+      );
+    } finally {
+      await rm(temporaryDirectory, { recursive: true, force: true });
+    }
+  } finally {
+    await rm(stagedPack.rootDirectory, { recursive: true, force: true });
+  }
+}
+
+async function createDedicatedUser(
+  run: ExecuteFile,
+  operation: Extract<PrivilegedOperation, { kind: "create-dedicated-user" }>,
+) {
+  try {
+    await run("/usr/sbin/useradd", [
+      "--system",
+      "--shell",
+      operation.shell,
+      "--home",
+      operation.homeDirectory,
+      operation.username,
+    ]);
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === 9) return;
+    throw error;
+  }
+}
+
+function stderrOf(error: unknown): string {
+  if (typeof error === "object" && error !== null && "stderr" in error) {
+    const stderr = (error as { stderr: unknown }).stderr;
+    if (typeof stderr === "string") return stderr;
+    if (Buffer.isBuffer(stderr)) return stderr.toString("utf8");
+  }
+  return error instanceof Error ? error.message : "";
+}
+
+function isMissingAptPackage(error: unknown, packageName: string): boolean {
+  return stderrOf(error).includes(`Unable to locate package ${packageName}`);
+}
+
+async function installSystemPackages(
+  run: ExecuteFile,
+  operation: Extract<PrivilegedOperation, { kind: "install-system-packages" }>,
+) {
+  for (const packageName of operation.packages) {
+    try {
+      await run("/usr/bin/apt-get", [
+        "install",
+        "-y",
+        "--no-remove",
+        packageName,
+      ]);
+    } catch (error) {
+      // Chrome Stable is the preferred browser but is not in the default
+      // Ubuntu/Debian archive. Setup still completes so the pinned Playwright
+      // Chromium fallback can be copied during protected-storage.
+      if (
+        packageName === "google-chrome-stable" &&
+        isMissingAptPackage(error, packageName)
+      ) {
+        continue;
+      }
+      throw error;
+    }
+  }
+}
+
+async function executeProductionOperation(
+  run: ExecuteFile,
+  operation: PrivilegedOperation,
+) {
+  if (operation.kind === "create-dedicated-user") {
+    return createDedicatedUser(run, operation);
+  }
+  if (operation.kind === "install-system-packages") {
+    return installSystemPackages(run, operation);
+  }
+  if (operation.kind === "stop-profile-processes") {
+    return stopMatchingProcesses(run, profileStopArguments(operation));
+  }
+  if (operation.kind === "stop-owned-processes") {
+    return stopMatchingProcesses(run, ownedProcessStopArguments());
+  }
+  if (operation.kind === "configure-protected-storage") {
+    return configureProtectedStorage(run, operation);
+  }
+  throw new Error(
+    `Production Browser privileged execution is not configured for ${operation.kind}.`,
+  );
+}
+
+export function createProductionPrivilegedExecutor(options?: {
+  executeFile?: ExecuteFile;
+}): PrivilegedExecutor {
+  const run = options?.executeFile ?? executeFile;
+  return {
+    execute: (operation) => executeProductionOperation(run, operation),
+  };
+}
+
+export type SetupProgressState = "pending" | "completed" | "failed";
+export type PurgeTargetId =
+  "stop-owned-processes" | "browser-data" | "configuration" | "dedicated-user";
+
+export interface HostAdministrationState {
+  setup: Record<
+    SetupStepId,
+    { state: SetupProgressState; failure: string | null }
+  >;
+  processesStopped: boolean;
+  stoppedProfileIds: string[];
+  purge: Record<
+    PurgeTargetId,
+    { state: SetupProgressState; failure: string | null }
+  >;
+}
+
+const progressRecordSchema = z
+  .object({
+    state: z.enum(["pending", "completed", "failed"]),
+    failure: z.string().min(1).nullable(),
+  })
+  .strict();
+
+const persistedStateSchema = z
+  .object({
+    setup: z
+      .object({
+        "dedicated-user": progressRecordSchema,
+        "system-packages": progressRecordSchema,
+        "protected-storage": progressRecordSchema,
+      })
+      .strict(),
+    processesStopped: z.boolean(),
+    stoppedProfileIds: z.array(z.string().min(1)).default([]),
+    purge: z
+      .object({
+        "stop-owned-processes": progressRecordSchema,
+        "browser-data": progressRecordSchema,
+        configuration: progressRecordSchema,
+        "dedicated-user": progressRecordSchema,
+      })
+      .strict(),
+  })
+  .strict();
+
+export interface HostAdministrationStateStore {
+  read(
+    hostId: string,
+  ): HostAdministrationState | Promise<HostAdministrationState | null> | null;
+  write(hostId: string, state: HostAdministrationState): void | Promise<void>;
+}
+
+function emptyProgressRecord() {
+  return { state: "pending" as const, failure: null };
+}
+
+export function emptyHostAdministrationState(): HostAdministrationState {
+  return {
+    setup: {
+      "dedicated-user": emptyProgressRecord(),
+      "system-packages": emptyProgressRecord(),
+      "protected-storage": emptyProgressRecord(),
+    },
+    processesStopped: false,
+    stoppedProfileIds: [],
+    purge: {
+      "stop-owned-processes": emptyProgressRecord(),
+      "browser-data": emptyProgressRecord(),
+      configuration: emptyProgressRecord(),
+      "dedicated-user": emptyProgressRecord(),
+    },
+  };
+}
+
+function cloneState(state: HostAdministrationState): HostAdministrationState {
+  return {
+    setup: {
+      "dedicated-user": { ...state.setup["dedicated-user"] },
+      "system-packages": { ...state.setup["system-packages"] },
+      "protected-storage": { ...state.setup["protected-storage"] },
+    },
+    processesStopped: state.processesStopped,
+    stoppedProfileIds: [...state.stoppedProfileIds],
+    purge: {
+      "stop-owned-processes": { ...state.purge["stop-owned-processes"] },
+      "browser-data": { ...state.purge["browser-data"] },
+      configuration: { ...state.purge.configuration },
+      "dedicated-user": { ...state.purge["dedicated-user"] },
+    },
+  };
+}
+
+export function createMemoryHostAdministrationStateStore(): HostAdministrationStateStore {
+  const states = new Map<string, HostAdministrationState>();
+  return {
+    read: (hostId) => {
+      const state = states.get(hostId);
+      return state === undefined ? null : cloneState(state);
+    },
+    write: (hostId, state) => {
+      states.set(hostId, cloneState(state));
+    },
+  };
+}
+
+function missingFile(error: unknown) {
+  return error instanceof Error && "code" in error && error.code === "ENOENT";
+}
+
+function administrationStatePath(stateDirectory: string, hostId: string) {
+  return join(stateDirectory, `${encodeURIComponent(hostId)}.json`);
+}
+
+async function readPersistedAdministrationState(statePath: string) {
+  try {
+    const serializedState = await readFile(statePath, "utf8");
+    return persistedStateSchema.parse(JSON.parse(serializedState));
+  } catch (error) {
+    if (missingFile(error)) return null;
+    throw error;
+  }
+}
+
+async function writePersistedAdministrationState(
+  statePath: string,
+  state: HostAdministrationState,
+) {
+  const temporaryPath = `${statePath}.${process.pid}.tmp`;
+  await writeFile(temporaryPath, JSON.stringify(state), {
+    encoding: "utf8",
+    mode: 0o600,
+  });
+  await rename(temporaryPath, statePath);
+}
+
+export function createFileHostAdministrationStateStore(
+  dataDir: string,
+): HostAdministrationStateStore {
+  const stateDirectory = join(dataDir, "administration-state");
+
+  return {
+    read: (hostId) =>
+      readPersistedAdministrationState(
+        administrationStatePath(stateDirectory, hostId),
+      ),
+    async write(hostId, state) {
+      await mkdir(stateDirectory, { recursive: true, mode: 0o700 });
+      await writePersistedAdministrationState(
+        administrationStatePath(stateDirectory, hostId),
+        state,
+      );
+    },
+  };
+}
+
+export interface BrowserInstallationPaths {
+  storageRoot: string;
+  hostStoragePath: string;
+  configurationPath: string;
+}
+
+export function browserInstallationPaths(
+  installationId: string,
+  hostId: string,
+): BrowserInstallationPaths {
+  if (!/^[A-Za-z0-9_-]+$/u.test(installationId)) {
+    throw new Error("Browser installation identifiers must be path-safe.");
+  }
+  return {
+    storageRoot: BROWSER_STORAGE_ROOT,
+    hostStoragePath: join(
+      BROWSER_STORAGE_ROOT,
+      "installations",
+      installationId,
+      "hosts",
+      browserHostStorageSegment(hostId),
+    ),
+    configurationPath: join(
+      BROWSER_CONFIGURATION_ROOT,
+      "installations",
+      installationId,
+    ),
+  };
+}
+
+const PURGE_TARGET_ORDER = [
+  "stop-owned-processes",
+  "browser-data",
+  "configuration",
+  "dedicated-user",
+] as const satisfies readonly PurgeTargetId[];
+
+function setupState(steps: BrowserSetupPlan["steps"]) {
+  if (steps.some((step) => step.state === "failed")) {
+    return "partial-failure" as const;
+  }
+  if (steps.every((step) => step.state === "completed")) {
+    return "ready" as const;
+  }
+  if (steps.some((step) => step.state === "completed")) {
+    return "in-progress" as const;
+  }
+  return "pending" as const;
+}
+
+function setupSteps(state: HostAdministrationState) {
+  return SETUP_STEP_DEFINITIONS.map((definition) => ({
+    ...definition,
+    state: state.setup[definition.id].state,
+    failure: state.setup[definition.id].failure,
+  }));
+}
+
+function setupRuntime() {
+  const runtime = browserRuntimePolicy();
+  validateBrowserRuntimePolicy(runtime);
+  return runtime;
+}
+
+function setupPlan(
+  target: BrowserHostTarget,
+  installationId: string,
+  state: HostAdministrationState,
+): BrowserSetupPlan {
+  const steps = setupSteps(state);
+  return browserSetupPlanSchema.parse({
+    ...target,
+    installationId,
+    state: setupState(steps),
+    nextStepId: steps.find((step) => step.state !== "completed")?.id ?? null,
+    ...browserInstallationPaths(installationId, target.hostId),
+    storageOwner: BROWSER_USER,
+    storageMode: "0700",
+    runtime: setupRuntime(),
+    packages: BROWSER_SYSTEM_PACKAGES,
+    steps,
+  });
+}
+
+function createDedicatedUserOperation(
+  confirmation: string,
+): PrivilegedOperation {
+  return {
+    kind: "create-dedicated-user",
+    username: BROWSER_USER,
+    homeDirectory: BROWSER_USER_HOME,
+    shell: BROWSER_USER_SHELL,
+    privilege: "unprivileged",
+    confirmation,
+  };
+}
+
+function installSystemPackagesOperation(
+  confirmation: string,
+): PrivilegedOperation {
+  return {
+    kind: "install-system-packages",
+    packages: BROWSER_SYSTEM_PACKAGES.map((packageSpec) => packageSpec.name),
+    repository: "signed-system-repository",
+    confirmation,
+  };
+}
+
+function configureProtectedStorageOperation(
+  target: BrowserHostTarget,
+  installationId: string,
+  confirmation: string,
+  fallbackSourcePath: string,
+): PrivilegedOperation {
+  const paths = browserInstallationPaths(installationId, target.hostId);
+  const fallback = fallbackBrowserPaths(paths.hostStoragePath);
+  return {
+    kind: "configure-protected-storage",
+    path: paths.hostStoragePath,
+    owner: BROWSER_USER,
+    mode: 0o700,
+    installationId,
+    hostId: target.hostId,
+    confirmation,
+    fallback: { sourcePath: fallbackSourcePath, ...fallback },
+  };
+}
+
+function setupOperation(
+  stepId: SetupStepId,
+  target: BrowserHostTarget,
+  installationId: string,
+  confirmation: string,
+  fallbackSourcePath: string,
+): PrivilegedOperation {
+  if (stepId === "dedicated-user") {
+    return createDedicatedUserOperation(confirmation);
+  }
+  if (stepId === "system-packages") {
+    return installSystemPackagesOperation(confirmation);
+  }
+  return configureProtectedStorageOperation(
+    target,
+    installationId,
+    confirmation,
+    fallbackSourcePath,
+  );
+}
+
+function operationFailure(scope: string) {
+  return `${scope} failed; no later operation was run. Retry this operation.`;
+}
+
+function setupResponse(
+  outcome: BrowserSetupResponse["outcome"],
+  message: string,
+  plan: BrowserSetupPlan,
+): BrowserSetupResponse {
+  return { outcome, message, plan };
+}
+
+function setupConfirmationResponse(
+  plan: BrowserSetupPlan,
+  step: BrowserSetupPlan["steps"][number],
+): BrowserSetupResponse {
+  return setupResponse(
+    "confirmation-required",
+    `Type exactly: ${step.confirmationText}`,
+    plan,
+  );
+}
+
+function setupOrderResponse(plan: BrowserSetupPlan): BrowserSetupResponse {
+  const nextStep = plan.steps.find(({ id }) => id === plan.nextStepId);
+  return setupResponse(
+    "blocked",
+    `Complete ${nextStep?.label ?? "the remaining setup step"} first.`,
+    plan,
+  );
+}
+
+function purgeConfirmationText(installationId: string, hostId: string) {
+  return `PURGE Browser installation ${installationId} on host ${hostId}`;
+}
+
+type PurgeProgress = HostAdministrationState["purge"][PurgeTargetId];
+type PurgeTarget = BrowserPurgePlan["targets"][number];
+
+function purgeProgress(
+  id: PurgeTargetId,
+  state: HostAdministrationState,
+): PurgeProgress {
+  const progress = state.purge[id];
+  if (id === "stop-owned-processes" && state.processesStopped) {
+    return { state: "completed", failure: null };
+  }
+  return progress;
+}
+
+function processPurgeTarget(progress: PurgeProgress): PurgeTarget {
+  return {
+    kind: "processes",
+    id: "stop-owned-processes",
+    scope: "Browser-owned processes",
+    ...progress,
+  };
+}
+
+function browserDataPurgeTarget(
+  progress: PurgeProgress,
+  paths: BrowserInstallationPaths,
+): PurgeTarget {
+  return {
+    kind: "browser-data",
+    id: "browser-data",
+    path: paths.hostStoragePath,
+    ...progress,
+  };
+}
+
+function configurationPurgeTarget(
+  progress: PurgeProgress,
+  paths: BrowserInstallationPaths,
+): PurgeTarget {
+  return {
+    kind: "configuration",
+    id: "configuration",
+    path: paths.configurationPath,
+    ...progress,
+  };
+}
+
+function userPurgeTarget(progress: PurgeProgress): PurgeTarget {
+  return {
+    kind: "system-user",
+    id: "dedicated-user",
+    username: BROWSER_USER,
+    ...progress,
+  };
+}
+
+function purgeTarget(
+  id: PurgeTargetId,
+  state: HostAdministrationState,
+  paths: BrowserInstallationPaths,
+): PurgeTarget {
+  const progress = purgeProgress(id, state);
+  if (id === "stop-owned-processes") return processPurgeTarget(progress);
+  if (id === "browser-data") return browserDataPurgeTarget(progress, paths);
+  if (id === "configuration") return configurationPurgeTarget(progress, paths);
+  return userPurgeTarget(progress);
+}
+
+function purgeState(targets: BrowserPurgePlan["targets"]) {
+  if (targets.some((target) => target.state === "failed")) {
+    return "partial-failure" as const;
+  }
+  if (targets.every((target) => target.state === "completed")) {
+    return "purged" as const;
+  }
+  if (targets.some((target) => target.state === "completed")) {
+    return "in-progress" as const;
+  }
+  return "pending" as const;
+}
+
+function purgePlan(
+  target: BrowserHostTarget,
+  installationId: string,
+  state: HostAdministrationState,
+): BrowserPurgePlan {
+  const paths = browserInstallationPaths(installationId, target.hostId);
+  const targets = PURGE_TARGET_ORDER.map((id) => purgeTarget(id, state, paths));
+  return browserPurgePlanSchema.parse({
+    ...target,
+    installationId,
+    state: purgeState(targets),
+    confirmationText: purgeConfirmationText(installationId, target.hostId),
+    targets,
+  });
+}
+
+function stopOwnedProcessesOperation(
+  installationId: string,
+  hostId: string,
+  confirmation: string,
+): PrivilegedOperation {
+  return {
+    kind: "stop-owned-processes",
+    owner: BROWSER_USER,
+    hostId,
+    installationId,
+    confirmation,
+  };
+}
+
+function stopProfileProcessesOperation(
+  target: BrowserHostTarget,
+  installationId: string,
+): PrivilegedOperation {
+  const installationPaths = browserInstallationPaths(
+    installationId,
+    target.hostId,
+  );
+  return {
+    kind: "stop-profile-processes",
+    owner: BROWSER_USER,
+    hostId: target.hostId,
+    installationId,
+    profileId: target.profileId,
+    profilePath: join(
+      installationPaths.hostStoragePath,
+      "profiles",
+      target.profileId,
+    ),
+    confirmation: "Authenticated owner profile lifecycle",
+  };
+}
+
+function removeBrowserDataOperation(
+  target: BrowserHostTarget,
+  installationId: string,
+  confirmation: string,
+): PrivilegedOperation {
+  const paths = browserInstallationPaths(installationId, target.hostId);
+  return {
+    kind: "remove-browser-data",
+    path: paths.hostStoragePath,
+    installationId,
+    hostId: target.hostId,
+    confirmation,
+  };
+}
+
+function removeConfigurationOperation(
+  target: BrowserHostTarget,
+  installationId: string,
+  confirmation: string,
+): PrivilegedOperation {
+  const paths = browserInstallationPaths(installationId, target.hostId);
+  return {
+    kind: "remove-installation-configuration",
+    path: paths.configurationPath,
+    installationId,
+    confirmation,
+  };
+}
+
+function removeDedicatedUserOperation(
+  target: BrowserHostTarget,
+  installationId: string,
+  confirmation: string,
+): PrivilegedOperation {
+  return {
+    kind: "remove-dedicated-user",
+    username: BROWSER_USER,
+    hostId: target.hostId,
+    installationId,
+    guard: {
+      type: "last-installation-only",
+      hostId: target.hostId,
+      installationId,
+    },
+    confirmation,
+  };
+}
+
+function purgeOperation(
+  id: PurgeTargetId,
+  target: BrowserHostTarget,
+  installationId: string,
+  confirmation: string,
+): PrivilegedOperation {
+  if (id === "stop-owned-processes") {
+    return stopOwnedProcessesOperation(
+      installationId,
+      target.hostId,
+      confirmation,
+    );
+  }
+  if (id === "browser-data") {
+    return removeBrowserDataOperation(target, installationId, confirmation);
+  }
+  if (id === "configuration") {
+    return removeConfigurationOperation(target, installationId, confirmation);
+  }
+  return removeDedicatedUserOperation(target, installationId, confirmation);
+}
+
+function purgeResponse(
+  outcome: BrowserPurgeResponse["outcome"],
+  message: string,
+  plan: BrowserPurgePlan,
+): BrowserPurgeResponse {
+  return { outcome, message, plan };
+}
+
+export interface HostAdministrationBoundary extends HostReadinessBoundary {
+  stopProfile(target: BrowserHostTarget): Promise<void>;
+  isProfileStopped(target: BrowserHostTarget): Promise<boolean>;
+  setupPlan(
+    target: BrowserHostTarget,
+  ): BrowserSetupPlan | Promise<BrowserSetupPlan>;
+  setup(
+    request: BrowserSetupRequest,
+  ): BrowserSetupResponse | Promise<BrowserSetupResponse>;
+  disable(
+    request: BrowserLifecycleRequest,
+  ): BrowserLifecycleResponse | Promise<BrowserLifecycleResponse>;
+  uninstall(
+    request: BrowserLifecycleRequest,
+  ): BrowserLifecycleResponse | Promise<BrowserLifecycleResponse>;
+  purgePlan(
+    target: BrowserHostTarget,
+  ): BrowserPurgePlan | Promise<BrowserPurgePlan>;
+  purge(
+    request: BrowserPurgeRequest,
+  ): BrowserPurgeResponse | Promise<BrowserPurgeResponse>;
+}
+
+export interface HostAdministrationOptions {
+  readiness: HostReadinessBoundary;
+  installationId: string;
+  executor: PrivilegedExecutor;
+  stateStore?: HostAdministrationStateStore;
+  fallbackSourcePath?: string;
+}
+
+interface HostAdministrationRuntime {
+  readiness: HostReadinessBoundary;
+  installationId: string;
+  executor: PrivilegedExecutor;
+  stateStore: HostAdministrationStateStore;
+  mutationQueues: Map<string, Promise<void>>;
+  fallbackSourcePath: string;
+}
+
+async function withHostMutationLock<T>(
+  runtime: HostAdministrationRuntime,
+  hostId: string,
+  mutation: () => Promise<T>,
+): Promise<T> {
+  const previous = runtime.mutationQueues.get(hostId) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  runtime.mutationQueues.set(hostId, current);
+  await previous;
+  try {
+    return await mutation();
+  } finally {
+    release();
+    if (runtime.mutationQueues.get(hostId) === current) {
+      runtime.mutationQueues.delete(hostId);
+    }
+  }
+}
+
+async function readState(
+  stateStore: HostAdministrationStateStore,
+  hostId: string,
+) {
+  return (await stateStore.read(hostId)) ?? emptyHostAdministrationState();
+}
+
+async function writeState(
+  stateStore: HostAdministrationStateStore,
+  hostId: string,
+  state: HostAdministrationState,
+) {
+  await stateStore.write(hostId, state);
+}
+
+function setupGateResponse(
+  plan: BrowserSetupPlan,
+  step: BrowserSetupPlan["steps"][number],
+  request: BrowserSetupRequest,
+): BrowserSetupResponse | null {
+  if (request.confirmation !== step.confirmationText) {
+    return setupConfirmationResponse(plan, step);
+  }
+  if (step.state === "completed") {
+    return setupResponse(
+      "already-complete",
+      `${step.label} is complete.`,
+      plan,
+    );
+  }
+  if (plan.nextStepId !== request.stepId) {
+    return setupOrderResponse(plan);
+  }
+  return null;
+}
+
+function setupReadinessBlock(readiness: BrowserStatus): string | null {
+  if (
+    readiness.state === "unsupported" ||
+    readiness.state === "repair-required" ||
+    readiness.state === "host-offline"
+  ) {
+    return readiness.message;
+  }
+  const connectCapability = readiness.capabilities.find(
+    ({ id }) => id === "bb-connect",
+  );
+  if (connectCapability?.status === "missing") {
+    return connectCapability.reason;
+  }
+  return null;
+}
+
+interface SetupExecutionContext {
+  request: BrowserSetupRequest;
+  target: BrowserHostTarget;
+  step: BrowserSetupPlan["steps"][number];
+  state: HostAdministrationState;
+  runtime: HostAdministrationRuntime;
+}
+
+async function recordSetupFailure(
+  context: SetupExecutionContext,
+): Promise<BrowserSetupResponse> {
+  const { request, target, step, state, runtime } = context;
+  const failure = operationFailure(step.label);
+  state.setup[request.stepId] = { state: "failed", failure };
+  await writeState(runtime.stateStore, request.hostId, state);
+  return setupResponse(
+    "partial-failure",
+    failure,
+    setupPlan(target, runtime.installationId, state),
+  );
+}
+
+async function recordSetupCompletion(
+  context: SetupExecutionContext,
+): Promise<BrowserSetupResponse> {
+  const { request, target, step, state, runtime } = context;
+  state.setup[request.stepId] = { state: "completed", failure: null };
+  await writeState(runtime.stateStore, request.hostId, state);
+  const completedPlan = setupPlan(target, runtime.installationId, state);
+  const outcome = completedPlan.state === "ready" ? "completed" : "progressed";
+  return setupResponse(outcome, `${step.label} is complete.`, completedPlan);
+}
+
+async function executeSetupStep(
+  context: SetupExecutionContext,
+): Promise<BrowserSetupResponse> {
+  const { request, target, runtime } = context;
+  try {
+    await runtime.executor.execute(
+      setupOperation(
+        request.stepId,
+        target,
+        runtime.installationId,
+        request.confirmation,
+        runtime.fallbackSourcePath,
+      ),
+    );
+  } catch (error) {
+    if (!(error instanceof Error)) throw error;
+    return recordSetupFailure(context);
+  }
+  return recordSetupCompletion(context);
+}
+
+async function runSetup(
+  request: BrowserSetupRequest,
+  runtime: HostAdministrationRuntime,
+): Promise<BrowserSetupResponse> {
+  const state = await readState(runtime.stateStore, request.hostId);
+  const target = { hostId: request.hostId, profileId: request.profileId };
+  const currentPlan = setupPlan(target, runtime.installationId, state);
+  const step = currentPlan.steps.find(({ id }) => id === request.stepId);
+  if (step === undefined) {
+    return setupResponse("blocked", "Unknown Browser setup step.", currentPlan);
+  }
+  const gateResponse = setupGateResponse(currentPlan, step, request);
+  if (gateResponse !== null) return gateResponse;
+  const hostReadiness = await runtime.readiness.inspect(target);
+  const readinessBlock = setupReadinessBlock(hostReadiness);
+  if (readinessBlock !== null) {
+    return setupResponse("blocked", readinessBlock, currentPlan);
+  }
+  return executeSetupStep({ request, target, step, state, runtime });
+}
+
+function lifecycleResponse(
+  action: BrowserLifecycleResponse["action"],
+  outcome: BrowserLifecycleResponse["outcome"],
+  message: string,
+): BrowserLifecycleResponse {
+  return {
+    action,
+    outcome,
+    message,
+    confirmationText: STOP_BROWSER_CONFIRMATION,
+    profilesRetained: true,
+  };
+}
+
+async function tryStopOwnedProcesses(
+  request: BrowserLifecycleRequest,
+  runtime: HostAdministrationRuntime,
+): Promise<boolean> {
+  try {
+    await runtime.executor.execute(
+      stopOwnedProcessesOperation(
+        runtime.installationId,
+        request.hostId,
+        request.confirmation,
+      ),
+    );
+    return true;
+  } catch (error) {
+    if (!(error instanceof Error)) throw error;
+    return false;
+  }
+}
+
+async function recordStoppedProcesses(
+  request: BrowserLifecycleRequest,
+  action: BrowserLifecycleResponse["action"],
+  state: HostAdministrationState,
+  runtime: HostAdministrationRuntime,
+): Promise<BrowserLifecycleResponse> {
+  state.processesStopped = true;
+  await writeState(runtime.stateStore, request.hostId, state);
+  return lifecycleResponse(
+    action,
+    "stopped",
+    "Browser-owned processes were stopped; profiles and authenticated state are retained.",
+  );
+}
+
+async function stopProcessesAfterConfirmation(
+  request: BrowserLifecycleRequest,
+  action: BrowserLifecycleResponse["action"],
+  runtime: HostAdministrationRuntime,
+): Promise<BrowserLifecycleResponse> {
+  const state = await readState(runtime.stateStore, request.hostId);
+  if (state.processesStopped) {
+    return lifecycleResponse(
+      action,
+      "already-stopped",
+      "Browser-owned processes are already stopped; profiles are retained.",
+    );
+  }
+  if (!(await tryStopOwnedProcesses(request, runtime))) {
+    return lifecycleResponse(
+      action,
+      "failed",
+      "Browser-owned processes could not be stopped; profiles are retained.",
+    );
+  }
+  return recordStoppedProcesses(request, action, state, runtime);
+}
+
+async function stopProcesses(
+  request: BrowserLifecycleRequest,
+  action: BrowserLifecycleResponse["action"],
+  runtime: HostAdministrationRuntime,
+): Promise<BrowserLifecycleResponse> {
+  if (request.confirmation !== STOP_BROWSER_CONFIRMATION) {
+    return lifecycleResponse(
+      action,
+      "confirmation-required",
+      `Type exactly: ${STOP_BROWSER_CONFIRMATION}`,
+    );
+  }
+  return stopProcessesAfterConfirmation(request, action, runtime);
+}
+
+interface PurgeExecutionContext {
+  request: BrowserPurgeRequest;
+  target: BrowserHostTarget;
+  targetId: PurgeTargetId;
+  state: HostAdministrationState;
+  runtime: HostAdministrationRuntime;
+}
+
+async function tryPurgeOperation(context: PurgeExecutionContext) {
+  try {
+    await context.runtime.executor.execute(
+      purgeOperation(
+        context.targetId,
+        context.target,
+        context.runtime.installationId,
+        context.request.confirmation,
+      ),
+    );
+    return true;
+  } catch (error) {
+    if (!(error instanceof Error)) throw error;
+    return false;
+  }
+}
+
+async function recordPurgeFailure(context: PurgeExecutionContext) {
+  const failure = operationFailure(`Purge target ${context.targetId}`);
+  context.state.purge[context.targetId] = { state: "failed", failure };
+  await writeState(
+    context.runtime.stateStore,
+    context.request.hostId,
+    context.state,
+  );
+}
+
+async function recordPurgeCompletion(context: PurgeExecutionContext) {
+  context.state.purge[context.targetId] = {
+    state: "completed",
+    failure: null,
+  };
+  if (context.targetId === "stop-owned-processes") {
+    context.state.processesStopped = true;
+  }
+  await writeState(
+    context.runtime.stateStore,
+    context.request.hostId,
+    context.state,
+  );
+}
+
+async function executePurgeTarget(
+  context: PurgeExecutionContext,
+): Promise<"skipped" | "completed" | "failed"> {
+  if (context.state.purge[context.targetId].state === "completed") {
+    return "skipped";
+  }
+  if (
+    context.targetId === "stop-owned-processes" &&
+    context.state.processesStopped
+  ) {
+    await recordPurgeCompletion(context);
+    return "completed";
+  }
+  if (!(await tryPurgeOperation(context))) {
+    await recordPurgeFailure(context);
+    return "failed";
+  }
+  await recordPurgeCompletion(context);
+  return "completed";
+}
+
+function purgeGateResponse(
+  plan: BrowserPurgePlan,
+  request: BrowserPurgeRequest,
+): BrowserPurgeResponse | null {
+  if (request.confirmation !== plan.confirmationText) {
+    return purgeResponse(
+      "confirmation-required",
+      `Type exactly: ${plan.confirmationText}`,
+      plan,
+    );
+  }
+  if (plan.state === "purged") {
+    return purgeResponse(
+      "already-purged",
+      "Browser installation is already purged.",
+      plan,
+    );
+  }
+  return null;
+}
+
+function purgeCompletionResponse(
+  plan: BrowserPurgePlan,
+  progressed: boolean,
+): BrowserPurgeResponse {
+  const purged = plan.state === "purged";
+  return purgeResponse(
+    purged ? "purged" : progressed ? "progressed" : "already-purged",
+    purged
+      ? "Browser installation, configuration, and authenticated browser data were purged."
+      : "Purge progress was recorded; retry with the same typed confirmation to continue.",
+    plan,
+  );
+}
+
+interface PurgeRunContext {
+  request: BrowserPurgeRequest;
+  target: BrowserHostTarget;
+  state: HostAdministrationState;
+  runtime: HostAdministrationRuntime;
+}
+
+interface PurgeRunResult {
+  progressed: boolean;
+  failedTarget: PurgeTargetId | null;
+}
+
+async function executePurgeTargets(
+  context: PurgeRunContext,
+): Promise<PurgeRunResult> {
+  let progressed = false;
+  for (const targetId of PURGE_TARGET_ORDER) {
+    const execution = await executePurgeTarget({ ...context, targetId });
+    if (execution === "failed") return { progressed, failedTarget: targetId };
+    progressed ||= execution === "completed";
+  }
+  return { progressed, failedTarget: null };
+}
+
+async function runPurge(
+  request: BrowserPurgeRequest,
+  runtime: HostAdministrationRuntime,
+): Promise<BrowserPurgeResponse> {
+  const state = await readState(runtime.stateStore, request.hostId);
+  const target = { hostId: request.hostId, profileId: request.profileId };
+  const currentPlan = purgePlan(target, runtime.installationId, state);
+  const gateResponse = purgeGateResponse(currentPlan, request);
+  if (gateResponse !== null) return gateResponse;
+  const execution = await executePurgeTargets({
+    request,
+    target,
+    state,
+    runtime,
+  });
+  if (execution.failedTarget !== null) {
+    const failure = operationFailure(`Purge target ${execution.failedTarget}`);
+    return purgeResponse(
+      "partial-failure",
+      failure,
+      purgePlan(target, runtime.installationId, state),
+    );
+  }
+  return purgeCompletionResponse(
+    purgePlan(target, runtime.installationId, state),
+    execution.progressed,
+  );
+}
+
+function createAdministrationRuntime(
+  options: HostAdministrationOptions,
+): HostAdministrationRuntime {
+  return {
+    readiness: options.readiness,
+    installationId: options.installationId,
+    executor: options.executor,
+    stateStore:
+      options.stateStore ?? createMemoryHostAdministrationStateStore(),
+    mutationQueues: new Map(),
+    fallbackSourcePath:
+      options.fallbackSourcePath ??
+      `/playwright/chromium-${PINNED_BROWSER_RUNTIME.chromiumRevision}/chrome`,
+  };
+}
+
+async function readSetupPlan(
+  target: BrowserHostTarget,
+  runtime: HostAdministrationRuntime,
+) {
+  return setupPlan(
+    target,
+    runtime.installationId,
+    await readState(runtime.stateStore, target.hostId),
+  );
+}
+
+async function readPurgePlan(
+  target: BrowserHostTarget,
+  runtime: HostAdministrationRuntime,
+) {
+  return purgePlan(
+    target,
+    runtime.installationId,
+    await readState(runtime.stateStore, target.hostId),
+  );
+}
+
+async function stopProfileProcesses(
+  target: BrowserHostTarget,
+  runtime: HostAdministrationRuntime,
+) {
+  const state = await readState(runtime.stateStore, target.hostId);
+  await runtime.executor.execute(
+    stopProfileProcessesOperation(target, runtime.installationId),
+  );
+  if (!state.stoppedProfileIds.includes(target.profileId)) {
+    state.stoppedProfileIds.push(target.profileId);
+  }
+  await writeState(runtime.stateStore, target.hostId, state);
+}
+
+async function profileProcessesAreStopped(
+  target: BrowserHostTarget,
+  runtime: HostAdministrationRuntime,
+) {
+  const state = await readState(runtime.stateStore, target.hostId);
+  return state.stoppedProfileIds.includes(target.profileId);
+}
+
+export function createHostAdministrationBoundary(
+  options: HostAdministrationOptions,
+): HostAdministrationBoundary {
+  const runtime = createAdministrationRuntime(options);
+  return {
+    inspect: (target) => runtime.readiness.inspect(target),
+    diagnostics: (target) => runtime.readiness.diagnostics(target),
+    stopProfile: (target) =>
+      withHostMutationLock(runtime, target.hostId, () =>
+        stopProfileProcesses(target, runtime),
+      ),
+    isProfileStopped: (target) => profileProcessesAreStopped(target, runtime),
+    setupPlan: (target) => readSetupPlan(target, runtime),
+    setup: (request) =>
+      withHostMutationLock(runtime, request.hostId, () =>
+        runSetup(request, runtime),
+      ),
+    disable: (request) =>
+      withHostMutationLock(runtime, request.hostId, () =>
+        stopProcesses(request, "disable", runtime),
+      ),
+    uninstall: (request) =>
+      withHostMutationLock(runtime, request.hostId, () =>
+        stopProcesses(request, "uninstall", runtime),
+      ),
+    purgePlan: (target) => readPurgePlan(target, runtime),
+    purge: (request) =>
+      withHostMutationLock(runtime, request.hostId, () =>
+        runPurge(request, runtime),
+      ),
+  };
+}
+
+export function createReadOnlyHostAdministrationBoundary(options: {
+  readiness: HostReadinessBoundary;
+  installationId: string;
+  stateStore?: HostAdministrationStateStore;
+}): HostAdministrationBoundary {
+  return createHostAdministrationBoundary({
+    ...options,
+    executor: createUnavailablePrivilegedExecutor(),
+  });
+}
+
+export { STOP_BROWSER_CONFIRMATION };

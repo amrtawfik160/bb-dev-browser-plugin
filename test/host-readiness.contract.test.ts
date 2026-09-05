@@ -15,7 +15,10 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { BROWSER_STORAGE_ROOT, DEFAULT_PROFILE_ID } from "../contracts.js";
+import {
+  BROWSER_STORAGE_ROOT,
+  DEFAULT_PROFILE_ID,
+} from "../src/shared/contracts.js";
 import {
   createDefaultHostSnapshotReader,
   createHostReadinessBoundary,
@@ -23,8 +26,8 @@ import {
   provisionedBrowserStorageRoot,
   type HostProbePaths,
   type HostProbeSnapshot,
-} from "../readiness.js";
-import { createBrowserHostEntry } from "../host.js";
+} from "../src/host/readiness.js";
+import { createBrowserHostEntry } from "../src/host/host.js";
 
 const target = {
   hostId: "host-readiness-test",

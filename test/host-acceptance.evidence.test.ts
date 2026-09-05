@@ -49,7 +49,7 @@ import {
   type ProvisionedHostContext,
   type WorkerReport,
 } from "./fixtures/host-provisioning.js";
-import { projectLoopbackAddress } from "../browser-navigation.js";
+import { projectLoopbackAddress } from "../src/browser/browser-navigation.js";
 
 describe("issue #24 AC3/AC4 deterministic remote acceptance", () => {
   it.runIf(integrationEnabled)(

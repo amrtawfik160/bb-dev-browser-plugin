@@ -2,8 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   prepareAgentExecution,
   wrapAgentScriptResult,
-} from "../agent-script.js";
-import { browserScriptParametersSchema } from "../contracts.js";
+} from "../src/browser/agent-script.js";
+import { browserScriptParametersSchema } from "../src/shared/contracts.js";
 
 type BrowserApi<Page> = {
   getPage: (nameOrId: string) => Promise<Page>;

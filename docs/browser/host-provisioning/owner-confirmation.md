@@ -9,7 +9,7 @@
 This document is the **exact supported-host diagnosis** and the **proposed
 privileged commands** for provisioning only the current enrolled host with the
 release candidate. It is derived from the real readiness probes in
-[`readiness.ts`](../../../readiness.ts) and the operator
+[`readiness.ts`](../../../src/host/readiness.ts) and the operator
 [setup guide](../operators.md#setup). Read it end-to-end, then confirm each
 item in the [confirmation checklist](#confirmation-checklist) before running a
 single privileged command.
@@ -30,9 +30,9 @@ privileged command without confirmation.
 ## 1. Exact supported-host diagnosis
 
 The readiness boundary probes nine capabilities (the
-`READINESS_CAPABILITIES` in [`contracts.ts`](../../../contracts.ts)). Each
+`READINESS_CAPABILITIES` in [`contracts.ts`](../../../src/shared/contracts.ts)). Each
 must report `ready` before the host is provisioned. The table below is the
-**exact** readiness logic from [`readiness.ts`](../../../readiness.ts) — these
+**exact** readiness logic from [`readiness.ts`](../../../src/host/readiness.ts) — these
 are the real checks the owner must satisfy, not a paraphrase.
 
 | #   | Capability          | "ready" means (exact probe)                                                                                                                                                                                                                                                                                                                                                                       | How the owner verifies                                                                                                       |

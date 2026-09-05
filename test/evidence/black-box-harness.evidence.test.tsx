@@ -13,7 +13,7 @@
  * contract suites; it only proves the matrix is driven together.
  */
 import { describe, expect, it } from "vitest";
-import { DEFAULT_PROFILE_ID } from "../../contracts.js";
+import { DEFAULT_PROFILE_ID } from "../../src/shared/contracts.js";
 import { deterministicLoginFixture } from "../fixtures/safe-login-fixture.js";
 import {
   createEvidenceHarness,

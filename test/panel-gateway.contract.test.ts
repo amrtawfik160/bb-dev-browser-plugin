@@ -4,9 +4,9 @@ import {
   PANEL_GATEWAY_BIND_HOST,
   PANEL_GATEWAY_INPUT_MAX_PER_SECOND,
   PANEL_GATEWAY_MESSAGE_MAX_BYTES,
-} from "../contracts.js";
-import { createPanelCapabilityStore } from "../panel-capability.js";
-import { createPanelGateway } from "../panel-gateway.js";
+} from "../src/shared/contracts.js";
+import { createPanelCapabilityStore } from "../src/panel/panel-capability.js";
+import { createPanelGateway } from "../src/panel/panel-gateway.js";
 
 const hostId = "host-gateway";
 const profileId = "profile-gateway";

@@ -7,15 +7,15 @@ import {
   PANEL_RECLAIM_WINDOW_MS,
   PANEL_RECONNECT_INITIAL_BACKOFF_MS,
   PANEL_RECONNECT_MAX_BACKOFF_MS,
-} from "../contracts.js";
+} from "../src/shared/contracts.js";
 import {
   adaptFrameRate,
   clampViewport,
   createAutomationStreamAdapter,
   frameIntervalMs,
   reconnectBackoffMs,
-} from "../panel-stream.js";
-import { createPanelCapabilityStore } from "../panel-capability.js";
+} from "../src/panel/panel-stream.js";
+import { createPanelCapabilityStore } from "../src/panel/panel-capability.js";
 
 const binding = {
   ownerSessionId: "owner-session-stream",

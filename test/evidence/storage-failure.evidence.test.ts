@@ -21,7 +21,7 @@ import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import {
   BROWSER_DATABASE_MIGRATIONS,
   createBrowserDatabaseMigrationPlan,
-} from "../../activity-records.js";
+} from "../../src/activity/activity-records.js";
 import {
   createEvidenceHarness,
   preparedEvidenceSnapshot,

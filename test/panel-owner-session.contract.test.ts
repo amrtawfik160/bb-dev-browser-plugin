@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ownerSessionIdFromContext } from "../panel-owner-session.js";
+import { ownerSessionIdFromContext } from "../src/shared/panel-owner-session.js";
 
 describe("Panel owner session derivation", () => {
   it("derives the owner session from the BB thread context, not a hardcoded literal", () => {

@@ -13,8 +13,8 @@ import { join } from "node:path";
 import { createConnection } from "node:net";
 import { chromium } from "playwright";
 import { describe, expect, it } from "vitest";
-import { createProductionBrowserProcessBoundary } from "../browser-process.js";
-import { RENDERER_PROCESS_LIMIT } from "../browser-runtime.js";
+import { createProductionBrowserProcessBoundary } from "../src/browser/browser-process.js";
+import { RENDERER_PROCESS_LIMIT } from "../src/browser/browser-runtime.js";
 
 /**
  * Real-browser-subprocess integration gate.

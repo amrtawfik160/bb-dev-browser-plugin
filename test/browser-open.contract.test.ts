@@ -3,7 +3,7 @@ import {
   openBrowserScript,
   openCliText,
   parseOpenPageState,
-} from "../browser-open.js";
+} from "../src/server/browser-open.js";
 
 const navigation = {
   address: { kind: "address" as const, url: "https://example.com/" },

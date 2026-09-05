@@ -4,11 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import { PINNED_BROWSER_RUNTIME } from "../dependency-inventory.js";
+import { PINNED_BROWSER_RUNTIME } from "../src/shared/dependency-inventory.js";
 import {
   requirePlaywrightRuntime,
   resolvePlaywrightRuntime,
-} from "../playwright-runtime.js";
+} from "../src/browser/playwright-runtime.js";
 
 const isolatedHostUrl = pathToFileURL(
   "/tmp/isolated-host-artifact/host.mjs",

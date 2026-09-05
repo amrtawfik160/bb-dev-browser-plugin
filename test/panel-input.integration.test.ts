@@ -8,7 +8,7 @@ it("commits native IME text once and releases held input when the window loses f
       contents: `
         import React, { useRef } from 'react';
         import { createRoot } from 'react-dom/client';
-        import { useBrowserPageInput } from './panel-input';
+        import { useBrowserPageInput } from './src/app/panel-input';
         function Surface() {
           const canvas = useRef(null);
           const textInput = useRef(null);

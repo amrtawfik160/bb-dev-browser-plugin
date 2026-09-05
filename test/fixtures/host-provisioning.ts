@@ -34,15 +34,18 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import type http from "node:http";
-import { DEFAULT_PROFILE_ID, type BrowserHostTarget } from "../../contracts.js";
-import { profileStoragePaths } from "../../profile-storage.js";
+import {
+  DEFAULT_PROFILE_ID,
+  type BrowserHostTarget,
+} from "../../src/shared/contracts.js";
+import { profileStoragePaths } from "../../src/host/profile-storage.js";
 import {
   createDefaultHostSnapshotReader,
   createHostReadinessBoundary,
   hostInstallationId,
   provisionedBrowserStorageRoot,
   type HostProbeSnapshot,
-} from "../../readiness.js";
+} from "../../src/host/readiness.js";
 import {
   integrationEnabled,
   realBrowserProvisioned,

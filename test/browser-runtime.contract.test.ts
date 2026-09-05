@@ -21,13 +21,13 @@ import {
   type BrowserExecutionRequest,
   type BrowserLaunchBoundary,
   type BrowserLaunchRequest,
-} from "../browser-runtime.js";
-import { deliverRendererMonitorFailure } from "../browser-process.js";
-import { fallbackBrowserPaths } from "../browser-fallback.js";
-import { PINNED_BROWSER_RUNTIME } from "../dependency-inventory.js";
-import { profileStoragePaths } from "../profile-storage.js";
-import { BROWSER_SCRIPT_RESULT_LIMIT_BYTES } from "../contracts.js";
-import { NON_WEB_NAVIGATION_DENIED_MESSAGE } from "../agent-script.js";
+} from "../src/browser/browser-runtime.js";
+import { deliverRendererMonitorFailure } from "../src/browser/browser-process.js";
+import { fallbackBrowserPaths } from "../src/host/browser-fallback.js";
+import { PINNED_BROWSER_RUNTIME } from "../src/shared/dependency-inventory.js";
+import { profileStoragePaths } from "../src/host/profile-storage.js";
+import { BROWSER_SCRIPT_RESULT_LIMIT_BYTES } from "../src/shared/contracts.js";
+import { NON_WEB_NAVIGATION_DENIED_MESSAGE } from "../src/browser/agent-script.js";
 import { waitForSettled } from "./wait.js";
 
 function launchFixture(
@@ -52,6 +52,7 @@ function launchFixture(
     }
   >();
   const pages = new Set(["actual-active-tab"]);
+  let activeTabId = "actual-active-tab";
   let nextPid = 4100;
   const boundary: BrowserLaunchBoundary = {
     runAsUser: options.runAsUser ?? "bb-browser",
@@ -132,7 +133,7 @@ function launchFixture(
           request.code.includes("let active = null"))
       ) {
         return JSON.stringify({
-          id: "actual-active-tab",
+          id: activeTabId,
           url: "about:blank",
           title: "",
           name: null,
@@ -141,7 +142,10 @@ function launchFixture(
       const requestedPage = request.code.match(
         /browser\.getPage\(("(?:[^"\\]|\\.)*")\)/u,
       )?.[1];
-      if (requestedPage !== undefined) pages.add(JSON.parse(requestedPage));
+      if (requestedPage !== undefined) {
+        activeTabId = JSON.parse(requestedPage);
+        pages.add(activeTabId);
+      }
       const activeTabMarker = request.code.match(
         /__bbActiveTabMarker:\s*"([^"\\]+)"/u,
       )?.[1];
@@ -151,6 +155,7 @@ function launchFixture(
             ? (options.untargetedAgentTabId ?? "actual-active-tab")
             : JSON.parse(requestedPage);
         pages.add(foregroundTabId);
+        activeTabId = foregroundTabId;
         return {
           output: `attached\n${JSON.stringify({
             __bbActiveTabMarker: activeTabMarker,
@@ -233,6 +238,65 @@ async function runtimeFixture(
 }
 
 describe("Browser Instance runtime", () => {
+  it.each(["navigate", "history"] as const)(
+    "%s follows the live active tab after the previous tab closes",
+    async (operation) => {
+      const fixture = await runtimeFixture();
+      let liveTabId = "old-tab";
+      const visited: string[] = [];
+      fixture.processFixture.boundary.execute = async (request) => {
+        let output = "";
+        const run = compileFunction(
+          `return (async () => { ${request.code} })();`,
+          ["browser", "console"],
+        );
+        await run(
+          {
+            listPages: async () => [{ id: liveTabId, url: "about:blank" }],
+            getPage: async (id: string) => ({
+              bringToFront: async () => {},
+              evaluate: async () => true,
+              goto: async () => {
+                visited.push(id);
+              },
+              url: () => "about:blank",
+            }),
+          },
+          {
+            log: (value: string) => {
+              output = value;
+            },
+          },
+        );
+        return output;
+      };
+      try {
+        await fixture.runtime.navigate(fixture.target, "https://example.test/");
+        liveTabId = "replacement-tab";
+        const response =
+          operation === "navigate"
+            ? await fixture.runtime.navigate(
+                fixture.target,
+                "https://example.test/next",
+              )
+            : await fixture.runtime.history(fixture.target, "reload");
+        expect(response.tabId).toBe("replacement-tab");
+        if (operation === "navigate")
+          expect(visited).toEqual(["old-tab", "replacement-tab"]);
+        await expect(
+          fixture.runtime.navigate(
+            { ...fixture.target, tabId: "old-tab" },
+            "https://example.test/",
+          ),
+        ).rejects.toThrow(
+          "Browser Tab is invalid or belongs to a previous runtime",
+        );
+      } finally {
+        await fixture.dispose();
+      }
+    },
+  );
+
   it("issue #12 sleeps an idle instance while a visible panel pins its profile", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-28T12:00:00.000Z"));
@@ -1004,10 +1068,10 @@ describe("Browser Instance runtime", () => {
       expect(fixture.processFixture.executions[0]?.code).toContain(
         'browser.getPage("tab-a")',
       );
-      expect(fixture.processFixture.executions[1]?.code).not.toContain(
+      expect(fixture.processFixture.executions.at(-1)?.code).not.toContain(
         "keyboard.press",
       );
-      expect(fixture.processFixture.executions[1]?.code).toContain(
+      expect(fixture.processFixture.executions.at(-1)?.code).toContain(
         'browser.getPage("tab-a")',
       );
     } finally {
@@ -1049,7 +1113,7 @@ describe("Browser Instance runtime", () => {
       expect(fixture.processFixture.executions[0]?.code).toContain(
         "await page.bringToFront()",
       );
-      expect(fixture.processFixture.executions[1]?.code).toContain(
+      expect(fixture.processFixture.executions.at(-1)?.code).toContain(
         'browser.getPage("tab-agent")',
       );
     } finally {
@@ -1072,7 +1136,7 @@ describe("Browser Instance runtime", () => {
         "https://fixture.example/after-agent",
       );
 
-      expect(fixture.processFixture.executions[1]?.code).toContain(
+      expect(fixture.processFixture.executions.at(-1)?.code).toContain(
         'browser.getPage("agent-selected-tab")',
       );
     } finally {

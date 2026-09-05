@@ -13,9 +13,9 @@ describe("Browser package contract", () => {
       license: "MIT",
       bb: {
         name: "Browser",
-        server: "./server.ts",
-        app: "./app.tsx",
-        host: "./host.ts",
+        server: "./src/server/server.ts",
+        app: "./src/app/app.tsx",
+        host: "./src/host/host.ts",
         skills: ["skills"],
       },
       dependencies: { "dev-browser": "0.2.9", playwright: "1.58.2" },

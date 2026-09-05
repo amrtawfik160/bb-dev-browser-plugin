@@ -1,7 +1,7 @@
 import { createServer, type Server } from "node:http";
 import { chromium, type BrowserContext, type Page } from "playwright";
 import { describe, expect, it } from "vitest";
-import { prepareAgentExecution } from "../agent-script.js";
+import { prepareAgentExecution } from "../src/browser/agent-script.js";
 
 type PinnedBrowserApi = {
   getPage: (nameOrId: string) => Promise<Page>;
