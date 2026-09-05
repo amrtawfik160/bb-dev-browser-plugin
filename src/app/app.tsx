@@ -1144,7 +1144,7 @@ function usePanelControlSession({
   ]);
 
   async function transfer(take: boolean) {
-    if (hostId === null || profileId === undefined) return;
+    if (hostId === null || profileId === undefined) return null;
     setTransferPending(true);
     try {
       const response = take
@@ -1160,7 +1160,9 @@ function usePanelControlSession({
             panelId,
             ownerSessionId,
           });
-      if (!isPanelIdentityRejection(response)) setControl(response);
+      if (isPanelIdentityRejection(response)) return null;
+      setControl(response);
+      return response;
     } finally {
       setTransferPending(false);
     }
@@ -1171,7 +1173,7 @@ function usePanelControlSession({
   // explicit action that re-grants input without silently re-granting it on
   // reconnect.
   async function reclaim() {
-    if (hostId === null || profileId === undefined) return;
+    if (hostId === null || profileId === undefined) return null;
     setTransferPending(true);
     try {
       const response = await rpc.call("browser_panel_reclaim_control", {
@@ -1180,7 +1182,9 @@ function usePanelControlSession({
         panelId,
         ownerSessionId,
       });
-      if (!isPanelIdentityRejection(response)) setControl(response);
+      if (isPanelIdentityRejection(response)) return null;
+      setControl(response);
+      return response;
     } finally {
       setTransferPending(false);
     }
@@ -1204,7 +1208,7 @@ function usePanelControlSession({
      * control, so the owner never needs a second, differently named button to
      * take their browser back.
      */
-    takeControl: () => void (canReclaim ? reclaim() : transfer(true)),
+    takeControl: () => (canReclaim ? reclaim() : transfer(true)),
     releaseControl: () => void transfer(false),
   };
 }
@@ -1272,11 +1276,20 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
   }
 
   /**
-   * One place the shared control state lands, whether it arrived from the join
-   * RPC, an explicit transfer, or a live broadcast over the stream. The tab
-   * strip travels with it, so every panel on this browser shows the same tabs.
+   * Shared control (who drives, viewport, agent purpose) without touching the
+   * tab strip. Viewport reports and a join that races a tab switch must not
+   * put the previous tab back.
    */
-  function applyControlState(response: BrowserPanelControlResponse | null) {
+  function applyControlSession(response: BrowserPanelControlResponse | null) {
+    setControl(response);
+  }
+
+  /**
+   * Live session snapshot: control and the shared tab strip together. Stream
+   * pushes and tab actions are the sources that may change which tab is on
+   * screen.
+   */
+  function applySessionSnapshot(response: BrowserPanelControlResponse | null) {
     setControl(response);
     setTabStrip(response === null ? null : response.tabs);
   }
@@ -1285,14 +1298,14 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
     status,
     panelId,
     control,
-    setControl: applyControlState,
+    setControl: streamIsLive ? applyControlSession : applySessionSnapshot,
     streamIsLive,
   });
   usePanelViewportReport({
     status,
     panelId,
     surface: pageSurfaceRef,
-    onControlState: applyControlState,
+    onControlState: applyControlSession,
   });
 
   useEffect(() => {
@@ -1735,7 +1748,15 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
         tabs={tabStrip?.tabs ?? []}
         activeTabId={tabStrip?.activeTabId ?? null}
         canDrive={view.canDrive}
-        onSelect={(tabId) => driveTabs("activate", tabId)}
+        onSelect={(tabId) => {
+          void (async () => {
+            if (!view.canDrive) {
+              const next = await controlSession.takeControl();
+              if (next?.role !== "controller") return;
+            }
+            driveTabs("activate", tabId);
+          })();
+        }}
         onClose={(tabId) => driveTabs("close", tabId)}
         onOpen={() => driveTabs("open")}
       />
@@ -1765,7 +1786,7 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
           panelId={panelId}
           isController={view.canDrive}
           agentDriven={view.agentDriven}
-          onControlState={applyControlState}
+          onControlState={applySessionSnapshot}
           onLiveChange={setStreamIsLive}
         />
         {view.showsNewTabSurface ? (

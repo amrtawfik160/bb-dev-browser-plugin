@@ -259,7 +259,6 @@ export function createBrowserTabStrip(
 
   function activateTab(tabId: string): boolean {
     if (!tabs.has(tabId)) return false;
-    if (activeTabId === tabId) return true;
     activeTabId = tabId;
     emit();
     return true;

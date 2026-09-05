@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { WebSocketServer, type WebSocket } from "ws";
 import { createCdpScreencastSource } from "../src/browser/browser-screencast.js";
+import { createBrowserTabStrip } from "../src/browser/browser-tabs.js";
 import { waitFor } from "./wait.js";
 
 /**
@@ -8,7 +9,11 @@ import { waitFor } from "./wait.js";
  * handshake the source drives and records the startScreencast parameters so the
  * contract can assert the controller viewport drives the capture size.
  */
-function createCdpEndpointStub() {
+function createCdpEndpointStub(
+  options: {
+    targetInfos?: Array<{ type: string; targetId: string }>;
+  } = {},
+) {
   const startScreencastCalls: Array<{
     maxWidth?: number;
     maxHeight?: number;
@@ -18,7 +23,13 @@ function createCdpEndpointStub() {
   const server = new WebSocketServer({ port: 0 });
   const endpoint = `ws://127.0.0.1:${(server.address() as { port: number }).port}`;
   let rejectNextEvaluate = false;
+  let targetInfos = options.targetInfos ?? [
+    { type: "page", targetId: "page-target-1" },
+  ];
+  let failAttach = false;
+  let connections = 0;
   server.on("connection", (socket: WebSocket) => {
+    connections += 1;
     socket.on("message", (raw) => {
       const message = JSON.parse(String(raw)) as {
         id?: number;
@@ -32,14 +43,21 @@ function createCdpEndpointStub() {
         socket.send(
           JSON.stringify({
             id: message.id,
-            result: {
-              targetInfos: [{ type: "page", targetId: "page-target-1" }],
-            },
+            result: { targetInfos },
           }),
         );
         return;
       }
       if (message.method === "Target.attachToTarget") {
+        if (failAttach) {
+          socket.send(
+            JSON.stringify({
+              id: message.id,
+              error: { message: "No target with given id" },
+            }),
+          );
+          return;
+        }
         socket.send(
           JSON.stringify({
             id: message.id,
@@ -100,6 +118,15 @@ function createCdpEndpointStub() {
     endpoint,
     startScreencastCalls,
     commands,
+    get connections() {
+      return connections;
+    },
+    setTargetInfos(next: Array<{ type: string; targetId: string }>) {
+      targetInfos = next;
+    },
+    failAttaches() {
+      failAttach = true;
+    },
     set rejectNextEvaluate(value: boolean) {
       rejectNextEvaluate = value;
     },
@@ -370,6 +397,88 @@ describe("CDP screencast source contract", () => {
       controller.abort();
       await source.stop();
       await stub.close();
+    }
+  });
+
+  it("attaches the screencast to the selected tab even when Chromium reports it as a tab target", async () => {
+    const stub = createCdpEndpointStub({
+      targetInfos: [
+        { type: "tab", targetId: "tab-target-1" },
+        { type: "page", targetId: "page-target-1" },
+      ],
+    });
+    const tabs = createBrowserTabStrip();
+    tabs.openTab("https://example.test/one", "One", "tab-target-1");
+    const controller = new AbortController();
+    const source = createCdpScreencastSource({
+      resolveEndpoint: async () => stub.endpoint,
+      viewport: { width: 1280, height: 720 },
+      tabs,
+    });
+    try {
+      void source.start(() => undefined, controller.signal);
+      await waitForStartScreencast(stub);
+      expect(
+        stub.commands.some(
+          (command) =>
+            command.method === "Target.attachToTarget" &&
+            (command.params as { targetId?: string }).targetId ===
+              "tab-target-1",
+        ),
+      ).toBe(true);
+    } finally {
+      controller.abort();
+      await source.stop();
+      await stub.close();
+      tabs.dispose();
+    }
+  });
+
+  it("keeps the live page when switching to a tab the browser has not attached yet", async () => {
+    const stub = createCdpEndpointStub({
+      targetInfos: [{ type: "page", targetId: "page-target-1" }],
+    });
+    const tabs = createBrowserTabStrip();
+    tabs.openTab("https://example.test/one", "One", "page-target-1");
+    const controller = new AbortController();
+    const source = createCdpScreencastSource({
+      resolveEndpoint: async () => stub.endpoint,
+      viewport: { width: 1280, height: 720 },
+      tabs,
+    });
+    try {
+      void source.start(() => undefined, controller.signal);
+      await waitForStartScreencast(stub);
+      stub.setTargetInfos([
+        { type: "page", targetId: "page-target-1" },
+        { type: "page", targetId: "page-target-2" },
+      ]);
+      stub.failAttaches();
+      tabs.openTab("https://example.test/two", "Two", "page-target-2");
+      await waitFor(() =>
+        stub.commands.some(
+          (command) =>
+            command.method === "Target.attachToTarget" &&
+            (command.params as { targetId?: string }).targetId ===
+              "page-target-2",
+        ),
+      );
+      expect(stub.connections).toBe(1);
+      expect(
+        stub.commands.filter(
+          (command) => command.method === "Target.detachFromTarget",
+        ),
+      ).toHaveLength(0);
+      expect(
+        stub.commands.filter(
+          (command) => command.method === "Page.startScreencast",
+        ).length,
+      ).toBe(1);
+    } finally {
+      controller.abort();
+      await source.stop();
+      await stub.close();
+      tabs.dispose();
     }
   });
 });

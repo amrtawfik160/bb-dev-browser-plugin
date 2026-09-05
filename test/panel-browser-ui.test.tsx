@@ -925,6 +925,44 @@ describe("Browser Panel", () => {
     }
   });
 
+  it("lets a view-only panel take control by switching tabs", async () => {
+    const browser = await createPublicPluginHarness({
+      status: healthyBrowserStatus,
+      browserRuntime: createTabInventoryRuntime(),
+    });
+    try {
+      const controller = browser.renderPanel();
+      const spectator = browser.renderPanel();
+      await spectator.findByRole("button", { name: "Take control" });
+
+      const newTab = await controller.findByRole("button", {
+        name: "Open a new tab",
+      });
+      fireEvent.click(newTab);
+      fireEvent.click(newTab);
+      const spectatorStrip = await spectator.findByRole("list", {
+        name: "Browser tabs",
+      });
+      await waitFor(() =>
+        expect(within(spectatorStrip).getAllByRole("listitem")).toHaveLength(2),
+      );
+
+      const first = within(spectatorStrip).getAllByRole("button", {
+        name: "New tab",
+      })[0]!;
+      fireEvent.click(first);
+      await waitFor(() =>
+        expect(first.getAttribute("aria-current")).toBe("page"),
+      );
+      await spectator.findByLabelText("Address or search");
+      expect(
+        spectator.queryByRole("button", { name: "Take control" }),
+      ).toBeNull();
+    } finally {
+      await browser.dispose();
+    }
+  });
+
   it("announces owner-facing recovery instead of transport internals when the stream cannot open", async () => {
     const browser = await createPublicPluginHarness({
       status: healthyBrowserStatus,

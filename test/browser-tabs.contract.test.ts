@@ -101,6 +101,12 @@ describe("Browser Tab strip", () => {
     strip.activateTab(a);
     expect(seen.length).toBeGreaterThanOrEqual(3);
     expect(seen[seen.length - 1]!.activeTabId).toBe(a);
+    const beforeRefocus = seen.length;
+    // Focusing the tab that is already selected still notifies, so a
+    // screencast that missed the first switch can retry instead of sticking.
+    strip.activateTab(a);
+    expect(seen.length).toBe(beforeRefocus + 1);
+    expect(seen[seen.length - 1]!.activeTabId).toBe(a);
     unsubscribe();
     strip.openTab("https://example.test/c", "C");
     // No further broadcasts after unsubscribe.

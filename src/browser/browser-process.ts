@@ -12,9 +12,9 @@ import {
   readdir,
   symlink,
   unlink,
-  watch,
 } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
+import { createConnection } from "node:net";
 import { join, dirname } from "node:path";
 import type {
   BrowserExecutionRequest,
@@ -48,6 +48,8 @@ const MAX_PROCESS_ERROR_BYTES = 64 * 1024;
 const MAX_SCREENSHOT_BYTES = BROWSER_SCRIPT_MAX_SCREENSHOT_BYTES;
 const SCREENSHOT_READ_CHUNK_BYTES = 64 * 1024;
 const HELPER_STOP_TIMEOUT_MS = 2_000;
+const AUTOMATION_ENDPOINT_PROBE_ATTEMPTS = 100;
+const AUTOMATION_ENDPOINT_PROBE_INTERVAL_MS = 50;
 const BROWSER_CLOSE_TIMEOUT_MS = 2_000;
 /**
  * The renderer ceiling is a resource bound, not a race to win: one check per
@@ -305,15 +307,34 @@ async function activeDevToolsEndpoint(profileDirectory: string) {
   }
 }
 
+function automationPortIsOpen(endpoint: string) {
+  let hostname: string;
+  let port: number;
+  try {
+    const url = new URL(endpoint);
+    hostname = url.hostname;
+    port = Number(url.port);
+  } catch {
+    return Promise.resolve(false);
+  }
+  if (!Number.isInteger(port) || port <= 0) return Promise.resolve(false);
+  return new Promise<boolean>((resolve) => {
+    const socket = createConnection({ host: hostname, port });
+    const finish = (open: boolean) => {
+      socket.removeAllListeners();
+      socket.destroy();
+      resolve(open);
+    };
+    socket.once("connect", () => finish(true));
+    socket.once("error", () => finish(false));
+  });
+}
+
 async function waitForDevToolsEndpoint(
   profileDirectory: string,
   browserProcess: ChildProcessWithoutNullStreams,
   standardError: () => string,
 ) {
-  const currentEndpoint = await activeDevToolsEndpoint(profileDirectory);
-  if (currentEndpoint !== null) return currentEndpoint;
-  const watcherAbort = new AbortController();
-  const changes = watch(profileDirectory, { signal: watcherAbort.signal });
   const exited = new Promise<never>((_resolve, reject) => {
     const rejectExit = (code: number | null, signal: NodeJS.Signals | null) => {
       reject(
@@ -335,18 +356,17 @@ async function waitForDevToolsEndpoint(
     });
   });
   const discovered = (async () => {
-    for await (const change of changes) {
-      if (change.filename !== DEVTOOLS_PORT_FILE) continue;
+    while (true) {
       const endpoint = await activeDevToolsEndpoint(profileDirectory);
-      if (endpoint !== null) return endpoint;
+      if (endpoint !== null && (await automationPortIsOpen(endpoint))) {
+        return endpoint;
+      }
+      await new Promise((resolve) =>
+        setTimeout(resolve, AUTOMATION_ENDPOINT_PROBE_INTERVAL_MS),
+      );
     }
-    throw new Error("Chrome stopped exposing Automation Mode readiness.");
   })();
-  try {
-    return await Promise.race([discovered, exited]);
-  } finally {
-    watcherAbort.abort();
-  }
+  return Promise.race([discovered, exited]);
 }
 
 function waitForExit(child: ChildProcessWithoutNullStreams) {
@@ -671,12 +691,24 @@ async function processMatchesIdentity(identity: BrowserProcessIdentity) {
 async function recoveredAutomationEndpoint(
   request: BrowserLaunchRequest,
   identity: BrowserProcessIdentity,
+  storedEndpoint: string | null,
 ) {
-  for (let attempt = 0; attempt < 40; attempt += 1) {
+  if (storedEndpoint !== null && (await automationPortIsOpen(storedEndpoint))) {
+    return storedEndpoint;
+  }
+  for (
+    let attempt = 0;
+    attempt < AUTOMATION_ENDPOINT_PROBE_ATTEMPTS;
+    attempt += 1
+  ) {
     const endpoint = await activeDevToolsEndpoint(request.profileDirectory);
-    if (endpoint !== null) return endpoint;
+    if (endpoint !== null && (await automationPortIsOpen(endpoint))) {
+      return endpoint;
+    }
     if (!(await processMatchesIdentity(identity))) return null;
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await new Promise((resolve) =>
+      setTimeout(resolve, AUTOMATION_ENDPOINT_PROBE_INTERVAL_MS),
+    );
   }
   return null;
 }
@@ -1278,9 +1310,11 @@ async function recoverProductionBrowser(
     sameProcessIdentity(recordedIdentity, expectedIdentity)
       ? storedEndpoint
       : null;
-  const automationEndpoint =
-    trustedEndpoint ??
-    (await recoveredAutomationEndpoint(request, expectedIdentity));
+  const automationEndpoint = await recoveredAutomationEndpoint(
+    request,
+    expectedIdentity,
+    trustedEndpoint,
+  );
   if (automationEndpoint === null) {
     await stopRecoveredProcess(expectedIdentity.pid);
     return null;

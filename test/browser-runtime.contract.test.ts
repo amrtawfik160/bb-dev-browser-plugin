@@ -1535,6 +1535,70 @@ describe("Browser Instance runtime", () => {
       await fixture.dispose();
     }
   });
+
+  it.each([
+    [
+      "directly",
+      (endpoint: string) =>
+        new Error(
+          `browserType.connectOverCDP: WebSocket error: connect ECONNREFUSED 127.0.0.1:44883
+Call log:
+- <ws connecting> ${endpoint}
+- <ws error> ${endpoint} error connect ECONNREFUSED 127.0.0.1:44883
+- <ws connect error> ${endpoint} connect ECONNREFUSED 127.0.0.1:44883
+- <ws disconnected> ${endpoint} code=1006 reason=`,
+        ),
+    ],
+    [
+      "wrapped in helper cleanup",
+      (endpoint: string) =>
+        new AggregateError(
+          [
+            new Error(
+              `browserType.connectOverCDP: WebSocket error: connect ECONNREFUSED 127.0.0.1:44883
+Call log:
+- <ws connecting> ${endpoint}`,
+            ),
+          ],
+          "Browser execution and cleanup failed.",
+        ),
+    ],
+  ] as const)(
+    "relaunches when Automation Mode refuses the stored CDP endpoint %s",
+    async (_name, makeError) => {
+      const fixture = await runtimeFixture();
+      let attempts = 0;
+      const originalExecute = fixture.processFixture.boundary.execute.bind(
+        fixture.processFixture.boundary,
+      );
+      fixture.processFixture.boundary.assertRendererProcessLimit = async (
+        pid,
+      ) => {
+        if (fixture.processFixture.stopped.includes(pid)) {
+          throw new BrowserInstanceError(
+            "renderer-limit",
+            `Renderer limit checked a stopped Browser Instance (${pid}).`,
+          );
+        }
+      };
+      fixture.processFixture.boundary.execute = async (request) => {
+        attempts += 1;
+        if (attempts === 1) throw makeError(request.endpoint);
+        return originalExecute(request);
+      };
+      try {
+        await fixture.runtime.start(fixture.target);
+        await expect(
+          fixture.runtime.execute(fixture.target, "return page.url()", 5_000),
+        ).resolves.toEqual({ output: "attached" });
+        expect(attempts).toBe(2);
+        expect(fixture.processFixture.launches).toHaveLength(2);
+        expect(fixture.processFixture.stopped).toEqual([4100]);
+      } finally {
+        await fixture.dispose();
+      }
+    },
+  );
 });
 
 describe("Browser Instance runtime Origin Scope enforcement", () => {

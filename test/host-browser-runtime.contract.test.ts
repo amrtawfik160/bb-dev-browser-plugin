@@ -1747,3 +1747,113 @@ it("issue #50 closes the live page a panel tab-open evicts at the retention cap"
     await rm(rootDirectory, { recursive: true, force: true });
   }
 });
+
+it("keeps the owner's selected Browser Tab when inventory still reports a different foreground", async () => {
+  const rootDirectory = await mkdtemp(
+    join(tmpdir(), "host-tab-keep-selected-"),
+  );
+  const profiles = createFileBrowserProfileStore({
+    rootDirectory,
+    installationId: "installation-tab-keep-selected",
+  });
+  await profiles.initialize(HOST_ID);
+  const listedPages: Array<{
+    id: string;
+    url: string;
+    title: string;
+    openerTabId: null;
+  }> = [];
+  let opened = 0;
+  const runtime = {
+    start: async () => {
+      throw new Error("not used");
+    },
+    stop: async () => {},
+    execute: async () => {
+      throw new Error("not used");
+    },
+    navigate: async () => {
+      throw new Error("not used");
+    },
+    history: async () => {
+      throw new Error("not used");
+    },
+    openPage: async () => {
+      const page = {
+        id: `page-${opened}`,
+        url: `https://app.example.test/${opened}`,
+        title: `Page ${opened}`,
+        openerTabId: null,
+      };
+      opened += 1;
+      listedPages.push(page);
+      return page;
+    },
+    focusPage: async () => {},
+    closePages: async () => 0,
+    listPages: async () => [...listedPages],
+    activeTabId: async () => listedPages[0]?.id,
+    status: async ({
+      hostId,
+      profileId,
+    }: {
+      hostId: string;
+      profileId: string;
+    }) => ({ state: "running" as const, hostId, profileId }),
+    pinPanel: async () => {
+      throw new Error("not used");
+    },
+    unpinPanel: async () => {},
+    hostDisconnected: () => {},
+    hostReconnected: async () => {},
+    dispose: async () => {},
+  };
+  const readiness = {
+    inspect: healthyStatus,
+    diagnostics: () => {
+      throw new Error("diagnostics not used");
+    },
+  };
+  const host = experimental_createHostEntryHarness(
+    createBrowserHostEntry(readiness, profiles, undefined, runtime),
+    {
+      experimental_paths: {
+        dataDir: rootDirectory,
+        tempDir: join(rootDirectory, "tmp"),
+      },
+    },
+  );
+  try {
+    await host.experimental_call("tabAction", {
+      hostId: HOST_ID,
+      profileId: DEFAULT_PROFILE_ID,
+      projectId: "project-tab-keep-selected",
+      action: "open" as const,
+    });
+    await host.experimental_call("tabAction", {
+      hostId: HOST_ID,
+      profileId: DEFAULT_PROFILE_ID,
+      projectId: "project-tab-keep-selected",
+      action: "open" as const,
+    });
+    const selected = (await host.experimental_call("tabAction", {
+      hostId: HOST_ID,
+      profileId: DEFAULT_PROFILE_ID,
+      projectId: "project-tab-keep-selected",
+      action: "activate" as const,
+      tabId: "page-1",
+    })) as { activeTabId: string | null };
+    expect(selected.activeTabId).toBe("page-1");
+
+    // Headless Chromium can still report the previous tab as visible. An
+    // inventory read must not undo the tab the owner just picked.
+    const strip = (await host.experimental_call("tabs", {
+      hostId: HOST_ID,
+      profileId: DEFAULT_PROFILE_ID,
+    })) as { activeTabId: string | null };
+    expect(strip.activeTabId).toBe("page-1");
+  } finally {
+    await host.experimental_dispose();
+    await rm(rootDirectory, { recursive: true, force: true });
+  }
+});

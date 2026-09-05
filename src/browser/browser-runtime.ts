@@ -879,16 +879,42 @@ function executionRequest(
 }
 
 async function readActiveTabId(
-  boundary: BrowserLaunchBoundary,
+  execute: (request: BrowserExecutionRequest) => Promise<unknown>,
   held: HeldBrowserInstance,
   profileId: string,
 ) {
   const raw = assertBrowserScriptResultWithinBounds(
-    await boundary.execute(
+    await execute(
       executionRequest(held, profileId, activeBrowserTabScript(), 30_000),
     ),
   );
   return parseActiveTabId(browserResultOutput(raw));
+}
+
+/**
+ * Playwright surfaces a refused loopback CDP websocket when the stored
+ * Automation Mode endpoint is stale. Helper cleanup can wrap that refusal in
+ * an AggregateError, so walk causes and aggregated errors too.
+ */
+function isUnreachableAutomationEndpoint(error: unknown) {
+  const seen = new Set<unknown>();
+  const pending = [error];
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (current === undefined || seen.has(current)) continue;
+    seen.add(current);
+    if (!(current instanceof Error)) continue;
+    const text = current.message;
+    if (
+      /ECONNREFUSED|ECONNRESET/u.test(text) &&
+      /connectOverCDP|devtools\/browser|127\.0\.0\.1/u.test(text)
+    ) {
+      return true;
+    }
+    if (current.cause !== undefined) pending.push(current.cause);
+    if (current instanceof AggregateError) pending.push(...current.errors);
+  }
+  return false;
 }
 
 /**
@@ -1624,6 +1650,41 @@ export function createBrowserInstanceRuntime(
     await stopHeld(evictable[0], evictable[1]);
   }
 
+  async function abandonUnreachableBrowser(held: HeldBrowserInstance) {
+    const key = runtimeKey(held.target);
+    try {
+      await stopHeld(key, held);
+    } catch {
+      // Chromium may already be gone; drop the start so the next
+      // heldInstance launches a replacement instead of reusing it.
+      starts.delete(key);
+    }
+  }
+
+  async function executeAgainstLiveBrowser(
+    held: HeldBrowserInstance,
+    request: BrowserExecutionRequest,
+  ): Promise<{ result: unknown; held: HeldBrowserInstance }> {
+    try {
+      return {
+        result: await options.launchBoundary.execute(request),
+        held,
+      };
+    } catch (error) {
+      if (!isUnreachableAutomationEndpoint(error)) throw error;
+      await abandonUnreachableBrowser(held);
+      const replacement = await heldInstance(held.target);
+      return {
+        result: await options.launchBoundary.execute({
+          ...request,
+          endpoint: replacement.publicState.automationEndpoint,
+          runtimeDirectory: replacement.runtimeDirectory,
+        }),
+        held: replacement,
+      };
+    }
+  }
+
   async function stopHeld(key: string, held: HeldBrowserInstance) {
     held.stopRequested = true;
     cancelIdleSleep(held);
@@ -1763,7 +1824,7 @@ export function createBrowserInstanceRuntime(
       target: Pick<BrowserRuntimeTarget, "hostId" | "profileId">,
     ) {
       const key = runtimeKey(target);
-      const held = await heldInstance({
+      let held = await heldInstance({
         hostId: target.hostId,
         profileId: target.profileId,
         locale: "en-US",
@@ -1772,7 +1833,11 @@ export function createBrowserInstanceRuntime(
       noteActivity(key, held);
       await enforceRendererProcessLimit(key, held);
       const active = await readActiveTabId(
-        options.launchBoundary,
+        async (request) => {
+          const executed = await executeAgainstLiveBrowser(held, request);
+          held = executed.held;
+          return executed.result;
+        },
         held,
         target.profileId,
       );
@@ -1797,9 +1862,10 @@ export function createBrowserInstanceRuntime(
       timeoutMs: number,
       operationOptions: BrowserOperationOptions = {},
     ) {
-      const held = await heldInstance(target);
+      const original = await heldInstance(target);
+      let held = original;
       const key = runtimeKey(target);
-      held.activeLeases += 1;
+      original.activeLeases += 1;
       noteActivity(key, held);
       const screenshot = operationOptions.screenshot
         ? {
@@ -1835,7 +1901,8 @@ export function createBrowserInstanceRuntime(
       try {
         try {
           await enforceRendererProcessLimit(key, held);
-          const rawBrowserResult = await options.launchBoundary.execute(
+          const executed = await executeAgainstLiveBrowser(
+            held,
             executionRequest(
               held,
               target.profileId,
@@ -1846,9 +1913,10 @@ export function createBrowserInstanceRuntime(
               originPolicy,
             ),
           );
+          held = executed.held;
           await enforceRendererProcessLimit(key, held);
           const activeTab = extractActiveTabMarker(
-            rawBrowserResult,
+            executed.result,
             activeTabMarker,
           );
           const browserResult = assertBrowserScriptResultWithinBounds(
@@ -1870,7 +1938,7 @@ export function createBrowserInstanceRuntime(
         }
       } finally {
         operationSignal.dispose();
-        held.activeLeases -= 1;
+        original.activeLeases -= 1;
         noteActivity(key, held);
       }
     },
@@ -1880,7 +1948,7 @@ export function createBrowserInstanceRuntime(
       operationOptions: BrowserOperationOptions = {},
     ) {
       const requestedAddress = resolveBrowserAddress(input);
-      const held = await heldInstance(target);
+      let held = await heldInstance(target);
       const address =
         requestedAddress.kind === "search"
           ? {
@@ -1906,7 +1974,8 @@ export function createBrowserInstanceRuntime(
       try {
         await enforceRendererProcessLimit(key, held);
         if (tabId === undefined) {
-          const discovered = await options.launchBoundary.execute(
+          const discovered = await executeAgainstLiveBrowser(
+            held,
             executionRequest(
               held,
               target.profileId,
@@ -1915,9 +1984,11 @@ export function createBrowserInstanceRuntime(
               operationSignal.signal,
             ),
           );
-          tabId = parseActiveTabId(browserResultOutput(discovered));
+          held = discovered.held;
+          tabId = parseActiveTabId(browserResultOutput(discovered.result));
         }
-        const location = await options.launchBoundary.execute(
+        const location = await executeAgainstLiveBrowser(
+          held,
           executionRequest(
             held,
             target.profileId,
@@ -1926,9 +1997,10 @@ export function createBrowserInstanceRuntime(
             operationSignal.signal,
           ),
         );
+        held = location.held;
         await enforceRendererProcessLimit(key, held);
         noteActivity(key, held);
-        return { address, location, tabId };
+        return { address, location: location.result, tabId };
       } finally {
         operationSignal.dispose();
       }
@@ -1938,14 +2010,15 @@ export function createBrowserInstanceRuntime(
       direction: "back" | "forward" | "reload",
       operationOptions: BrowserOperationOptions = {},
     ) {
-      const held = await heldInstance(target);
+      let held = await heldInstance(target);
       const key = runtimeKey(target);
       const operationSignal = linkedOperationSignal(operationOptions);
       let tabId = target.tabId;
       try {
         await enforceRendererProcessLimit(key, held);
         if (tabId === undefined) {
-          const discovered = await options.launchBoundary.execute(
+          const discovered = await executeAgainstLiveBrowser(
+            held,
             executionRequest(
               held,
               target.profileId,
@@ -1954,9 +2027,11 @@ export function createBrowserInstanceRuntime(
               operationSignal.signal,
             ),
           );
-          tabId = parseActiveTabId(browserResultOutput(discovered));
+          held = discovered.held;
+          tabId = parseActiveTabId(browserResultOutput(discovered.result));
         }
-        const location = await options.launchBoundary.execute(
+        const location = await executeAgainstLiveBrowser(
+          held,
           executionRequest(
             held,
             target.profileId,
@@ -1965,16 +2040,18 @@ export function createBrowserInstanceRuntime(
             operationSignal.signal,
           ),
         );
+        held = location.held;
         await enforceRendererProcessLimit(key, held);
         noteActivity(key, held);
         const address = {
           kind: "address" as const,
           url:
-            typeof location === "string" && location.trim().length > 0
-              ? safeHistoryUrl(location)
+            typeof location.result === "string" &&
+            location.result.trim().length > 0
+              ? safeHistoryUrl(location.result)
               : "about:blank",
         };
-        return { address, location, tabId };
+        return { address, location: location.result, tabId };
       } finally {
         operationSignal.dispose();
       }
@@ -1992,7 +2069,7 @@ export function createBrowserInstanceRuntime(
       // listPages runs after an operation that already started the instance, so
       // heldInstance returns the running start without relaunching; the locale
       // and timezone are only used for a fresh launch, which does not happen here.
-      const held = await heldInstance({
+      let held = await heldInstance({
         hostId: target.hostId,
         profileId: target.profileId,
         locale: "en-US",
@@ -2001,11 +2078,12 @@ export function createBrowserInstanceRuntime(
       const key = runtimeKey(target);
       noteActivity(key, held);
       await enforceRendererProcessLimit(key, held);
-      const raw = assertBrowserScriptResultWithinBounds(
-        await options.launchBoundary.execute(
-          executionRequest(held, target.profileId, pageInventoryScript, 30_000),
-        ),
+      const executed = await executeAgainstLiveBrowser(
+        held,
+        executionRequest(held, target.profileId, pageInventoryScript, 30_000),
       );
+      held = executed.held;
+      const raw = assertBrowserScriptResultWithinBounds(executed.result);
       await enforceRendererProcessLimit(key, held);
       const parsed = parsePageInventory(raw);
       return parsed.map((page) => ({
@@ -2026,23 +2104,25 @@ export function createBrowserInstanceRuntime(
       target: BrowserInstanceTarget,
       operationOptions: BrowserOperationOptions = {},
     ): Promise<RuntimeBrowserPage> {
-      const held = await heldInstance(target);
+      let held = await heldInstance(target);
       const key = runtimeKey(target);
       const operationSignal = linkedOperationSignal(operationOptions);
       try {
         await enforceRendererProcessLimit(key, held);
-        const raw = assertBrowserScriptResultWithinBounds(
-          await options.launchBoundary.execute(
-            executionRequest(
-              held,
-              target.profileId,
-              browserTabOpenScript(),
-              PAGE_COMMAND_TIMEOUT_MS,
-              operationSignal.signal,
-            ),
+        const executed = await executeAgainstLiveBrowser(
+          held,
+          executionRequest(
+            held,
+            target.profileId,
+            browserTabOpenScript(),
+            PAGE_COMMAND_TIMEOUT_MS,
+            operationSignal.signal,
           ),
         );
-        const opened = parseOpenedPage(raw);
+        held = executed.held;
+        const opened = parseOpenedPage(
+          assertBrowserScriptResultWithinBounds(executed.result),
+        );
         // The tab the owner just opened is the one later owner navigation
         // targets, exactly as if they had navigated in it.
         noteActivity(key, held);
@@ -2062,12 +2142,13 @@ export function createBrowserInstanceRuntime(
       tabId: string,
       operationOptions: BrowserOperationOptions = {},
     ): Promise<void> {
-      const held = await heldInstance(target);
+      let held = await heldInstance(target);
       const key = runtimeKey(target);
       const operationSignal = linkedOperationSignal(operationOptions);
       try {
         await enforceRendererProcessLimit(key, held);
-        await options.launchBoundary.execute(
+        const executed = await executeAgainstLiveBrowser(
+          held,
           executionRequest(
             held,
             target.profileId,
@@ -2076,6 +2157,7 @@ export function createBrowserInstanceRuntime(
             operationSignal.signal,
           ),
         );
+        held = executed.held;
         noteActivity(key, held);
         await enforceRendererProcessLimit(key, held);
       } finally {
@@ -2092,7 +2174,7 @@ export function createBrowserInstanceRuntime(
       tabIds: readonly string[],
     ): Promise<number> {
       if (tabIds.length === 0) return 0;
-      const held = await heldInstance({
+      let held = await heldInstance({
         hostId: target.hostId,
         profileId: target.profileId,
         locale: "en-US",
@@ -2101,16 +2183,17 @@ export function createBrowserInstanceRuntime(
       const key = runtimeKey(target);
       noteActivity(key, held);
       await enforceRendererProcessLimit(key, held);
-      const raw = assertBrowserScriptResultWithinBounds(
-        await options.launchBoundary.execute(
-          executionRequest(
-            held,
-            target.profileId,
-            pageCloseScript(tabIds),
-            30_000,
-          ),
+      const executed = await executeAgainstLiveBrowser(
+        held,
+        executionRequest(
+          held,
+          target.profileId,
+          pageCloseScript(tabIds),
+          30_000,
         ),
       );
+      held = executed.held;
+      const raw = assertBrowserScriptResultWithinBounds(executed.result);
       await enforceRendererProcessLimit(key, held);
       const closed = Number.parseInt(String(raw).trim(), 10);
       return Number.isSafeInteger(closed) && closed >= 0 ? closed : 0;
