@@ -239,8 +239,9 @@ async function boundPage(input: {
       [...pages.values()].map((page) => ({ id: page.id, url: page.url })),
     getPage: async (id: string) => {
       const page = pages.get(id);
-      if (page === undefined) throw new Error(`unknown page ${id}`);
-      return page;
+      if (page !== undefined) return page;
+      created += 1;
+      return makePage(`created-${created}`, "about:blank", true);
     },
     newPage: async () => {
       created += 1;

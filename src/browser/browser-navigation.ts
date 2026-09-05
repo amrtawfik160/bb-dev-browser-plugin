@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { newTabId } from "./browser-tabs.js";
 import {
   isBrowserLoopbackHostname,
   isRawLocalhostHostname,
@@ -104,10 +105,12 @@ console.log(JSON.stringify({ tabId: ${JSON.stringify(tabId)}, url: page.url() })
  * browser's own blank page: the panel draws its new-tab surface over a blank
  * page rather than presenting the owner with an empty white canvas, so the
  * script never navigates anywhere on the owner's behalf.
+ * Named pages persist; dev-browser disposes anonymous newPage() pages when
+ * each QuickJS script ends.
  */
 export function browserTabOpenScript() {
   return `const __bbBefore = (await browser.listPages()).map(function (entry) { return entry.id; });
-await browser.newPage();
+await browser.getPage(${JSON.stringify(newTabId())});
 const __bbAfter = await browser.listPages();
 const __bbOpened = __bbAfter.filter(function (entry) { return __bbBefore.indexOf(entry.id) === -1; });
 const __bbTab = __bbOpened.length > 0 ? __bbOpened[__bbOpened.length - 1] : __bbAfter[__bbAfter.length - 1];
@@ -132,10 +135,22 @@ console.log(JSON.stringify({ tabId: ${JSON.stringify(tabId)}, url: page.url() })
  * visible (headless Chromium can leave every page hidden after the front tab
  * closes), the first tab is brought to front and reported instead, so owner
  * navigation and strip reconciliation keep working while any tab exists.
+ * Owner actions may open a blank tab for an empty profile; inventory reads
+ * leave the tab set unchanged.
  */
-export function activeBrowserTabScript() {
-  return `const pages = await browser.listPages();
-if (pages.length === 0) throw new Error("The Browser Profile has no open tabs");
+export function activeBrowserTabScript({
+  openIfEmpty = false,
+}: { openIfEmpty?: boolean } = {}) {
+  return `let pages = await browser.listPages();
+${
+  openIfEmpty
+    ? `if (pages.length === 0) {
+  await browser.getPage(${JSON.stringify(newTabId())});
+  pages = await browser.listPages();
+}
+`
+    : ""
+}if (pages.length === 0) throw new Error("The Browser Profile has no open tabs");
 let active = null;
 for (const entry of pages) {
   try {

@@ -140,7 +140,7 @@ function launchFixture(
         });
       }
       const requestedPage = request.code.match(
-        /browser\.getPage\(("(?:[^"\\]|\\.)*")\)/u,
+        /^const page = await browser\.getPage\(("(?:[^"\\]|\\.)*")\)/mu,
       )?.[1];
       if (requestedPage !== undefined) {
         activeTabId = JSON.parse(requestedPage);
@@ -238,6 +238,71 @@ async function runtimeFixture(
 }
 
 describe("Browser Instance runtime", () => {
+  it.each(["navigate", "reload"] as const)(
+    "%s opens a tab when the Browser Profile has no pages",
+    async (operation) => {
+      const fixture = await runtimeFixture();
+      const pages = new Map<string, { id: string; url: string }>();
+      let openedCount = 0;
+      fixture.processFixture.boundary.execute = async (request) => {
+        let output = "";
+        const run = compileFunction(
+          `return (async () => { ${request.code} })();`,
+          ["browser", "console"],
+        );
+        await run(
+          {
+            listPages: async () => [...pages.values()],
+            getPage: async (id: string) => {
+              let entry = pages.get(id);
+              if (entry === undefined) {
+                const targetId = `new-tab-${++openedCount}`;
+                entry = { id: targetId, url: "about:blank" };
+                pages.set(targetId, entry);
+              }
+              return {
+                bringToFront: async () => {},
+                evaluate: async () => true,
+                goto: async (url: string) => {
+                  entry.url = url;
+                },
+                url: () => entry.url,
+              };
+            },
+          },
+          {
+            log: (value: string) => {
+              output = value;
+            },
+          },
+        );
+        return output;
+      };
+      const performAction = () =>
+        operation === "navigate"
+          ? fixture.runtime.navigate(
+              fixture.target,
+              "https://example.test/recovered",
+            )
+          : fixture.runtime.history(fixture.target, "reload");
+      try {
+        const first = await performAction();
+        expect(first.tabId).toBe("new-tab-1");
+        expect(pages.get(first.tabId)?.url).toBe(
+          operation === "navigate"
+            ? "https://example.test/recovered"
+            : "about:blank",
+        );
+        await performAction();
+        expect(openedCount).toBe(1);
+        pages.clear();
+        expect((await performAction()).tabId).toBe("new-tab-2");
+      } finally {
+        await fixture.dispose();
+      }
+    },
+  );
+
   it.each(["navigate", "history"] as const)(
     "%s follows the live active tab after the previous tab closes",
     async (operation) => {

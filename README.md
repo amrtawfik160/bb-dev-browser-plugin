@@ -180,7 +180,8 @@ use `it.runIf(integrationEnabled)` and throw at module load if
 npm run test:real-browser
 ```
 
-That runs `test/browser-auth.integration.test.ts` only.
+That runs the authentication and empty-profile recovery integration tests
+against real Chromium and QuickJS.
 
 Inside a BB session, `BB_CLI` may override the locally installed CLI. To build
 with this project's pinned BB and SDK versions, run

@@ -2,6 +2,7 @@ import {
   BROWSER_SCRIPT_MAX_TIMEOUT_MS,
   BROWSER_SCRIPT_MIN_TIMEOUT_MS,
 } from "../shared/contracts.js";
+import { newTabId } from "./browser-tabs.js";
 
 /**
  * Convenience wrapping for agent Playwright scripts.
@@ -324,6 +325,8 @@ function boundedOperationTimeoutMs(scriptTimeoutMs: number): number {
  * the profile has no tabs at all a fresh one is opened. Agents expect `page`
  * to exist; a profile whose tabs were all closed used to fail every script
  * with "no visible active tab" until an owner opened one by hand.
+ * Use a named page for that fallback because dev-browser closes anonymous
+ * newPage() pages at the end of the script.
  */
 export function agentPagePreamble(
   tabId?: string,
@@ -382,7 +385,7 @@ if (__bbPreferred !== null) {
 }
 if (page === undefined) page = __bbVisiblePage;
 if (page === undefined && __bbPages.length > 0) page = await browser.getPage(__bbPages[0].id);
-if (page === undefined) page = await browser.newPage();
+if (page === undefined) page = await browser.getPage(${JSON.stringify(newTabId())});
 if (page === undefined) throw new Error(${JSON.stringify(ACTIVE_TAB_UNAVAILABLE_MESSAGE)});
 await page.bringToFront();
 ${cutAgentBrowserRoots("__bbPages", enforceNonWebNavigation, operationTimeoutMs)}`;

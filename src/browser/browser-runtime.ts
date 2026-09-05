@@ -1910,7 +1910,7 @@ export function createBrowserInstanceRuntime(
             executionRequest(
               held,
               target.profileId,
-              activeBrowserTabScript(),
+              activeBrowserTabScript({ openIfEmpty: true }),
               30_000,
               operationSignal.signal,
             ),
@@ -1949,7 +1949,7 @@ export function createBrowserInstanceRuntime(
             executionRequest(
               held,
               target.profileId,
-              activeBrowserTabScript(),
+              activeBrowserTabScript({ openIfEmpty: true }),
               30_000,
               operationSignal.signal,
             ),
