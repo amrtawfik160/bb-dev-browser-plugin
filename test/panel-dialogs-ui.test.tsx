@@ -333,7 +333,7 @@ describe("Browser panel dialog chrome (issue #17)", () => {
     expect(onRespond).not.toHaveBeenCalled();
   });
 
-  it("uses AA-contrast fallback colors for dialog text and borders", () => {
+  it("takes dialog text and border colors from the host theme, not fixed hex values", () => {
     render(
       <PanelDialogLayer
         dialog={alertDialog()}
@@ -344,12 +344,13 @@ describe("Browser panel dialog chrome (issue #17)", () => {
       />,
     );
     const dialog = screen.getByRole("dialog") as HTMLElement;
-    expect(dialog.style.color).not.toBe("");
-    expect(dialog.style.borderColor).not.toBe("");
-    // The fallback colors are AA-contrast hex constants (jsdom may serialize
-    // them to rgb(); assert the resolved value is non-empty and dark enough).
-    expect(dialog.style.color).toMatch(/#|rgb/);
-    expect(dialog.style.borderColor).toMatch(/#|rgb/);
+    // The host guarantees AA contrast for its popover tokens in both themes;
+    // a hardcoded color would hold in one theme and fail in the other.
+    expect(dialog.className).toContain("bg-popover");
+    expect(dialog.className).toContain("text-popover-foreground");
+    expect(dialog.className).toContain("border-border");
+    expect(dialog.style.color).toBe("");
+    expect(dialog.style.borderColor).toBe("");
   });
 });
 

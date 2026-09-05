@@ -1,14 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import type React from "react";
-import {
-  BROWSER_PANEL_ACCENT_CONTRAST,
-  BROWSER_PANEL_BORDER_CONTRAST,
-  BROWSER_PANEL_TEXT_CONTRAST,
-  type BrowserContextAction,
-  type BrowserDialogEvent,
-  type BrowserDownloadListingEntry,
-  type BrowserDownloadLimits,
+import type {
+  BrowserContextAction,
+  BrowserDialogEvent,
+  BrowserDownloadListingEntry,
+  BrowserDownloadLimits,
 } from "./contracts.js";
+import { Button, inputClassName } from "./panel-primitives.js";
 
 /**
  * Browser panel chrome for dialogs and context actions (issue #17). These are
@@ -69,7 +67,6 @@ export function PanelDialogLayer({
     setPromptText(dialog.defaultValue);
     previouslyFocused.current =
       (document.activeElement as HTMLElement | null) ?? null;
-    // Focus the prompt input for prompts, else the primary action.
     const target =
       dialog.type === "prompt" ? promptRef.current : primaryRef.current;
     target?.focus();
@@ -132,18 +129,10 @@ export function PanelDialogLayer({
       aria-label={`${dialog.type} dialog from ${dialog.url}`}
       aria-describedby={`browser-dialog-${dialog.dialogId}-message`}
       onKeyDown={handleKeyDown}
-      className="mt-3 rounded border p-4 text-left"
-      style={{
-        borderColor: BROWSER_PANEL_BORDER_CONTRAST,
-        color: BROWSER_PANEL_TEXT_CONTRAST,
-        transition: reducedMotion ? "none" : undefined,
-      }}
+      className="mt-3 rounded-lg border border-border bg-popover p-4 text-left text-popover-foreground shadow-md"
+      style={{ transition: reducedMotion ? "none" : undefined }}
     >
-      <p
-        id={`browser-dialog-${dialog.dialogId}-message`}
-        className="text-sm"
-        style={{ color: BROWSER_PANEL_TEXT_CONTRAST }}
-      >
+      <p id={`browser-dialog-${dialog.dialogId}-message`} className="text-sm">
         {dialog.message === "" ? `${dialog.type} dialog` : dialog.message}
       </p>
       {dialog.type === "prompt" ? (
@@ -152,8 +141,7 @@ export function PanelDialogLayer({
           <input
             ref={promptRef}
             type="text"
-            className="mt-1 block w-full rounded border px-2 py-1 text-sm"
-            style={{ borderColor: BROWSER_PANEL_BORDER_CONTRAST }}
+            className={`${inputClassName} mt-1`}
             value={promptText}
             disabled={!isController}
             onChange={(event) => setPromptText(event.target.value)}
@@ -161,33 +149,27 @@ export function PanelDialogLayer({
           />
         </label>
       ) : null}
-      <div className="mt-3 flex gap-2">
-        <button
-          type="button"
+      <div className="mt-3 flex flex-wrap items-center gap-2">
+        <Button
+          variant="primary"
+          size="sm"
           ref={primaryRef}
-          className="rounded border px-3 py-1 text-xs"
           disabled={!isController}
-          style={{
-            backgroundColor: isController
-              ? BROWSER_PANEL_ACCENT_CONTRAST
-              : undefined,
-            color: isController ? "white" : undefined,
-          }}
           onClick={() =>
             isController &&
             onRespond(true, dialog.type === "prompt" ? promptText : undefined)
           }
         >
           {acceptLabel}
-        </button>
-        <button
-          type="button"
-          className="rounded border px-3 py-1 text-xs"
+        </Button>
+        <Button
+          variant="secondary"
+          size="sm"
           disabled={!isController}
           onClick={() => isController && onRespond(false)}
         >
           {dismissLabel}
-        </button>
+        </Button>
         {isController ? null : (
           <span className="self-center text-xs text-muted-foreground">
             Only the controller can answer this dialog.
@@ -274,12 +256,8 @@ export function PanelContextMenu({
       <div
         role="menu"
         aria-label="Browser context actions"
-        className="mt-3 rounded border p-2 text-xs"
-        style={{
-          borderColor: BROWSER_PANEL_BORDER_CONTRAST,
-          color: BROWSER_PANEL_TEXT_CONTRAST,
-          transition: reducedMotion ? "none" : undefined,
-        }}
+        className="mt-3 rounded-lg border border-border bg-popover p-2 text-xs text-popover-foreground shadow-md"
+        style={{ transition: reducedMotion ? "none" : undefined }}
       >
         No link or image actions are available at this point.
       </div>
@@ -290,14 +268,10 @@ export function PanelContextMenu({
       role="menu"
       aria-label="Browser context actions"
       onKeyDown={handleKeyDown}
-      className="mt-3 inline-block rounded border p-1 text-left"
-      style={{
-        borderColor: BROWSER_PANEL_BORDER_CONTRAST,
-        color: BROWSER_PANEL_TEXT_CONTRAST,
-        transition: reducedMotion ? "none" : undefined,
-      }}
+      className="mt-3 inline-block rounded-lg border border-border bg-popover p-1 text-left text-popover-foreground shadow-md"
+      style={{ transition: reducedMotion ? "none" : undefined }}
     >
-      <p className="mb-1 text-xs text-muted-foreground">
+      <p className="mb-1 px-3 pt-1 text-xs text-muted-foreground">
         Actions at {Math.round(point.x)}, {Math.round(point.y)}
       </p>
       {actions.map((action, index) => (
@@ -310,7 +284,7 @@ export function PanelContextMenu({
           role="menuitem"
           tabIndex={index === activeIndex ? 0 : -1}
           disabled={!isController}
-          className="block w-full rounded px-3 py-1 text-left text-xs"
+          className="block w-full rounded-md px-3 py-1.5 text-left text-xs hover:bg-state-hover focus-visible:bg-state-hover focus-visible:outline-none disabled:opacity-50"
           onClick={() => isController && onChoose(action)}
           onMouseEnter={() => setActiveIndex(index)}
         >
@@ -363,7 +337,7 @@ export function PanelDownloadsSurface({
       aria-label="Browser Host Downloads quarantine"
       className="mt-4 text-left"
     >
-      <h3 className="text-sm font-medium">Host Downloads</h3>
+      <h3 className="text-sm font-semibold text-foreground">Host Downloads</h3>
       <p className="mt-1 text-xs text-muted-foreground">
         Downloads are quarantined on the workspace host and never opened or
         exported automatically. Export is an explicit owner decision.
@@ -377,13 +351,13 @@ export function PanelDownloadsSurface({
         </p>
       )}
       {exportState.error === null ? null : (
-        <p role="alert" className="mt-1 text-xs text-red-600">
+        <p role="alert" className="mt-2 text-xs text-destructive-text">
           {exportState.error}
         </p>
       )}
       {downloads.length === 0 ? (
         <p className="mt-2 text-xs text-muted-foreground">
-          No quarantined downloads.
+          No quarantined downloads. Files the browser saves land here first.
         </p>
       ) : (
         <ul className="mt-2 space-y-2">
@@ -391,11 +365,16 @@ export function PanelDownloadsSurface({
             return (
               <li
                 key={download.downloadId}
-                className="rounded border p-2 text-xs"
+                className="rounded-lg border border-border bg-card p-3 text-xs"
               >
                 <div className="flex flex-wrap items-baseline justify-between gap-2">
-                  <strong className="break-all">{download.safeName}</strong>
-                  <span aria-label="Download quarantine state">
+                  <strong className="break-all text-foreground">
+                    {download.safeName}
+                  </strong>
+                  <span
+                    aria-label="Download quarantine state"
+                    className="font-mono text-muted-foreground"
+                  >
                     {download.phase}
                   </span>
                 </div>
@@ -411,7 +390,7 @@ export function PanelDownloadsSurface({
                 </div>
                 {download.error === null ||
                 download.error === undefined ? null : (
-                  <p role="alert" className="mt-1 text-red-600">
+                  <p role="alert" className="mt-1 text-destructive-text">
                     {download.error}
                   </p>
                 )}
@@ -419,18 +398,18 @@ export function PanelDownloadsSurface({
                   {download.phase === "downloading" &&
                   isController &&
                   onCancel !== undefined ? (
-                    <button
-                      type="button"
-                      className="rounded border px-2 py-1"
+                    <Button
+                      variant="secondary"
+                      size="sm"
                       onClick={() => onCancel(download.downloadId)}
                     >
                       Cancel download
-                    </button>
+                    </Button>
                   ) : null}
                   {download.phase === "quarantined" && isController ? (
-                    <button
-                      type="button"
-                      className="rounded border px-2 py-1"
+                    <Button
+                      variant="secondary"
+                      size="sm"
                       disabled={
                         exportState.inFlightDownloadId === download.downloadId
                       }
@@ -439,7 +418,7 @@ export function PanelDownloadsSurface({
                       {exportState.inFlightDownloadId === download.downloadId
                         ? "Exporting…"
                         : "Export to client"}
-                    </button>
+                    </Button>
                   ) : null}
                 </div>
               </li>

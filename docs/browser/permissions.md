@@ -41,8 +41,10 @@ The following are **denied in v1**:
 
 ## Agent permissions
 
-- Agents are **denied by default**. A Profile Grant authorizes one BB project to
-  fully automate one profile within an Origin Scope.
+- Agents receive **Default Access**: a project's first agent operation on a
+  profile records a whole-web Profile Grant, which authorizes that BB project to
+  fully automate the profile. Revoke it in Browser Settings to put the project
+  on Grant Request approval instead.
 - File transfer and invalid-certificate access are **separate owner opt-ins** on
   top of a grant.
 - Agent scripts run QuickJS-sandboxed with no Node, modules, process, or

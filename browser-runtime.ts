@@ -44,6 +44,7 @@ import {
   TAB_INVALID_MESSAGE,
 } from "./agent-script.js";
 import { inspectFallbackBrowser } from "./browser-fallback.js";
+import { withScriptSyntaxHint } from "./script-syntax.js";
 import {
   BROWSER_SCRIPT_MAX_SCREENSHOT_BYTES,
   BROWSER_SCRIPT_MAX_SCREENSHOT_BASE64_LENGTH,
@@ -400,7 +401,11 @@ async function browserArguments(
     "--disable-extensions",
     "--disable-notifications",
     "--disable-save-password-bubble",
-    "--disable-features=PasswordManagerEnabled,AutofillAddressEnabled,AutofillCreditCardEnabled,AutofillServerCommunication",
+    // BackForwardCache is off so that going back to a document is always a
+    // network navigation the Origin Scope route can see: an owner tab parked on
+    // about:blank during an agent call cannot be restored from cache behind the
+    // guard's back.
+    "--disable-features=PasswordManagerEnabled,AutofillAddressEnabled,AutofillCreditCardEnabled,AutofillServerCommunication,BackForwardCache",
     `--renderer-process-limit=${RENDERER_PROCESS_LIMIT}`,
     `--js-flags=--max-old-space-size=${RENDERER_HEAP_LIMIT_MB}`,
     `--lang=${target.locale}`,
@@ -1870,7 +1875,7 @@ export function createBrowserInstanceRuntime(
           ) {
             await quarantineOriginScopeFailure(key, held, classified);
           }
-          throw classified;
+          throw withScriptSyntaxHint(classified, code);
         }
       } finally {
         operationSignal.dispose();

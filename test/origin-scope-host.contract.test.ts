@@ -27,6 +27,9 @@ type ContextListener = (event: ContextEvent) => void;
 class SimulatedPage {
   closed = false;
   closeBarrier: Promise<void> | null = null;
+  /** Rejects the next host-driven navigation, like a beforeunload prompt. */
+  gotoFailure: Error | null = null;
+  readonly history: string[] = [];
 
   constructor(
     readonly id: string,
@@ -43,7 +46,15 @@ class SimulatedPage {
   }
 
   async goto(address: string) {
+    if (this.gotoFailure !== null) throw this.gotoFailure;
+    this.history.push(this.currentUrl);
     this.currentUrl = address;
+  }
+
+  async goBack() {
+    const previous = this.history.pop();
+    if (previous !== undefined) this.currentUrl = previous;
+    return null;
   }
 
   async close() {
@@ -312,24 +323,65 @@ describe("host-owned Origin Scope guard", () => {
     expect(boundary.context.page("popup-1")).toBeUndefined();
   });
 
-  it("denies an unchanged out-of-scope tab before agent code can read it", async () => {
-    const boundary = simulatedBrowser([
-      new SimulatedPage("main", "https://outside.example.test/"),
-      new SimulatedPage("other", "https://second-outside.example.test/"),
-    ]);
-
-    await expect(
-      installHostOriginScopeGuard(
-        "ws://127.0.0.1/devtools/browser/test",
-        policy(),
-        boundary.connect,
-      ),
-    ).rejects.toEqual(
-      new BrowserOriginScopeDeniedError("https://outside.example.test"),
+  it("parks unchanged out-of-scope owner tabs on about:blank and restores them after the call", async () => {
+    const main = new SimulatedPage("main", "https://outside.example.test/");
+    const other = new SimulatedPage(
+      "other",
+      "https://second-outside.example.test/",
     );
-    expect(boundary.context.page("main")).toBeUndefined();
-    expect(boundary.context.page("other")).toBeUndefined();
+    const granted = new SimulatedPage("granted", "https://app.example.test/");
+    const boundary = simulatedBrowser([main, other, granted]);
+
+    const guard = await installHostOriginScopeGuard(
+      "ws://127.0.0.1/devtools/browser/test",
+      policy(),
+      boundary.connect,
+    );
+
+    // The agent's call proceeds; the owner's tabs are out of reach, not gone.
+    expect(guard.deniedOrigin()).toBeNull();
+    expect(main.url()).toBe("about:blank");
+    expect(other.url()).toBe("about:blank");
+    expect(main.closed).toBe(false);
+    expect(other.closed).toBe(false);
+    expect(granted.url()).toBe("https://app.example.test/");
+
+    await guard.dispose();
+    expect(main.url()).toBe("https://outside.example.test/");
+    expect(other.url()).toBe("https://second-outside.example.test/");
     expect(boundary.close).toHaveBeenCalledOnce();
+  });
+
+  it("leaves a parked tab where the agent navigated it", async () => {
+    const parked = new SimulatedPage("parked", "https://outside.example.test/");
+    const boundary = simulatedBrowser([parked]);
+    const guard = await installHostOriginScopeGuard(
+      "ws://127.0.0.1/devtools/browser/test",
+      policy(),
+      boundary.connect,
+    );
+    expect(parked.url()).toBe("about:blank");
+
+    expect(
+      await boundary.context.navigate(parked, "https://app.example.test/work"),
+    ).toBe("continued");
+    await guard.dispose();
+    expect(parked.url()).toBe("https://app.example.test/work");
+  });
+
+  it("closes an out-of-scope tab that refuses to park", async () => {
+    const stuck = new SimulatedPage("stuck", "https://outside.example.test/");
+    stuck.gotoFailure = new Error("beforeunload prompt kept the page");
+    const boundary = simulatedBrowser([stuck]);
+
+    const guard = await installHostOriginScopeGuard(
+      "ws://127.0.0.1/devtools/browser/test",
+      policy(),
+      boundary.connect,
+    );
+    expect(guard.deniedOrigin()).toBeNull();
+    expect(boundary.context.page("stuck")).toBeUndefined();
+    await guard.dispose();
   });
 
   // Recovery issue #64: non-web locations must not disappear into the old
@@ -341,18 +393,20 @@ describe("host-owned Origin Scope guard", () => {
     "chrome://settings",
     "javascript:document.body.innerHTML='private'",
     "not a URL",
-  ])("fails closed for an existing non-web page: %s", async (url) => {
+  ])("parks an existing non-web page before agent access: %s", async (url) => {
     const page = new SimulatedPage("non-web", url);
     const boundary = simulatedBrowser([page]);
 
-    await expect(
-      installHostOriginScopeGuard(
-        "ws://127.0.0.1/devtools/browser/test",
-        policy(),
-        boundary.connect,
-      ),
-    ).rejects.toEqual(new BrowserOriginScopeDeniedError(null));
-    expect(boundary.context.page("non-web")).toBeUndefined();
+    const guard = await installHostOriginScopeGuard(
+      "ws://127.0.0.1/devtools/browser/test",
+      policy(),
+      boundary.connect,
+    );
+    expect(guard.deniedOrigin()).toBeNull();
+    expect(page.url()).toBe("about:blank");
+    expect(page.closed).toBe(false);
+    await guard.dispose();
+    expect(page.url()).toBe(url);
     expect(boundary.close).toHaveBeenCalledOnce();
   });
 
@@ -432,16 +486,15 @@ describe("host-owned Origin Scope guard", () => {
     );
     const boundary = simulatedBrowser([page]);
 
-    await expect(
-      installHostOriginScopeGuard(
-        "ws://127.0.0.1/devtools/browser/test",
-        policy(),
-        boundary.connect,
-      ),
-    ).rejects.toEqual(
-      new BrowserOriginScopeDeniedError("https://outside.example.test"),
+    const guard = await installHostOriginScopeGuard(
+      "ws://127.0.0.1/devtools/browser/test",
+      policy(),
+      boundary.connect,
     );
-    expect(boundary.context.page("blob-page")).toBeUndefined();
+    expect(page.url()).toBe("about:blank");
+    expect(page.closed).toBe(false);
+    await guard.dispose();
+    expect(page.url()).toBe("blob:https://outside.example.test/blob-id");
     expect(boundary.close).toHaveBeenCalledOnce();
   });
 
@@ -496,23 +549,26 @@ describe("host-owned Origin Scope guard", () => {
     await guard.dispose();
   });
 
-  it("denies a page that escapes while the host route is being installed", async () => {
+  it("parks a page that escapes while the host route is being installed", async () => {
     const page = new SimulatedPage("main", "https://app.example.test/");
     const boundary = simulatedBrowser([page]);
     boundary.context.onRouteInstalled = () => {
       page.currentUrl = "https://race.example.test/";
     };
 
-    await expect(
-      installHostOriginScopeGuard(
-        "ws://127.0.0.1/devtools/browser/test",
-        policy(),
-        boundary.connect,
-      ),
-    ).rejects.toEqual(
-      new BrowserOriginScopeDeniedError("https://race.example.test"),
+    // The agent has not run yet, so the escape is the owner's or the
+    // renderer's navigation: the document leaves the agent's reach without
+    // costing the owner the tab.
+    const guard = await installHostOriginScopeGuard(
+      "ws://127.0.0.1/devtools/browser/test",
+      policy(),
+      boundary.connect,
     );
-    expect(boundary.context.page("main")).toBeUndefined();
+    expect(guard.deniedOrigin()).toBeNull();
+    expect(page.url()).toBe("about:blank");
+    expect(boundary.context.page("main")).toBe(page);
+    await guard.dispose();
+    expect(page.url()).toBe("https://race.example.test/");
     expect(boundary.close).toHaveBeenCalledOnce();
   });
 

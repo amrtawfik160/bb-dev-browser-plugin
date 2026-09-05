@@ -316,6 +316,15 @@ function boundedOperationTimeoutMs(scriptTimeoutMs: number): number {
   return scriptTimeoutMs - headroomMs;
 }
 
+/**
+ * Bind `page` before the agent code runs. An explicit `tabId` must exist or
+ * the script fails closed as `tab_invalid`. Otherwise the binding order is:
+ * the visible tab when it is already on the preferred (granted) origin, then
+ * any tab on that origin, then the visible tab, then the first tab, and when
+ * the profile has no tabs at all a fresh one is opened. Agents expect `page`
+ * to exist; a profile whose tabs were all closed used to fail every script
+ * with "no visible active tab" until an owner opened one by hand.
+ */
 export function agentPagePreamble(
   tabId?: string,
   preferredOrigin?: string,
@@ -334,42 +343,74 @@ ${cutAgentBrowserRoots("__bbTargetPages", enforceNonWebNavigation, operationTime
   return `const __bbPages = await browser.listPages();
 let page;
 const __bbPreferred = ${JSON.stringify(preferredOrigin ?? null)};
-if (__bbPreferred !== null) {
-  for (const __bbEntry of __bbPages) {
-    if (typeof __bbEntry.url !== "string" || (__bbEntry.url.indexOf("http://") !== 0 && __bbEntry.url.indexOf("https://") !== 0)) {
-      continue;
-    }
-    if (new URL(__bbEntry.url).origin === __bbPreferred) {
-      page = await browser.getPage(__bbEntry.id);
-      break;
-    }
+const __bbEntryOrigin = (entry) => {
+  if (typeof entry.url !== "string" || (entry.url.indexOf("http://") !== 0 && entry.url.indexOf("https://") !== 0)) {
+    return null;
   }
-} else {
-  for (const __bbEntry of __bbPages) {
-    const __bbCandidate = await browser.getPage(__bbEntry.id);
-    if (await __bbCandidate.evaluate(() => document.visibilityState === "visible")) {
-      page = __bbCandidate;
-      break;
+  return new URL(entry.url).origin;
+};
+const __bbIsVisible = async (candidate) => {
+  try {
+    return await candidate.evaluate(() => document.visibilityState === "visible");
+  } catch {
+    // A page that cannot answer (closed or crashed between the listing and
+    // this call) is not one to bind; keep looking rather than fail the script.
+    return false;
+  }
+};
+let __bbVisibleEntry;
+let __bbVisiblePage;
+for (const __bbEntry of __bbPages) {
+  const __bbCandidate = await browser.getPage(__bbEntry.id);
+  if (await __bbIsVisible(__bbCandidate)) {
+    __bbVisibleEntry = __bbEntry;
+    __bbVisiblePage = __bbCandidate;
+    break;
+  }
+}
+if (__bbPreferred !== null) {
+  if (__bbVisibleEntry !== undefined && __bbEntryOrigin(__bbVisibleEntry) === __bbPreferred) {
+    page = __bbVisiblePage;
+  } else {
+    for (const __bbEntry of __bbPages) {
+      if (__bbEntryOrigin(__bbEntry) === __bbPreferred) {
+        page = await browser.getPage(__bbEntry.id);
+        break;
+      }
     }
   }
 }
+if (page === undefined) page = __bbVisiblePage;
+if (page === undefined && __bbPages.length > 0) page = await browser.getPage(__bbPages[0].id);
+if (page === undefined) page = await browser.newPage();
 if (page === undefined) throw new Error(${JSON.stringify(ACTIVE_TAB_UNAVAILABLE_MESSAGE)});
 await page.bringToFront();
 ${cutAgentBrowserRoots("__bbPages", enforceNonWebNavigation, operationTimeoutMs)}`;
 }
 
+/**
+ * Report which tab is in front once the agent code has finished, so the host
+ * can keep the shared strip's active tab in step with the browser. A script
+ * that closed its last tab, or left every page hidden, has still succeeded:
+ * the report is skipped rather than turning a good result into a failure.
+ */
 function activeTabReport(activeTabMarker: string) {
   return `const __bbActivePages = await browser.listPages();
 let __bbActiveTabId;
 for (const __bbActiveEntry of __bbActivePages) {
-  const __bbActiveCandidate = await browser.getPage(__bbActiveEntry.id);
-  if (await __bbActiveCandidate.evaluate(() => document.visibilityState === "visible")) {
-    __bbActiveTabId = __bbActiveEntry.id;
-    break;
+  try {
+    const __bbActiveCandidate = await browser.getPage(__bbActiveEntry.id);
+    if (await __bbActiveCandidate.evaluate(() => document.visibilityState === "visible")) {
+      __bbActiveTabId = __bbActiveEntry.id;
+      break;
+    }
+  } catch {
+    continue;
   }
 }
-if (__bbActiveTabId === undefined) throw new Error(${JSON.stringify(ACTIVE_TAB_UNAVAILABLE_MESSAGE)});
-console.log(JSON.stringify({ ${ACTIVE_TAB_MARKER_FIELD}: ${JSON.stringify(activeTabMarker)}, id: __bbActiveTabId }));`;
+if (__bbActiveTabId !== undefined) {
+  console.log(JSON.stringify({ ${ACTIVE_TAB_MARKER_FIELD}: ${JSON.stringify(activeTabMarker)}, id: __bbActiveTabId }));
+}`;
 }
 
 export function wrapAgentScriptResult(

@@ -18,20 +18,23 @@ to `dev-browser`.
 
 Parameters are defined by `browserScriptParametersSchema` (`.strict()`):
 
-| Parameter            | Required | Type / bounds                     | Notes                                                                                                                                                       |
-| -------------------- | -------- | --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `purpose`            | yes      | string, trimmed, 1–200 chars      | Human-readable reason. Shown to the owner only while the Control Lease is live, then discarded.                                                             |
-| `code`               | yes      | string, non-empty                 | QuickJS Playwright code. No Node, modules, process, or filesystem access.                                                                                   |
-| `destinationOrigin`  | no       | exact `scheme://host:port` origin | Omitting it returns `origin_denied`. Access is denied until the owner grants that origin to this project and profile. Grant changes apply to the next call. |
-| `profileId`          | no       | string                            | Host-local Browser Profile ID. Omit to use the selected profile (`bb-personal` by default).                                                                 |
-| `tabId`              | no       | string                            | Opaque runtime-only tab ID from `browser.listPages()`. Omit to use the active tab.                                                                          |
-| `timeoutMs`          | no       | integer 1000–30000                | Default `30000`; the minimum is `BROWSER_SCRIPT_MIN_TIMEOUT_MS`.                                                                                            |
-| `screenshot`         | no       | boolean (default false)           | Request up to 3 native screenshots explicitly.                                                                                                              |
-| `fileTransfer`       | no       | boolean (default false)           | Separate elevation; needs its own owner grant.                                                                                                              |
-| `invalidCertificate` | no       | boolean (default false)           | Per-origin opt-in; the host bypasses certificate validation only for the exact approved origin.                                                             |
+| Parameter            | Required | Type / bounds                     | Notes                                                                                                                                                                                                                                                      |
+| -------------------- | -------- | --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `purpose`            | yes      | string, trimmed, 1–200 chars      | Human-readable reason. Shown to the owner only while the Control Lease is live, then discarded.                                                                                                                                                            |
+| `code`               | yes      | string, non-empty                 | QuickJS Playwright code. No Node, modules, process, or filesystem access.                                                                                                                                                                                  |
+| `destinationOrigin`  | no       | exact `scheme://host:port` origin | Omitting it returns `origin_denied`. Any web origin is allowed by default; the first call records a whole-web grant for this project and profile. Once the owner revokes that grant, access waits on their approval. Grant changes apply to the next call. |
+| `profileId`          | no       | string                            | Host-local Browser Profile ID. Omit to use the selected profile (`bb-personal` by default).                                                                                                                                                                |
+| `tabId`              | no       | string                            | Opaque runtime-only tab ID from `browser.listPages()`. Omit to use the active tab.                                                                                                                                                                         |
+| `timeoutMs`          | no       | integer 1000–30000                | Default `30000`; the minimum is `BROWSER_SCRIPT_MIN_TIMEOUT_MS`.                                                                                                                                                                                           |
+| `screenshot`         | no       | boolean (default false)           | Request up to 3 native screenshots explicitly.                                                                                                                                                                                                             |
+| `fileTransfer`       | no       | boolean (default false)           | Separate elevation; needs its own owner grant.                                                                                                                                                                                                             |
+| `invalidCertificate` | no       | boolean (default false)           | Per-origin opt-in; the host bypasses certificate validation only for the exact approved origin.                                                                                                                                                            |
 
-The script runs with Playwright `page` bound to the active tab (or `tabId`).
-`return` values become the tool result. There is no `document` global.
+The script runs with Playwright `page` bound to the explicit `tabId`, else to
+a tab already on the granted origin, else to the active tab; a profile with no
+tabs gets a fresh one. `return` values become the tool result. There is no
+`document` global. Owner tabs outside the grant are parked on `about:blank`
+for the length of the call and restored afterwards.
 
 The host applies `BrowserContext.setDefaultTimeout` and
 `BrowserContext.setDefaultNavigationTimeout` to the shared context, reserving

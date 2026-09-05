@@ -65,6 +65,45 @@ describe("public Browser Panel lifecycle seam", () => {
       await browser.dispose();
     }
   });
+  it("drops tabs the browser no longer has even when no tab is in front", async () => {
+    const runtime = createTabInventoryRuntime();
+    const target = {
+      hostId: "ci-host",
+      profileId: DEFAULT_PROFILE_ID,
+      locale: "en-US",
+      timezone: "UTC",
+    };
+    const opened = await runtime.openPage(target);
+    // A browser with no front page cannot answer the active-tab read; the
+    // inventory read still works and is what the strip must follow.
+    const browserRuntime = {
+      ...runtime,
+      activeTabId: async () => {
+        if ((await runtime.listPages(target)).length === 0) {
+          throw new Error("The Browser Profile has no open tabs");
+        }
+        return opened.id;
+      },
+    };
+    const browser = await createPublicPanelLifecycleHarness({ browserRuntime });
+    try {
+      const before = await browser.rpc.browser_tabs({
+        hostId: browser.hostId,
+        profileId: DEFAULT_PROFILE_ID,
+      });
+      expect(before.tabs.map((tab) => tab.tabId)).toEqual([opened.id]);
+
+      await runtime.closePages(target, [opened.id]);
+      const after = await browser.rpc.browser_tabs({
+        hostId: browser.hostId,
+        profileId: DEFAULT_PROFILE_ID,
+      });
+      expect(after.tabs).toEqual([]);
+      expect(after.activeTabId).toBeNull();
+    } finally {
+      await browser.dispose();
+    }
+  });
   it.each([false, true])(
     "copies an address to the displaying client's clipboard and reports refusal (%s)",
     async (refused) => {

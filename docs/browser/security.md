@@ -68,6 +68,12 @@ active agent work without closing the owner's page. Profile Grants confer **full
 automation** within scope because arbitrary Playwright scripts cannot be
 reliably classified as read-only.
 
+A project's first agent operation on a profile records a persistent whole-web
+grant automatically (**Default Access**, ADR 0015). Revoking that grant in
+Browser Settings withdraws Default Access for the project and profile, after
+which its agents go through Grant Requests; granting the whole web again
+restores it. Lifecycle revocations do not withdraw Default Access.
+
 Grant administration and Grant Request decisions require the authenticated
 owner session available to Browser Settings. The CLI exposes no owner identity,
 so its grant-administration compatibility commands fail closed with Settings
@@ -90,20 +96,25 @@ Profile Grant**.
 Origin Scope uses exact `scheme://host:port` origins and optional explicit
 subdomain patterns (ADR 0004, ADR 0013). URL paths do not narrow a grant; each
 localhost port is separate; `*` is a distinct whole-web permission. Cross-origin
-subresources may render normally. A denied web origin produces a typed
-`origin_denied` result and a non-blocking Grant Request. A denied non-web
-navigation produces the same typed error with a null origin and no Grant
-Request.
+subresources may render normally. A web origin is denied only when the owner
+has withdrawn the project's Default Access and no grant covers it; that
+produces a typed `origin_denied` result and a non-blocking Grant Request. A
+denied non-web navigation produces the same typed error with a null origin and
+no Grant Request.
 
 Enforcement is host-owned and layered. Before the QuickJS helper starts, the
-host connects independently to the profile's Playwright context, rejects and
-closes any existing out-of-scope web or non-web document, installs the web
-grant-matching route, and attaches a CDP guard to each page. Restored Chrome
-new-tab / error documents are cleared to `about:blank` before agent access because
-they can expose profile history or failed addresses. Exact `about:blank` is the
-only safe internal exception; `blob:` navigation is classified by its embedded HTTP(S) origin
-when exposed. The agent sandbox supplies no callback and cannot remove these
-controls.
+host connects independently to the profile's Playwright context, installs the
+web grant-matching route, attaches a CDP guard to each page, and parks any
+existing out-of-scope web or non-web document on exact `about:blank` for the
+length of the call. Parked owner tabs return to their previous document when
+the call ends; a tab that cannot be parked is closed instead. Chromium runs
+with back/forward cache disabled, so returning to a parked document is always
+a network navigation the route sees. Restored Chrome new-tab / error documents
+are cleared to `about:blank` before agent access because they can expose
+profile history or failed addresses. Exact `about:blank` is the only safe
+internal exception; `blob:` navigation is classified by its embedded HTTP(S)
+origin when exposed. The agent sandbox supplies no callback and cannot remove
+these controls.
 
 For an active Origin Scope, the generated agent boundary also rejects a direct
 Playwright `Frame.goto` whose address is not exact `about:blank`, HTTP(S), or an
@@ -129,9 +140,11 @@ BrowserContext emitted after the initial connection snapshot is registered.
   normally.
 - The first denied navigation is sticky for the operation. Navigating back into
   scope, closing a popup, or throwing a later exception cannot erase it.
-- Denied popup targets and pre-existing denied tabs are closed when they exist;
-  a popup opener remains available when Chromium rejects the popup before a
-  target page exists, so a later call cannot recover denied page content.
+- Denied popup targets are closed when they exist. Pre-existing out-of-scope
+  tabs are parked on `about:blank` while the call runs and restored afterwards,
+  so a later call cannot recover denied page content and the owner keeps the
+  tab. A popup opener remains available when Chromium rejects the popup before
+  a target page exists.
 - Every new sandbox page uses the one routed context, so `browser.newPage()`
   cannot create an unenforced context.
 

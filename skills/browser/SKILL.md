@@ -11,17 +11,20 @@ stays signed in for later automation.
 
 ## Start here
 
-Use `browser_script` with the exact HTTP(S) origin you need. If it returns
-`origin_denied`, surface any Grant Request to the owner and pause until the
-owner makes a decision in authenticated Browser Settings. A non-web navigation
-is denied without a Grant Request.
+Use `browser_script` with the exact HTTP(S) origin you need. Any web origin
+works by default: your project's first call records a whole-web grant the
+owner can see in Browser Settings. `origin_denied` means the owner withdrew
+that access for your project (surface the attached Grant Request and pause
+until they decide in authenticated Browser Settings) or the navigation is
+non-web (no Grant Request; do not retry it).
 
 `bb browser open https://example.com` is the shell equivalent for opening an
 authorized URL: it runs as an agent operation under the same Profile Grant,
 Control Lease, and Activity attribution. The URL is required; no-argument
 opens fail closed before reading host tab state. Use the Browser Panel for
 current-tab inspection and search text. The agent `open` command derives its
-host from BB context and rejects `--host`.
+host and project from BB context (`BB_THREAD_ID`, set in every project
+thread) and rejects `--host`.
 
 ## Automating a page
 
@@ -61,7 +64,11 @@ workspace access.
 - `browser.listPages()` lists tabs; `browser.getPage(id)` binds one. Tab IDs are
   runtime-only and change when the browser restarts.
 - Tab state persists between scripts. If a tab is already on your granted
-  origin, `page` binds to it — read it instead of navigating again.
+  origin, `page` binds to it — read it instead of navigating again. Otherwise
+  `page` is the active tab, or a fresh tab when the profile has none.
+- Owner tabs outside your grant are parked on `about:blank` while your script
+  runs and come back when it finishes. They are not yours to read; do not
+  report them as failures.
 - The host applies Playwright `BrowserContext` action and navigation defaults
   with 25% headroom (capped at 5 seconds) inside the host deadline. The defaults
   cover existing pages and later pages from `browser.getPage` or
@@ -100,15 +107,15 @@ await Promise.all([page.waitForURL(/\/search\?/), box.press("Enter")]);
 
 ## Failures and what to do
 
-| Code                | Meaning                                         | Do                                                                      |
-| ------------------- | ----------------------------------------------- | ----------------------------------------------------------------------- |
-| `origin_denied`     | Grant missing or navigation is non-web          | Surface any Grant Request; retry web origins only after approval        |
-| `browser_busy`      | Owner control or a 30-second agent wait expired | This call did not run; let the active operation finish, then retry once |
-| `browser_timeout`   | Script hit its deadline                         | Split the work or wait on a condition instead of a timer                |
-| `script_failed`     | Playwright error                                | Read the call log at the end of the message — it names the reason       |
-| `tab_invalid`       | Tab belongs to a previous runtime               | `browser.listPages()` again                                             |
-| `setup_required`    | Host is not provisioned                         | Report it. Do not retry, install packages, or find another browser      |
-| `safe_login_denied` | Owner-only Safe Login is active                 | Wait for the owner; you cannot see or drive the browser                 |
+| Code                | Meaning                                         | Do                                                                                                                     |
+| ------------------- | ----------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `origin_denied`     | Owner withdrew access, or navigation is non-web | Surface any Grant Request; retry web origins only after approval                                                       |
+| `browser_busy`      | Owner control or a 30-second agent wait expired | This call did not run; let the active operation finish, then retry once                                                |
+| `browser_timeout`   | Script hit its deadline                         | Split the work or wait on a condition instead of a timer                                                               |
+| `script_failed`     | Playwright or syntax error                      | Read the call log at the end of the message — it names the reason. A `Syntax check:` line names the script line to fix |
+| `tab_invalid`       | Tab belongs to a previous runtime               | `browser.listPages()` again                                                                                            |
+| `setup_required`    | Host is not provisioned                         | Report it. Do not retry, install packages, or find another browser                                                     |
+| `safe_login_denied` | Owner-only Safe Login is active                 | Wait for the owner; you cannot see or drive the browser                                                                |
 
 `bb browser status` reports host readiness and live control state; `bb browser
 diagnostics` adds repair detail.
@@ -120,6 +127,8 @@ bb browser requests                      # pending grant requests
 bb browser request-status --request <id> # inspect one scoped request
 ```
 
+Your project is granted the whole web on first use. An owner can revoke that
+in Browser Settings, after which your calls go through Grant Requests.
 Grantable scopes are exact origins (`https://example.com`) or explicit
 subdomain patterns (`https://*.example.com`) or `*`. Paths are not grantable.
 The owner manages grants and request decisions in authenticated Browser

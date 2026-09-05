@@ -761,16 +761,37 @@ function browserScriptJson(browserResult: unknown) {
   return serialized === undefined ? "" : serialized;
 }
 
+/**
+ * `bb browser open` and `bb browser script` are agent operations attributed
+ * to a BB thread and its project. The CLI forwards BB_THREAD_ID and
+ * BB_PROJECT_ID when the invoking shell has them; some provider shells carry
+ * only the thread id, so the project is read from the thread rather than
+ * refusing to run.
+ */
+async function agentCliIdentity(
+  bb: BbPluginApi,
+  command: "open" | "script",
+  context: PluginCliContext,
+): Promise<{ projectId: string; threadId: string }> {
+  if (context.threadId === undefined) {
+    throw new Error(
+      `browser ${command} requires BB thread context; run it from a project thread, where BB_THREAD_ID is set.`,
+    );
+  }
+  if (context.projectId !== undefined) {
+    return { projectId: context.projectId, threadId: context.threadId };
+  }
+  const thread = await bb.sdk.threads.get({ threadId: context.threadId });
+  return { projectId: thread.projectId, threadId: context.threadId };
+}
+
 async function runBrowserScriptCli(
+  bb: BbPluginApi,
   browser: BrowserService,
   cliArguments: ParsedCliArguments,
   context: PluginCliContext,
 ) {
-  if (context.projectId === undefined || context.threadId === undefined) {
-    throw new Error(
-      "browser script requires BB project and thread context; invoke it from a project thread.",
-    );
-  }
+  const identity = await agentCliIdentity(bb, "script", context);
   const parameters = browserScriptParametersSchema.parse({
     purpose: cliArguments.purpose,
     code: cliArguments.code,
@@ -795,8 +816,8 @@ async function runBrowserScriptCli(
       : { screenshot: cliArguments.screenshot }),
   });
   const response = await browser.browserScript(parameters, {
-    projectId: context.projectId,
-    threadId: context.threadId,
+    projectId: identity.projectId,
+    threadId: identity.threadId,
     signal: context.signal ?? new AbortController().signal,
   });
   if (!response.ok) {
@@ -815,21 +836,18 @@ async function runBrowserScriptCli(
 }
 
 async function runOpenCli(
+  bb: BbPluginApi,
   browser: BrowserService,
   cliArguments: ParsedCliArguments,
   context: PluginCliContext,
 ) {
-  if (context.projectId === undefined || context.threadId === undefined) {
-    throw new Error(
-      "browser open requires BB project and thread context; invoke it from a project thread.",
-    );
-  }
+  const identity = await agentCliIdentity(bb, "open", context);
   if (cliArguments.address === undefined) {
     throw new Error(
       "browser open requires an HTTP(S) URL; omit the URL only in the Browser Panel.",
     );
   }
-  const target = await browser.grantScope(context, {
+  const target = await browser.grantScope(identity, {
     ...(cliArguments.profileId === undefined
       ? {}
       : { profileId: cliArguments.profileId }),
@@ -852,8 +870,8 @@ async function runOpenCli(
         : { screenshot: cliArguments.screenshot }),
     }),
     {
-      projectId: context.projectId,
-      threadId: context.threadId,
+      projectId: identity.projectId,
+      threadId: identity.threadId,
       signal: context.signal ?? new AbortController().signal,
     },
   );
@@ -866,7 +884,10 @@ async function runOpenCli(
   if (page === null) {
     throw new Error("The Workspace Browser returned an invalid open result.");
   }
-  const navigation = await currentOpenTab(browser, target, context);
+  const navigation = await currentOpenTab(browser, target, {
+    ...context,
+    ...identity,
+  });
   return openCliResult(target, navigation, page, cliArguments.json);
 }
 
@@ -1408,7 +1429,7 @@ async function runCli(
   const { command, json, profileId, hostId, requestId } = parsed.arguments;
   try {
     if (command === "open") {
-      return await runOpenCli(browser, parsed.arguments, context);
+      return await runOpenCli(bb, browser, parsed.arguments, context);
     }
     if (command === "status") {
       return await runStatusCli(browser, profileId, hostId, json, context);
@@ -1423,7 +1444,7 @@ async function runCli(
       return await runGrantRequestStatusCli(browser, requestId!, json, context);
     }
     if (command === "script") {
-      return await runBrowserScriptCli(browser, parsed.arguments, context);
+      return await runBrowserScriptCli(bb, browser, parsed.arguments, context);
     }
     return await runAdministrationCli(browser, parsed.arguments, context);
   } catch (error) {

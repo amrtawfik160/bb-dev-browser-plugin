@@ -49,7 +49,12 @@ const MAX_SCREENSHOT_BYTES = BROWSER_SCRIPT_MAX_SCREENSHOT_BYTES;
 const SCREENSHOT_READ_CHUNK_BYTES = 64 * 1024;
 const HELPER_STOP_TIMEOUT_MS = 2_000;
 const BROWSER_CLOSE_TIMEOUT_MS = 2_000;
-const RENDERER_PROCESS_CHECK_INTERVAL_MS = 250;
+/**
+ * The renderer ceiling is a resource bound, not a race to win: one check per
+ * second notices a runaway page well before it matters and keeps the monitor's
+ * own cost in the noise.
+ */
+const RENDERER_PROCESS_CHECK_INTERVAL_MS = 1_000;
 const UNIX_SOCKET_PATH_MAX_BYTES = 107;
 const DEV_BROWSER_NODE_MODULES = [
   "playwright",
@@ -459,9 +464,103 @@ function processDescendants(
   return descendants;
 }
 
+/**
+ * Linux exposes each task's first-level children at
+ * `/proc/<pid>/task/<tid>/children` (CONFIG_PROC_CHILDREN). Reading those
+ * files walks only the browser's own subtree instead of every process on the
+ * host, which is the difference between a dozen small reads and a full
+ * `/proc` scan four times a second. The probe against this worker's own pid
+ * is one cheap syscall per check, so it is not cached.
+ */
+function processChildrenFilesSupported() {
+  return access(
+    `/proc/${process.pid}/task/${process.pid}/children`,
+    constants.R_OK,
+  ).then(
+    () => true,
+    () => false,
+  );
+}
+
+async function processChildIds(pid: number): Promise<number[] | null> {
+  let tasks: string[];
+  try {
+    tasks = await readdir(`/proc/${pid}/task`);
+  } catch (error) {
+    if (processHasGone(error)) return null;
+    throw error;
+  }
+  const children: number[] = [];
+  for (const task of tasks) {
+    let contents: string;
+    try {
+      contents = await readFile(`/proc/${pid}/task/${task}/children`, "utf8");
+    } catch (error) {
+      // A thread that exited between the listing and the read is not a
+      // failure; only the browser process itself vanishing is reported below.
+      if (processHasGone(error)) continue;
+      throw error;
+    }
+    for (const entry of contents.trim().split(/\s+/u)) {
+      if (/^\d+$/u.test(entry)) children.push(Number(entry));
+    }
+  }
+  return children;
+}
+
+async function processCommandLine(pid: number): Promise<string | null> {
+  try {
+    return await readFile(`/proc/${pid}/cmdline`, "utf8");
+  } catch (error) {
+    if (processHasGone(error)) return null;
+    throw error;
+  }
+}
+
+/**
+ * Count renderers by walking the browser's own process subtree. Renderers are
+ * sandboxed and cannot fork, and they carry most of Chromium's threads, so
+ * their per-thread children files are not read at all. A descendant whose
+ * command line cannot be read still fails the check closed.
+ */
+async function rendererCountFromSubtree(browserPid: number) {
+  const unavailable = new Error("Browser process metadata is unavailable.");
+  let renderers = 0;
+  const visited = new Set<number>([browserPid]);
+  const pending = [browserPid];
+  for (let index = 0; index < pending.length; index += 1) {
+    const pid = pending[index]!;
+    const commandLine = await processCommandLine(pid);
+    if (commandLine === null) {
+      if (pid === browserPid) throw unavailable;
+      continue;
+    }
+    if (isRendererProcess(commandLine)) {
+      renderers += 1;
+      continue;
+    }
+    const children = await processChildIds(pid);
+    if (children === null) {
+      if (pid === browserPid) throw unavailable;
+      continue;
+    }
+    for (const childId of children) {
+      if (visited.has(childId)) continue;
+      visited.add(childId);
+      pending.push(childId);
+    }
+  }
+  return renderers;
+}
+
 async function rendererProcessCount(browserPid: number) {
-  const liveProcesses = await liveProcessSnapshots();
-  const descendants = processDescendants(browserPid, liveProcesses);
+  if (await processChildrenFilesSupported()) {
+    return rendererCountFromSubtree(browserPid);
+  }
+  const descendants = processDescendants(
+    browserPid,
+    await liveProcessSnapshots(),
+  );
   const renderers = await Promise.all(
     [...descendants].map(async (pid) => {
       try {

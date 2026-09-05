@@ -243,6 +243,40 @@ describe("Browser public plugin contract", () => {
     },
   );
 
+  it("reads the project from the thread when the CLI shell carries only BB_THREAD_ID", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+      browserRuntime: publicRuntime(async () => ({ title: "threaded" })),
+    });
+    try {
+      await grantDefaultProfileOrigin(browser, "https://example.com");
+      const cli = await browser.runBrowserCli(
+        [
+          "script",
+          "--purpose",
+          "Read the title from a thread-only shell",
+          "--code",
+          "return document.title;",
+          "--origin",
+          "https://example.com",
+          "--json",
+        ],
+        { projectId: undefined },
+      );
+      expect(cli.exitCode).toBe(0);
+      expect(JSON.parse(cli.stdout)).toEqual({ title: "threaded" });
+
+      const noThread = await browser.runBrowserCli(
+        ["open", "https://example.com"],
+        { threadId: undefined },
+      );
+      expect(noThread.exitCode).toBe(1);
+      expect(noThread.stderr).toContain("BB_THREAD_ID");
+    } finally {
+      await browser.dispose();
+    }
+  });
+
   it("issue #18 states Safe Login limitations on the panel for hardware-bound passkeys, DRM, corporate device policy, and site-specific anti-automation behavior", async () => {
     const browser = await createPublicPluginHarness({
       status: browserStatusSchema.parse({
@@ -435,7 +469,7 @@ describe("Browser public plugin contract", () => {
 
     const settings = browser.renderSettings();
     const button = await settings.findByRole("button", {
-      name: "Generate redacted diagnostics",
+      name: "Download redacted diagnostics",
     });
     button.click();
     const settingsDiagnostics = await settings.findByLabelText(
@@ -746,6 +780,7 @@ describe("Browser public plugin contract", () => {
         hostId: "host-browser-test",
         name: "Owner authority target",
       });
+      await browser.withdrawDefaultAccess();
       const existingGrant = await browser.createBrowserGrant({
         projectId: "project-browser-test",
         hostId: "host-browser-test",
@@ -917,7 +952,7 @@ describe("Browser public plugin contract", () => {
     }
   });
 
-  it("gates browser_script through the owner grant create, inspect, and revoke contract", async () => {
+  it("grants the whole web on first use and gates browser_script through the owner grant contract once that grant is revoked", async () => {
     const browser = await createPublicPluginHarness({
       snapshot: preparedSnapshot,
       browserScriptResponse: { ok: true, result: { title: "done" } },
@@ -927,6 +962,29 @@ describe("Browser public plugin contract", () => {
       name: "Grant target",
     });
 
+    // Default Access: the first call records a whole-web grant and proceeds.
+    const firstCall = await browser.runBrowserScriptWithProfile(undefined, {
+      destinationOrigin: "https://app.example.test/",
+    });
+    expect(firstCall.isError).toBe(false);
+    const recorded = await browser.listBrowserGrants({
+      projectId: "project-browser-test",
+    });
+    expect(recorded).toMatchObject([
+      {
+        projectId: "project-browser-test",
+        hostId: "host-browser-test",
+        profileId: DEFAULT_PROFILE_ID,
+        originScope: "*",
+        wholeWeb: true,
+      },
+    ]);
+
+    // Revoking it in Settings withdraws Default Access for this project.
+    expect(await browser.revokeBrowserGrant(recorded[0]!.grantId)).toEqual({
+      grantId: recorded[0]!.grantId,
+      outcome: "revoked",
+    });
     const beforeGrant = await browser.runBrowserScriptWithProfile(undefined, {
       destinationOrigin: "https://app.example.test/",
     });
@@ -1001,6 +1059,7 @@ describe("Browser public plugin contract", () => {
         hostId: "host-browser-test",
         name: "Origin scope fixture",
       });
+      await browser.withdrawDefaultAccess();
       await browser.createBrowserGrant({
         projectId: "project-browser-test",
         hostId: "host-browser-test",
@@ -1103,11 +1162,7 @@ describe("Browser public plugin contract", () => {
 
     const settings = browser.renderSettings();
     await settings.findByText("Browser Grant Requests");
-    fireEvent.click(
-      await settings.findByRole("button", {
-        name: "Inspect Browser Grant Requests",
-      }),
-    );
+    // Requests load with the section; no inspect step stands in the way.
     await settings.findByRole("list", { name: "Browser Grant Request list" });
     await browser.dispose();
   });
@@ -1122,15 +1177,19 @@ describe("Browser public plugin contract", () => {
         hostId: "host-browser-test",
         name: "Scoped request target",
       });
+      await browser.withdrawDefaultAccess();
       const ownDenied = await browser.runBrowserScriptWithProfile(undefined, {
         destinationOrigin: "https://scoped-own.example.test",
       });
+      // Other bindings keep Default Access, so their requests come from an
+      // elevation the whole-web grant does not carry.
       const foreignProjectDenied = await browser.runBrowserScriptWithProfile(
         undefined,
         {
           destinationOrigin: "https://scoped-foreign-project.example.test",
           projectId: "project-foreign",
           threadId: "thread-foreign-project",
+          fileTransfer: true,
         },
       );
       const otherProfile = (
@@ -1141,7 +1200,10 @@ describe("Browser public plugin contract", () => {
       }
       const foreignProfileDenied = await browser.runBrowserScriptWithProfile(
         otherProfile.profileId,
-        { destinationOrigin: "https://scoped-foreign-profile.example.test" },
+        {
+          destinationOrigin: "https://scoped-foreign-profile.example.test",
+          fileTransfer: true,
+        },
       );
       const ownRequestId = browserScriptFailureSchema.parse(
         JSON.parse(ownDenied.content[0]!.text),
@@ -1190,6 +1252,7 @@ describe("Browser public plugin contract", () => {
       hostId: "host-browser-test",
       name: "Retry target",
     });
+    await browser.withdrawDefaultAccess();
     const denied = await browser.runBrowserScriptWithProfile(undefined, {
       destinationOrigin: "https://retry.example.test",
     });
@@ -1227,6 +1290,7 @@ describe("Browser public plugin contract", () => {
       hostId: "host-browser-test",
       name: "Request lifecycle target",
     });
+    await browser.withdrawDefaultAccess();
     const denied = await browser.runBrowserScriptWithProfile(undefined, {
       destinationOrigin: "https://lifecycle-request.example.test",
     });
@@ -1274,47 +1338,37 @@ describe("Browser public plugin contract", () => {
       ).error.grantRequest!;
       const settings = browser.renderSettings();
 
-      fireEvent.click(
-        await settings.findByRole("button", {
-          name: "Inspect Browser Grant Requests",
-        }),
-      );
       const list = await settings.findByRole("list", {
         name: "Browser Grant Request list",
       });
       expect(list.textContent).toContain(request.requestId);
       expect(list.textContent).toContain("pending");
       expect(list.textContent).toContain(request.origin);
+      // Every decision names the site, not the request identifier.
+      expect(
+        settings.getByRole("button", { name: `Deny ${request.origin}` }),
+      ).toBeDefined();
+      expect(
+        settings.getByRole("button", { name: `Allow ${request.origin} once` }),
+      ).toBeDefined();
       expect(
         settings.getByRole("button", {
-          name: `Deny Browser Grant Request ${request.requestId}`,
+          name: `Allow ${request.origin} for an hour`,
         }),
       ).toBeDefined();
       expect(
         settings.getByRole("button", {
-          name: `Approve Browser Grant Request ${request.requestId} for one retry`,
+          name: `Allow ${request.origin} always`,
         }),
       ).toBeDefined();
       expect(
         settings.getByRole("button", {
-          name: `Approve Browser Grant Request ${request.requestId} for one hour`,
-        }),
-      ).toBeDefined();
-      expect(
-        settings.getByRole("button", {
-          name: `Persist Browser Grant Request ${request.requestId}`,
-        }),
-      ).toBeDefined();
-      expect(
-        settings.getByRole("button", {
-          name: `Revoke Browser Grant Request ${request.requestId}`,
+          name: `Revoke request for ${request.origin}`,
         }),
       ).toBeDefined();
 
       fireEvent.click(
-        settings.getByRole("button", {
-          name: `Deny Browser Grant Request ${request.requestId}`,
-        }),
+        settings.getByRole("button", { name: `Deny ${request.origin}` }),
       );
       await settings.findByText(
         new RegExp(`${request.requestId}.*denied`, "i"),
@@ -1341,6 +1395,7 @@ describe("Browser public plugin contract", () => {
         hostId: "host-browser-test",
         name: "Settings retry target",
       });
+      await browser.withdrawDefaultAccess();
       const denied = await browser.runBrowserScriptWithProfile(undefined, {
         destinationOrigin: "https://settings-retry.example.test",
       });
@@ -1350,12 +1405,7 @@ describe("Browser public plugin contract", () => {
       const settings = browser.renderSettings();
       fireEvent.click(
         await settings.findByRole("button", {
-          name: "Inspect Browser Grant Requests",
-        }),
-      );
-      fireEvent.click(
-        await settings.findByRole("button", {
-          name: `Approve Browser Grant Request ${requestId} for one retry`,
+          name: "Allow https://settings-retry.example.test once",
         }),
       );
       await settings.findByText(
@@ -1371,9 +1421,7 @@ describe("Browser public plugin contract", () => {
       expect(retry.isError).toBe(false);
       expect(hostCalls).toBe(1);
       fireEvent.click(
-        settings.getByRole("button", {
-          name: "Inspect Browser Grant Requests",
-        }),
+        settings.getByRole("button", { name: "Refresh requests" }),
       );
       const list = await settings.findByRole("list", {
         name: "Browser Grant Request list",
@@ -1395,6 +1443,7 @@ describe("Browser public plugin contract", () => {
         hostId: "host-browser-test",
         name: "Settings duration target",
       });
+      await browser.withdrawDefaultAccess();
 
       const oneHourDenied = await browser.runBrowserScriptWithProfile(
         undefined,
@@ -1408,12 +1457,7 @@ describe("Browser public plugin contract", () => {
       const hourSettings = browser.renderSettings();
       fireEvent.click(
         await hourSettings.findByRole("button", {
-          name: "Inspect Browser Grant Requests",
-        }),
-      );
-      fireEvent.click(
-        await hourSettings.findByRole("button", {
-          name: `Approve Browser Grant Request ${oneHourId} for one hour`,
+          name: "Allow https://settings-hour.example.test for an hour",
         }),
       );
       await hourSettings.findByText(
@@ -1421,7 +1465,7 @@ describe("Browser public plugin contract", () => {
       );
       fireEvent.click(
         hourSettings.getByRole("button", {
-          name: `Revoke Browser Grant Request ${oneHourId}`,
+          name: "Revoke request for https://settings-hour.example.test",
         }),
       );
       await hourSettings.findByText(new RegExp(`${oneHourId}.*revoked`, "i"));
@@ -1437,14 +1481,16 @@ describe("Browser public plugin contract", () => {
         JSON.parse(persistentDenied.content[0]!.text),
       ).error.grantRequest!.requestId;
       const persistentSettings = browser.renderSettings();
+      // Lasting access opens a confirmation step; submitting it empty is
+      // refused by the server, and the typed phrase completes it.
       fireEvent.click(
         await persistentSettings.findByRole("button", {
-          name: "Inspect Browser Grant Requests",
+          name: "Allow https://settings-persist.example.test always",
         }),
       );
       fireEvent.click(
         await persistentSettings.findByRole("button", {
-          name: `Persist Browser Grant Request ${persistentId}`,
+          name: "Confirm lasting access for https://settings-persist.example.test",
         }),
       );
       await persistentSettings.findByText(/second confirmation/i);
@@ -1456,7 +1502,7 @@ describe("Browser public plugin contract", () => {
       );
       fireEvent.click(
         persistentSettings.getByRole("button", {
-          name: `Persist Browser Grant Request ${persistentId}`,
+          name: "Confirm lasting access for https://settings-persist.example.test",
         }),
       );
       await persistentSettings.findByText(
@@ -1538,6 +1584,7 @@ describe("Browser public plugin contract", () => {
         hostId: "host-browser-test",
         name: "Expired request target",
       });
+      await browser.withdrawDefaultAccess();
       const denied = await browser.runBrowserScriptWithProfile(undefined, {
         purpose: "Secret denied purpose",
         code: "return 'secret denied script';",
@@ -1567,11 +1614,6 @@ describe("Browser public plugin contract", () => {
 
       vi.setSystemTime(new Date("2026-08-28T00:16:00.000Z"));
       const settings = browser.renderSettings();
-      fireEvent.click(
-        await settings.findByRole("button", {
-          name: "Inspect Browser Grant Requests",
-        }),
-      );
       const list = await settings.findByRole("list", {
         name: "Browser Grant Request list",
       });
@@ -1601,6 +1643,7 @@ describe("Browser public plugin contract", () => {
         hostId: "host-browser-test",
         name: "Live request target",
       });
+      await browser.withdrawDefaultAccess();
       const denied = await browser.runBrowserScriptWithProfile(undefined, {
         destinationOrigin: "https://live-request.example.test",
       });
@@ -1657,6 +1700,7 @@ describe("Browser public plugin contract", () => {
         hostId: "host-browser-test",
         name: "Overlapping refresh target",
       });
+      await browser.withdrawDefaultAccess();
       const denied = await browser.runBrowserScriptWithProfile(undefined, {
         destinationOrigin: "https://overlapping-refresh.example.test",
       });
@@ -1757,6 +1801,7 @@ describe("Browser public plugin contract", () => {
         hostId: "host-browser-test",
         name: "Temporary expiry target",
       });
+      await browser.withdrawDefaultAccess();
       const denied = await browser.runBrowserScriptWithProfile(undefined, {
         destinationOrigin: "https://temporary-expiry.example.test",
       });
@@ -2006,6 +2051,7 @@ describe("Browser public plugin contract", () => {
       hostId: "host-browser-test",
       name: "Lifecycle target",
     });
+    await browser.withdrawDefaultAccess();
     const grant = await browser.createBrowserGrant({
       projectId: "project-browser-test",
       hostId: "host-browser-test",
@@ -2104,6 +2150,7 @@ describe("Browser public plugin contract", () => {
       hostId: "host-browser-test",
       name: "Private network target",
     });
+    await browser.withdrawDefaultAccess();
 
     const denied = await browser.runBrowserScriptWithProfile(undefined, {
       destinationOrigin: "http://192.168.10.12:3000",
@@ -2169,6 +2216,7 @@ describe("Browser public plugin contract", () => {
       hostId: "host-browser-test",
       name: "Binding target",
     });
+    await browser.withdrawDefaultAccess();
     const wildcard = await browser.createBrowserGrant({
       projectId: "project-browser-test",
       hostId: "host-browser-test",
@@ -2190,14 +2238,16 @@ describe("Browser public plugin contract", () => {
       destinationOrigin: "https://example.test",
     });
     expect(baseDenied.isError).toBe(true);
-    const copiedProjectDenied = await browser.runBrowserScriptWithProfile(
-      undefined,
-      {
-        projectId: "project-copy",
-        destinationOrigin: "https://api.example.test",
-      },
-    );
-    expect(copiedProjectDenied.isError).toBe(true);
+    // The wildcard grant does not follow a copied project: that project is
+    // authorized by a whole-web grant of its own, recorded on first use.
+    const copiedProject = await browser.runBrowserScriptWithProfile(undefined, {
+      projectId: "project-copy",
+      destinationOrigin: "https://api.example.test",
+    });
+    expect(copiedProject.isError).toBe(false);
+    expect(
+      await browser.listBrowserGrants({ projectId: "project-copy" }),
+    ).toMatchObject([{ projectId: "project-copy", originScope: "*" }]);
 
     const alias = projectLoopbackAlias("project-browser-test", 3000);
     await browser.createBrowserGrant({
@@ -2321,6 +2371,7 @@ describe("Browser public plugin contract", () => {
         hostId: "host-browser-test",
         name: "Temporary lifecycle target",
       });
+      await browser.withdrawDefaultAccess();
       const denied = await browser.runBrowserScriptWithProfile(undefined, {
         destinationOrigin: "https://temporary-lifecycle.example.test",
       });
@@ -3336,6 +3387,7 @@ describe("Browser public plugin contract", () => {
         hostId: "host-browser-test",
         name: "Authority target",
       });
+      await browser.withdrawDefaultAccess({ profileId: profile.profileId });
       const persistent = await browser.createBrowserGrant({
         projectId: "project-browser-test",
         hostId: "host-browser-test",
@@ -3426,6 +3478,7 @@ describe("Browser public plugin contract", () => {
         hostId: "host-browser-test",
         name: "Expiry authority",
       });
+      await browser.withdrawDefaultAccess({ profileId: profile.profileId });
       const grant = await browser.createBrowserGrant({
         projectId: "project-browser-test",
         hostId: "host-browser-test",
@@ -3492,6 +3545,7 @@ describe("Browser public plugin contract", () => {
         hostId: "host-browser-test",
         name: "Missing authority",
       });
+      await browser.withdrawDefaultAccess({ profileId: profile.profileId });
       const grant = await browser.createBrowserGrant({
         projectId: "project-browser-test",
         hostId: "host-browser-test",
@@ -3599,13 +3653,16 @@ describe("Browser public plugin contract", () => {
       snapshot: preparedSnapshot,
       profileStore,
       deferProfileInventory: true,
-      deferProfileInventoryAfterCalls: 1,
+      // Withdrawing Default Access reads the inventory once more before the
+      // denied call; the deferred read must still be the approval's.
+      deferProfileInventoryAfterCalls: 2,
     });
     try {
       const profile = await browser.createBrowserProfile({
         hostId: "host-browser-test",
         name: "Approval epoch",
       });
+      await browser.withdrawDefaultAccess({ profileId: profile.profileId });
       const denied = browserScriptFailureSchema.parse(
         JSON.parse(
           (
@@ -4571,10 +4628,6 @@ describe("Browser public plugin contract", () => {
     });
 
     const settings = browser.renderSettings();
-    const reviewButton = await settings.findByRole("button", {
-      name: "Review Browser activity",
-    });
-    fireEvent.click(reviewButton);
     const records = await settings.findByLabelText("Browser activity records");
     expect(records.textContent).toContain("browser-script");
 
@@ -4596,7 +4649,9 @@ describe("Browser public plugin contract", () => {
       settings.getByRole("button", { name: "Clear Browser activity" }),
     );
     await settings.findByText("Cleared 2 Browser activity records.");
-    expect(records.textContent).toBe("[]");
+    await settings.findByText(
+      "No agent activity recorded for this profile yet.",
+    );
     await browser.dispose();
   });
 
@@ -4625,12 +4680,9 @@ describe("Browser public plugin contract", () => {
     await settings.findByText(/Created Browser Grant grant-/);
     expect(settings.getByText("https://app.example.test")).toBeDefined();
 
-    fireEvent.click(
-      settings.getByRole("button", { name: "Inspect Browser Grants" }),
-    );
     await settings.findByRole("list", { name: "Browser Profile Grant list" });
     const revokeButton = settings.getByRole("button", {
-      name: /Revoke Browser Grant grant-/,
+      name: /Revoke grant for project-browser-test on https:\/\/app\.example\.test/,
     });
     fireEvent.click(revokeButton);
     await settings.findByText(/Browser Grant grant-.*: revoked\./);
@@ -4737,11 +4789,21 @@ describe("Browser public plugin contract", () => {
       code: "return document.title;",
       destinationOrigin: "https://example.com",
     });
-    fireEvent.click(
-      settings.getByRole("button", { name: "Review Browser activity" }),
+    // The activity block follows the profile agents use, and names it.
+    const activityBlock = await settings.findByLabelText(
+      "Browser activity controls for host host-browser-test",
     );
-    const records = await settings.findByLabelText("Browser activity records");
-    expect(records.textContent).toContain(selectedProfileId);
+    await waitFor(() =>
+      expect(activityBlock.textContent).toContain(selectedProfileId),
+    );
+    fireEvent.click(
+      settings.getByRole("button", { name: "Refresh Browser activity" }),
+    );
+    await waitFor(() =>
+      expect(
+        settings.getByLabelText("Browser activity records").textContent,
+      ).toContain("browser-script"),
+    );
 
     await browser.dispose();
   });
@@ -4779,53 +4841,57 @@ describe("Browser public plugin contract", () => {
   });
 
   it("exposes profile creation, rename, and selection controls in Settings", async () => {
-    const browser = await createPublicPluginHarness({
-      snapshot: preparedSnapshot,
-    });
-    const settings = browser.renderSettings();
+    const browser = await createPublicPluginHarness({ status: healthyStatus });
+    try {
+      const settings = browser.renderSettings();
 
-    await settings.findByText("Browser Profiles");
-    await settings.findByText(DEFAULT_PROFILE_ID);
-    const name = await settings.findByRole("textbox", {
-      name: "New Browser Profile name",
-    });
-    fireEvent.change(name, { target: { value: "Settings profile" } });
-    fireEvent.click(
-      settings.getByRole("button", { name: "Create Browser Profile" }),
-    );
-    await settings.findByText("Settings profile");
+      await settings.findByText("Browser Profiles");
+      await settings.findAllByText(DEFAULT_PROFILE_ID);
+      const name = await settings.findByRole("textbox", {
+        name: "New Browser Profile name",
+      });
+      fireEvent.change(name, { target: { value: "Settings profile" } });
+      fireEvent.click(
+        settings.getByRole("button", { name: "Create Browser Profile" }),
+      );
+      await settings.findByText("Settings profile");
 
-    const rename = settings.getByRole("textbox", {
-      name: "Rename Browser Profile Settings profile",
-    });
-    fireEvent.change(rename, { target: { value: "Settings renamed" } });
-    fireEvent.click(
-      settings.getByRole("button", { name: "Rename Settings profile" }),
-    );
-    await settings.findByText("Settings renamed");
+      const rename = settings.getByRole("textbox", {
+        name: "Rename Browser Profile Settings profile",
+      });
+      fireEvent.change(rename, { target: { value: "Settings renamed" } });
+      fireEvent.click(
+        settings.getByRole("button", { name: "Save Settings profile" }),
+      );
+      await settings.findByText("Settings renamed");
 
-    fireEvent.change(
-      settings.getByRole("textbox", {
-        name: "Locale for Browser Profile Settings renamed",
-      }),
-      { target: { value: "de-DE" } },
-    );
-    fireEvent.change(
-      settings.getByRole("textbox", {
-        name: "Timezone for Browser Profile Settings renamed",
-      }),
-      { target: { value: "Europe/Berlin" } },
-    );
-    fireEvent.click(
-      settings.getByRole("button", { name: "Save settings Settings renamed" }),
-    );
-    await settings.findByText(/Locale: de-DE/);
+      fireEvent.change(
+        settings.getByRole("textbox", {
+          name: "Locale for Browser Profile Settings renamed",
+        }),
+        { target: { value: "de-DE" } },
+      );
+      fireEvent.change(
+        settings.getByRole("textbox", {
+          name: "Timezone for Browser Profile Settings renamed",
+        }),
+        { target: { value: "Europe/Berlin" } },
+      );
+      const selectButton = settings.getByRole("button", {
+        name: "Select Settings renamed",
+      }) as HTMLButtonElement;
+      fireEvent.click(
+        settings.getByRole("button", { name: "Save Settings renamed" }),
+      );
+      // The save disables the profile's buttons while it is in flight; wait for
+      // it to settle before selecting, so the click is not swallowed.
+      await waitFor(() => expect(selectButton.disabled).toBe(false));
 
-    fireEvent.click(
-      settings.getByRole("button", { name: "Select Settings renamed" }),
-    );
-    await settings.findByText(/Selected: profile-/);
-    await browser.dispose();
+      fireEvent.click(selectButton);
+      await settings.findByText(/Selected: profile-/);
+    } finally {
+      await browser.dispose();
+    }
   });
 
   it("manages quarantined Host Downloads from Settings", async () => {
@@ -4839,12 +4905,6 @@ describe("Browser public plugin contract", () => {
         contents: "quarantined bytes",
       });
       const settings = browser.renderSettings();
-
-      fireEvent.click(
-        await settings.findByRole("button", {
-          name: "Inspect Host Downloads",
-        }),
-      );
 
       // The file is named and its quarantine state is stated; leaving
       // quarantine stays an explicit owner decision.

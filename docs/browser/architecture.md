@@ -81,8 +81,10 @@ See [safe-login.md](safe-login.md) for the full workflow.
   seconds. Agent calls fail immediately while an owner has control and wait at
   most 30 seconds behind other agents before returning `browser_busy`. Waiting
   calls run in arrival order and are removed on cancellation or owner takeover.
-- Agents are denied by default. A persistent **Profile Grant** authorizes one BB
-  project to use one profile at explicit web origins. (ADR 0004)
+- A persistent **Profile Grant** authorizes one BB project to use one profile
+  within an Origin Scope (ADR 0004). A project's first agent operation on a
+  profile records a whole-web grant automatically; revoking it in Settings puts
+  that project on the Grant Request flow (ADR 0015).
 - Agent access is exposed through a native `browser_script` tool, an equivalent
   `bb browser` CLI, and a bundled skill. Those boundaries enforce profile,
   project, origin, timeout, and lease policy. (ADR 0008)

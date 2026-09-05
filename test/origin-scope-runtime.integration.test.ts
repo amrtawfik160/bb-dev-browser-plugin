@@ -1,5 +1,8 @@
 import { chromium } from "playwright";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { originScopeMatcher } from "../authorization.js";
 import {
@@ -78,6 +81,57 @@ describe("pinned Chromium Origin Scope runtime", () => {
     } finally {
       await guard?.dispose();
       await context.close();
+    }
+  });
+
+  it("parks an out-of-scope owner tab on about:blank and restores it after the call", async () => {
+    const server = createServer((request, response) => {
+      response.setHeader("content-type", "text/html");
+      response.end(`<title>${request.headers.host}</title><h1>owner</h1>`);
+    });
+    const port = await listen(server);
+    // The guard connects over CDP on its own, as the host does, so disposing
+    // it disconnects the guard without closing the owner's browser.
+    const userDataDir = await mkdtemp(join(tmpdir(), "bb-origin-scope-"));
+    const context = await chromium.launchPersistentContext(userDataDir, {
+      headless: true,
+      args: ["--remote-debugging-port=0"],
+    });
+    const ownerUrl = `http://localhost:${port}/owner`;
+    try {
+      const agentTab = context.pages()[0]!;
+      const ownerTab = await context.newPage();
+      await agentTab.goto(`http://127.0.0.1:${port}/agent`);
+      await ownerTab.goto(ownerUrl);
+      const devToolsPort = (
+        await readFile(join(userDataDir, "DevToolsActivePort"), "utf8")
+      ).split("\n")[0]!;
+      const guardBrowser = await chromium.connectOverCDP(
+        `http://127.0.0.1:${devToolsPort}`,
+      );
+      const guard = await installHostOriginScopeGuard(
+        "unused",
+        policy(`http://127.0.0.1:${port}`),
+        async () => guardBrowser,
+      );
+      try {
+        expect(guard.deniedError()).toBeNull();
+        expect(ownerTab.isClosed()).toBe(false);
+        await expect.poll(() => ownerTab.url()).toBe("about:blank");
+        expect(await ownerTab.content()).not.toContain("owner");
+        expect(agentTab.url()).toBe(`http://127.0.0.1:${port}/agent`);
+      } finally {
+        await guard.dispose();
+      }
+      expect(ownerTab.isClosed()).toBe(false);
+      await expect.poll(() => ownerTab.url()).toBe(ownerUrl);
+      await expect
+        .poll(() => ownerTab.locator("h1").textContent())
+        .toBe("owner");
+    } finally {
+      await context.close();
+      await rm(userDataDir, { recursive: true, force: true });
+      await close(server);
     }
   });
 

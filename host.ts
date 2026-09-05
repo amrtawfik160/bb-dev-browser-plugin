@@ -749,8 +749,15 @@ export function createBrowserHostEntry(
     requestedActiveTabId?: string,
   ) {
     const pages = await browserRuntime.listPages(target);
-    const protectedTabId =
-      requestedActiveTabId ?? (await browserRuntime.activeTabId?.(target));
+    let protectedTabId = requestedActiveTabId;
+    if (protectedTabId === undefined && pages.length > 0) {
+      // The active-tab read fails when the browser has no front page. The
+      // inventory is still authoritative: syncing it drops tabs the browser no
+      // longer has, which is what keeps stale ids out of the strip.
+      protectedTabId = await browserRuntime
+        .activeTabId?.(target)
+        .catch(() => undefined);
+    }
     strip.syncPages(
       pages.map((page) => ({
         id: page.id,

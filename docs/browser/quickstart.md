@@ -100,9 +100,16 @@ All panels receive live state, but only one owner client or agent holds the
 
 ## Grants and requests
 
-Agents are **denied by default**. A persistent **Profile Grant** authorizes one
-BB project to fully automate one profile at explicit web origins. Grants are
-managed in authenticated Browser Settings, not from a thread.
+A persistent **Profile Grant** authorizes one BB project to fully automate one
+profile within an Origin Scope. A project's first agent operation on a profile
+records a whole-web grant automatically (**Default Access**); revoke it under
+**Agent access** in Browser Settings to put that project on the Grant Request
+flow described below, and grant the whole web again to restore it.
+
+Browser Settings has six sections: **Browser** (hosts and readiness),
+**Agent access** (grants and requests), **Profiles**, **Downloads**,
+**Activity**, and **Maintenance** (setup, backups, disable, uninstall, purge,
+and diagnostics). Grants are managed there, not from a thread.
 
 - **Origin Scope** uses exact `scheme://host:port` origins and optional explicit
   subdomain patterns such as `https://*.example.test`. URL paths do not narrow

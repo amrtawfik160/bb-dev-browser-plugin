@@ -81,6 +81,10 @@ clipboard is supported.
   no-commit event guarantee.
   Ordinary cross-origin subresources may render. Cross-origin frame documents
   therefore need their own grant.
+- Owner tabs outside an agent's Origin Scope are parked on `about:blank` while
+  that agent's call runs and reloaded when it ends. Scroll position and unsaved
+  form input in those tabs do not survive an agent call, and back/forward
+  cache is disabled for the whole browser, so Back always reloads.
 - Exact `about:blank` is the only safe internal page. Restored Chrome new-tab /
   error documents are cleared to `about:blank` before agent access; direct
   navigation to them is denied. Other

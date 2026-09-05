@@ -197,8 +197,8 @@ function webOrigin(address: string): string | null {
 function deniedExistingPages(
   contexts: readonly BrowserContext[],
   matcher: OriginScopeMatcher,
-): { denial: BrowserOriginScopeDeniedError; page: Page }[] {
-  const denied: { denial: BrowserOriginScopeDeniedError; page: Page }[] = [];
+): Page[] {
+  const denied: Page[] = [];
   for (const context of contexts) {
     for (const page of context.pages()) {
       const address = page.url();
@@ -209,29 +209,82 @@ function deniedExistingPages(
         (classification.kind === "web" &&
           !matcherPermitsOrigin(matcher, classification.origin))
       ) {
-        denied.push({
-          denial: new BrowserOriginScopeDeniedError(
-            classification.kind === "web" ? classification.origin : null,
-          ),
-          page,
-        });
+        denied.push(page);
       }
     }
   }
   return denied;
 }
 
-async function closeDeniedExistingPages(denied: readonly { page: Page }[]) {
+type ParkedPage = { page: Page; url: string };
+
+const PARKED_PAGE_RESTORE_TIMEOUT_MS = 5_000;
+
+/**
+ * Put an owner tab that is outside the agent's Origin Scope beyond the agent's
+ * reach for the length of the call without discarding it. The tab is parked on
+ * exact `about:blank`, the one safe internal document, and brought back when
+ * the guard is disposed. Closing these tabs instead, as the guard once did,
+ * meant every agent call under an exact-origin grant threw away whatever else
+ * the owner had open and left the shared strip pointing at pages that no
+ * longer existed. A tab that refuses to park (a beforeunload prompt, a hung
+ * renderer) is still closed so the call never starts with an out-of-scope
+ * document readable.
+ */
+async function parkDeniedExistingPages(
+  denied: readonly Page[],
+  timeoutMs: number,
+  parked: ParkedPage[],
+): Promise<{ failures: unknown[]; deniedOrigin: string | null }> {
   const results = await Promise.allSettled(
-    denied.map(({ page }) => page.close()),
+    denied.map(async (page) => {
+      const url = page.url();
+      try {
+        await page.goto("about:blank", { timeout: timeoutMs });
+      } catch {
+        await page.close();
+        return;
+      }
+      if (page.isClosed()) return;
+      if (page.url() !== "about:blank") {
+        await page.close();
+        return;
+      }
+      parked.push({ page, url });
+    }),
   );
-  const failures = rejectedReasons(results);
-  if (failures.length > 0) {
-    throw cleanupFailure(
-      "An out-of-scope Browser Tab could not be closed.",
-      failures,
-    );
-  }
+  const failures: unknown[] = [];
+  let deniedOrigin: string | null = null;
+  results.forEach((result, index) => {
+    if (result.status !== "rejected") return;
+    failures.push(result.reason);
+    deniedOrigin ??= webOrigin(denied[index]!.url());
+  });
+  return { failures, deniedOrigin };
+}
+
+/**
+ * Bring parked owner tabs back once the routes and page guards are gone. A tab
+ * the agent navigated during the call is left where the agent put it, exactly
+ * as a shared active tab would be. Restoration is best effort: a tab that
+ * cannot return keeps its history, so the owner's Back button still works.
+ */
+async function restoreParkedPages(parked: readonly ParkedPage[]) {
+  await Promise.allSettled(
+    parked.map(async ({ page, url }) => {
+      if (page.isClosed() || page.url() !== "about:blank") return;
+      await page.goBack({
+        timeout: PARKED_PAGE_RESTORE_TIMEOUT_MS,
+        waitUntil: "commit",
+      });
+      if (!page.isClosed() && page.url() === "about:blank") {
+        await page.goto(url, {
+          timeout: PARKED_PAGE_RESTORE_TIMEOUT_MS,
+          waitUntil: "commit",
+        });
+      }
+    }),
+  );
 }
 
 export function originRequiresCertificateBypass(
@@ -446,6 +499,7 @@ export async function installHostOriginScopeGuard(
   const registeredPages = new Set<Page>();
   const pendingPageInstallations = new Set<Promise<void>>();
   const installationFailures: unknown[] = [];
+  const parkedPages: ParkedPage[] = [];
   let browserCloseAttempt: Promise<void> | undefined;
   let browserCloseObserved = false;
   const browserCloseFailures: unknown[] = [];
@@ -542,8 +596,20 @@ export async function installHostOriginScopeGuard(
     await Promise.all([installRoutes([registration]), ...pageInstallations]);
     const existingDenials = deniedExistingPages([context], policy.matcher);
     if (existingDenials.length > 0) {
-      recordDenial(existingDenials[0].denial);
-      await closeDeniedExistingPages(existingDenials);
+      const outcome = await parkDeniedExistingPages(
+        existingDenials,
+        policy.timeoutMs,
+        parkedPages,
+      );
+      if (outcome.failures.length > 0) {
+        // An out-of-scope document is still readable, so the call must not
+        // proceed: surface a typed denial whose cause retires the instance.
+        recordDenial(new BrowserOriginScopeDeniedError(outcome.deniedOrigin));
+        throw cleanupFailure(
+          "An out-of-scope Browser Tab could not be parked or closed.",
+          outcome.failures,
+        );
+      }
     }
   };
   const observeContext = (context: BrowserContext) => {
@@ -592,6 +658,9 @@ export async function installHostOriginScopeGuard(
     );
     cleanupFailures.push(...(await removeRoutes(registrations)));
     cleanupFailures.push(...(await settlePendingRoutes(registrations)));
+    // Routes and page guards are gone, so bringing the owner's tabs back is an
+    // ordinary navigation again rather than a denied one.
+    await restoreParkedPages(parkedPages.splice(0));
     cleanupFailures.push(...(await collectBrowserCloseFailures()));
     return cleanupFailures;
   };

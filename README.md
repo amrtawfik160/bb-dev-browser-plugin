@@ -5,10 +5,10 @@
 It puts a real browser in BB's right panel, running on the enrolled host that
 owns the repository. Cookies, site storage, and a Restorable Session live in a
 named Browser Profile on that host. You watch and drive it from a streamed
-Browser Panel. Agents only get Playwright access after you grant them a
-Profile Grant.
+Browser Panel. Agents get Playwright access to the whole web by default; the
+grant that records it is visible and revocable in Browser Settings.
 
-Agents start with nothing. There is no public browser-control URL.
+There is no public browser-control URL.
 
 Version 0.1.0 runs on Ubuntu and Debian x86_64. It needs BB Connect even if
 you are sitting at the same machine. The browser process runs as a dedicated
@@ -24,7 +24,15 @@ and agents only act where you said they could.
 ## What it does
 
 **Browser Panel.** Opens from an existing thread or the New thread launcher.
-Opening it again focuses the panel already using that profile.
+Opening it again focuses the panel already using that profile. A toolbar, one
+scrolling tab strip, and the page below them, drawn in BB's own theme so it
+follows light and dark. While an agent drives the browser the page carries an
+amber frame and the agent's stated purpose; nothing else uses that colour.
+
+**Browser Settings.** Six sections under Browser in BB settings: **Browser**
+(hosts and readiness), **Agent access** (grants and pending requests),
+**Profiles**, **Downloads**, **Activity**, and **Maintenance** (setup,
+backups, disable, uninstall, purge, diagnostics).
 
 **Browser Profiles.** Named identities on one host. Reuse them across
 repositories on that host. They never copy to another machine.
@@ -35,13 +43,18 @@ with input.
 **Safe Login Mode.** For sites that reject automation. You sign in. Agents get
 no pixels and no DOM until it ends.
 
-**Profile Grants and Grant Requests.** You grant exact origins, subdomain
-patterns, or `*` in authenticated Browser Settings. A denied web origin
-returns a typed error and can raise a Grant Request. A non-web navigation
-returns the same typed error and does not raise a request.
+**Profile Grants and Grant Requests.** A project's first agent call on a
+profile records a whole-web grant automatically. Revoke it in authenticated
+Browser Settings to put that project back on the request flow, where you grant
+exact origins, subdomain patterns, or `*`, and a denied web origin raises a
+Grant Request. A non-web navigation returns a typed error and does not raise a
+request.
 
 **Origin Scope.** Exact `scheme://host:port`, optional subdomain patterns.
-Denied pages are removed. Exact `about:blank` is the safe internal page. Restored Chrome new-tab / error documents are cleared to `about:blank` before agent access.
+Tabs outside an agent's scope are parked on `about:blank` during its call and
+restored afterwards. Exact `about:blank` is the safe internal page. Restored
+Chrome new-tab / error documents are cleared to `about:blank` before agent
+access.
 
 **Control Lease.** One owner client or one agent sends input at a time. You
 can take it back.
@@ -94,8 +107,9 @@ Until that finishes, the panel shows **Setup required**.
 
 ### Owner
 
-Open **Browser** from a thread's right panel or the New thread launcher. Grant
-origins only in authenticated Browser Settings.
+Open **Browser** from a thread's right panel or the New thread launcher. Agent
+access is on by default; review or revoke it under **Agent access** in
+authenticated Browser Settings.
 
 ```text
 bb browser status
@@ -109,9 +123,9 @@ site fights automation.
 
 ### Agent
 
-Do not drive anything until the owner grants an origin in Browser Settings.
-Then use `browser_script` or `bb browser script`. `page` is the active tab.
-Whatever you `return` is the result. Pass an exact origin every time.
+Use `browser_script` or `bb browser script`; any web origin works by default.
+`page` is the active tab. Whatever you `return` is the result. Pass an exact
+origin every time.
 
 ```text
 bb browser script --purpose "Read the page title" \
@@ -119,8 +133,8 @@ bb browser script --purpose "Read the page title" \
   --code "return await page.title()"
 ```
 
-A denied web origin returns `origin_denied` and may raise a Grant Request. A
-non-web navigation returns `origin_denied` and does not. There is no
+`origin_denied` means the owner revoked this project's access (a Grant Request
+is attached) or the navigation is non-web (no request). There is no
 `document` global.
 
 Typed results, contention, and retry live in
@@ -172,8 +186,11 @@ That runs `test/browser-auth.integration.test.ts` only.
 
 ```
 app.tsx, panel-*.ts(x)   Browser Panel UI, protocol, and shared session
+panel-primitives.tsx     Buttons, fields, notices, glyphs, and list states
+settings-*.ts(x)         Browser Settings sections and selected-profile store
 host.ts                  Workspace-host browser runtime
 server.ts                Plugin RPC and bb browser CLI
+authorization.ts         Profile Grants, Default Access, and Origin Scope
 docs/browser/            Owner, operator, agent, and security guides
 docs/adr/                Architecture decisions
 test/                    Contract, evidence, and integration tests
@@ -184,8 +201,9 @@ CONTEXT.md               Glossary
 
 ## Security and privacy
 
-Agents are denied by default. Each automation act needs a Profile Grant bound
-to the BB project.
+Agents may drive any web origin by default. Each automation act still runs
+under a Profile Grant bound to the BB project, recorded automatically on first
+use and revocable in Browser Settings.
 
 Automation goes through bounded `browser_script` calls with typed results.
 

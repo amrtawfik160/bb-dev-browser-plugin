@@ -1,16 +1,15 @@
 import { useEffect, useRef, useState } from "react";
 import type React from "react";
 import type { ReactNode } from "react";
-import {
-  BROWSER_PANEL_ACCENT_CONTRAST,
-  BROWSER_PANEL_BORDER_CONTRAST,
-  BROWSER_PANEL_STATUS_BLOCKED_CONTRAST,
-  BROWSER_PANEL_STATUS_READY_CONTRAST,
-  BROWSER_PANEL_STATUS_SETTLING_CONTRAST,
-  type BrowserStatus,
-  type BrowserTab,
-} from "./contracts.js";
+import type { BrowserStatus, BrowserTab } from "./contracts.js";
 import { isBbGlobalShortcut } from "./panel-chrome.js";
+import {
+  Button,
+  Glyph,
+  IconButton,
+  StatusDot,
+  inputClassName,
+} from "./panel-primitives.js";
 
 /**
  * The browser the owner sees (issue #50): a toolbar, a tab strip, and the page
@@ -147,27 +146,21 @@ function BrowserOptionsMenu({
 
   return (
     <div className="relative">
-      <button
-        type="button"
+      <IconButton
         ref={triggerRef}
-        aria-label="Browser options"
+        label="Browser options"
+        glyph="more"
         aria-haspopup="menu"
         aria-expanded={open}
-        className="rounded border px-2 py-1 text-sm"
         onClick={() => setOpen((current) => !current)}
-      >
-        ⋯
-      </button>
+      />
       {!open ? null : (
         <div
           role="menu"
           aria-label="Browser options"
           onKeyDown={handleKeyDown}
-          className="absolute right-0 z-20 mt-1 w-64 rounded border bg-background p-1 text-left shadow-md"
-          style={{
-            borderColor: BROWSER_PANEL_BORDER_CONTRAST,
-            transition: reducedMotion ? "none" : undefined,
-          }}
+          className="absolute right-0 z-20 mt-1 w-64 rounded-lg border border-border bg-popover p-1 text-left text-popover-foreground shadow-md"
+          style={{ transition: reducedMotion ? "none" : undefined }}
         >
           {options.map((option) => {
             if (option.kind === "note") {
@@ -187,7 +180,7 @@ function BrowserOptionsMenu({
               },
               tabIndex: index === activeIndex ? 0 : -1,
               className:
-                "block w-full rounded px-3 py-2 text-left text-sm disabled:opacity-50",
+                "block w-full rounded-md px-3 py-2 text-left text-sm hover:bg-state-hover focus-visible:bg-state-hover focus-visible:outline-none disabled:opacity-50",
               onMouseEnter: () => setActiveIndex(index),
             } as const;
             if (option.kind === "toggle") {
@@ -200,10 +193,16 @@ function BrowserOptionsMenu({
                   {...shared}
                   onClick={() => option.onChange(!option.checked)}
                 >
-                  <span aria-hidden="true">{option.checked ? "☑" : "☐"} </span>
-                  {option.label}
+                  <span className="flex items-center gap-2">
+                    <span className="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-sm border border-input">
+                      {option.checked ? (
+                        <Glyph name="check" className="h-3 w-3" />
+                      ) : null}
+                    </span>
+                    {option.label}
+                  </span>
                   {option.description === undefined ? null : (
-                    <span className="block text-xs text-muted-foreground">
+                    <span className="block pl-6 text-xs text-muted-foreground">
                       {option.description}
                     </span>
                   )}
@@ -275,7 +274,7 @@ function BrowserOmnibox({
       <input
         ref={inputRef}
         aria-label="Address or search"
-        className="w-full min-w-0 rounded border px-3 py-1 text-sm"
+        className={`${inputClassName} h-7 py-0`}
         value={draft ?? address}
         onChange={(event) => setDraft(event.target.value)}
         onKeyDown={(event) => {
@@ -332,34 +331,25 @@ export function BrowserToolbar({
   const settling = browserStateIsSettling(status.state);
   const isController = control.role === "controller";
   return (
-    <div className="border-b bg-background">
-      <div className="flex items-center gap-1 px-2 py-1">
+    <div className="border-b border-border bg-background">
+      <div className="flex h-9 items-center gap-1 px-2">
         {isController ? (
           <>
-            <button
-              type="button"
-              aria-label="Go back"
-              className="rounded border px-2 py-1 text-sm"
+            <IconButton
+              label="Go back"
+              glyph="back"
               onClick={() => navigation.onHistory("back")}
-            >
-              ←
-            </button>
-            <button
-              type="button"
-              aria-label="Go forward"
-              className="rounded border px-2 py-1 text-sm"
+            />
+            <IconButton
+              label="Go forward"
+              glyph="forward"
               onClick={() => navigation.onHistory("forward")}
-            >
-              →
-            </button>
-            <button
-              type="button"
-              aria-label="Reload page"
-              className="rounded border px-2 py-1 text-sm"
+            />
+            <IconButton
+              label="Reload page"
+              glyph="reload"
               onClick={() => navigation.onHistory("reload")}
-            >
-              ⟳
-            </button>
+            />
             <BrowserOmnibox
               address={navigation.address}
               autoFocus={navigation.focusAddress}
@@ -371,17 +361,14 @@ export function BrowserToolbar({
           // situation, where the address field would otherwise be, so it is
           // obvious both that this panel cannot drive the browser and what to
           // do about it.
-          <button
-            type="button"
-            className="grow rounded border px-3 py-1 text-sm"
-            style={{
-              backgroundColor: BROWSER_PANEL_ACCENT_CONTRAST,
-              color: "white",
-            }}
+          <Button
+            variant="primary"
+            size="sm"
+            className="grow"
             onClick={control.onTakeControl}
           >
             Take control
-          </button>
+          </Button>
         )}
         {settling ? (
           <span
@@ -397,41 +384,42 @@ export function BrowserToolbar({
             {control.spectatorCount} watching
           </span>
         )}
-        <button
-          type="button"
+        <Button
+          variant="ghost"
+          size="sm"
           aria-label={`Browser status: ${status.label}`}
-          className="rounded px-1 py-1 text-xs"
+          title={status.label}
+          className="w-7 px-0"
           onClick={onStatusSelect}
         >
-          <span
-            aria-hidden="true"
-            className="inline-block h-2 w-2 rounded-full align-middle"
-            style={{
-              backgroundColor:
-                status.state === "healthy"
-                  ? BROWSER_PANEL_STATUS_READY_CONTRAST
-                  : settling
-                    ? BROWSER_PANEL_STATUS_SETTLING_CONTRAST
-                    : BROWSER_PANEL_STATUS_BLOCKED_CONTRAST,
-            }}
+          <StatusDot
+            tone={
+              status.state === "healthy"
+                ? "ready"
+                : settling
+                  ? "settling"
+                  : "blocked"
+            }
+            label={status.label}
           />
-        </button>
+        </Button>
         <BrowserOptionsMenu options={options} reducedMotion={reducedMotion} />
       </div>
       {control.agentPurpose === null ? null : (
-        <div
-          className="flex flex-wrap items-center gap-2 px-2 pb-1 text-xs"
-          style={{ color: BROWSER_PANEL_ACCENT_CONTRAST }}
-        >
-          <span>An agent is using this browser: {control.agentPurpose}</span>
+        // The one place the panel uses the attention color: the owner's
+        // authenticated session is being driven by something that is not them.
+        <div className="flex flex-wrap items-center gap-2 border-t border-attention/40 bg-surface-attention px-2 py-1 text-xs text-foreground">
+          <span className="min-w-0 grow truncate">
+            Agent: {control.agentPurpose}
+          </span>
           {isController ? (
-            <button
-              type="button"
-              className="rounded border px-2 py-1"
+            <Button
+              variant="secondary"
+              size="sm"
               onClick={control.onTakeControl}
             >
               Interrupt the agent
-            </button>
+            </Button>
           ) : null}
         </div>
       )}
@@ -500,7 +488,7 @@ export function BrowserAccessRequestNotices({
   return (
     <section
       aria-label="Site access requests"
-      className="overflow-auto border-b px-2 py-2 text-left"
+      className="overflow-auto border-b border-border px-2 py-2 text-left"
       // However many sites are waiting, the page keeps most of the panel.
       style={{ maxHeight: "40%" }}
     >
@@ -514,7 +502,10 @@ export function BrowserAccessRequestNotices({
             ? `Allow ${request.origin} for an hour`
             : `Allow ${request.origin}`;
           return (
-            <li key={browserAccessRequestKey(request)} className="text-sm">
+            <li
+              key={browserAccessRequestKey(request)}
+              className="rounded-lg border border-border bg-card p-3 text-sm"
+            >
               <p>
                 Let agents in this project use{" "}
                 <strong className="break-all">{request.origin}</strong>?
@@ -523,36 +514,32 @@ export function BrowserAccessRequestNotices({
                   : ""}
               </p>
               <div className="mt-2 flex flex-wrap items-center gap-2">
-                <button
-                  type="button"
-                  className="rounded px-3 py-1 text-xs"
-                  style={{
-                    backgroundColor: BROWSER_PANEL_ACCENT_CONTRAST,
-                    color: "white",
-                  }}
+                <Button
+                  variant="primary"
+                  size="sm"
                   disabled={answering !== null}
                   onClick={() => onAllow(request)}
                 >
                   {allowLabel}
-                </button>
-                <button
-                  type="button"
-                  className="rounded border px-3 py-1 text-xs"
+                </Button>
+                <Button
+                  variant="secondary"
+                  size="sm"
                   disabled={answering !== null}
                   onClick={() => onDeny(request)}
                 >
                   {`Deny ${request.origin}`}
-                </button>
-                <button
-                  type="button"
-                  className="rounded px-2 py-1 text-xs underline"
+                </Button>
+                <Button
+                  variant="link"
+                  className="text-xs"
                   disabled={answering !== null}
                   onClick={() => onTrustProject(request)}
                 >
                   Allow every site for this project
-                </button>
+                </Button>
               </div>
-              <p className="mt-1 text-xs text-muted-foreground">
+              <p className="mt-2 text-xs text-muted-foreground">
                 Whatever you choose, the agent does not carry on by itself: it
                 has to try again.
               </p>
@@ -628,10 +615,10 @@ export function BrowserTabStripView({
   }
 
   return (
-    <div className="flex items-center gap-1 border-b px-2 py-1">
+    <div className="flex items-center gap-1 border-b border-border px-2 py-1">
       <ul
         aria-label="Browser tabs"
-        className="flex min-w-0 grow flex-wrap items-center gap-1 text-xs"
+        className="flex min-w-0 grow items-center gap-1 overflow-x-auto text-xs [scrollbar-width:none]"
         onKeyDown={handleKeyDown}
       >
         {tabs.map((tab, index) => {
@@ -640,12 +627,11 @@ export function BrowserTabStripView({
           return (
             <li
               key={tab.tabId}
-              className="flex max-w-[16rem] items-center gap-1 rounded border px-2 py-1"
-              style={{
-                borderColor: active
-                  ? BROWSER_PANEL_ACCENT_CONTRAST
-                  : BROWSER_PANEL_BORDER_CONTRAST,
-              }}
+              className={`flex min-w-24 max-w-56 shrink-0 items-center gap-1 rounded-md border pr-1 pl-2 ${
+                active
+                  ? "border-surface-selected-border bg-surface-selected"
+                  : "border-border bg-card hover:bg-state-hover"
+              }`}
             >
               <button
                 type="button"
@@ -654,46 +640,77 @@ export function BrowserTabStripView({
                 }}
                 tabIndex={index === activeIndex ? 0 : -1}
                 aria-current={active ? "page" : undefined}
-                className="min-w-0 truncate"
-                style={{ fontWeight: active ? 600 : 400 }}
+                className={`flex min-w-0 grow items-center gap-1 py-1 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${
+                  active
+                    ? "font-medium text-foreground"
+                    : "text-muted-foreground"
+                }`}
                 title={tab.url}
                 disabled={!canDrive}
                 onClick={() => onSelect(tab.tabId)}
               >
-                {tab.origin === "popup" ? "↗ " : ""}
-                {label}
+                {tab.origin === "popup" ? (
+                  <Glyph name="external" className="h-3 w-3 shrink-0" />
+                ) : null}
+                <span className="truncate">{label}</span>
               </button>
               {canDrive ? (
-                <button
-                  type="button"
-                  aria-label={`Close ${label}`}
-                  className="rounded px-1"
+                <IconButton
+                  label={`Close ${label}`}
+                  glyph="close"
+                  className="h-5 w-5"
                   onClick={() => onClose(tab.tabId)}
-                >
-                  <span aria-hidden="true">×</span>
-                </button>
+                />
               ) : null}
             </li>
           );
         })}
       </ul>
       {canDrive ? (
-        <button
-          type="button"
-          aria-label="Open a new tab"
-          className="rounded border px-2 py-1 text-xs"
-          onClick={onOpen}
-        >
-          <span aria-hidden="true">+</span>
-        </button>
+        <IconButton label="Open a new tab" glyph="plus" onClick={onOpen} />
       ) : null}
       <span
-        className="whitespace-nowrap text-xs text-muted-foreground"
+        className="shrink-0 whitespace-nowrap text-xs text-muted-foreground"
         title="Every BB panel open on this browser shows these tabs."
       >
         Shared tabs
       </span>
     </div>
+  );
+}
+
+/**
+ * The host's readiness checks, one line each. A passed check gets a check
+ * mark in the host's success color and a failed one a dash; the label carries
+ * the meaning, so the glyphs are decoration for sighted readers only.
+ */
+export function ReadinessChecklist({ status }: { status: BrowserStatus }) {
+  return (
+    <ul
+      aria-label="Host readiness checklist"
+      className="mt-5 space-y-3 text-left"
+    >
+      {status.capabilities.map((capability) => {
+        const ready = capability.status === "ready";
+        return (
+          <li
+            key={capability.id}
+            className="flex gap-2 text-sm text-foreground"
+          >
+            <Glyph
+              name={ready ? "check" : "dash"}
+              className={`mt-0.5 h-4 w-4 shrink-0 ${
+                ready ? "text-success-foreground" : "text-muted-foreground"
+              }`}
+            />
+            <div className="min-w-0">
+              <span className="font-medium">{capability.label}</span>
+              <p className="text-muted-foreground">{capability.reason}</p>
+            </div>
+          </li>
+        );
+      })}
+    </ul>
   );
 }
 
@@ -720,8 +737,8 @@ export function BrowserNewTabSurface({
         signed in on that host, and never leave it.
       </p>
       <p className="max-w-md text-sm text-muted-foreground">
-        Manage agent access in Browser Settings, or approve a single site when
-        an agent asks to use it.
+        Agents in this project can drive this browser. Review or revoke that in
+        Browser Settings.
       </p>
     </section>
   );
