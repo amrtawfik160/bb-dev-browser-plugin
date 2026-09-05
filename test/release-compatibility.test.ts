@@ -101,6 +101,8 @@ describe("release compatibility (issue #23 AC7)", () => {
         /^@get-bb\/plugin-sdk\/testing(?:\/(?:app|host))?$/,
         /^@testing-library\/react$/,
         /^better-sqlite3$/,
+        /^esbuild$/,
+        /^react-dom\/client$/,
         /^playwright$/,
         /^react$/,
         /^typescript-eslint$/,

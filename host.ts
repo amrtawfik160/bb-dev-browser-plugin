@@ -749,8 +749,15 @@ export function createBrowserHostEntry(
     requestedActiveTabId?: string,
   ) {
     const pages = await browserRuntime.listPages(target);
-    const protectedTabId =
-      requestedActiveTabId ?? (await browserRuntime.activeTabId?.(target));
+    let protectedTabId = requestedActiveTabId;
+    if (protectedTabId === undefined && pages.length > 0) {
+      // The active-tab read fails when the browser has no front page. The
+      // inventory is still authoritative: syncing it drops tabs the browser no
+      // longer has, which is what keeps stale ids out of the strip.
+      protectedTabId = await browserRuntime
+        .activeTabId?.(target)
+        .catch(() => undefined);
+    }
     strip.syncPages(
       pages.map((page) => ({
         id: page.id,
@@ -1255,7 +1262,11 @@ export function createBrowserHostEntry(
       return readiness;
     }
     const target = await panelRuntimeTarget(request, dataDir);
-    if (target === null) return browserProfileUnavailableStatus(request);
+    if (target === null)
+      return browserProfileUnavailableStatus({
+        hostId: request.hostId,
+        profileId: request.profileId,
+      });
     panelControlSession({
       hostId: request.hostId,
       profileId: request.profileId,
@@ -1575,8 +1586,12 @@ export function createBrowserHostEntry(
       });
       return startBoundPanelTransport(request, dataDir, opened, () =>
         createCdpScreencastSource({
-          resolveEndpoint: async () =>
-            (await browserRuntime.start(target)).automationEndpoint,
+          tabs: strip,
+          resolveEndpoint: async () => {
+            const instance = await browserRuntime.start(target);
+            await reconcileRuntimeTabs(dataDir, target);
+            return instance.automationEndpoint;
+          },
           // The controller's logical viewport drives the screencast capture size;
           // spectators scale and letterbox it rather than resizing it.
           viewport: control.controllerViewport ?? undefined,
@@ -1886,8 +1901,9 @@ export function createBrowserHostEntry(
           context.experimental_paths.dataDir,
         );
       },
-      tabs: (target, context) => {
+      tabs: async (target, context) => {
         retainWorker(context);
+        await reconcileRuntimeTabs(context.experimental_paths.dataDir, target);
         return browserTabStrip(target).snapshot() as BrowserTabStrip;
       },
       panelControl: (request, context) => {

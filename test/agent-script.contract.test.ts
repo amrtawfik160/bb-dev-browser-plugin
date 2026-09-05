@@ -192,6 +192,160 @@ async function preparedLogs(
   return logs;
 }
 
+type BoundPage = {
+  id: string;
+  url: string;
+  visible: boolean;
+  broughtToFront: boolean;
+};
+
+/**
+ * Run the prepared preamble against a fake tab set and report which page the
+ * agent code received. Pages are plain objects: the boundary hardening only
+ * touches Playwright internals when they exist, so a minimal page and context
+ * shape is enough to exercise tab selection.
+ */
+async function boundPage(input: {
+  pages: readonly { id: string; url: string; visible?: boolean }[];
+  preferredOrigin?: string;
+  activeTabMarker?: string;
+}) {
+  const context = {
+    setDefaultNavigationTimeout: () => undefined,
+    setDefaultTimeout: () => undefined,
+  };
+  const pages = new Map<string, BoundPage & Record<string, unknown>>();
+  const makePage = (id: string, url: string, visible: boolean) => {
+    const page: BoundPage & Record<string, unknown> = {
+      id,
+      url,
+      visible,
+      broughtToFront: false,
+      context: () => context,
+      evaluate: async () => page.visible,
+      bringToFront: async () => {
+        page.broughtToFront = true;
+      },
+    };
+    pages.set(id, page);
+    return page;
+  };
+  for (const entry of input.pages) {
+    makePage(entry.id, entry.url, entry.visible ?? false);
+  }
+  let created = 0;
+  const fakeBrowser = createPinnedBrowserApi<BoundPage>({
+    listPages: async () =>
+      [...pages.values()].map((page) => ({ id: page.id, url: page.url })),
+    getPage: async (id: string) => {
+      const page = pages.get(id);
+      if (page === undefined) throw new Error(`unknown page ${id}`);
+      return page;
+    },
+    newPage: async () => {
+      created += 1;
+      return makePage(`created-${created}`, "about:blank", true);
+    },
+    closePage: async () => undefined,
+  });
+  const logs: string[] = [];
+  const prepared = prepareAgentExecution({
+    code: "return page.id;",
+    ...(input.preferredOrigin === undefined
+      ? {}
+      : { preferredOrigin: input.preferredOrigin }),
+    ...(input.activeTabMarker === undefined
+      ? {}
+      : { activeTabMarker: input.activeTabMarker }),
+  });
+  const run = new Function(
+    "browser",
+    "console",
+    `return (async () => {\n${prepared}\n})();`,
+  ) as (
+    browser: typeof fakeBrowser,
+    console: { log: (value: unknown) => void },
+  ) => Promise<void>;
+  await run(fakeBrowser, { log: (value) => logs.push(String(value)) });
+  return { logs, pages, created };
+}
+
+describe("agent page binding", () => {
+  it("falls back to the visible tab when no tab is on the preferred origin", async () => {
+    const bound = await boundPage({
+      pages: [
+        { id: "signin", url: "https://accounts.example.test/", visible: true },
+      ],
+      preferredOrigin: "https://app.example.test",
+    });
+    expect(bound.logs).toEqual(["signin"]);
+    expect(bound.pages.get("signin")?.broughtToFront).toBe(true);
+    expect(bound.created).toBe(0);
+  });
+
+  it("prefers the visible tab when several tabs share the preferred origin", async () => {
+    const bound = await boundPage({
+      pages: [
+        { id: "background", url: "https://app.example.test/a" },
+        { id: "front", url: "https://app.example.test/b", visible: true },
+      ],
+      preferredOrigin: "https://app.example.test",
+    });
+    expect(bound.logs).toEqual(["front"]);
+  });
+
+  it("binds a hidden tab on the preferred origin ahead of a visible tab elsewhere", async () => {
+    const bound = await boundPage({
+      pages: [
+        { id: "elsewhere", url: "https://other.example.test/", visible: true },
+        { id: "granted", url: "https://app.example.test/" },
+      ],
+      preferredOrigin: "https://app.example.test",
+    });
+    expect(bound.logs).toEqual(["granted"]);
+    expect(bound.pages.get("granted")?.broughtToFront).toBe(true);
+  });
+
+  it("uses the first tab when no tab reports itself visible", async () => {
+    const bound = await boundPage({
+      pages: [
+        { id: "first", url: "https://app.example.test/" },
+        { id: "second", url: "https://app.example.test/" },
+      ],
+    });
+    expect(bound.logs).toEqual(["first"]);
+    expect(bound.pages.get("first")?.broughtToFront).toBe(true);
+  });
+
+  it("opens a tab when the profile has none instead of failing", async () => {
+    const bound = await boundPage({
+      pages: [],
+      preferredOrigin: "https://app.example.test",
+    });
+    expect(bound.created).toBe(1);
+    expect(bound.logs).toEqual(["created-1"]);
+  });
+
+  it("keeps a successful result when no tab is visible afterwards", async () => {
+    const bound = await boundPage({
+      pages: [{ id: "hidden", url: "https://app.example.test/" }],
+      activeTabMarker: "marker-1",
+    });
+    expect(bound.logs).toEqual(["hidden"]);
+  });
+
+  it("reports the visible tab after the agent code when one exists", async () => {
+    const bound = await boundPage({
+      pages: [{ id: "front", url: "https://app.example.test/", visible: true }],
+      activeTabMarker: "marker-2",
+    });
+    expect(bound.logs).toEqual([
+      '{"__bbActiveTabMarker":"marker-2","id":"front"}',
+      "front",
+    ]);
+  });
+});
+
 describe("agent script convenience wrapping", () => {
   it("prints a returned string as the script result", async () => {
     expect(await capturedLogs('return "https://example.com/";')).toEqual([
@@ -321,6 +475,12 @@ const attempts = await Promise.all([
     .then(() => "forwarded", () => "blocked"),
   connection.sendMessageToServer(frame, new String("goto"), { url: new String("blob:https://app.example.test/blob-id") }, {})
     .then(() => "forwarded", () => "blocked"),
+  connection.sendMessageToServer(frame, new String("goto"), { url: new String("chrome://newtab/") }, {})
+    .then(() => "forwarded", () => "blocked"),
+  connection.sendMessageToServer(frame, new String("goto"), { url: new String("chrome-untrusted://new-tab-page/one-google-bar") }, {})
+    .then(() => "forwarded", () => "blocked"),
+  connection.sendMessageToServer(frame, "goto", { url: { href: "https://example.com/", toString() { return this.href; } } }, {})
+    .then(() => "forwarded", () => "blocked"),
 ]);
 console.log(JSON.stringify({ attempts, sentMethods: connection.sentMethods }));
 return "completed";`,
@@ -328,8 +488,15 @@ return "completed";`,
       true,
     );
     expect(JSON.parse(logs[0] ?? "{}")).toEqual({
-      attempts: ["blocked", "forwarded", "forwarded"],
-      sentMethods: ["goto", "goto"],
+      attempts: [
+        "blocked",
+        "forwarded",
+        "forwarded",
+        "blocked",
+        "blocked",
+        "forwarded",
+      ],
+      sentMethods: ["goto", "goto", "goto"],
     });
     expect(logs[1]).toContain("non-web URL");
   });
@@ -368,7 +535,7 @@ throw new Error("later script failure");`,
       preferredOrigin: "https://example.com",
     });
     expect(prepared).toContain("https://example.com");
-    expect(prepared).toContain("new URL(__bbEntry.url).origin");
+    expect(prepared).toContain("new URL(entry.url).origin");
   });
 
   it("leaves helper headroom at the minimum accepted host timeout", () => {

@@ -76,6 +76,24 @@ function createStore() {
     clock: () => now,
     idFactory: () => `contract-${nextId++}`,
   });
+  // These contracts exercise the Grant Request flow, which Default Access
+  // bypasses until the owner revokes a project's whole-web grant. Withdraw it
+  // for the bindings under test, with explicit ids so the counter above still
+  // numbers requests and temporary grants the way the assertions expect.
+  for (const projectId of ["project-a", "project-copy"]) {
+    const wholeWeb = store.create({
+      grantId: `grant-default-access-${projectId}`,
+      projectId,
+      hostId: "host-a",
+      installationId: "installation-a",
+      profileId: "profile-a",
+      originScope: "*",
+      wholeWeb: true,
+      fileTransfer: false,
+      invalidCertificateOrigins: [],
+    });
+    store.revoke(wholeWeb.grantId);
+  }
   return {
     backend,
     store,

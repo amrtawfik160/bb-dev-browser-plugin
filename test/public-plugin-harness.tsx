@@ -375,6 +375,7 @@ export const healthyBrowserStatus: BrowserStatus = {
 };
 
 export async function createPublicPluginHarness(options?: {
+  serverTunnelOnly?: boolean;
   hostId?: string;
   status?: BrowserStatus;
   hostConnection?: HostConnectionStatus;
@@ -468,6 +469,8 @@ export async function createPublicPluginHarness(options?: {
         })
       : Promise.resolve();
   const hostRpcFailures = new Map<string, string>();
+  const connectShares = new Map<number, string>();
+  const connectExposures: { hostId: string; ports: number[] }[] = [];
   const hostConnectionRequests: z.output<
     typeof browserHostConnectionRequestSchema
   >[] = [];
@@ -555,6 +558,12 @@ export async function createPublicPluginHarness(options?: {
       installationId: "installation-public-test",
       lifecycle: { stopProfile: async () => undefined },
     });
+  if (
+    options?.browserRuntime !== undefined &&
+    options.profileStore === undefined
+  ) {
+    await profileStore.initialize(configuredHostId);
+  }
   const profileRecovery =
     options?.profileRecovery ??
     createFileBrowserProfileRecovery({
@@ -590,10 +599,39 @@ export async function createPublicPluginHarness(options?: {
   const backend = createFakePluginHost({
     pluginId: "browser",
     agentSkillIds: ["browser"],
-    sharedPortTunnelIdentities: {
-      [configuredHostId]: { label: "ci-gate", baseDomain: "ci.getbb.app" },
-    },
+    sharedPortTunnelIdentities: options?.serverTunnelOnly
+      ? {}
+      : {
+          [configuredHostId]: { label: "ci-gate", baseDomain: "ci.getbb.app" },
+        },
     sdk: {
+      plugins: {
+        callRpc: async ({ pluginId, method, input, outputSchema }) => {
+          if (pluginId !== "connect") throw new Error("Unexpected plugin RPC");
+          const { hostId, port } = z
+            .object({ hostId: z.string(), port: z.number() })
+            .parse(input);
+          if (method === "expose") {
+            connectShares.set(port, hostId);
+            connectExposures.push({ hostId, ports: [port] });
+            return outputSchema.parse({
+              hostId,
+              port,
+              url: `https://ci-gate--${port}.ci.getbb.app`,
+            });
+          }
+          if (method === "unexpose") {
+            connectShares.delete(port);
+            return outputSchema.parse({
+              removed: true,
+              hostId,
+              hostName: "Fixture host",
+              port,
+            });
+          }
+          throw new Error("Unexpected Connect RPC");
+        },
+      },
       subscribe: (args) => {
         if (args.event === "project:changed") {
           const listener = args.callback as ProjectChangeListener;
@@ -1550,8 +1588,25 @@ export async function createPublicPluginHarness(options?: {
   };
 
   function renderSettings() {
+    // The BB app lists every registered settings section on one page. Stack
+    // them the same way so a test queries one tree, whichever section owns
+    // the control it is looking for.
+    const sections = app.settingsSections;
+    const AllSettingsSections = () => (
+      <div>
+        {sections.map((section) => {
+          const SectionComponent = section.component;
+          return (
+            <section key={section.id} aria-label={section.title ?? section.id}>
+              {section.title === undefined ? null : <h2>{section.title}</h2>}
+              <SectionComponent />
+            </section>
+          );
+        })}
+      </div>
+    );
     const panel = renderSlot<PluginSettingsSectionProps, typeof rpcContract>(
-      app.settingsSections[0]!,
+      { component: AllSettingsSections },
       {},
       { rpc },
     );
@@ -1833,6 +1888,26 @@ export async function createPublicPluginHarness(options?: {
     persistenceConfirmation?: string;
   }) {
     return rpc.browser_grant_create(input);
+  }
+
+  /**
+   * Put a project back on the Grant Request flow. Default Access hands a
+   * project the whole web on its first call; only the owner revoking that
+   * whole-web grant in Settings withdraws it, so do exactly that.
+   */
+  async function withdrawDefaultAccess(
+    binding: { projectId?: string; profileId?: string } = {},
+  ) {
+    const wholeWeb = await createBrowserGrant({
+      projectId: binding.projectId ?? PROJECT_ID,
+      hostId: configuredHostId,
+      profileId: binding.profileId ?? DEFAULT_PROFILE_ID,
+      originScope: "*",
+      wholeWeb: true,
+      fileTransfer: false,
+      invalidCertificateOrigins: [],
+    });
+    await revokeBrowserGrant(wholeWeb.grantId);
   }
 
   function listBrowserGrants(
@@ -2270,8 +2345,9 @@ export async function createPublicPluginHarness(options?: {
       return setupInspectionTargets;
     },
     get sharedPortDeclarations() {
-      return backend.harness.inspection.sharedPortDeclarations;
+      return connectExposures;
     },
+    connectShares,
     get navigationRequests() {
       return [...navigationRequests];
     },
@@ -2343,6 +2419,7 @@ export async function createPublicPluginHarness(options?: {
     restoreBrowserProfile,
     importBrowserProfile,
     createBrowserGrant,
+    withdrawDefaultAccess,
     listBrowserGrants,
     inspectBrowserGrant,
     revokeBrowserGrant,

@@ -29,7 +29,7 @@ export function createLoopbackAuthFixture(): Server {
     response.setHeader("content-type", "text/html; charset=utf-8");
     if (request.url === "/account" && signedIn) {
       response.end(
-        "<h1>Signed in</h1><button id=\"popup\" onclick=\"open('/popup', 'fixture-popup')\">Popup</button>",
+        "<h1>Signed in</h1><button id=\"popup\" onclick=\"window.open('/popup', 'fixture-popup')\">Popup</button>",
       );
       return;
     }

@@ -247,6 +247,7 @@ it.runIf(integrationEnabled)(
     };
     await cleanupFixtureProfiles(fixtureProfiles);
     let cleanupRequired = false;
+    let testFailure: unknown;
     try {
       cleanupRequired = true;
       const first = await runWorker({
@@ -331,11 +332,21 @@ it.runIf(integrationEnabled)(
       await expect(
         access(`${paths.runtimeManifestPath}.instance.lock`),
       ).rejects.toMatchObject({ code: "ENOENT" });
+    } catch (error) {
+      testFailure = error;
+      throw error;
     } finally {
       if (cleanupRequired) {
         await runWorker({
           ...workerEnvironment,
           BB_BROWSER_WORKER_ACTION: "cleanup",
+        }).catch((cleanupError: unknown) => {
+          if (testFailure === undefined) throw cleanupError;
+          throw new AggregateError(
+            [testFailure, cleanupError],
+            "Browser acceptance and cleanup failed.",
+            { cause: testFailure },
+          );
         });
       }
       await closeLoopbackFixture(server);

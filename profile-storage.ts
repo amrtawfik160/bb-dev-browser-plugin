@@ -416,7 +416,7 @@ function startupConfiguration() {
   };
 }
 
-function profileManifest(
+export function profileManifest(
   request: {
     profileId: string;
     name: string;

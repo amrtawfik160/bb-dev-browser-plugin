@@ -53,6 +53,19 @@ each.
 - Automation Mode is adaptive 5–15 FPS up to 1920×1080 with no audio. Safe Login
   uses an X display and VNC stream. Neither promises high-fidelity media.
 
+## Keyboard shortcuts
+
+BB retains Ctrl/Cmd/Alt key combinations, so page shortcuts using those
+modifiers are not forwarded. Text paste through the displaying client's
+clipboard is supported.
+
+## Image saving
+
+- The Automation Mode context menu can open images in another tab and copy
+  their addresses. It does not offer **Save image**: that action has no Host
+  Download quarantine integration yet. The previous menu item only changed
+  Chromium's download settings without downloading the image.
+
 ## Origin Scope enforcement
 
 - Origin Scope applies to HTTP(S) document navigation and to `blob:` documents
@@ -68,10 +81,16 @@ each.
   no-commit event guarantee.
   Ordinary cross-origin subresources may render. Cross-origin frame documents
   therefore need their own grant.
-- Exact `about:blank` is allowed as a safe internal page. Other `about:`,
-  `data:`, `file:`, `chrome:`, `javascript:`, malformed, and unknown non-web
-  document navigations fail closed; they are never treated as an unscoped
-  destination.
+- Owner tabs outside an agent's Origin Scope are parked on `about:blank` while
+  that agent's call runs and reloaded when it ends. Scroll position and unsaved
+  form input in those tabs do not survive an agent call, and back/forward
+  cache is disabled for the whole browser, so Back always reloads.
+- Exact `about:blank` is the only safe internal page. Restored Chrome new-tab /
+  error documents are cleared to `about:blank` before agent access; direct
+  navigation to them is denied. Other
+  `about:`, `data:`, `file:`, `chrome:`, `javascript:`, malformed, and unknown
+  non-web document navigations fail closed; they are never treated as an
+  unscoped destination.
 - Invalid-certificate access is an exact-origin elevation. It does not disable
   certificate validation globally or for another allowed origin.
 

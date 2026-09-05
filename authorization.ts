@@ -91,6 +91,24 @@ export const BROWSER_AUTHORIZATION_MIGRATIONS = [
   authorizationProjectMigration,
 ] as const;
 
+/**
+ * A row here means the owner revoked a project's whole-web grant on a profile
+ * in Browser Settings, so that project no longer receives Default Access
+ * there and its agents go through Grant Requests instead. Migrations are
+ * tracked by position, so this one is appended to the end of the combined
+ * database list rather than to the authorization group above.
+ */
+export const BROWSER_DEFAULT_ACCESS_MIGRATION = `
+CREATE TABLE browser_default_access_withdrawals (
+  project_id TEXT NOT NULL,
+  host_id TEXT NOT NULL,
+  installation_id TEXT NOT NULL,
+  profile_id TEXT NOT NULL,
+  withdrawn_at TEXT NOT NULL,
+  PRIMARY KEY (project_id, host_id, installation_id, profile_id)
+);
+`;
+
 export type { BrowserAuthorizationRequest } from "./contracts.js";
 
 export type BrowserAuthorizationFailure = {
@@ -676,8 +694,70 @@ function insertGrant(
     }
     if (project === null) insertActiveProject(database, grant.projectId);
     persistGrant(database, grant);
+    if (grant.originScope === "*") restoreDefaultAccess(database, grant);
     return grant;
   })();
+}
+
+type ProfileGrantBinding = Pick<
+  BrowserAuthorizationRequest,
+  "projectId" | "hostId" | "installationId" | "profileId"
+>;
+
+function defaultAccessWithdrawn(
+  database: Database.Database,
+  binding: ProfileGrantBinding,
+) {
+  return (
+    database
+      .prepare(
+        `SELECT 1 FROM browser_default_access_withdrawals
+         WHERE project_id = ? AND host_id = ? AND installation_id = ? AND profile_id = ?`,
+      )
+      .get(
+        binding.projectId,
+        binding.hostId,
+        binding.installationId,
+        binding.profileId,
+      ) !== undefined
+  );
+}
+
+function withdrawDefaultAccess(
+  database: Database.Database,
+  binding: ProfileGrantBinding,
+  withdrawnAt: string,
+) {
+  database
+    .prepare(
+      `INSERT OR REPLACE INTO browser_default_access_withdrawals
+       (project_id, host_id, installation_id, profile_id, withdrawn_at)
+       VALUES (?, ?, ?, ?, ?)`,
+    )
+    .run(
+      binding.projectId,
+      binding.hostId,
+      binding.installationId,
+      binding.profileId,
+      withdrawnAt,
+    );
+}
+
+function restoreDefaultAccess(
+  database: Database.Database,
+  binding: ProfileGrantBinding,
+) {
+  database
+    .prepare(
+      `DELETE FROM browser_default_access_withdrawals
+       WHERE project_id = ? AND host_id = ? AND installation_id = ? AND profile_id = ?`,
+    )
+    .run(
+      binding.projectId,
+      binding.hostId,
+      binding.installationId,
+      binding.profileId,
+    );
 }
 
 function permitsRequestedElevations(
@@ -829,11 +909,19 @@ function revokeStoredGrantTransaction(
     return { revocation: existingResult, events: [] };
   }
   const revokedAt = dependencies.clock().toISOString();
+  const revoked = inspectStoredGrant(dependencies.database, grantId);
   const outcome = updateGrantRevocation(
     dependencies.database,
     grantId,
     revokedAt,
   );
+  // This path is the owner's Settings action. Taking the whole web away from
+  // a project is how the owner says "ask me first" for it; lifecycle
+  // revocations (project deleted, profile archived) go through other paths
+  // and leave Default Access in place.
+  if (outcome === "revoked" && revoked?.originScope === "*") {
+    withdrawDefaultAccess(dependencies.database, revoked, revokedAt);
+  }
   return {
     revocation: { grantId, outcome },
     events:
@@ -878,23 +966,76 @@ function storedGrantRevokedAt(database: Database.Database, grantId: string) {
   return storedRevokedAt(row);
 }
 
-function authorizeStoredRequest(
-  database: Database.Database,
-  clock: () => Date,
+/**
+ * Default Access: a project's first agent operation on a profile records a
+ * persistent whole-web Profile Grant instead of ending in a denial and a Grant
+ * Request the owner must answer before the agent can go on. The grant is
+ * visible and revocable in Browser Settings like any other; revoking it
+ * withdraws Default Access for that project and profile, and granting the
+ * whole web again restores it. Raw localhost stays outside whole-web scope
+ * (ADR 0013) and keeps the request flow, elevations stay separate opt-ins, and
+ * a project deletion tombstone still blocks new grants.
+ */
+type StoredAuthorizationContext = {
+  database: Database.Database;
+  clock: () => Date;
+  idFactory: () => string;
+  grantRequests: GrantRequestStore;
+};
+
+function defaultAccessGrant(
+  context: StoredAuthorizationContext,
+  grants: readonly BrowserProfileGrant[],
   request: BrowserAuthorizationRequest,
-  grantRequests: GrantRequestStore,
+  now: Date,
+): BrowserProfileGrant | null {
+  const origin = normalizedAuthorizationOrigin(request);
+  if (origin === null) return null;
+  if (grantsForOrigin(grants, origin).length > 0) return null;
+  if (grants.some((grant) => grant.originScope === "*")) return null;
+  if (defaultAccessWithdrawn(context.database, request)) return null;
+  if (storedProject(context.database, request.projectId)?.deleted_at != null) {
+    return null;
+  }
+  return insertGrant(
+    context.database,
+    {
+      projectId: request.projectId,
+      hostId: request.hostId,
+      installationId: request.installationId,
+      profileId: request.profileId,
+      originScope: "*",
+      wholeWeb: true,
+      fileTransfer: false,
+      invalidCertificateOrigins: [],
+      persistentElevations: true,
+      persistenceConfirmation: PERSIST_BROWSER_ELEVATED_ACCESS_CONFIRMATION,
+    },
+    () => now,
+    context.idFactory,
+  );
+}
+
+function authorizeStoredRequest(
+  context: StoredAuthorizationContext,
+  request: BrowserAuthorizationRequest,
 ) {
-  const grants = activeGrantRows(database, {
+  const grants = activeGrantRows(context.database, {
     projectId: request.projectId,
     hostId: request.hostId,
     installationId: request.installationId,
     profileId: request.profileId,
   }).map((row) => grantFromRow(row));
-  const now = clock();
-  const decision = authorizeAgainstGrants(grants, request, now);
+  const now = context.clock();
+  let decision = authorizeAgainstGrants(grants, request, now);
   if (decision.allowed) return decision;
+  const defaultGrant = defaultAccessGrant(context, grants, request, now);
+  if (defaultGrant !== null) {
+    decision = authorizeAgainstGrants([...grants, defaultGrant], request, now);
+    if (decision.allowed) return decision;
+  }
   const requestDecision: GrantRequestAuthorizationDecision =
-    grantRequests.authorize(request, decision.message, now);
+    context.grantRequests.authorize(request, decision.message, now);
   if (!requestDecision.allowed) return requestDecision;
   return {
     allowed: true as const,
@@ -1047,7 +1188,10 @@ export function createProfileGrantStore(
         grantId,
       ),
     authorize: (request) =>
-      authorizeStoredRequest(database, clock, request, grantRequests),
+      authorizeStoredRequest(
+        { database, clock, idFactory, grantRequests },
+        request,
+      ),
     listRequests: (query = {}) => grantRequests.listRequests(query),
     inspectRequest: (requestId) => grantRequests.inspectRequest(requestId),
     inspectTemporaryGrant: (grantId) =>

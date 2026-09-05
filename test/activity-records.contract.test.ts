@@ -136,7 +136,7 @@ describe("Browser activity record persistence", () => {
       );
       expect(
         database.prepare("SELECT id FROM _bb_migrations ORDER BY id").all(),
-      ).toEqual(Array.from({ length: 14 }, (_, id) => ({ id })));
+      ).toEqual(Array.from({ length: 15 }, (_, id) => ({ id })));
     } finally {
       await disposeBackend(backend);
     }

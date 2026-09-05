@@ -115,6 +115,53 @@ describe("Browser panel reduced-motion hook (issue #17)", () => {
 });
 
 describe("Browser panel dialog chrome (issue #17)", () => {
+  it("leaves Enter on Cancel to the button instead of accepting the dialog", () => {
+    const onRespond = vi.fn();
+    render(
+      <PanelDialogLayer
+        dialog={promptDialog()}
+        isController={true}
+        reducedMotion={true}
+        onRespond={onRespond}
+        onClose={vi.fn()}
+      />,
+    );
+    const cancel = screen.getByRole("button", { name: "Cancel" });
+    cancel.focus();
+    fireEvent.keyDown(cancel, { key: "Enter" });
+    expect(onRespond).not.toHaveBeenCalled();
+    fireEvent.click(cancel);
+    expect(onRespond).toHaveBeenCalledExactlyOnceWith(false);
+  });
+
+  it("uses the new default answer when another prompt replaces the current dialog", () => {
+    const props = {
+      isController: true,
+      reducedMotion: true,
+      onRespond: vi.fn(),
+      onClose: vi.fn(),
+    };
+    const panel = render(
+      <PanelDialogLayer {...props} dialog={promptDialog()} />,
+    );
+    fireEvent.change(screen.getByRole("textbox"), {
+      target: { value: "Edited" },
+    });
+    panel.rerender(
+      <PanelDialogLayer
+        {...props}
+        dialog={{
+          ...promptDialog(),
+          dialogId: "next-prompt",
+          defaultValue: "Next answer",
+        }}
+      />,
+    );
+    expect((screen.getByRole("textbox") as HTMLInputElement).value).toBe(
+      "Next answer",
+    );
+  });
+
   it("renders an alert dialog as an accessible modal with OK and Cancel", () => {
     const onRespond = vi.fn();
     render(
@@ -286,7 +333,7 @@ describe("Browser panel dialog chrome (issue #17)", () => {
     expect(onRespond).not.toHaveBeenCalled();
   });
 
-  it("uses AA-contrast fallback colors for dialog text and borders", () => {
+  it("takes dialog text and border colors from the host theme, not fixed hex values", () => {
     render(
       <PanelDialogLayer
         dialog={alertDialog()}
@@ -297,12 +344,13 @@ describe("Browser panel dialog chrome (issue #17)", () => {
       />,
     );
     const dialog = screen.getByRole("dialog") as HTMLElement;
-    expect(dialog.style.color).not.toBe("");
-    expect(dialog.style.borderColor).not.toBe("");
-    // The fallback colors are AA-contrast hex constants (jsdom may serialize
-    // them to rgb(); assert the resolved value is non-empty and dark enough).
-    expect(dialog.style.color).toMatch(/#|rgb/);
-    expect(dialog.style.borderColor).toMatch(/#|rgb/);
+    // The host guarantees AA contrast for its popover tokens in both themes;
+    // a hardcoded color would hold in one theme and fail in the other.
+    expect(dialog.className).toContain("bg-popover");
+    expect(dialog.className).toContain("text-popover-foreground");
+    expect(dialog.className).toContain("border-border");
+    expect(dialog.style.color).toBe("");
+    expect(dialog.style.borderColor).toBe("");
   });
 });
 

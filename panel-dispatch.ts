@@ -1,5 +1,6 @@
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import type { z } from "zod";
+import { createPanelPortSharing } from "./panel-sharing.js";
 import {
   browserHistoryRequestSchema,
   browserHostPanelVisibilityRequestSchema,
@@ -257,12 +258,9 @@ function surfaceDispatchIdentity(request: {
 }
 
 async function issuedCapability(
-  bb: BbPluginApi,
-  hostId: string,
+  tunnel: { label: string; baseDomain: string },
   transport: Extract<BrowserPanelTransportResponse, { outcome: "opened" }>,
 ): Promise<BrowserPanelCapabilityResponse> {
-  const tunnel = await bb.hosts.ensureSharedPortTunnel(hostId);
-  bb.hosts.declareSharedPorts(hostId, [transport.gatewayPort]);
   return browserPanelCapabilityResponseSchema.parse({
     outcome: "issued",
     capabilityId: transport.capabilityId,
@@ -283,6 +281,7 @@ export function createPanelLifecycleDispatch(
   bb: BbPluginApi,
   host: PanelDispatchHost,
 ) {
+  const portSharing = createPanelPortSharing(bb);
   async function requireResolvedHost(request: {
     hostId: string;
     ownerSessionId: string;
@@ -334,7 +333,8 @@ export function createPanelLifecycleDispatch(
     if (transport.outcome !== "opened") {
       return browserPanelCapabilityResponseSchema.parse(transport);
     }
-    return issuedCapability(bb, identity.hostId, transport);
+    const tunnel = await portSharing.expose(request, transport.gatewayPort);
+    return issuedCapability(tunnel, transport);
   }
 
   async function setVisibility(
@@ -370,7 +370,7 @@ export function createPanelLifecycleDispatch(
     if (identity.outcome !== "resolved") {
       return browserPanelReleaseResponseSchema.parse(identity);
     }
-    return browserPanelReleaseResponseSchema.parse(
+    const response = browserPanelReleaseResponseSchema.parse(
       await host.call(
         "panelRelease",
         browserPanelReleaseHostRequestSchema.parse({
@@ -381,6 +381,8 @@ export function createPanelLifecycleDispatch(
         { hostId: identity.hostId, signal },
       ),
     );
+    await portSharing.release(request);
+    return response;
   }
 
   async function navigate(

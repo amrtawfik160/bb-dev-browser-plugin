@@ -15,7 +15,10 @@ import {
   type BrowserActivityExport,
   type BrowserActivityRecord,
 } from "./contracts.js";
-import { BROWSER_AUTHORIZATION_MIGRATIONS } from "./authorization.js";
+import {
+  BROWSER_AUTHORIZATION_MIGRATIONS,
+  BROWSER_DEFAULT_ACCESS_MIGRATION,
+} from "./authorization.js";
 import { GRANT_REQUEST_MIGRATION } from "./grant-requests.js";
 
 export { browserActivityEventFromOutboxItem as activityEventFromOutboxItem } from "./contracts.js";
@@ -120,6 +123,7 @@ export const BROWSER_DATABASE_MIGRATIONS = [
   GRANT_REQUEST_MIGRATION,
   activityGrantMetadataMigration,
   activityGrantRequestMetadataMigration,
+  BROWSER_DEFAULT_ACCESS_MIGRATION,
 ] as const;
 
 const skippedCompatibilityMigration = "SELECT 1";

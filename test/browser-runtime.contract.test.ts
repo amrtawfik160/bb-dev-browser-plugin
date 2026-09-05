@@ -790,6 +790,7 @@ describe("Browser Instance runtime", () => {
       const launch = fixture.processFixture.launches[0]!;
       expect(launch.chromeArguments).toContain("--restore-last-session");
       expect(launch.chromeArguments).toContain("--lang=en-GB");
+      expect(launch.chromeArguments).toContain("--accept-lang=en-GB");
       expect(launch.chromeArguments).toContain("--no-first-run");
       expect(launch.chromeArguments).toContain("--no-default-browser-check");
       expect(launch.chromeArguments).toContain("--disable-sync");

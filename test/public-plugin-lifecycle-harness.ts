@@ -8,10 +8,10 @@ import {
   encodePanelProtocolMessage,
 } from "../panel-protocol.js";
 import {
-  setTestLoopbackPanelTransport,
+  setTestPanelTransport,
   setTestPanelLifecycleClock,
 } from "../panel-test-loopback.js";
-import { DEFAULT_PROFILE_ID } from "../contracts.js";
+import { DEFAULT_PROFILE_ID, type BrowserContextAction } from "../contracts.js";
 import { ownerSessionIdFromContext } from "../panel-owner-session.js";
 import type { HostProbeSnapshot } from "../readiness.js";
 import type { BrowserInstanceRuntime } from "../browser-runtime.js";
@@ -56,6 +56,7 @@ type TrackedSocket = NodeWebSocket & { url: string };
 
 function createDeterministicPanelFrameSource(
   receivedInputs: unknown[],
+  contextActions: BrowserContextAction[] = [],
 ): ScreencastSource {
   return {
     async start(onFrame, signal) {
@@ -79,6 +80,9 @@ function createDeterministicPanelFrameSource(
     },
     input(payload) {
       receivedInputs.push(payload);
+    },
+    async resolveContextActions() {
+      return contextActions;
     },
     async stop() {},
   };
@@ -119,6 +123,8 @@ export type LifecyclePanel = ReturnType<typeof within> &
 
 export async function createPublicPanelLifecycleHarness(options?: {
   browserRuntime?: BrowserInstanceRuntime;
+  contextActions?: BrowserContextAction[];
+  transport?: "loopback" | "tunnel";
 }) {
   let now = Date.parse("2026-08-31T12:00:00.000Z");
   const clock = { now: () => now };
@@ -132,6 +138,7 @@ export async function createPublicPanelLifecycleHarness(options?: {
   >();
   let nextReconnectTimerId = 1;
   const receivedInputs: unknown[] = [];
+  const requestedSocketUrls: string[] = [];
   let holdNewSocketOpen = false;
   let holdNewSocketMessages = false;
   const heldOpenSockets = new Set<TrackedSocket>();
@@ -156,7 +163,16 @@ export async function createPublicPanelLifecycleHarness(options?: {
 
   class LifecycleWebSocket extends NodeWebSocket {
     constructor(url: string | URL, protocols?: string | string[]) {
-      const href = url.toString();
+      const requestedUrl = url.toString();
+      requestedSocketUrls.push(requestedUrl);
+      let href = requestedUrl;
+      if (options?.transport === "tunnel") {
+        // Model Connect's port routing while retaining the real host gateway.
+        const routed = /^wss:\/\/ci-gate--(\d+)\.ci\.getbb\.app\/?$/.exec(href);
+        if (routed === null)
+          throw new Error("No shared-port route for this URL.");
+        href = `ws://127.0.0.1:${routed[1]}`;
+      }
       super(href, protocols);
       const socket = this as unknown as TrackedSocket;
       Object.defineProperty(socket, "url", { value: href });
@@ -270,7 +286,7 @@ export async function createPublicPanelLifecycleHarness(options?: {
   if (typeof window !== "undefined") {
     (window as { WebSocket: typeof WebSocket }).WebSocket = WebSocketCtor;
   }
-  setTestLoopbackPanelTransport(true);
+  setTestPanelTransport(options?.transport ?? "loopback");
   setTestPanelLifecycleClock({
     setTimeout(callback, milliseconds) {
       const id = nextReconnectTimerId;
@@ -290,7 +306,11 @@ export async function createPublicPanelLifecycleHarness(options?: {
     ...(options?.browserRuntime === undefined
       ? {}
       : { browserRuntime: options.browserRuntime }),
-    panelFrameSource: () => createDeterministicPanelFrameSource(receivedInputs),
+    panelFrameSource: () =>
+      createDeterministicPanelFrameSource(
+        receivedInputs,
+        options?.contextActions,
+      ),
   });
   const ownerSessionId = ownerSessionIdFromContext({
     projectId: PROJECT_ID,
@@ -870,7 +890,7 @@ export async function createPublicPanelLifecycleHarness(options?: {
   }
 
   async function dispose() {
-    setTestLoopbackPanelTransport(false);
+    setTestPanelTransport(undefined);
     setTestPanelLifecycleClock(undefined);
     reconnectTimers.clear();
     (globalThis as { WebSocket: typeof WebSocket }).WebSocket =
@@ -886,6 +906,7 @@ export async function createPublicPanelLifecycleHarness(options?: {
   }
 
   return {
+    requestedSocketUrls,
     hostId: HOST_ID,
     projectId: PROJECT_ID,
     threadId: THREAD_ID,

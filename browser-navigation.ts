@@ -127,17 +127,30 @@ await page.bringToFront();
 console.log(JSON.stringify({ tabId: ${JSON.stringify(tabId)}, url: page.url() }));`;
 }
 
+/**
+ * Report the tab the browser currently shows. When no page reports itself
+ * visible (headless Chromium can leave every page hidden after the front tab
+ * closes), the first tab is brought to front and reported instead, so owner
+ * navigation and strip reconciliation keep working while any tab exists.
+ */
 export function activeBrowserTabScript() {
   return `const pages = await browser.listPages();
 if (pages.length === 0) throw new Error("The Browser Profile has no open tabs");
 let active = null;
 for (const entry of pages) {
-  const candidate = await browser.getPage(entry.id);
-  if (await candidate.evaluate(() => document.visibilityState === "visible")) {
-    active = entry;
-    break;
+  try {
+    const candidate = await browser.getPage(entry.id);
+    if (await candidate.evaluate(() => document.visibilityState === "visible")) {
+      active = entry;
+      break;
+    }
+  } catch {
+    continue;
   }
 }
-if (active === null) throw new Error("The Browser Profile has no visible active tab.");
+if (active === null) {
+  active = pages[0];
+  await (await browser.getPage(active.id)).bringToFront();
+}
 console.log(JSON.stringify(active));`;
 }

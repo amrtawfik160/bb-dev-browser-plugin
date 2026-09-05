@@ -18,20 +18,23 @@ to `dev-browser`.
 
 Parameters are defined by `browserScriptParametersSchema` (`.strict()`):
 
-| Parameter            | Required | Type / bounds                     | Notes                                                                                                                                                       |
-| -------------------- | -------- | --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `purpose`            | yes      | string, trimmed, 1–200 chars      | Human-readable reason. Shown to the owner only while the Control Lease is live, then discarded.                                                             |
-| `code`               | yes      | string, non-empty                 | QuickJS Playwright code. No Node, modules, process, or filesystem access.                                                                                   |
-| `destinationOrigin`  | no       | exact `scheme://host:port` origin | Omitting it returns `origin_denied`. Access is denied until the owner grants that origin to this project and profile. Grant changes apply to the next call. |
-| `profileId`          | no       | string                            | Host-local Browser Profile ID. Omit to use the selected profile (`bb-personal` by default).                                                                 |
-| `tabId`              | no       | string                            | Opaque runtime-only tab ID from `browser.listPages()`. Omit to use the active tab.                                                                          |
-| `timeoutMs`          | no       | integer 1000–30000                | Default `30000`; the minimum is `BROWSER_SCRIPT_MIN_TIMEOUT_MS`.                                                                                            |
-| `screenshot`         | no       | boolean (default false)           | Request up to 3 native screenshots explicitly.                                                                                                              |
-| `fileTransfer`       | no       | boolean (default false)           | Separate elevation; needs its own owner grant.                                                                                                              |
-| `invalidCertificate` | no       | boolean (default false)           | Per-origin opt-in; the host bypasses certificate validation only for the exact approved origin.                                                             |
+| Parameter            | Required | Type / bounds                     | Notes                                                                                                                                                                                                                                                      |
+| -------------------- | -------- | --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `purpose`            | yes      | string, trimmed, 1–200 chars      | Human-readable reason. Shown to the owner only while the Control Lease is live, then discarded.                                                                                                                                                            |
+| `code`               | yes      | string, non-empty                 | QuickJS Playwright code. No Node, modules, process, or filesystem access.                                                                                                                                                                                  |
+| `destinationOrigin`  | no       | exact `scheme://host:port` origin | Omitting it returns `origin_denied`. Any web origin is allowed by default; the first call records a whole-web grant for this project and profile. Once the owner revokes that grant, access waits on their approval. Grant changes apply to the next call. |
+| `profileId`          | no       | string                            | Host-local Browser Profile ID. Omit to use the selected profile (`bb-personal` by default).                                                                                                                                                                |
+| `tabId`              | no       | string                            | Opaque runtime-only tab ID from `browser.listPages()`. Omit to use the active tab.                                                                                                                                                                         |
+| `timeoutMs`          | no       | integer 1000–30000                | Default `30000`; the minimum is `BROWSER_SCRIPT_MIN_TIMEOUT_MS`.                                                                                                                                                                                           |
+| `screenshot`         | no       | boolean (default false)           | Request up to 3 native screenshots explicitly.                                                                                                                                                                                                             |
+| `fileTransfer`       | no       | boolean (default false)           | Separate elevation; needs its own owner grant.                                                                                                                                                                                                             |
+| `invalidCertificate` | no       | boolean (default false)           | Per-origin opt-in; the host bypasses certificate validation only for the exact approved origin.                                                                                                                                                            |
 
-The script runs with Playwright `page` bound to the active tab (or `tabId`).
-`return` values become the tool result. There is no `document` global.
+The script runs with Playwright `page` bound to the explicit `tabId`, else to
+a tab already on the granted origin, else to the active tab; a profile with no
+tabs gets a fresh one. `return` values become the tool result. There is no
+`document` global. Owner tabs outside the grant are parked on `about:blank`
+for the length of the call and restored afterwards.
 
 The host applies `BrowserContext.setDefaultTimeout` and
 `BrowserContext.setDefaultNavigationTimeout` to the shared context, reserving
@@ -112,7 +115,7 @@ The `error` is one of:
 
    | code                | meaning                                                            |
    | ------------------- | ------------------------------------------------------------------ |
-   | `browser_busy`      | An owner has control, or 5 s elapsed waiting behind another agent. |
+   | `browser_busy`      | An owner has control, or 30 s elapsed waiting behind other agents. |
    | `browser_timeout`   | The script exceeded its timeout.                                   |
    | `result_too_large`  | Output exceeded 256 KiB.                                           |
    | `lease_revoked`     | The owner revoked the lease.                                       |
@@ -152,9 +155,12 @@ Every script holds one atomic **Control Lease** for its host and profile.
 
 - **Owner has priority**: owner navigation interrupts an agent immediately; the
   agent receives a typed error (the lease is revoked or busy).
-- **Two agents**: a competing agent waits at most **5 seconds**
-  (`CONTROL_LEASE_AGENT_WAIT_MS`), then receives `browser_busy`. Queued work is
-  **never** retained for later execution.
+- **Two agents**: a competing agent waits in arrival order for at most
+  **30 seconds** (`CONTROL_LEASE_AGENT_WAIT_MS`), then receives `browser_busy`
+  without running. This wait is separate from `timeoutMs`, which bounds script
+  execution. Cancelled, expired, and owner-interrupted waiting calls are removed.
+- If another agent still has control after the wait, let that operation finish
+  before retrying once. Switching from the tool to the CLI uses the same lease.
 - Commands are never replayed automatically after a denial, revocation, or
   timeout.
 

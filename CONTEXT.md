@@ -25,8 +25,12 @@ A stopped, grant-free Browser Profile retained temporarily for recovery before p
 _Avoid_: Deleted profile, sleeping profile
 
 **Profile Grant**:
-A persistent authorization allowing agents from one BB project to fully automate one Browser Profile within its Origin Scope. Owner interaction needs no grant, while unrestricted origins and file transfer require separate owner opt-ins.
+A persistent authorization allowing agents from one BB project to fully automate one Browser Profile within its Origin Scope. Owner interaction needs no grant. A project receives a whole-web grant through Default Access; file transfer and invalid-certificate access require separate owner opt-ins.
 _Avoid_: Host access, blanket browser permission
+
+**Default Access**:
+The whole-web Profile Grant a BB project receives automatically the first time one of its agents operates on a Browser Profile. Revoking that grant in Browser Settings withdraws Default Access for the project and profile, so later agent operations go through Grant Requests; granting the whole web again restores it.
+_Avoid_: Auto-approval, implicit permission
 
 **Grant Request**:
 A non-blocking request for an owner to expand one project's Profile Grant for a specific profile, origin, and elevated permission set after an agent operation is denied.

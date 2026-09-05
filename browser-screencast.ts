@@ -1,5 +1,6 @@
 import { WebSocket } from "ws";
-import { tmpdir } from "node:os";
+import { browserInputCommand } from "./browser-input.js";
+import type { BrowserTabStripStore } from "./browser-tabs.js";
 import type { ScreencastFrame, ScreencastSource } from "./panel-transport.js";
 import {
   PANEL_MAX_FRAMES_PER_SECOND,
@@ -19,6 +20,7 @@ import {
  */
 
 export type CdpScreencastSourceOptions = {
+  tabs?: Pick<BrowserTabStripStore, "snapshot" | "subscribe">;
   /**
    * Resolve the browser-level CDP endpoint (ws://127.0.0.1:<port>) when
    * streaming starts. The browser may not be running when the transport binds,
@@ -49,12 +51,6 @@ export type CdpScreencastSourceOptions = {
    * limitation) rather than silently no-op.
    */
   onContextActionResult?: (result: { actionId: string; ok: boolean }) => void;
-  /**
-   * Directory the browser writes downloads into (Page.setDownloadBehavior).
-   * Defaults to a subdirectory of the OS temp dir; the host overrides it with
-   * the real Host Download staging path when transfer staging is wired.
-   */
-  downloadPath?: string;
 };
 
 type CdpResponse = {
@@ -62,12 +58,11 @@ type CdpResponse = {
   result?: unknown;
   error?: { message: string };
 };
-type CdpEvent = { method: string; params?: unknown };
+type CdpEvent = { method: string; params?: unknown; sessionId?: string };
 
 const SCREENCAST_FORMAT = "jpeg" as const;
 const SCREENCAST_QUALITY = 60;
-// everyNthFrame throttles capture; 1 captures every frame. The runtime adapts
-// between 5 and 15 FPS by adjusting this together with the viewport.
+// Frame acknowledgements provide pacing; capture every available update.
 const SCREENCAST_EVERY_NTH_FRAME = 1;
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -84,10 +79,15 @@ export function createCdpScreencastSource(
   const resolveEndpoint = options.resolveEndpoint;
   let socket: WebSocket | null = null;
   let nextId = 1;
+  let frameSequence = 0;
   let sessionId: string | undefined;
+  let activeTargetId: string | undefined;
+  let unsubscribeTabs: (() => void) | undefined;
+  let switching = Promise.resolve();
   let screencastStarted = false;
   let stopped = false;
-  let captureTimer: ReturnType<typeof setInterval> | undefined;
+  let finishStream: (() => void) | undefined;
+  let captureTimer: ReturnType<typeof setTimeout> | undefined;
   let viewport: { width: number; height: number } = options.viewport ?? {
     width: PANEL_MAX_VIEWPORT_WIDTH,
     height: PANEL_MAX_VIEWPORT_HEIGHT,
@@ -110,7 +110,7 @@ export function createCdpScreencastSource(
 
   function send(method: string, params: unknown, targetSessionId?: string) {
     return new Promise<unknown>((resolve, reject) => {
-      if (socket === null) {
+      if (socket === null || socket.readyState !== WebSocket.OPEN) {
         reject(new Error("The CDP screencast socket is not connected."));
         return;
       }
@@ -123,25 +123,70 @@ export function createCdpScreencastSource(
     });
   }
 
+  function endConnection() {
+    for (const request of pending.values()) {
+      request.reject(new Error("The browser stream connection closed."));
+    }
+    pending.clear();
+    finishStream?.();
+  }
+
   async function attachToPage(): Promise<string | undefined> {
-    // The browser-level endpoint lists page targets; attach to the first page
-    // (the runtime pins the active tab) and return its session id.
     const targets = (await send("Target.getTargets", {})) as {
       targetInfos?: Array<{ type: string; targetId: string }>;
     };
-    const page =
-      targets?.targetInfos?.find((entry) => entry.type === "page") ??
-      targets?.targetInfos?.[0];
+    const selected = options.tabs?.snapshot().activeTabId;
+    const page = targets?.targetInfos?.find(
+      (entry) =>
+        entry.type === "page" &&
+        (selected == null || entry.targetId === selected),
+    );
     if (page === undefined) return undefined;
+    activeTargetId = page.targetId;
     const attached = (await send("Target.attachToTarget", {
       targetId: page.targetId,
       flatten: true,
     })) as { sessionId?: string };
+    if (attached?.sessionId !== undefined) {
+      await send("Page.enable", {}, attached.sessionId);
+      await send("Page.bringToFront", {}, attached.sessionId);
+    }
     return attached?.sessionId;
   }
 
-  async function startScreencast(session: string, fps: number) {
+  async function switchPage() {
+    const selected = options.tabs?.snapshot().activeTabId;
+    if (stopped || selected === activeTargetId) return;
+    const previous = sessionId;
+    sessionId = undefined;
+    activeTargetId = undefined;
+    screencastStarted = false;
+    if (captureTimer !== undefined) clearTimeout(captureTimer);
+    if (previous !== undefined) {
+      await send("Target.detachFromTarget", { sessionId: previous }).catch(
+        () => undefined,
+      );
+    }
+    if (selected === null) return;
+    sessionId = await attachToPage();
+    if (sessionId !== undefined && !stopped) {
+      await startScreencast(sessionId);
+      screencastStarted = true;
+    }
+  }
+
+  async function startScreencast(session: string) {
     const clamped = clampScreencastViewport(viewport);
+    await send(
+      "Emulation.setDeviceMetricsOverride",
+      {
+        width: clamped.width,
+        height: clamped.height,
+        deviceScaleFactor: 1,
+        mobile: false,
+      },
+      session,
+    );
     await send(
       "Page.startScreencast",
       {
@@ -153,16 +198,6 @@ export function createCdpScreencastSource(
       },
       session,
     );
-    // CDP does not natively rate-limit by FPS; pace capture acknowledgements
-    // to the Automation Mode window so the stream adapts between 5 and 15 FPS.
-    const interval = frameIntervalForFps(fps);
-    if (captureTimer !== undefined) clearInterval(captureTimer);
-    captureTimer = setInterval(() => {
-      if (stopped) return;
-      void send("Page.screencastFrameAck", { sessionId: 0 }, session).catch(
-        () => undefined,
-      );
-    }, interval);
   }
 
   async function handleScreencastFrame(
@@ -172,59 +207,28 @@ export function createCdpScreencastSource(
   ) {
     if (!isObject(params) || typeof params.data !== "string") return;
     if (typeof params.metadata !== "object" || params.metadata === null) return;
-    const metadata = params.metadata as { timestamp?: number };
+    if (typeof params.sessionId !== "number") return;
     const frame: ScreencastFrame = {
-      sequence: typeof metadata.timestamp === "number" ? metadata.timestamp : 0,
+      sequence: ++frameSequence,
       mimeType: "image/jpeg",
       data: Buffer.from(params.data, "base64"),
     };
     onFrame(frame);
-    await send("Page.screencastFrameAck", { sessionId: 0 }, session).catch(
-      () => undefined,
-    );
+    // Acknowledge the actual frame ID after pacing; a synthetic ID stalls CDP.
+    const frameId = params.sessionId;
+    captureTimer = setTimeout(() => {
+      if (!stopped && sessionId === session)
+        void send(
+          "Page.screencastFrameAck",
+          { sessionId: frameId },
+          session,
+        ).catch(() => undefined);
+    }, frameIntervalForFps(PANEL_MAX_FRAMES_PER_SECOND));
   }
 
   async function dispatchInput(payload: unknown, session: string) {
-    if (!isObject(payload) || typeof payload.kind !== "string") return;
-    if (payload.kind === "mouse") {
-      await send(
-        "Input.dispatchMouseEvent",
-        {
-          type:
-            typeof payload.action === "string" ? payload.action : "mouseMoved",
-          x: typeof payload.x === "number" ? payload.x : 0,
-          y: typeof payload.y === "number" ? payload.y : 0,
-          button: typeof payload.button === "string" ? payload.button : "left",
-          clickCount: typeof payload.count === "number" ? payload.count : 1,
-        },
-        session,
-      );
-      return;
-    }
-    if (payload.kind === "key") {
-      await send(
-        "Input.dispatchKeyEvent",
-        {
-          type: typeof payload.action === "string" ? payload.action : "keyDown",
-          key: typeof payload.key === "string" ? payload.key : "",
-        },
-        session,
-      );
-      return;
-    }
-    if (payload.kind === "wheel") {
-      await send(
-        "Input.dispatchMouseEvent",
-        {
-          type: "mouseWheel",
-          x: typeof payload.x === "number" ? payload.x : 0,
-          y: typeof payload.y === "number" ? payload.y : 0,
-          deltaX: typeof payload.deltaX === "number" ? payload.deltaX : 0,
-          deltaY: typeof payload.deltaY === "number" ? payload.deltaY : 0,
-        },
-        session,
-      );
-    }
+    const command = browserInputCommand(payload);
+    if (command !== null) await send(command.method, command.params, session);
   }
 
   function mapDialogType(cdType: unknown): BrowserDialogEvent["type"] | null {
@@ -319,12 +323,6 @@ export function createCdpScreencastSource(
           label: "Copy image address",
           targetUrl: value.image,
         },
-        {
-          actionId: "save-image",
-          kind: "save-image",
-          label: "Save image",
-          targetUrl: value.image,
-        },
       );
     }
     for (const action of actions) contextActions.set(action.actionId, action);
@@ -374,34 +372,23 @@ export function createCdpScreencastSource(
       const ok = await send(
         "Runtime.evaluate",
         {
-          expression: `navigator.clipboard && navigator.clipboard.writeText(${JSON.stringify(action.targetUrl)})`,
+          expression: `navigator.clipboard.writeText(${JSON.stringify(action.targetUrl)})`,
           returnByValue: true,
+          awaitPromise: true,
+          userGesture: true,
         },
         sessionId,
       )
-        .then(() => true)
+        .then(
+          (response) =>
+            isObject(response) &&
+            response.exceptionDetails === undefined &&
+            isObject(response.result) &&
+            response.result.subtype !== "error",
+        )
         .catch(() => false);
       report?.({ actionId, ok });
       return;
-    }
-    if (action.kind === "save-image") {
-      // Download the image as a quarantined Host Download (never auto-opened).
-      // Page.navigate has no download transition; a real download needs
-      // Page.setDownloadBehavior plus the Browser download handler, so the
-      // image is fetched as a Host Download rather than navigating the active
-      // tab away from the controller's page.
-      const ok = await send(
-        "Page.setDownloadBehavior",
-        {
-          behavior: "allow",
-          downloadPath:
-            options.downloadPath ?? `${tmpdir()}/bb-browser-downloads`,
-        },
-        sessionId,
-      )
-        .then(() => true)
-        .catch(() => false);
-      report?.({ actionId, ok });
     }
   }
 
@@ -410,69 +397,111 @@ export function createCdpScreencastSource(
       const endpoint = await resolveEndpoint();
       if (stopped || signal.aborted) return;
       socket = new WebSocket(endpoint);
-      await new Promise<void>((resolve, reject) => {
-        const open = () => resolve();
-        const error = (error: Error) => reject(error);
-        socket!.once("open", open);
-        socket!.once("error", error);
-        signal.addEventListener(
-          "abort",
-          () => {
-            socket!.off("open", open);
-            reject(
-              new Error("The CDP screencast was stopped before connecting."),
-            );
-          },
-          { once: true },
-        );
+      const connectedSocket = socket;
+      const ended = new Promise<void>((resolve) => {
+        finishStream = resolve;
       });
-      socket.on("message", (raw) => {
-        let message: CdpResponse & CdpEvent;
-        try {
-          message = JSON.parse(String(raw)) as CdpResponse & CdpEvent;
-        } catch {
-          return;
-        }
-        if (typeof message.id === "number") {
-          const entry = pending.get(message.id);
-          if (entry !== undefined) {
-            pending.delete(message.id);
-            if (message.error !== undefined) {
-              entry.reject(new Error(message.error.message));
-            } else {
-              entry.resolve(message.result);
-            }
+      const abortStream = () => {
+        connectedSocket.close();
+        endConnection();
+      };
+      connectedSocket.on("close", endConnection);
+      connectedSocket.on("error", endConnection);
+      signal.addEventListener("abort", abortStream, { once: true });
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const cleanup = () => {
+            connectedSocket.off("open", open);
+            connectedSocket.off("error", error);
+            connectedSocket.off("close", close);
+          };
+          const open = () => {
+            cleanup();
+            resolve();
+          };
+          const error = (cause: Error) => {
+            cleanup();
+            reject(cause);
+          };
+          const close = () =>
+            error(new Error("The browser stream closed before connecting."));
+          connectedSocket.once("open", open);
+          connectedSocket.once("error", error);
+          connectedSocket.once("close", close);
+        });
+        socket.on("message", (raw) => {
+          let message: CdpResponse & CdpEvent;
+          try {
+            message = JSON.parse(String(raw)) as CdpResponse & CdpEvent;
+          } catch {
+            return;
           }
-          return;
+          if (typeof message.id === "number") {
+            const entry = pending.get(message.id);
+            if (entry !== undefined) {
+              pending.delete(message.id);
+              if (message.error !== undefined) {
+                entry.reject(new Error(message.error.message));
+              } else {
+                entry.resolve(message.result);
+              }
+            }
+            return;
+          }
+          if (
+            message.method === "Page.screencastFrame" &&
+            sessionId !== undefined &&
+            message.sessionId === sessionId
+          ) {
+            void handleScreencastFrame(
+              message.params,
+              onFrame,
+              sessionId,
+            ).catch(() => undefined);
+          }
+          if (
+            message.method === "Page.javascriptDialogOpening" &&
+            sessionId !== undefined &&
+            message.sessionId === sessionId
+          ) {
+            handleDialogOpening(message.params);
+          }
+        });
+        sessionId = await attachToPage();
+        if (sessionId !== undefined) {
+          await startScreencast(sessionId);
+          screencastStarted = true;
         }
-        if (
-          message.method === "Page.screencastFrame" &&
-          sessionId !== undefined
-        ) {
-          void handleScreencastFrame(message.params, onFrame, sessionId).catch(
-            () => undefined,
-          );
-        }
-        if (
-          message.method === "Page.javascriptDialogOpening" &&
-          sessionId !== undefined
-        ) {
-          handleDialogOpening(message.params);
-        }
-      });
-      sessionId = await attachToPage();
-      if (sessionId !== undefined) {
-        await startScreencast(sessionId, PANEL_MAX_FRAMES_PER_SECOND);
-        screencastStarted = true;
+        unsubscribeTabs = options.tabs?.subscribe(() => {
+          switching = switching.then(switchPage).catch(() => {
+            socket?.close();
+          });
+        });
+        if (options.tabs !== undefined) await switchPage();
+        await ended;
+      } finally {
+        signal.removeEventListener("abort", abortStream);
+        unsubscribeTabs?.();
+        unsubscribeTabs = undefined;
+        if (captureTimer !== undefined) clearTimeout(captureTimer);
+        connectedSocket.close();
+        endConnection();
+        socket = null;
+        sessionId = undefined;
+        stopped = true;
       }
-      await new Promise<void>((resolve) => {
-        signal.addEventListener("abort", () => resolve(), { once: true });
-      });
     },
     input(payload) {
-      if (sessionId === undefined || socket === null) return;
-      const session = sessionId;
-      void dispatchInput(payload, session).catch(() => undefined);
+      const selected = options.tabs?.snapshot().activeTabId;
+      void switching
+        .then(async () => {
+          if (sessionId === undefined || socket === null || stopped) return;
+          if (selected != null && selected !== activeTargetId) return;
+          await dispatchInput(payload, sessionId);
+        })
+        .catch(() => {
+          socket?.close();
+        });
     },
     /**
      * Apply the controller's logical viewport to the screencast. If the
@@ -482,15 +511,15 @@ export function createCdpScreencastSource(
     setViewport(next: { width: number; height: number }) {
       viewport = clampScreencastViewport(next);
       if (screencastStarted && sessionId !== undefined) {
-        void startScreencast(sessionId, PANEL_MAX_FRAMES_PER_SECOND).catch(
-          () => undefined,
-        );
+        void startScreencast(sessionId).catch(() => undefined);
       }
     },
     async stop() {
       stopped = true;
+      unsubscribeTabs?.();
+      unsubscribeTabs = undefined;
       if (captureTimer !== undefined) {
-        clearInterval(captureTimer);
+        clearTimeout(captureTimer);
         captureTimer = undefined;
       }
       if (socket !== null && screencastStarted && sessionId !== undefined) {
@@ -501,7 +530,7 @@ export function createCdpScreencastSource(
         socket.close();
         socket = null;
       }
-      pending.clear();
+      endConnection();
       openDialogs.clear();
       contextActions.clear();
       dialogListeners.clear();

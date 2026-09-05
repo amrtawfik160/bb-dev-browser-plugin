@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
-import { act, waitFor } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { act, fireEvent, waitFor } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
 import { WebSocket } from "ws";
 import {
   DEFAULT_PROFILE_ID,
@@ -43,6 +43,235 @@ function panelOperationHostCommands(calls: readonly string[]) {
 }
 
 describe("public Browser Panel lifecycle seam", () => {
+  it("restores the runtime tab inventory when a fresh panel session opens", async () => {
+    const runtime = createTabInventoryRuntime();
+    const restored = await runtime.openPage({
+      hostId: "ci-host",
+      profileId: DEFAULT_PROFILE_ID,
+      locale: "en-US",
+      timezone: "UTC",
+    });
+    const browser = await createPublicPanelLifecycleHarness({
+      browserRuntime: runtime,
+    });
+    try {
+      const strip = await browser.rpc.browser_tabs({
+        hostId: browser.hostId,
+        profileId: DEFAULT_PROFILE_ID,
+      });
+      expect(strip.tabs.map((tab) => tab.tabId)).toContain(restored.id);
+      expect(strip.activeTabId).toBe(restored.id);
+    } finally {
+      await browser.dispose();
+    }
+  });
+  it("drops tabs the browser no longer has even when no tab is in front", async () => {
+    const runtime = createTabInventoryRuntime();
+    const target = {
+      hostId: "ci-host",
+      profileId: DEFAULT_PROFILE_ID,
+      locale: "en-US",
+      timezone: "UTC",
+    };
+    const opened = await runtime.openPage(target);
+    // A browser with no front page cannot answer the active-tab read; the
+    // inventory read still works and is what the strip must follow.
+    const browserRuntime = {
+      ...runtime,
+      activeTabId: async () => {
+        if ((await runtime.listPages(target)).length === 0) {
+          throw new Error("The Browser Profile has no open tabs");
+        }
+        return opened.id;
+      },
+    };
+    const browser = await createPublicPanelLifecycleHarness({ browserRuntime });
+    try {
+      const before = await browser.rpc.browser_tabs({
+        hostId: browser.hostId,
+        profileId: DEFAULT_PROFILE_ID,
+      });
+      expect(before.tabs.map((tab) => tab.tabId)).toEqual([opened.id]);
+
+      await runtime.closePages(target, [opened.id]);
+      const after = await browser.rpc.browser_tabs({
+        hostId: browser.hostId,
+        profileId: DEFAULT_PROFILE_ID,
+      });
+      expect(after.tabs).toEqual([]);
+      expect(after.activeTabId).toBeNull();
+    } finally {
+      await browser.dispose();
+    }
+  });
+  it.each([false, true])(
+    "copies an address to the displaying client's clipboard and reports refusal (%s)",
+    async (refused) => {
+      const writeText = vi.fn(async () => {
+        if (refused) throw new Error("Permission denied");
+      });
+      const previousClipboard = Object.getOwnPropertyDescriptor(
+        navigator,
+        "clipboard",
+      );
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value: { writeText },
+      });
+      const browser = await createPublicPanelLifecycleHarness({
+        contextActions: [
+          {
+            actionId: "copy-link",
+            kind: "copy-link",
+            label: "Copy link address",
+            targetUrl: "https://example.test/link",
+          },
+        ],
+      });
+      try {
+        const [owner] = await browser.openTwoPanels();
+        const canvas = await owner.findByRole("img", {
+          name: "Browser page view",
+        });
+        canvas.getBoundingClientRect = () => new DOMRect(0, 0, 960, 540);
+        fireEvent.contextMenu(canvas, { clientX: 200, clientY: 200 });
+        fireEvent.click(
+          await owner.findByRole("menuitem", { name: "Copy link address" }),
+        );
+        await waitFor(() =>
+          expect(writeText).toHaveBeenCalledExactlyOnceWith(
+            "https://example.test/link",
+          ),
+        );
+        if (refused) {
+          expect((await owner.findByRole("alert")).textContent).toContain(
+            "Could not copy the address",
+          );
+        } else {
+          expect(owner.queryByRole("alert")).toBeNull();
+        }
+      } finally {
+        await browser.dispose();
+        if (previousClipboard === undefined)
+          Reflect.deleteProperty(navigator, "clipboard");
+        else Object.defineProperty(navigator, "clipboard", previousClipboard);
+      }
+    },
+  );
+
+  it("ignores letterbox margins, pastes text, and releases held input when the owner leaves the page", async () => {
+    const browser = await createPublicPanelLifecycleHarness();
+    try {
+      const [owner] = await browser.openTwoPanels();
+      const canvas = await owner.findByRole("img", {
+        name: "Browser page view",
+      });
+      const textInput = owner.getByRole("textbox", {
+        name: "Browser page keyboard input",
+      });
+      canvas.getBoundingClientRect = () => new DOMRect(0, 0, 960, 960);
+      fireEvent.mouseDown(canvas, { clientX: 480, clientY: 10 });
+      fireEvent.wheel(canvas, { clientX: 480, clientY: 10, deltaY: 100 });
+      fireEvent.mouseDown(canvas, { clientX: 480, clientY: 480, buttons: 1 });
+      fireEvent.paste(textInput, {
+        clipboardData: { getData: () => "café" },
+      });
+      fireEvent.keyDown(textInput, {
+        key: "Shift",
+        code: "ShiftLeft",
+        shiftKey: true,
+      });
+      fireEvent.keyDown(textInput, { key: "Escape", shiftKey: true });
+      await waitFor(() => expect(browser.receivedInputs).toHaveLength(5));
+      expect(browser.receivedInputs).toEqual([
+        expect.objectContaining({
+          kind: "mouse",
+          action: "mousePressed",
+          x: 960,
+          y: 540,
+        }),
+        { kind: "text", text: "café" },
+        expect.objectContaining({
+          kind: "key",
+          action: "keyDown",
+          key: "Shift",
+        }),
+        expect.objectContaining({ kind: "key", action: "keyUp", key: "Shift" }),
+        expect.objectContaining({
+          kind: "mouse",
+          action: "mouseReleased",
+          buttons: 0,
+        }),
+      ]);
+      expect(document.activeElement).not.toBe(canvas);
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("forwards owner clicks, typing, and scrolling from the rendered page and blocks spectators", async () => {
+    const browser = await createPublicPanelLifecycleHarness();
+    try {
+      const [owner, spectator] = await browser.openTwoPanels();
+      const canvas = await owner.findByRole("img", {
+        name: "Browser page view",
+      });
+      const textInput = owner.getByRole("textbox", {
+        name: "Browser page keyboard input",
+      });
+      const otherCanvas = await spectator.findByRole("img", {
+        name: "Browser page view",
+      });
+      for (const surface of [canvas, otherCanvas]) {
+        surface.getBoundingClientRect = () => new DOMRect(10, 20, 960, 540);
+      }
+      fireEvent.mouseDown(canvas, { clientX: 490, clientY: 290, button: 0 });
+      fireEvent.mouseUp(canvas, { clientX: 490, clientY: 290, button: 0 });
+      fireEvent.keyDown(textInput, { key: "a", code: "KeyA", keyCode: 65 });
+      fireEvent.keyUp(textInput, { key: "a", code: "KeyA", keyCode: 65 });
+      fireEvent.wheel(canvas, { clientX: 490, clientY: 290, deltaY: 120 });
+      await waitFor(() => expect(browser.receivedInputs).toHaveLength(5));
+      expect(browser.receivedInputs).toEqual([
+        expect.objectContaining({
+          kind: "mouse",
+          action: "mousePressed",
+          x: 960,
+          y: 540,
+        }),
+        expect.objectContaining({
+          kind: "mouse",
+          action: "mouseReleased",
+          x: 960,
+          y: 540,
+        }),
+        expect.objectContaining({
+          kind: "key",
+          action: "keyDown",
+          key: "a",
+          text: "a",
+        }),
+        expect.objectContaining({ kind: "key", action: "keyUp", key: "a" }),
+        expect.objectContaining({ kind: "wheel", x: 960, y: 540, deltaY: 240 }),
+      ]);
+      fireEvent.mouseDown(otherCanvas, { clientX: 490, clientY: 290 });
+      fireEvent.keyDown(otherCanvas, { key: "x" });
+      fireEvent.wheel(otherCanvas, { deltaY: 120 });
+      fireEvent.keyDown(textInput, { key: "k", ctrlKey: true });
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+      });
+      expect(browser.receivedInputs).toHaveLength(5);
+      await browser.forcePhysicalSocketLoss(owner);
+      await owner.findByText("Reconnecting to the browser…");
+      fireEvent.mouseDown(canvas, { clientX: 490, clientY: 290 });
+      fireEvent.keyDown(textInput, { key: "x" });
+      fireEvent.wheel(canvas, { clientX: 490, clientY: 290, deltaY: 120 });
+      expect(browser.receivedInputs).toHaveLength(5);
+    } finally {
+      await browser.dispose();
+    }
+  });
+
   it("gives two rendered Browser Panels distinct identities that redeem a Panel Capability and become ready", async () => {
     const browser = await createPublicPanelLifecycleHarness();
     try {
@@ -212,13 +441,7 @@ describe("public Browser Panel lifecycle seam", () => {
         ).toMatchObject({ connection: "disconnected" });
       });
 
-      const released = await browser.releasePanel({
-        hostId: first.hostId,
-        profileId: first.profileId,
-        panelId: first.panelId,
-        ownerSessionId: first.ownerSessionId,
-      });
-      expect(released).toEqual({ outcome: "released" });
+      await browser.closePanel(first);
       await waitFor(() => {
         expect(
           browser
@@ -274,6 +497,56 @@ describe("public Browser Panel lifecycle seam", () => {
       expect(second.framesReceived).toBeGreaterThan(0);
     } finally {
       await browser.dispose();
+    }
+  });
+
+  it("routes remote panels to their shared gateway ports and paints the received page", async () => {
+    class DecodedImage extends EventTarget {
+      set src(_value: string) {
+        queueMicrotask(() => this.dispatchEvent(new Event("load")));
+      }
+    }
+    vi.stubGlobal("Image", DecodedImage);
+    const painted = new Set<HTMLCanvasElement>();
+    const getContext = vi
+      .spyOn(HTMLCanvasElement.prototype, "getContext")
+      .mockImplementation(function (this: HTMLCanvasElement) {
+        return {
+          clearRect() {},
+          drawImage: () => painted.add(this),
+        } as unknown as CanvasRenderingContext2D;
+      });
+    const browser = await createPublicPanelLifecycleHarness({
+      transport: "tunnel",
+    });
+    try {
+      const [first, second] = await browser.openTwoPanels();
+      for (const panel of [first, second]) {
+        expect(browser.requestedSocketUrls).toContain(
+          `wss://ci-gate--${panel.gatewayPort}.ci.getbb.app`,
+        );
+        const canvas = await panel.findByRole("img", {
+          name: "Browser page view",
+        });
+        await waitFor(() =>
+          expect(painted.has(canvas as HTMLCanvasElement)).toBe(true),
+        );
+      }
+      await browser.forcePhysicalSocketLoss(first);
+      const reconnecting = await first.findByText(
+        "Reconnecting to the browser…",
+      );
+      expect(reconnecting.classList.contains("sr-only")).toBe(false);
+      const framesBeforeReconnect = first.framesReceived;
+      await browser.advanceTime(PANEL_RECONNECT_INITIAL_BACKOFF_MS);
+      await first.findByText("The page is live.");
+      await waitFor(() =>
+        expect(first.framesReceived).toBeGreaterThan(framesBeforeReconnect),
+      );
+    } finally {
+      await browser.dispose();
+      getContext.mockRestore();
+      vi.unstubAllGlobals();
     }
   });
 

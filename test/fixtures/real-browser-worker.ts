@@ -10,12 +10,19 @@ import {
 } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { createRequire } from "node:module";
-import { createProductionBrowserProcessBoundary } from "../../browser-process.js";
+import {
+  createProductionBrowserProcessBoundary,
+  helperRuntimeHome,
+} from "../../browser-process.js";
 import {
   BrowserOriginScopeDeniedError,
   createBrowserInstanceRuntime,
 } from "../../browser-runtime.js";
-import { profileStoragePaths } from "../../profile-storage.js";
+import {
+  createBrowserUserProfileOwnershipBoundary,
+  profileManifest,
+  profileStoragePaths,
+} from "../../profile-storage.js";
 import { createPanelCapabilityStore } from "../../panel-capability.js";
 import { createPanelGateway } from "../../panel-gateway.js";
 import { createAutomationStreamAdapter } from "../../panel-stream.js";
@@ -135,14 +142,49 @@ const runtimeOptions = {
   launchBoundary: boundary,
   ...(action === "lifecycle" ? { idleSleepMs: 250 } : {}),
 };
-const runtime = createBrowserInstanceRuntime(runtimeOptions);
+const baseRuntime = createBrowserInstanceRuntime(runtimeOptions);
+const runtime = {
+  ...baseRuntime,
+  async start(request: Parameters<typeof baseRuntime.start>[0]) {
+    const paths = profileStoragePaths({ ...runtimeOptions, ...request });
+    if (!(await pathExists(paths.manifestPath))) {
+      const ownership = createBrowserUserProfileOwnershipBoundary();
+      const manifest = profileManifest(
+        {
+          ...runtimeOptions,
+          ...request,
+          name: `Acceptance ${request.profileId}`,
+          locale: request.locale ?? "en-US",
+          timezone: request.timezone ?? "UTC",
+        },
+        () => new Date(),
+      );
+      await mkdir(paths.profileDirectory, { recursive: true, mode: 0o700 });
+      await ownership.ensureOwned(paths.profileDirectory, 0o700);
+      await writeFile(paths.manifestPath, JSON.stringify(manifest), {
+        mode: 0o600,
+      });
+      await ownership.ensureOwned(paths.manifestPath, 0o600);
+    }
+    return baseRuntime.start(request);
+  },
+};
+// A failed worker must not leave a live browser behind for the next test.
+process.once("uncaughtException", async (error) => {
+  console.error(error);
+  const cleanup = await Promise.allSettled([runtime.dispose()]);
+  for (const outcome of cleanup) {
+    if (outcome.status === "rejected") console.error(outcome.reason);
+  }
+  process.exit(1);
+});
 const storagePaths = profileStoragePaths({
   rootDirectory,
   installationId: requiredEnvironment("BB_BROWSER_REAL_INSTALLATION_ID"),
   hostId: target.hostId,
   profileId: target.profileId,
 });
-const helperHome = join(
+const helperHome = helperRuntimeHome(
   storagePaths.runtimeManifestsDirectory,
   `bb-${target.profileId}`,
 );
@@ -413,12 +455,22 @@ if (action === "start") {
   scriptOutput = String(await runtime.execute(target, signInScript, 20_000));
   const before = JSON.parse(
     String(await runtime.execute(target, pageInventoryScript, 20_000)),
-  ) as unknown[];
-  const navigationResponse = await runtime.navigate(target, fixtureAddress);
+  ) as { id: string; name: string | null }[];
+  const account = before.find((page) => page.name === "auth");
+  if (account === undefined)
+    throw new Error("The authenticated tab is missing.");
+  const navigationResponse = await runtime.navigate(
+    { ...target, tabId: account.id },
+    fixtureAddress,
+  );
   const after = JSON.parse(
     String(await runtime.execute(target, pageInventoryScript, 20_000)),
   ) as unknown[];
   navigation = { before, after, tabId: navigationResponse.tabId };
+  // Checkpoint Chrome's asynchronous storage writes before testing a crash.
+  await runtime.stop(target);
+  instance = await runtime.start(target);
+  await runtime.execute(target, pageInventoryScript, 20_000);
 } else if (action === "crash-recover") {
   crashedPid = initialInstance.pid;
   process.kill(crashedPid, "SIGKILL");
@@ -1108,7 +1160,7 @@ const runningState = {
   disableReEnable,
   uid: boundary.effectiveUserId,
   gid: boundary.effectiveGroupId,
-  ownedProcesses: await ownedProcesses(rootDirectory),
+  ownedProcesses: await ownedProcesses(storagePaths.profileDirectory),
   helperProcess:
     automationHelperPid === null
       ? null
@@ -1135,7 +1187,7 @@ const report =
             ? null
             : { crashedPid, recoveredPid: instance.pid },
         postStop: {
-          ownedProcesses: await ownedProcesses(rootDirectory),
+          ownedProcesses: await ownedProcesses(storagePaths.profileDirectory),
           browserPresent: await processExists(instance.pid),
           helperPresent:
             automationHelperPid === null

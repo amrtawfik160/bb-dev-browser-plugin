@@ -260,10 +260,7 @@ describe("CDP screencast source contract", () => {
     }
   });
 
-  it("downloads a saved image through setDownloadBehavior, not a Page.navigate download transition", async () => {
-    // SPEC-1: Page.navigate with transition:"download" is invalid CDP and
-    // silently swallows. Save-image must use Page.setDownloadBehavior + the
-    // Browser download handler, never a download-transition navigate.
+  it("does not offer image saving without a Host Download staging path", async () => {
     const stub = createCdpEndpointStub();
     const controller = new AbortController();
     const source = createCdpScreencastSource({
@@ -273,19 +270,14 @@ describe("CDP screencast source contract", () => {
     try {
       void source.start(() => undefined, controller.signal);
       await waitForStartScreencast(stub);
-      // Prime a save-image action through the context-action store.
-      await source.resolveContextActions?.({ x: 0, y: 0 });
+      const actions = await source.resolveContextActions?.({ x: 0, y: 0 });
+      expect(actions?.map((action) => action.kind)).not.toContain("save-image");
       source.performContextAction?.("save-image");
-      await waitFor(() =>
-        stub.commands.some(
-          (command) => command.method === "Page.setDownloadBehavior",
-        ),
-      );
       expect(
         stub.commands.some(
           (command) => command.method === "Page.setDownloadBehavior",
         ),
-      ).toBe(true);
+      ).toBe(false);
       // The broken download-transition navigate must never be sent.
       expect(
         stub.commands.some(

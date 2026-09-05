@@ -279,7 +279,7 @@ describe("Browser Panel", () => {
       // The owner learns where this browser runs and how agents get to use it,
       // rather than staring at a blank canvas that reads as a failed load.
       expect(landing.textContent).toMatch(/runs on/iu);
-      expect(landing.textContent).toMatch(/bb browser trust/u);
+      expect(landing.textContent).toMatch(/Browser Settings/u);
       const address = await panel.findByLabelText("Address or search");
       await waitFor(() => expect(document.activeElement).toBe(address));
     } finally {
@@ -586,10 +586,12 @@ describe("Browser Panel", () => {
 
       const panel = browser.renderPanel();
       // The owner never mistakes agent-driven navigation for their own: the
-      // page is marked and the agent says what it is doing.
+      // page is marked in the host's attention color and the agent says what
+      // it is doing.
       await panel.findByText(/Book the flight/u, undefined, { timeout: 5_000 });
       const page = await panel.findByRole("region", { name: "Browser page" });
       expect(page.getAttribute("style")).toContain("box-shadow");
+      expect(page.getAttribute("style")).toContain("var(--attention)");
       // And the owner can take the browser back from here.
       await panel.findByRole("button", { name: "Interrupt the agent" });
 
@@ -611,6 +613,63 @@ describe("Browser Panel", () => {
     }
   });
 
+  it("draws toolbar controls as icon buttons with tooltips, not text glyphs", async () => {
+    const browser = await createPublicPluginHarness({
+      status: healthyBrowserStatus,
+      browserRuntime: createTabInventoryRuntime(),
+    });
+    try {
+      const panel = browser.renderPanel();
+      const back = await panel.findByRole("button", { name: "Go back" });
+      expect(back.textContent).toBe("");
+      expect(back.querySelector("svg")).not.toBeNull();
+      expect(back.getAttribute("title")).toBe("Go back");
+      const status = await panel.findByRole("button", {
+        name: "Browser status: Ready",
+      });
+      expect(status.querySelector("[role=img]")).not.toBeNull();
+      const options = await panel.findByRole("button", {
+        name: "Browser options",
+      });
+      expect(options.querySelector("svg")).not.toBeNull();
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("keeps the tab strip on one scrolling row however many tabs are open", async () => {
+    const browser = await createPublicPluginHarness({
+      status: healthyBrowserStatus,
+      browserRuntime: createTabInventoryRuntime(),
+    });
+    try {
+      await browser.createBrowserProfile({
+        hostId: "host-browser-test",
+        name: "Wide tab strip panel",
+      });
+      const panel = browser.renderPanel();
+      const strip = await panel.findByRole("list", { name: "Browser tabs" });
+      const newTab = await panel.findByRole("button", {
+        name: "Open a new tab",
+      });
+      for (let count = 1; count <= 6; count += 1) {
+        fireEvent.click(newTab);
+        await waitFor(() =>
+          expect(within(strip).getAllByRole("listitem")).toHaveLength(count),
+        );
+      }
+      // Six tabs stay on one row that scrolls; wrapping would push the page
+      // down a line for every few tabs the owner opens.
+      expect(strip.className).toContain("overflow-x-auto");
+      expect(strip.className).not.toContain("flex-wrap");
+      expect(
+        within(strip).getAllByRole("button", { name: "Close New tab" }),
+      ).toHaveLength(6);
+    } finally {
+      await browser.dispose();
+    }
+  });
+
   it("asks about a denied site by name, with allowing that one site the primary answer", async () => {
     const browser = await createPublicPluginHarness({
       status: healthyBrowserStatus,
@@ -621,6 +680,7 @@ describe("Browser Panel", () => {
         hostId: "host-browser-test",
         name: "Denied site target",
       });
+      await browser.withdrawDefaultAccess();
       const denied = await browser.runBrowserScriptWithProfile(undefined, {
         destinationOrigin: "https://denied-site.example.test",
       });
@@ -684,9 +744,12 @@ describe("Browser Panel", () => {
         hostId: "host-browser-test",
         name: "Two project target",
       });
+      await browser.withdrawDefaultAccess();
       // One profile serves every project on the host, so two projects can be
       // waiting on the same site at once. They are two questions: answering
-      // one must not be taken for answering the other.
+      // one must not be taken for answering the other. The foreign project
+      // keeps Default Access, so its question comes from an elevation the
+      // whole-web grant does not carry.
       await browser.runBrowserScriptWithProfile(undefined, {
         destinationOrigin: "https://shared-site.example.test",
       });
@@ -694,6 +757,7 @@ describe("Browser Panel", () => {
         destinationOrigin: "https://shared-site.example.test",
         projectId: "project-foreign",
         threadId: "thread-foreign-project",
+        fileTransfer: true,
       });
       const pending = await browser.listBrowserGrantRequests({
         status: "pending",
@@ -704,9 +768,11 @@ describe("Browser Panel", () => {
       const question = await panel.findByRole("region", {
         name: "Site access requests",
       });
+      // The foreign project's question asks for an elevation, so its answer
+      // is the hour-long one; both are still about this one site.
       expect(
         within(question).getAllByRole("button", {
-          name: "Allow https://shared-site.example.test",
+          name: /^Allow https:\/\/shared-site\.example\.test( for an hour)?$/u,
         }),
       ).toHaveLength(2);
       expect(keyWarnings).toEqual([]);
@@ -726,6 +792,7 @@ describe("Browser Panel", () => {
         hostId: "host-browser-test",
         name: "Repeated denial target",
       });
+      await browser.withdrawDefaultAccess();
       for (const purpose of ["First try", "Second try"]) {
         await browser.runBrowserScriptWithProfile(undefined, {
           purpose,
@@ -778,6 +845,7 @@ describe("Browser Panel", () => {
         hostId: "host-browser-test",
         name: "Trust project target",
       });
+      await browser.withdrawDefaultAccess();
       await browser.runBrowserScriptWithProfile(undefined, {
         destinationOrigin: "https://trust-project.example.test",
       });

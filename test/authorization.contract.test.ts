@@ -42,6 +42,16 @@ function createClockedStore() {
   };
 }
 
+function bindingA(origin: string) {
+  return {
+    projectId: "project-a",
+    hostId: "host-a",
+    installationId: "installation-a",
+    profileId: "profile-a",
+    origin,
+  };
+}
+
 function grant(
   overrides: Partial<BrowserProfileGrant> = {},
 ): BrowserProfileGrant {
@@ -120,81 +130,141 @@ describe("Browser Profile Grant public authorization contract", () => {
     expect(browserOriginScopeSchema.parse(projectAlias)).toBe(projectAlias);
   });
 
-  it("denies an agent by default and only allows the exact project/profile/install binding", async () => {
+  it("grants a project the whole web on its first agent operation and records one grant per binding", async () => {
     const { backend, store } = createStore();
 
     try {
-      expect(
-        store.authorize({
+      const first = store.authorize(bindingA("https://app.example.test"));
+      expect(first).toMatchObject({
+        allowed: true,
+        grant: {
           projectId: "project-a",
-          hostId: "host-a",
-          installationId: "installation-a",
           profileId: "profile-a",
-          origin: "https://app.example.test",
-        }),
-      ).toMatchObject({ allowed: false, code: "origin_denied" });
+          originScope: "*",
+          wholeWeb: true,
+          wholeWebExpiresAt: null,
+          persistentElevations: true,
+        },
+        grantRequest: null,
+      });
+      expect(store.list({ projectId: "project-a" })).toHaveLength(1);
+
+      // Later calls, to any web origin, reuse the recorded grant.
       expect(
-        store.authorize({
-          projectId: "project-a",
-          hostId: "host-a",
-          installationId: "installation-a",
-          profileId: "profile-a",
-          origin: "",
-        }),
-      ).toMatchObject({
+        store.authorize(bindingA("https://elsewhere.example.test")),
+      ).toMatchObject({ allowed: true });
+      expect(store.list({ projectId: "project-a" })).toHaveLength(1);
+
+      // A malformed destination is still refused and records nothing new.
+      expect(store.authorize(bindingA(""))).toMatchObject({
         allowed: false,
         code: "origin_denied",
         message: AGENT_EXACT_ORIGIN_REQUIRED,
         grantRequest: null,
       });
+      expect(store.list({ projectId: "project-a" })).toHaveLength(1);
 
-      store.create(grant());
-
-      expect(
-        store.authorize({
-          projectId: "project-a",
-          hostId: "host-a",
-          installationId: "installation-a",
-          profileId: "profile-a",
-          origin: "https://app.example.test/",
-        }),
-      ).toMatchObject({ allowed: true });
-      expect(
-        store.authorize({
-          projectId: "project-copy",
-          hostId: "host-a",
-          installationId: "installation-a",
-          profileId: "profile-a",
-          origin: "https://app.example.test",
-        }),
-      ).toMatchObject({ allowed: false, code: "origin_denied" });
-      expect(
-        store.authorize({
-          projectId: "project-a",
-          hostId: "host-a",
-          installationId: "installation-a",
-          profileId: "profile-other",
-          origin: "https://app.example.test",
-        }),
-      ).toMatchObject({ allowed: false, code: "origin_denied" });
-      expect(
-        store.authorize({
-          projectId: "project-a",
-          hostId: "host-a",
+      // Other projects, profiles, hosts, and installations receive their own
+      // grant rather than borrowing this one.
+      for (const binding of [
+        { ...bindingA("https://app.example.test"), projectId: "project-copy" },
+        { ...bindingA("https://app.example.test"), profileId: "profile-other" },
+        {
+          ...bindingA("https://app.example.test"),
           installationId: "installation-other",
-          profileId: "profile-a",
-          origin: "https://app.example.test",
-        }),
-      ).toMatchObject({ allowed: false, code: "origin_denied" });
+        },
+        { ...bindingA("https://app.example.test"), hostId: "host-other" },
+      ]) {
+        expect(store.authorize(binding)).toMatchObject({ allowed: true });
+      }
+      expect(store.list({ projectId: "project-a" })).toHaveLength(4);
+      expect(store.list({ projectId: "project-copy" })).toHaveLength(1);
+    } finally {
+      await backend.harness.lifecycle.dispose();
+    }
+  });
+
+  it("withdraws Default Access when the owner revokes the whole-web grant and restores it when the whole web is granted again", async () => {
+    const { backend, store } = createStore();
+
+    try {
+      const first = store.authorize(bindingA("https://app.example.test"));
+      if (!first.allowed) throw new Error("expected Default Access");
+      expect(store.revoke(first.grant.grantId)).toMatchObject({
+        outcome: "revoked",
+      });
+
+      // The project is back on the request flow for every web origin.
+      const denied = store.authorize(bindingA("https://app.example.test"));
+      expect(denied).toMatchObject({
+        allowed: false,
+        code: "origin_denied",
+        grantRequest: { origin: "https://app.example.test", status: "pending" },
+      });
+      expect(store.list({ projectId: "project-a" })).toEqual([]);
+
+      // An exact grant works as before while Default Access is withdrawn.
+      store.create(grant({ grantId: "grant-exact" }));
       expect(
-        store.authorize({
-          projectId: "project-a",
-          hostId: "host-other",
-          installationId: "installation-a",
-          profileId: "profile-a",
-          origin: "https://app.example.test",
-        }),
+        store.authorize(bindingA("https://app.example.test")),
+      ).toMatchObject({ allowed: true, grant: { grantId: "grant-exact" } });
+      expect(
+        store.authorize(bindingA("https://other.example.test")),
       ).toMatchObject({ allowed: false, code: "origin_denied" });
+
+      // Granting the whole web again restores Default Access: after a
+      // lifecycle revocation the project is granted afresh on its next call.
+      store.create(
+        grant({
+          grantId: "grant-whole-web-again",
+          originScope: "*",
+          wholeWeb: true,
+        }),
+      );
+      store.revokeProfile({
+        hostId: "host-a",
+        installationId: "installation-a",
+        profileId: "profile-a",
+      });
+      expect(store.list({ projectId: "project-a" })).toEqual([]);
+      const renewed = store.authorize(bindingA("https://other.example.test"));
+      expect(renewed).toMatchObject({
+        allowed: true,
+        grant: { originScope: "*" },
+      });
+      if (!renewed.allowed) throw new Error("expected Default Access");
+      expect(renewed.grant.grantId).not.toBe("grant-whole-web-again");
+    } finally {
+      await backend.harness.lifecycle.dispose();
+    }
+  });
+
+  it("keeps elevations as explicit opt-ins under Default Access", async () => {
+    const { backend, store } = createStore();
+
+    try {
+      const denied = store.authorize({
+        ...bindingA("https://app.example.test"),
+        fileTransfer: true,
+      });
+      expect(denied).toMatchObject({
+        allowed: false,
+        code: "origin_denied",
+        grantRequest: {
+          origin: "https://app.example.test",
+          requestedElevations: {
+            fileTransfer: true,
+            invalidCertificate: false,
+          },
+        },
+      });
+      // The project still received the whole web for ordinary automation.
+      expect(store.list({ projectId: "project-a" })).toMatchObject([
+        { originScope: "*", fileTransfer: false },
+      ]);
+      expect(
+        store.authorize(bindingA("https://app.example.test")),
+      ).toMatchObject({ allowed: true });
     } finally {
       await backend.harness.lifecycle.dispose();
     }
@@ -473,20 +543,20 @@ describe("Browser Profile Grant public authorization contract", () => {
     const { backend, store } = createStore();
 
     try {
-      const created = store.create(grant());
+      const created = store.create(
+        grant({ grantId: "grant-whole-web", originScope: "*", wholeWeb: true }),
+      );
       expect(store.revoke(created.grantId)).toMatchObject({
         grantId: created.grantId,
         outcome: "revoked",
       });
       expect(store.list({ projectId: "project-a" })).toEqual([]);
+      expect(store.inspect(created.grantId)).toMatchObject({
+        grantId: created.grantId,
+        revokedAt: NOW.toISOString(),
+      });
       expect(
-        store.authorize({
-          projectId: "project-a",
-          hostId: "host-a",
-          installationId: "installation-a",
-          profileId: "profile-a",
-          origin: "https://app.example.test",
-        }),
+        store.authorize(bindingA("https://app.example.test")),
       ).toMatchObject({ allowed: false, code: "origin_denied" });
     } finally {
       await backend.harness.lifecycle.dispose();

@@ -79,6 +79,12 @@ follow. Popups become shared Browser Tabs.
 - Alert, confirm, prompt, and before-unload dialogs render in BB. Unresolved
   agent dialogs are dismissed when the agent's Control Lease ends.
 
+Click the streamed page to type or scroll. Press **Shift+Escape** to return
+focus to BB. BB keeps its global shortcuts. Right-click a link or image to
+open it in another tab or copy its address to your device; copying requires
+your displaying browser's clipboard permission. Image saving from this menu
+is unavailable until it is connected to Host Download quarantine.
+
 ## Controller transfer
 
 All panels receive live state, but only one owner client or agent holds the
@@ -94,9 +100,16 @@ All panels receive live state, but only one owner client or agent holds the
 
 ## Grants and requests
 
-Agents are **denied by default**. A persistent **Profile Grant** authorizes one
-BB project to fully automate one profile at explicit web origins. Grants are
-managed in authenticated Browser Settings, not from a thread.
+A persistent **Profile Grant** authorizes one BB project to fully automate one
+profile within an Origin Scope. A project's first agent operation on a profile
+records a whole-web grant automatically (**Default Access**); revoke it under
+**Agent access** in Browser Settings to put that project on the Grant Request
+flow described below, and grant the whole web again to restore it.
+
+Browser Settings has six sections: **Browser** (hosts and readiness),
+**Agent access** (grants and requests), **Profiles**, **Downloads**,
+**Activity**, and **Maintenance** (setup, backups, disable, uninstall, purge,
+and diagnostics). Grants are managed there, not from a thread.
 
 - **Origin Scope** uses exact `scheme://host:port` origins and optional explicit
   subdomain patterns such as `https://*.example.test`. URL paths do not narrow
@@ -109,9 +122,11 @@ managed in authenticated Browser Settings, not from a thread.
 - Disallowed HTTP(S) navigation is aborted before commit by the host route.
   Direct agent non-web `Frame.goto` is rejected before its Playwright command
   reaches Chromium; renderer-initiated navigation, redirects, popups, and
-  frames fail closed through the CDP guard. Exact `about:blank` is the only
-  safe internal exception; HTTP(S)-backed `blob:` uses its embedded origin, and
-  cross-origin subresources may render normally.
+  frames fail closed through the CDP guard. Exact `about:blank` is the safe
+  internal exception. Restored Chrome new-tab / error documents are cleared to
+  `about:blank` before agent access; direct navigation to them is denied. HTTP(S)-backed
+  `blob:` uses its embedded origin, and cross-origin subresources may render
+  normally.
 
 ### Grant Requests (after a denial)
 

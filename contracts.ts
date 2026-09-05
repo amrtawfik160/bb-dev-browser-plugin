@@ -2168,13 +2168,12 @@ export type BrowserDialogResponseMessage = z.infer<
  * the available actions, then executes the chosen one. `targetUrl` is the
  * link href or image src the action applies to.
  *
- * Limitation (SPEC-2): `copy-link` and `copy-image-address` write through
- * `navigator.clipboard.writeText` evaluated in the page, which requires
- * transient activation the controller's CDP input does not reliably provide.
- * The source surfaces each copy outcome (ok/not-ok) through its
- * `onContextActionResult` callback rather than silently swallowing failures,
- * so the host can disclose that a copy did not land; v1 does not guarantee
- * delivery to the controller's clipboard.
+ * The Browser Panel copies link/image addresses through its displaying client's
+ * Clipboard API after an explicit owner click, and reports permission failures.
+ * Source-only callers can request a host-page clipboard write; its callback
+ * reports execution failure, but that path does not reach the owner's device.
+ * `save-image` remains a wire kind for compatibility and is not offered until
+ * image saving is connected to Host Download quarantine.
  */
 export const browserContextActionKindSchema = z.enum([
   "open-link-new-tab",

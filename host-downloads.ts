@@ -176,7 +176,6 @@ export function normalizeDownloadName(suggested: string): string {
   let name = suggested.replace(/[\u0000-\u001f\u007f]/gu, "");
   // Remove every path separator so the name cannot contain a segment.
   name = name.replace(/[/\\]+/gu, " ").trim();
-  // Collapse runs of whitespace.
   name = name.replace(/\s+/gu, " ").trim();
   // Reject leading dots so the result cannot be `.`/`..` or a hidden escape.
   name = name.replace(/^[.\s]+/u, "").replace(/[.\s]+$/u, "");

@@ -13,7 +13,9 @@ bb browser diagnostics [--profile <id>] [--host <id>] [--json]
 
 `status` prints the label, message, and a nine-capability checklist. Use
 `diagnostics` when the status asks for repair details; the bundle is redacted
-(no URLs, cookies, profile data, scripts, screenshots, or form contents).
+(no URLs, cookies, profile data, scripts, screenshots, or form contents). In
+Browser Settings the same bundle downloads as a file from the **Maintenance**
+section.
 
 ## State reference
 
@@ -86,17 +88,31 @@ Connect session, panel capability redemption) and reconnect behavior.
 
 ## Common operations
 
-- **Agent denial** — a denied web origin returns `origin_denied` with a Grant
-  Request: surface it to the owner; after approval, retry explicitly. A
-  non-web denial has no Grant Request and cannot be approved. The failed call
-  never resumes automatically.
+- **Agent denial** — web origins are allowed by default; a project's first call
+  records a whole-web grant. A denied web origin means the owner revoked that
+  grant: it returns `origin_denied` with a Grant Request, so surface it to the
+  owner and retry explicitly after approval. A non-web denial has no Grant
+  Request and cannot be approved. The failed call never resumes automatically.
   If the message asks for `destinationOrigin`, pass `--origin https://example.com`
   (or the tool parameter) as an exact origin. A Grant Request is only created
   for a real origin.
-- **Agent contention** — `browser_busy`: an owner has control, or 5 s elapsed
-  waiting behind another agent. Do not queue; surface and let the owner act.
+- **Agent contention** — `browser_busy`: an owner has control, or the call
+  waited 30 seconds behind other agents. The waiting call did not run. If
+  another agent is active, let it finish before retrying once. If the owner is
+  controlling the page, wait for them to release control. The CLI uses the same
+  lease and cannot bypass contention.
 - **Tab not found** — `tab_invalid`: tab IDs are runtime-only. List tabs again
   after any browser or worker restart and retry with a fresh ID.
+- **Script syntax error** — QuickJS reports `expecting ','` without a
+  position. The `script_failed` message appends a `Syntax check:` line from
+  Node's parser naming the script line to fix.
+- **`bb browser open` or `script` refuses to run from a shell** — both need
+  `BB_THREAD_ID`, which every project thread sets. When `BB_PROJECT_ID` is
+  absent the project is read from the thread.
+- **Owner tabs went blank** — while an agent runs under an exact-origin grant,
+  tabs outside that origin are parked on `about:blank` and return when the
+  call ends. If one does not come back, its Back button reaches the previous
+  page.
 - **Disk pressure** — new instances and downloads are refused below 5 GiB host
   free space; low-disk is classified as `repair-required` without deleting
   cookies or site storage.

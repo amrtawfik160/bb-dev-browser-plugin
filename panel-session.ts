@@ -118,6 +118,7 @@ function createSessionStreamFanout() {
   let source: ScreencastSource | undefined;
   let sharedAbort: AbortController | undefined;
   let started = false;
+  let running: Promise<void> | undefined;
   let lastFrame: ScreencastFrame | undefined;
   const sinks = new Set<(frame: ScreencastFrame) => void>();
 
@@ -133,18 +134,32 @@ function createSessionStreamFanout() {
         if (!started) {
           started = true;
           sharedAbort = new AbortController();
-          void real.start((frame) => {
+          running = real.start((frame) => {
             lastFrame = frame;
             for (const next of sinks) next(frame);
           }, sharedAbort.signal);
         }
-        await new Promise<void>((resolve) => {
+        let stopWaiting: (() => void) | undefined;
+        const disconnected = new Promise<void>((resolve) => {
           if (signal.aborted) {
             resolve();
             return;
           }
-          signal.addEventListener("abort", () => resolve(), { once: true });
+          stopWaiting = () => resolve();
+          signal.addEventListener("abort", stopWaiting, { once: true });
         });
+        try {
+          await Promise.race([running, disconnected]);
+        } finally {
+          if (stopWaiting !== undefined)
+            signal.removeEventListener("abort", stopWaiting);
+          if (!signal.aborted && source === real) {
+            source = undefined;
+            started = false;
+            lastFrame = undefined;
+            await real.stop();
+          }
+        }
       },
       input(payload) {
         real.input(payload);
