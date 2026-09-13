@@ -68,7 +68,7 @@ export type BrowserTabStripOptions = {
   maxTabs?: number;
 };
 
-export const TAB_STRIP_DEFAULT_MAX_TABS = 64;
+export const TAB_STRIP_DEFAULT_MAX_TABS = 12;
 
 /**
  * Mint a runtime-only tab identifier. It is opaque and carries no transport

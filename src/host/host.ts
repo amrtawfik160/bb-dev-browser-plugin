@@ -339,6 +339,8 @@ function downloadNotProvisionedFallback(
 function scriptRuntimeErrorCode(
   error: unknown,
 ): BrowserScriptRuntimeError["code"] {
+  if (error instanceof BrowserInstanceError && error.code === "awake-limit")
+    return "awake-limit";
   return error instanceof BrowserScriptExecutionError
     ? error.code
     : "script_failed";
@@ -349,6 +351,7 @@ const scriptRuntimeErrorLabels: Record<
   string
 > = {
   browser_busy: "Browser busy",
+  "awake-limit": "Browser capacity in use",
   browser_timeout: "Browser script timed out",
   result_too_large: "Browser result too large",
   lease_revoked: "Browser Control Lease revoked",
@@ -1774,7 +1777,9 @@ export function createBrowserHostEntry(
               }
               if (
                 (context.signal.aborted && !lease.signal.aborted) ||
-                (error instanceof BrowserInstanceError && !lease.signal.aborted)
+                (error instanceof BrowserInstanceError &&
+                  error.code !== "awake-limit" &&
+                  !lease.signal.aborted)
               ) {
                 throw error;
               }
@@ -1969,6 +1974,15 @@ export function createBrowserHostEntry(
           profileId: DEFAULT_PROFILE_ID,
         });
         return profiles(dataDir).createProfile(request);
+      },
+      ensureScopedProfile: async (request, context) => {
+        retainWorker(context);
+        const dataDir = context.experimental_paths.dataDir;
+        await requireReadyForProfileMutation(administration(dataDir), {
+          hostId: request.hostId,
+          profileId: DEFAULT_PROFILE_ID,
+        });
+        return profiles(dataDir).ensureScopedProfile(request);
       },
       renameProfile: async (request, context) => {
         retainWorker(context);

@@ -36,6 +36,7 @@ import {
   browserPanelReclaimControlRequestSchema,
   browserHostReleaseControlRequestSchema,
   browserProfileCreateRequestSchema,
+  browserScopedProfileRequestSchema,
   browserProfileDeleteRequestSchema,
   browserProfileExpiryResponseSchema,
   browserProfileBackupRequestSchema,
@@ -189,6 +190,10 @@ export const browserHostContract = defineRpcContract({
   },
   createProfile: {
     input: browserProfileCreateRequestSchema,
+    output: browserProfileSchema,
+  },
+  ensureScopedProfile: {
+    input: browserScopedProfileRequestSchema,
     output: browserProfileSchema,
   },
   renameProfile: {

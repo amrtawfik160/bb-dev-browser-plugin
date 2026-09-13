@@ -388,6 +388,18 @@ export const browserProfileCreateRequestSchema = z
   })
   .strict();
 
+export const browserScopedProfileRequestSchema = z
+  .object({
+    hostId: z.string().min(1),
+    projectId: z.string().min(1),
+    threadId: z.string().min(1).optional(),
+  })
+  .strict();
+
+export type BrowserScopedProfileRequest = z.infer<
+  typeof browserScopedProfileRequestSchema
+>;
+
 export const browserProfileRenameRequestSchema = z
   .object({
     hostId: z.string().min(1),
@@ -3381,6 +3393,7 @@ export const browserScriptRuntimeErrorSchema = z
     state: z.literal("runtime-error"),
     code: z.enum([
       "browser_busy",
+      "awake-limit",
       "browser_timeout",
       "result_too_large",
       "lease_revoked",

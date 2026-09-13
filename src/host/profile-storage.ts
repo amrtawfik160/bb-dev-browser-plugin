@@ -27,6 +27,7 @@ import {
   RESET_PROFILE_CONFIRMATION,
   type BrowserProfile,
   type BrowserProfileCreateRequest,
+  type BrowserScopedProfileRequest,
   type BrowserProfileDeleteRequest,
   type BrowserProfileExpiryResponse,
   type BrowserProfileInventory,
@@ -38,6 +39,7 @@ import {
   type BrowserProfileSelectRequest,
   type BrowserProfileTarget,
 } from "../shared/contracts.js";
+import { scopedProfileId } from "../shared/profile-scope.js";
 
 const PROFILE_DIRECTORY_MODE = 0o700;
 const PROFILE_MANIFEST_MODE = 0o600;
@@ -95,6 +97,9 @@ export interface BrowserProfileStore {
   listProfiles(hostId: string): Promise<BrowserProfileInventory>;
   initialize(hostId: string): Promise<void>;
   createProfile(request: BrowserProfileCreateRequest): Promise<BrowserProfile>;
+  ensureScopedProfile(
+    request: BrowserScopedProfileRequest,
+  ): Promise<BrowserProfile>;
   renameProfile(request: BrowserProfileRenameRequest): Promise<BrowserProfile>;
   selectProfile(
     request: BrowserProfileSelectRequest,
@@ -1388,17 +1393,25 @@ export function createFileBrowserProfileStore(
 
   async function createProfile(
     request: BrowserProfileCreateRequest,
+    scope?: BrowserScopedProfileRequest,
   ): Promise<BrowserProfile> {
     return withMutationLock(options, request.hostId, ownership, async () => {
       await ensureDefaultProfile(request.hostId);
       const inventory = await listProfilesUnlocked(request.hostId);
+      const profileId =
+        scope === undefined
+          ? profileIdFromFactory(idFactory)
+          : scopedProfileId(scope);
+      const existing = inventory.profiles.find(
+        (profile) => profile.profileId === profileId,
+      );
+      if (scope !== undefined && existing !== undefined) return existing;
       if (profileNameConflict(inventory.profiles, request.name)) {
         throw new BrowserProfileError(
           "profile-name-conflict",
           `A Browser Profile named "${request.name.trim()}" already exists on host ${request.hostId}.`,
         );
       }
-      const profileId = profileIdFromFactory(idFactory);
       const paths = profilePaths(
         options.rootDirectory,
         options.installationId,
@@ -1719,10 +1732,27 @@ export function createFileBrowserProfileStore(
     );
   }
 
+  async function ensureScopedProfile(request: BrowserScopedProfileRequest) {
+    const profileId = scopedProfileId(request);
+    const inventory = await listProfiles(request.hostId);
+    const existing = inventory.profiles.find(
+      (profile) => profile.profileId === profileId,
+    );
+    if (existing !== undefined) return existing;
+    return createProfile(
+      {
+        hostId: request.hostId,
+        name: `${request.threadId === undefined ? "Project" : "Thread"} ${profileId.split("-").at(-1)}`,
+      },
+      request,
+    );
+  }
+
   return {
     listProfiles,
     initialize,
     createProfile,
+    ensureScopedProfile,
     publishStagedProfile,
     renameProfile,
     selectProfile,

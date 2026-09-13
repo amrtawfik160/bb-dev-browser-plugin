@@ -9,6 +9,20 @@ A real Chromium runs on the workspace host under a dedicated user. It keeps its
 own logins and cookies in a Browser Profile, so a site you signed into once
 stays signed in for later automation.
 
+Leave `profileId` unset for an isolated default profile belonging to this BB
+thread. Repeated tool and CLI calls reuse it, and the thread's Browser Panel
+opens it too. Without a thread, the default belongs to the project. Profiles
+start with separate cookies and logins. Specify `profileId` only to deliberately
+share that named profile; owner selections can also opt a project or thread
+into sharing. Calls sharing a profile still take turns under its Control Lease.
+
+The host runs at most three Browser Instances. Unpinned profiles sleep after
+five idle minutes and can sleep earlier to make room. `awake-limit` means all
+three are in use: this call did not run. Wait until capacity is available;
+do not close another agent's tabs or stop its profile. Keep only needed tabs:
+the 12-tab retention cap closes the oldest inactive pages. Sleeping preserves
+site storage and tab locations, but transient form state can be lost.
+
 ## Start here
 
 Use `browser_script` with the exact HTTP(S) origin you need. Any web origin
@@ -112,6 +126,7 @@ await Promise.all([page.waitForURL(/\/search\?/), box.press("Enter")]);
 | `origin_denied`     | Owner withdrew access, or navigation is non-web | Surface any Grant Request; retry web origins only after approval                                                       |
 | `browser_busy`      | Owner control or a 30-second agent wait expired | This call did not run; let the active operation finish, then retry once                                                |
 | `browser_timeout`   | Script hit its deadline                         | Split the work or wait on a condition instead of a timer                                                               |
+| `awake-limit`       | All three running instances are in use          | Wait for capacity; do not stop another profile or close its tabs                                                       |
 | `script_failed`     | Playwright or syntax error                      | Read the call log at the end of the message — it names the reason. A `Syntax check:` line names the script line to fix |
 | `tab_invalid`       | Tab belongs to a previous runtime               | `browser.listPages()` again                                                                                            |
 | `setup_required`    | Host is not provisioned                         | Report it. Do not retry, install packages, or find another browser                                                     |

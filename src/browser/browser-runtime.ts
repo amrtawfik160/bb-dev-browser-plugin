@@ -339,7 +339,7 @@ type BrowserCrashHistory = {
 
 const CRASH_WINDOW_MS = 5 * 60 * 1_000;
 const CRASH_LIMIT = 3;
-export const DEFAULT_IDLE_SLEEP_MS = 30 * 60 * 1_000;
+export const DEFAULT_IDLE_SLEEP_MS = 5 * 60 * 1_000;
 export const DEFAULT_AWAKE_INSTANCE_LIMIT = 3;
 
 type StoredBrowserInstance =
@@ -1644,7 +1644,7 @@ export function createBrowserInstanceRuntime(
     if (evictable === undefined) {
       throw new BrowserInstanceError(
         "awake-limit",
-        `All ${awakeLimit} awake Browser Instances are pinned by a visible panel or active Control Lease.`,
+        `All ${awakeLimit} awake Browser Instances are pinned by a visible panel or active Control Lease. This call did not run. Wait for capacity without stopping another profile.`,
       );
     }
     await stopHeld(evictable[0], evictable[1]);

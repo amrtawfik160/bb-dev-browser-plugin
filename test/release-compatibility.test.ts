@@ -64,12 +64,16 @@ describe("release compatibility (issue #23 AC7)", () => {
         pluginId: "browser",
         pluginVersion: pkg.version,
         sdkMajor,
-        sdkVersion,
-        builtWith: { pluginSdkVersion: sdkVersion },
+        sdkVersion: expect.stringMatching(/^\d+\.\d+\.\d+$/u),
+        builtWith: { pluginSdkVersion: meta.sdkVersion },
       });
+      expect(Number(meta.sdkVersion.split(".")[0])).toBe(sdkMajor);
+      expect(
+        meta.sdkVersion.localeCompare(sdkVersion, "en", { numeric: true }),
+      ).toBeGreaterThanOrEqual(0);
     }
 
-    // The package engines gate matches the SDK the artifacts were built with.
+    // The dependency pin is the minimum supported SDK, not the builder version.
     expect(pkg.engines.bbPluginSdk).toBe(`>=${sdkVersion}`);
   });
 

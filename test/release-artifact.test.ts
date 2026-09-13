@@ -66,7 +66,7 @@ describe("release artifact (issue #23 AC2)", () => {
       ).toBe(true);
     }
 
-    // Each meta.json pins the SDK contract surface for that artifact.
+    // The builder records its SDK; it may be newer than our declaration pin.
     for (const artifact of [
       "server.meta.json",
       "app.meta.json",
@@ -78,8 +78,8 @@ describe("release artifact (issue #23 AC2)", () => {
         pluginId: "browser",
         pluginVersion: "0.1.0",
         sdkMajor: 0,
-        sdkVersion: "0.4.21",
-        builtWith: { pluginSdkVersion: "0.4.21" },
+        sdkVersion: expect.stringMatching(/^0\.\d+\.\d+$/u),
+        builtWith: { pluginSdkVersion: meta.sdkVersion },
       });
     }
   });

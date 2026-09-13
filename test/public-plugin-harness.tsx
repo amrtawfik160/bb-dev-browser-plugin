@@ -49,6 +49,7 @@ import {
   browserPurgePlanSchema,
   browserPurgeResponseSchema,
   browserProfileCreateRequestSchema,
+  browserScopedProfileRequestSchema,
   browserProfileDeleteRequestSchema,
   browserProfileBackupRequestSchema,
   browserProfileHostTargetSchema,
@@ -152,7 +153,11 @@ const PROJECT_ID = "project-browser-test";
 const THREAD_ID = "thread-browser-test";
 const FOREIGN_THREAD_ID = "thread-foreign-project";
 const ENVIRONMENT_ID = "environment-browser-test";
-const KNOWN_HARNESS_THREAD_IDS = new Set([THREAD_ID, FOREIGN_THREAD_ID]);
+const KNOWN_HARNESS_THREAD_IDS = new Set([
+  THREAD_ID,
+  FOREIGN_THREAD_ID,
+  "thread-second",
+]);
 const KNOWN_HARNESS_PROJECT_IDS = new Set([
   PROJECT_ID,
   "project-foreign",
@@ -402,6 +407,8 @@ export async function createPublicPluginHarness(options?: {
   privilegedExecutor?: PrivilegedExecutor;
   administrationStateStore?: HostAdministrationStateStore;
   profileStore?: BrowserProfileStore;
+  /** Existing contract fixtures explicitly share Personal; isolation tests use fresh defaults. */
+  sharedProfile?: boolean;
   profileRecovery?: BrowserProfileRecovery;
   deferProjectLookup?: boolean;
   deferProfileInventory?: boolean;
@@ -903,6 +910,13 @@ export async function createPublicPluginHarness(options?: {
           { signal },
         );
       }
+      if (method === "ensureScopedProfile") {
+        return host.experimental_call(
+          "ensureScopedProfile",
+          browserScopedProfileRequestSchema.parse(input),
+          { signal },
+        );
+      }
       if (method === "renameProfile") {
         return host.experimental_call(
           "renameProfile",
@@ -1023,6 +1037,18 @@ export async function createPublicPluginHarness(options?: {
     },
   });
   await plugin(backend.bb);
+  if (options?.sharedProfile !== false) {
+    const preference = backend.bb.storage
+      .database()
+      .prepare(
+        "INSERT INTO browser_preferences (project_id, host_id, profile_id) VALUES (?, ?, ?)",
+      );
+    for (const projectId of KNOWN_HARNESS_PROJECT_IDS) {
+      for (const hostId of options?.hostIds ?? [configuredHostId]) {
+        preference.run(projectId, hostId, DEFAULT_PROFILE_ID);
+      }
+    }
+  }
   const app = await loadPluginApp(() => import("../src/app/app.js"));
   const threadPanels = new Map<string, RenderedSlot>();
   const newThreadPanels = new Map<string, RenderedSlot>();

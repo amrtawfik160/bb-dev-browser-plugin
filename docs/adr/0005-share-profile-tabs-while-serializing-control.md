@@ -1,5 +1,8 @@
 # Share profile tabs while serializing control
 
+> Amended by [ADR 0017](0017-isolate-default-profiles-by-thread.md): threads now
+> use separate default profiles. Explicitly shared profiles retain the behavior below.
+
 Browser Tabs, one active tab, and one Browser Instance belong to a Browser Profile rather than to a BB thread, so Browser Panels across threads and BB clients observe the same ordered tab set, tab selection, and controller-driven logical viewport; popup windows are normalized into that tab set. Input remains serialized through a Control Lease: owner interaction has priority, an agent script receives a visible, interruptible lease lasting no more than 30 seconds, and a second owner client remains view-only until it explicitly takes control. Agent work is rejected while an owner controls the profile and waits at most 30 seconds behind other agents. Waiting calls are served in arrival order and discarded on cancellation, expiry, or owner takeover; they are never persisted or executed after a busy response.
 
 On 4 September 2026, the wait limit changed from five to 30 seconds after two

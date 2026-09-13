@@ -370,13 +370,17 @@ describe("Browser Instance runtime", () => {
       await fixture.runtime.start(fixture.target);
       await fixture.runtime.pinPanel(fixture.target, "panel-a");
 
-      await vi.advanceTimersByTimeAsync(30 * 60 * 1_000);
+      await vi.advanceTimersByTimeAsync(5 * 60 * 1_000);
       expect(await fixture.runtime.status(fixture.target)).toMatchObject({
         state: "running",
       });
 
       await fixture.runtime.unpinPanel(fixture.target, "panel-a");
-      await vi.advanceTimersByTimeAsync(30 * 60 * 1_000);
+      await vi.advanceTimersByTimeAsync(5 * 60 * 1_000 - 1);
+      expect(await fixture.runtime.status(fixture.target)).toMatchObject({
+        state: "running",
+      });
+      await vi.advanceTimersByTimeAsync(1);
       expect(await fixture.runtime.status(fixture.target)).toEqual({
         state: "sleeping",
         hostId: "host-a",
@@ -493,6 +497,50 @@ describe("Browser Instance runtime", () => {
       });
     } finally {
       releaseExecution();
+      await fixture.dispose();
+    }
+  });
+
+  it("refuses a fourth agent without interrupting three active scripts", async () => {
+    const fixture = await runtimeFixture();
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const started = vi.fn();
+    fixture.processFixture.boundary.execute = async () => {
+      started();
+      await pending;
+      return "complete";
+    };
+    const operations = ["profile-a", "profile-b", "profile-c"].map(
+      (profileId) =>
+        fixture.runtime.execute(
+          { ...fixture.target, profileId },
+          "return page.url()",
+          30_000,
+        ),
+    );
+    try {
+      await vi.waitFor(() => expect(started).toHaveBeenCalledTimes(3));
+      await expect(
+        fixture.runtime.execute(
+          { ...fixture.target, profileId: "profile-d" },
+          "return page.url()",
+          30_000,
+        ),
+      ).rejects.toMatchObject({ code: "awake-limit" });
+      expect(fixture.processFixture.stopped).toEqual([]);
+      expect(fixture.processFixture.launches).toHaveLength(3);
+      release();
+      await expect(Promise.all(operations)).resolves.toEqual([
+        "complete",
+        "complete",
+        "complete",
+      ]);
+    } finally {
+      release();
+      await Promise.allSettled(operations);
       await fixture.dispose();
     }
   });

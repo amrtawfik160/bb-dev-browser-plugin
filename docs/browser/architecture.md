@@ -47,7 +47,10 @@ summarizes the runtime and indexes them.
   contents are best-effort across restarts. (ADR 0009)
 - Browser Tabs belong to a Browser Profile, not a BB thread. Every panel using
   that profile observes the same ordered tab set and one shared active tab.
-  (ADR 0005)
+  Threads have separate default profiles; explicit selections can share one.
+  At most three instances run, with five-minute idle sleep and a 12-tab cap
+  per instance. Active scripts and visible panels prevent capacity eviction.
+  (ADRs 0005, 0017)
 - Local development prefers a stable **Project Loopback Alias** such as
   `p-<project-hash>.localhost:<port>`. Raw localhost is an explicit compatibility
   fallback. (ADR 0013)

@@ -37,6 +37,19 @@ backups, disable, uninstall, purge, diagnostics).
 **Browser Profiles.** Named identities on one host. Reuse them across
 repositories on that host. They never copy to another machine.
 
+Each thread gets a separate default profile, so another agent cannot change
+its page between calls. Calls without a thread use a project default. Tool,
+CLI, and Browser Panel use the same selection. An explicit profile selection
+opts into sharing; a project selection applies to its threads unless a thread
+has its own selection. New profiles start with separate logins and cookies.
+
+At most three Browser Instances run on a host. An idle profile sleeps after
+five minutes; a fourth request can retire the least recently used idle instance.
+Active scripts and visible panels prevent retirement. If all three are busy,
+the request fails with `awake-limit`. Profiles retain at most 12 tabs, closing
+the oldest inactive pages beyond that limit. These bounds reduce resource use;
+they are not a fixed RAM quota. Sleeping profiles retain their data on disk.
+
 **Automation Mode.** You and granted agents share the stream and take turns
 with input.
 
