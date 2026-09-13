@@ -128,6 +128,7 @@ import { createPanelLifecycleDispatch } from "./panel-dispatch.js";
 import { BROWSER_SETTINGS_PROJECT_ID } from "../shared/panel-owner-session.js";
 import { dependencyInventory } from "../shared/dependency-inventory.js";
 import { authorizeFileTransfer } from "../host/transfer-staging.js";
+import { profileScopeKey, scopedProfileId } from "../shared/profile-scope.js";
 
 const PROFILE_IMPORT_ACTIVITY_ACTION = ["imp", "ort"].join("");
 const OWNER_SETTINGS_AUTHORITY_ERROR =
@@ -935,6 +936,12 @@ export function createBrowserService(
     if (!hostCanDispatchAutomation(readiness)) {
       return { ok: false as const, error: readiness };
     }
+    await ensureDefaultProfile(
+      call.context,
+      call.hostId,
+      call.profileId,
+      call.context.signal,
+    );
     const inventory = await profileInventory(
       { hostId: call.hostId },
       call.context.signal,
@@ -1211,25 +1218,84 @@ export function createBrowserService(
       { hostId: target.hostId },
       { hostId: target.hostId, signal },
     );
-    const projectId = await profileContextProjectId(bb, target);
-    return inventoryWithSelectedProfile(
-      inventory,
-      selectedProfilePreference(database, projectId, target.hostId),
+    const scope = await profileScope(target);
+    const preferred = profilePreference(scope, target.hostId);
+    const defaultId = scope.defaultProfileId;
+    if (preferred === null && defaultId !== DEFAULT_PROFILE_ID) {
+      return {
+        ...inventory,
+        selectedProfileId: defaultId,
+        profiles: inventory.profiles.map((profile) => ({
+          ...profile,
+          selected: profile.profileId === defaultId,
+        })),
+      };
+    }
+    return inventoryWithSelectedProfile(inventory, preferred);
+  }
+
+  async function profileScope(identity: ProfileContext) {
+    const projectId = await profileContextProjectId(bb, identity);
+    const scope = {
+      projectId,
+      ...(identity.threadId === undefined
+        ? {}
+        : { threadId: identity.threadId }),
+    };
+    return {
+      ...scope,
+      preferenceKey:
+        identity.threadId === undefined
+          ? projectId
+          : `scope:${profileScopeKey(scope)}`,
+      defaultProfileId:
+        projectId === SETTINGS_PROJECT_ID
+          ? DEFAULT_PROFILE_ID
+          : scopedProfileId(scope),
+    };
+  }
+
+  function profilePreference(
+    scope: { preferenceKey: string; projectId: string },
+    hostId: string,
+  ) {
+    return (
+      selectedProfilePreference(database, scope.preferenceKey, hostId) ??
+      selectedProfilePreference(database, scope.projectId, hostId)
+    );
+  }
+
+  async function ensureDefaultProfile(
+    identity: ProfileContext,
+    hostId: string,
+    profileId: string,
+    signal?: AbortSignal,
+  ) {
+    const scope = await profileScope(identity);
+    if (
+      scope.defaultProfileId === DEFAULT_PROFILE_ID ||
+      profileId !== scope.defaultProfileId
+    )
+      return;
+    return host.call(
+      "ensureScopedProfile",
+      {
+        hostId,
+        projectId: scope.projectId,
+        ...(scope.threadId === undefined ? {} : { threadId: scope.threadId }),
+      },
+      { hostId, signal },
     );
   }
 
   async function selectedProfileId(identity: BrowserIdentity, hostId: string) {
-    const resolution = await identityHostResolution(bb, identity);
-    const projectId = resolution.projectId ?? SETTINGS_PROJECT_ID;
-    return (
-      selectedProfilePreference(database, projectId, hostId) ??
-      DEFAULT_PROFILE_ID
-    );
+    const scope = await profileScope(identity);
+    return profilePreference(scope, hostId) ?? scope.defaultProfileId;
   }
 
   async function resolveTarget(
     identity: BrowserIdentity,
-    profileId = DEFAULT_PROFILE_ID,
+    profileId?: string,
     requestedHostId?: string,
   ): Promise<BrowserHostTarget> {
     const hostId = await resolvedHostId(bb, {
@@ -1239,7 +1305,10 @@ export function createBrowserService(
     if (hostId === null) {
       throw new Error("Select a workspace host before changing Browser setup.");
     }
-    return { hostId, profileId };
+    return {
+      hostId,
+      profileId: profileId ?? (await selectedProfileId(identity, hostId)),
+    };
   }
 
   async function status(
@@ -1286,14 +1355,21 @@ export function createBrowserService(
     if ((await hostConnection(hostId, signal)) !== "connected") {
       return hostStatus(hostId, DEFAULT_PROFILE_ID, signal);
     }
-    const projectId = await profileContextProjectId(bb, identity);
-    const preferredProfileId = selectedProfilePreference(
-      database,
-      projectId,
+    const scope = await profileScope(identity);
+    const preferredProfileId = profilePreference(scope, hostId);
+    const profileId = preferredProfileId ?? scope.defaultProfileId;
+    const readiness = await hostStatus(hostId, profileId, signal);
+    if (!hostCanDispatchAutomation(readiness)) return readiness;
+    const defaultProfile = await ensureDefaultProfile(
+      identity,
       hostId,
+      profileId,
+      signal,
     );
-    const profileId = preferredProfileId ?? DEFAULT_PROFILE_ID;
-    if (preferredProfileId !== null) {
+    if (defaultProfile?.state === "archived") {
+      return browserProfileUnavailableStatus({ hostId, profileId });
+    }
+    if (preferredProfileId !== null && profileId !== DEFAULT_PROFILE_ID) {
       const inventory = await profileInventory({ ...identity, hostId }, signal);
       const preferred = inventory.profiles.find(
         (profile) => profile.profileId === profileId,
@@ -1304,14 +1380,14 @@ export function createBrowserService(
       if (preferred.state === "archived") {
         saveSelectedProfilePreference(
           database,
-          projectId,
+          scope.preferenceKey,
           hostId,
           inventory.selectedProfileId,
         );
         return hostStatus(hostId, inventory.selectedProfileId, signal);
       }
     }
-    return hostStatus(hostId, profileId, signal);
+    return readiness;
   }
 
   async function settingsStatuses(profileId = DEFAULT_PROFILE_ID) {
@@ -1673,7 +1749,7 @@ export function createBrowserService(
           hostRequest,
           signal,
         );
-        const projectId = await profileContextProjectId(bb, request);
+        const scope = await profileScope(request);
         const snapshot = profileAuthoritySnapshot({
           hostId: request.hostId,
           installationId: inventory.installationId,
@@ -1683,7 +1759,7 @@ export function createBrowserService(
           assertProfileAuthorityCurrent(snapshot);
           saveSelectedProfilePreference(
             database,
-            projectId,
+            scope.preferenceKey,
             request.hostId,
             request.profileId,
           );

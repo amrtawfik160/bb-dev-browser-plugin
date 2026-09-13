@@ -22,6 +22,56 @@ import {
 } from "../src/host/profile-storage.js";
 
 describe("host-local Browser Profile storage", () => {
+  it("creates one scoped profile under concurrent calls and reuses it after restart", async () => {
+    const rootDirectory = await mkdtemp(join(tmpdir(), "bb-browser-scopes-"));
+    const options = {
+      rootDirectory,
+      installationId: "installation-test",
+      lifecycle: { stopProfile: async () => undefined },
+    };
+    const scope = {
+      hostId: "host-a",
+      projectId: "project-a",
+      threadId: "thread-a",
+    };
+    try {
+      const firstStore = createFileBrowserProfileStore(options);
+      const secondStore = createFileBrowserProfileStore(options);
+      const [first, second] = await Promise.all([
+        firstStore.ensureScopedProfile(scope),
+        secondStore.ensureScopedProfile(scope),
+      ]);
+      expect(first.profileId).toBe(second.profileId);
+      await firstStore.renameProfile({
+        hostId: scope.hostId,
+        profileId: first.profileId,
+        name: "My checkout",
+      });
+      const restarted = createFileBrowserProfileStore(options);
+      expect(await restarted.ensureScopedProfile(scope)).toMatchObject({
+        profileId: first.profileId,
+        name: "My checkout",
+      });
+      const other = await restarted.ensureScopedProfile({
+        ...scope,
+        threadId: "thread-b",
+      });
+      expect(other.profileId).not.toBe(first.profileId);
+      expect(
+        (await restarted.listProfiles(scope.hostId)).profiles,
+      ).toHaveLength(3);
+      await restarted.archiveProfile({
+        hostId: scope.hostId,
+        profileId: first.profileId,
+      });
+      expect(await restarted.ensureScopedProfile(scope)).toMatchObject({
+        state: "archived",
+      });
+    } finally {
+      await rm(rootDirectory, { recursive: true, force: true });
+    }
+  });
+
   it("lists an uninitialized host without creating Browser Profile storage", async () => {
     const rootDirectory = await mkdtemp(join(tmpdir(), "bb-browser-profile-"));
     try {

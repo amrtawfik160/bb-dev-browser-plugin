@@ -18,6 +18,7 @@ _Avoid_: Client browser, server browser
 
 **Browser Profile**:
 A named, host-local browser identity containing site authentication and storage. A profile may be reused across repositories on the same host but is never synchronized to another host.
+Threads receive separate default profiles; calls without a thread receive a project default. Explicit profile selections opt into sharing. Browser processes remain bounded independently of the number of stored profiles.
 _Avoid_: Account, global session
 
 **Archived Profile**:
