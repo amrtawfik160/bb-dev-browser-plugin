@@ -153,6 +153,93 @@ describe("Browser host runtime boundary", () => {
       await rm(rootDirectory, { recursive: true, force: true });
     }
   });
+
+  it("sleeps a running Browser Instance without stopping its profile", async () => {
+    const rootDirectory = await mkdtemp(join(tmpdir(), "host-sleep-runtime-"));
+    let lifecycleState: "sleeping" | "running" = "sleeping";
+    const stopped: string[] = [];
+    const notUsed = async () => {
+      throw new Error("not used");
+    };
+    const runtime = {
+      start: notUsed,
+      stop: async ({ profileId }: { profileId: string }) => {
+        stopped.push(profileId);
+        lifecycleState = "sleeping";
+      },
+      execute: notUsed,
+      navigate: notUsed,
+      history: notUsed,
+      openPage: notUsed,
+      focusPage: notUsed,
+      closePages: async () => 0,
+      listPages: async () => [],
+      status: async (target: { hostId: string; profileId: string }) => ({
+        state: lifecycleState,
+        ...target,
+      }),
+      pinPanel: notUsed,
+      unpinPanel: async () => {},
+      hostDisconnected: () => {},
+      hostReconnected: async () => {},
+      dispose: async () => {},
+    };
+    const profileStops: string[] = [];
+    const profiles = createFileBrowserProfileStore({
+      rootDirectory,
+      installationId: "installation-sleep-runtime",
+      lifecycle: {
+        stopProfile: async (_hostId, profileId) => {
+          profileStops.push(profileId);
+        },
+      },
+    });
+    await profiles.initialize(HOST_ID);
+    const host = experimental_createHostEntryHarness(
+      createBrowserHostEntry(
+        {
+          inspect: healthyStatus,
+          diagnostics: () => {
+            throw new Error("not used");
+          },
+        },
+        profiles,
+        undefined,
+        runtime,
+      ),
+      {
+        experimental_paths: {
+          dataDir: rootDirectory,
+          tempDir: join(rootDirectory, "tmp"),
+        },
+      },
+    );
+    const target = { hostId: HOST_ID, profileId: DEFAULT_PROFILE_ID };
+    try {
+      await expect(
+        host.experimental_call("sleepProfile", target),
+      ).resolves.toEqual({ outcome: "not-running" });
+      expect(stopped).toEqual([]);
+      lifecycleState = "running";
+      await expect(
+        host.experimental_call("sleepProfile", target),
+      ).resolves.toEqual({ outcome: "slept" });
+      expect(stopped).toEqual([DEFAULT_PROFILE_ID]);
+      expect(profileStops).toEqual([]);
+      const inventory = await host.experimental_call("listProfiles", {
+        hostId: HOST_ID,
+      });
+      expect(inventory.profiles).toContainEqual(
+        expect.objectContaining({
+          profileId: DEFAULT_PROFILE_ID,
+          state: "active",
+        }),
+      );
+    } finally {
+      await host.experimental_dispose();
+      await rm(rootDirectory, { recursive: true, force: true });
+    }
+  });
   it("issue #12 keeps one Browser Instance across the production host reconnect bridge", async () => {
     const rootDirectory = await mkdtemp(join(tmpdir(), "host-runtime-"));
     const profiles = createFileBrowserProfileStore({

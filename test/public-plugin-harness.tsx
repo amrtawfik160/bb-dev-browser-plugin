@@ -936,7 +936,11 @@ export async function createPublicPluginHarness(options?: {
         }
         return inventory;
       }
-      if (method === "archiveProfile" || method === "restoreArchivedProfile") {
+      if (
+        method === "archiveProfile" ||
+        method === "restoreArchivedProfile" ||
+        method === "sleepProfile"
+      ) {
         return host.experimental_call(
           method,
           browserProfileTargetSchema.parse(input),
@@ -2199,6 +2203,16 @@ export async function createPublicPluginHarness(options?: {
     }
   }
 
+  function emitThreadEvent(
+    event: "thread.archived" | "thread.deleted",
+    threadId = THREAD_ID,
+    projectId = PROJECT_ID,
+  ) {
+    return backend.harness.behavior.emitThreadEvent(event, {
+      thread: makeThreadResponse({ id: threadId, projectId }),
+    });
+  }
+
   async function seedHostActivityEvent(eventId = "seeded-host-activity") {
     await host.experimental_call("browserScript", {
       purpose: "Seed host activity",
@@ -2412,6 +2426,7 @@ export async function createPublicPluginHarness(options?: {
     setHostRpcFailure,
     emitHostConnection,
     emitProjectChange,
+    emitThreadEvent,
     projectLookupStarted,
     releaseProjectLookup() {
       releaseProjectLookupGate?.();

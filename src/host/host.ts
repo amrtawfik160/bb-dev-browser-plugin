@@ -6,7 +6,10 @@ import {
   createActivityOutbox,
   type ActivityOutbox,
 } from "../activity/activity-outbox.js";
-import { browserHostContract } from "../shared/host-contract.js";
+import {
+  browserHostContract,
+  type BrowserProfileSleepResponse,
+} from "../shared/host-contract.js";
 import {
   createBrowserUserProfileOwnershipBoundary,
   createFileBrowserProfileStore,
@@ -814,19 +817,24 @@ export function createBrowserHostEntry(
         });
     return retainedBoundary;
   }
+  function releaseProfileControl(target: {
+    hostId: string;
+    profileId: string;
+  }) {
+    controlLeases.revoke(controlLeaseKey(target));
+    // Stopping the profile ends every agent Control Lease: dismiss open
+    // dialogs before tearing down so they never strand.
+    dismissOpenDialogsForProfile(target);
+    // Stopping the profile releases every panel's control and invalidates
+    // the shared tab strip so stale runtime tab ids fail closed.
+    const session = panelSessions.sessionFor(target);
+    session.revoke();
+    session.tabStrip().resetInstance();
+  }
   function profileLifecycle(dataDir: string): BrowserProfileLifecycleBoundary {
     return {
       async stopProfile(hostId, profileId) {
-        const key = controlLeaseKey({ hostId, profileId });
-        controlLeases.revoke(key);
-        // Stopping the profile ends every agent Control Lease: dismiss open
-        // dialogs before tearing down so they never strand.
-        dismissOpenDialogsForProfile({ hostId, profileId });
-        // Stopping the profile releases every panel's control and invalidates
-        // the shared tab strip so stale runtime tab ids fail closed.
-        const session = panelSessions.sessionFor({ hostId, profileId });
-        session.revoke();
-        session.tabStrip().resetInstance();
+        releaseProfileControl({ hostId, profileId });
         try {
           await runtime(dataDir)?.stop({ hostId, profileId });
         } finally {
@@ -834,6 +842,24 @@ export function createBrowserHostEntry(
         }
       },
     };
+  }
+  /**
+   * Put a Browser Instance to sleep the way idle sleep does: the process
+   * stops, but unlike stopProfile nothing marks the profile stopped, so its
+   * storage, restorable tabs, and grants survive and the next use wakes it.
+   */
+  async function sleepProfile(
+    dataDir: string,
+    target: { hostId: string; profileId: string },
+  ): Promise<BrowserProfileSleepResponse> {
+    const browserRuntime = runtime(dataDir);
+    const state = (await browserRuntime?.status(target))?.state;
+    if (state !== "running" && state !== "waking") {
+      return { outcome: "not-running" };
+    }
+    releaseProfileControl(target);
+    await browserRuntime?.stop(target);
+    return { outcome: "slept" };
   }
   function runtime(dataDir: string) {
     if (retainedRuntime !== undefined) return retainedRuntime;
@@ -2018,6 +2044,10 @@ export function createBrowserHostEntry(
         const dataDir = context.experimental_paths.dataDir;
         await requireReadyForProfileMutation(administration(dataDir), request);
         return profiles(dataDir).restoreArchivedProfile(request);
+      },
+      sleepProfile: async (request, context) => {
+        retainWorker(context);
+        return sleepProfile(context.experimental_paths.dataDir, request);
       },
       resetProfile: async (request, context) => {
         retainWorker(context);

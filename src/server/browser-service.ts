@@ -878,6 +878,107 @@ export function createBrowserService(
     bb.onDispose(unsubscribe);
   }
 
+  /**
+   * Thread events are observe-only and fire-and-forget; `bb.events.on` has no
+   * unsubscribe because listeners end with the plugin generation.
+   */
+  function subscribeToThreadLifecycle() {
+    bb.events.on("thread.archived", ({ thread }) =>
+      releaseEndedThreadProfile(thread, "sleep"),
+    );
+    bb.events.on("thread.deleted", ({ thread }) =>
+      releaseEndedThreadProfile(thread, "archive"),
+    );
+  }
+
+  /**
+   * An archived thread's default profile sleeps so unarchiving wakes it with
+   * its sessions intact; a deleted thread's default profile becomes a
+   * recoverable Archived Profile. Only the profile derived from the thread
+   * identity is touched, and only on hosts that already hold it.
+   */
+  async function releaseEndedThreadProfile(
+    thread: { id: string; projectId: string },
+    release: "sleep" | "archive",
+  ) {
+    if (thread.projectId === "") return;
+    const scope = { projectId: thread.projectId, threadId: thread.id };
+    const profileId = scopedProfileId(scope);
+    const preferenceKey = `scope:${profileScopeKey(scope)}`;
+    const hosts = await bb.sdk.hosts.list().catch(() => null);
+    if (hosts === null) {
+      bb.log.warn(
+        "Browser could not list workspace hosts for an ended thread.",
+      );
+      return;
+    }
+    const offline = hosts.filter(({ status }) => status !== "connected");
+    if (offline.length > 0) {
+      bb.log.warn(
+        `Browser skipped ${offline.length} disconnected workspace host(s) while releasing an ended thread's browser.`,
+      );
+    }
+    await Promise.all(
+      hosts
+        .filter(({ status }) => status === "connected")
+        .map(({ id: hostId }) =>
+          releaseThreadProfileOnHost(
+            { hostId, profileId },
+            thread.projectId,
+            preferenceKey,
+            release,
+          ).catch(() => {
+            bb.log.warn(
+              "Browser could not release an ended thread's browser on a workspace host.",
+            );
+          }),
+        ),
+    );
+  }
+
+  async function releaseThreadProfileOnHost(
+    target: BrowserProfileTarget,
+    projectId: string,
+    preferenceKey: string,
+    release: "sleep" | "archive",
+  ) {
+    const inventory = await host.call(
+      "listProfiles",
+      { hostId: target.hostId },
+      { hostId: target.hostId },
+    );
+    const profile = inventory.profiles.find(
+      ({ profileId }) => profileId === target.profileId,
+    );
+    if (profile?.state !== "active") return;
+    if (profileSelectedOutsideScope(target, preferenceKey)) return;
+    if (release === "sleep") {
+      await host.call("sleepProfile", target, { hostId: target.hostId });
+      return;
+    }
+    await archiveListedProfile(target, inventory, {
+      actor: "system",
+      projectId,
+    });
+  }
+
+  /**
+   * An owner who explicitly selected a thread's default profile for another
+   * project or thread made it shared, so thread lifecycle leaves it alone.
+   */
+  function profileSelectedOutsideScope(
+    target: BrowserProfileTarget,
+    preferenceKey: string,
+  ) {
+    return (
+      database
+        .prepare(
+          "SELECT 1 FROM browser_preferences WHERE host_id = ? AND profile_id = ? AND project_id <> ?",
+        )
+        .get(target.hostId, target.profileId, preferenceKey) !== undefined
+    );
+  }
+
   async function resolveAgentScriptTarget(
     parameters: BrowserScriptParameters,
     context: PluginAgentToolContext,
@@ -1869,16 +1970,30 @@ export function createBrowserService(
   ) {
     requireOwnerSettingsAuthority(authority);
     const { inventory } = await lifecycleProfile(request, signal);
-    return recordProfileLifecycleActivity(request, "archive", async () => {
-      const response = await runDestructiveProfileLifecycle(
-        request,
-        inventory,
-        "profile-archived",
-        () => callConnectedProfile("archiveProfile", request, signal),
-      );
-      replaceProfilePreferences(request, inventory);
-      return response;
-    });
+    return archiveListedProfile(request, inventory, undefined, signal);
+  }
+
+  function archiveListedProfile(
+    request: BrowserProfileTarget,
+    inventory: BrowserProfileInventory,
+    attribution?: { actor: "system"; projectId: string },
+    signal?: AbortSignal,
+  ) {
+    return recordProfileLifecycleActivity(
+      request,
+      "archive",
+      async () => {
+        const response = await runDestructiveProfileLifecycle(
+          request,
+          inventory,
+          "profile-archived",
+          () => callConnectedProfile("archiveProfile", request, signal),
+        );
+        replaceProfilePreferences(request, inventory);
+        return response;
+      },
+      attribution,
+    );
   }
 
   async function restoreArchivedProfile(
@@ -2083,16 +2198,19 @@ export function createBrowserService(
     outcome: (response: T) => string;
     successTarget?: (response: T) => BrowserHostTarget;
     projectId?: string | null;
+    actor?: "owner" | "system";
     grantMetadata?: (response?: T) => BrowserActivityGrantMetadata;
   }): Promise<T> {
     const occurredAt = new Date().toISOString();
+    const actor = request.actor ?? "owner";
+    const eventPrefix = actor === "system" ? "system" : "server";
     try {
       const response = await request.operation();
       const target = request.successTarget?.(response) ?? request.target;
       activityProducers.record({
-        eventId: newActivityEventId("server"),
+        eventId: newActivityEventId(eventPrefix),
         occurredAt,
-        actor: "owner",
+        actor,
         projectId: request.projectId ?? null,
         hostId: target.hostId,
         profileId: target.profileId,
@@ -2108,9 +2226,9 @@ export function createBrowserService(
       return response;
     } catch (error) {
       activityProducers.record({
-        eventId: newActivityEventId("server"),
+        eventId: newActivityEventId(eventPrefix),
         occurredAt,
-        actor: "owner",
+        actor,
         projectId: request.projectId ?? null,
         hostId: request.target.hostId,
         profileId: request.target.profileId,
@@ -2162,6 +2280,7 @@ export function createBrowserService(
     target: BrowserHostTarget,
     action: string,
     operation: () => Promise<BrowserProfileLifecycleResponse>,
+    attribution?: { actor: "system"; projectId: string },
   ) {
     return recordActivity({
       target,
@@ -2169,6 +2288,7 @@ export function createBrowserService(
       action,
       operation,
       outcome: ({ outcome }) => outcome,
+      ...attribution,
     });
   }
 
@@ -2425,6 +2545,7 @@ export function createBrowserService(
 
   subscribeToHostConnections();
   subscribeToProjectDeletion();
+  subscribeToThreadLifecycle();
 
   /**
    * Stage an explicitly selected workspace or displaying-client file through
