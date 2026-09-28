@@ -29,6 +29,13 @@ scrolling tab strip, and the page below them, drawn in BB's own theme so it
 follows light and dark. While an agent drives the browser the page carries an
 amber frame and the agent's stated purpose; nothing else uses that colour.
 
+**Browser Cards.** An agent can show the thread's browser inside its reply
+with `::browser-live`: the profile, its state, the page it is on, and an
+**Open in panel** button. When a site needs you to sign in, the agent ends its
+reply with a Sign-in Handoff, `::browser-sign-in{origin="https://…"}`. Its
+button opens the Browser Panel on that site so you sign in yourself, then you
+reply in the thread. Cards stream no pixels and never wake a sleeping browser.
+
 **Browser Settings.** Six sections under Browser in BB settings: **Browser**
 (hosts and readiness), **Agent access** (grants and pending requests),
 **Profiles**, **Downloads**, **Activity**, and **Maintenance** (setup,
@@ -48,7 +55,9 @@ five minutes; a fourth request can retire the least recently used idle instance.
 Active scripts and visible panels prevent retirement. If all three are busy,
 the request fails with `awake-limit`. Profiles retain at most 12 tabs, closing
 the oldest inactive pages beyond that limit. These bounds reduce resource use;
-they are not a fixed RAM quota. Sleeping profiles retain their data on disk.
+they are not a fixed RAM quota. Sleeping profiles retain their data on disk. Archiving a thread puts its browser
+to sleep; deleting a thread archives its browser profile, which stays
+recoverable until it expires.
 
 **Automation Mode.** You and granted agents share the stream and take turns
 with input.

@@ -1,4 +1,5 @@
 import { defineRpcContract } from "@get-bb/plugin-sdk";
+import { z } from "zod";
 import {
   browserDiagnosticsSchema,
   browserActivityAcknowledgementRequestSchema,
@@ -86,6 +87,18 @@ import {
   browserDownloadPurgeInputSchema,
   browserDownloadPurgeOutcomeSchema,
 } from "./contracts.js";
+
+/**
+ * Sleeping stops a Browser Instance without touching its profile: storage,
+ * restorable tab locations, and grants survive, and the next use wakes it.
+ */
+export const browserProfileSleepResponseSchema = z
+  .object({ outcome: z.enum(["slept", "not-running"]) })
+  .strict();
+
+export type BrowserProfileSleepResponse = z.infer<
+  typeof browserProfileSleepResponseSchema
+>;
 
 export const browserHostContract = defineRpcContract({
   hostConnection: {
@@ -211,6 +224,10 @@ export const browserHostContract = defineRpcContract({
   restoreArchivedProfile: {
     input: browserProfileTargetSchema,
     output: browserProfileLifecycleResponseSchema,
+  },
+  sleepProfile: {
+    input: browserProfileTargetSchema,
+    output: browserProfileSleepResponseSchema,
   },
   resetProfile: {
     input: browserProfileResetRequestSchema,

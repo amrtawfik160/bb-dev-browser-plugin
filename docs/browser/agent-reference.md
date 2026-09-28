@@ -78,6 +78,27 @@ Its guidance for `setup_required` is **final**: report that host setup is
 required; do not retry, provision packages, launch a browser through another
 path, or seek a raw browser endpoint.
 
+## Browser Cards in chat
+
+Two message directives render live cards in a reply (ADR 0019). Each goes on
+its own line.
+
+| Directive                                    | Card                                                             |
+| -------------------------------------------- | ---------------------------------------------------------------- |
+| `::browser-live`                             | Profile, state, active tab title and address, **Open in panel**  |
+| `::browser-sign-in{origin="https://x.test"}` | Sign-in Handoff: the owner opens the origin in the Browser Panel |
+
+- Both use the profile this thread's Browser Panel shows. Add
+  `profile-id="<id>"` only when the scripts passed that `profileId`.
+- `origin` must be an exact HTTP(S) origin: no path, query, fragment, or
+  credentials. Unknown attributes make the card render an error instead.
+- Embed a card only when a person is likely watching, and at most one per
+  reply.
+- A Sign-in Handoff is the last thing in its reply; end the turn after it. If
+  sign-in is still pending when you check back, embed it again.
+- Never ask for passwords or codes in chat, and never type the owner's
+  credentials. Safe Login Mode is a separate owner-only flow.
+
 ## Typed results
 
 `browser_script` returns a `BrowserScriptResponse` discriminated on `ok`

@@ -119,6 +119,31 @@ keypress so you do not miss it:
 await Promise.all([page.waitForURL(/\/search\?/), box.press("Enter")]);
 ```
 
+## Showing the browser in chat
+
+When a person is likely watching, put `::browser-live` on its own line in your
+reply. It renders a live card with this thread's browser: profile, page title
+and address, and a button that opens the Browser Panel. Skip it for unattended
+or batch work, and use at most one card per reply. Add `profile-id="<id>"` only
+when you passed that `profileId`.
+
+When a site needs the owner to sign in, hand it over instead of asking for
+credentials:
+
+```text
+I need you to sign in to GitHub so I can continue.
+
+::browser-sign-in{origin="https://github.com"}
+```
+
+- `origin` is an exact origin: no path, query, or credentials.
+- Make the card the last thing in your reply and end your turn. Starting a long
+  wait after it collapses the turn and buries the card.
+- When the owner replies, check with `browser_script`. If sign-in is still
+  pending, embed the card again as the last thing in that reply.
+- Never ask for a password or code in chat, and never type the owner's
+  credentials yourself.
+
 ## Failures and what to do
 
 | Code                | Meaning                                         | Do                                                                                                                     |
