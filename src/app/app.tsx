@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { definePluginApp, useBbContext, useRpc } from "@get-bb/plugin-sdk/app";
 import type {
   PluginNewThreadPanelProps,
@@ -7,6 +7,7 @@ import type {
 import {
   BROWSER_WHOLE_WEB_ORIGIN_SCOPE,
   DEFAULT_PROFILE_ID,
+  browserProfileIdSchema,
   PERSIST_BROWSER_ELEVATED_ACCESS_CONFIRMATION,
   BROWSER_PANEL_STREAM_DISCLOSURE,
   PANEL_AUTH_ROTATION_MS,
@@ -83,11 +84,17 @@ import {
 } from "./panel-test-loopback.js";
 import { SAFE_LOGIN_LIMITATIONS_NOTICE } from "../shared/safe-login-notice.js";
 import {
+  BROWSER_LIVE_DIRECTIVE,
+  BROWSER_PANEL_ACTION_ID,
+  BROWSER_SIGN_IN_DIRECTIVE,
+  browserPanelParams,
+} from "./browser-card-presentation.js";
+import { BrowserLiveCard, BrowserSignInCard } from "./browser-cards.js";
+import {
   createAutomationStreamAdapter,
   type PanelStreamAdapter,
 } from "../panel/panel-stream.js";
 
-const panelParams = { profileId: DEFAULT_PROFILE_ID } as const;
 const GRANT_REQUEST_REFRESH_INTERVAL_MS = 1_000;
 let nextBrowserPanelId = 1;
 
@@ -1260,14 +1267,17 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
   // control broadcast carried.
   const [tabStrip, setTabStrip] = useState<BrowserTabStrip | null>(null);
 
+  // A panel opened for a named profile (a Browser Card for a profile other
+  // than the thread's) shows that profile; every other panel shows the
+  // profile this thread or project has selected.
+  const profileSelection =
+    request.profileId === DEFAULT_PROFILE_ID
+      ? { profileSelection: "selected" as const }
+      : {};
   const statusRequest: BrowserStatusInput =
     selectedHostId === undefined
-      ? { ...request, profileSelection: "selected" }
-      : {
-          ...request,
-          hostId: selectedHostId,
-          profileSelection: "selected",
-        };
+      ? { ...request, ...profileSelection }
+      : { ...request, hostId: selectedHostId, ...profileSelection };
 
   function profileContext() {
     return request.surface === "thread"
@@ -1824,12 +1834,25 @@ function attachPresentedOptions(
   });
 }
 
-function ThreadBrowserPanel({ threadId }: PluginThreadPanelProps) {
-  return (
-    <BrowserPanel
-      request={{ surface: "thread", threadId, profileId: DEFAULT_PROFILE_ID }}
-    />
+/**
+ * Tab params are persisted and replayed by the host, so they are untrusted
+ * here: anything but a valid profile id falls back to the thread's selection.
+ */
+function pinnedPanelProfileId(params: PluginThreadPanelProps["params"]) {
+  if (typeof params !== "object" || params === null || Array.isArray(params)) {
+    return DEFAULT_PROFILE_ID;
+  }
+  const parsed = browserProfileIdSchema.safeParse(params.profileId);
+  return parsed.success ? parsed.data : DEFAULT_PROFILE_ID;
+}
+
+function ThreadBrowserPanel({ threadId, params }: PluginThreadPanelProps) {
+  const profileId = pinnedPanelProfileId(params);
+  const request = useMemo<BrowserStatusInput>(
+    () => ({ surface: "thread", threadId, profileId }),
+    [threadId, profileId],
   );
+  return <BrowserPanel request={request} />;
 }
 
 function NewThreadBrowserPanel({ projectId }: PluginNewThreadPanelProps) {
@@ -1889,14 +1912,25 @@ export default definePluginApp((app) => {
   });
 
   app.slots.threadPanelAction({
-    id: "browser",
+    id: BROWSER_PANEL_ACTION_ID,
     title: "Browser",
     icon: "Globe",
     component: ThreadBrowserPanel,
     layout: "flush",
     run: ({ openPanel }) => {
-      openPanel({ title: "Browser", params: panelParams });
+      openPanel({ title: "Browser", params: browserPanelParams });
     },
+  });
+
+  // Browser Cards (ADR 0019): an agent writes one of these on its own line to
+  // show the owner this thread's browser, or to hand them a sign-in.
+  app.slots.messageDirective({
+    id: BROWSER_LIVE_DIRECTIVE,
+    component: BrowserLiveCard,
+  });
+  app.slots.messageDirective({
+    id: BROWSER_SIGN_IN_DIRECTIVE,
+    component: BrowserSignInCard,
   });
 
   app.slots.experimental_newThreadPanelAction({
@@ -1906,7 +1940,7 @@ export default definePluginApp((app) => {
     component: NewThreadBrowserPanel,
     layout: "flush",
     run: ({ openPanel }) => {
-      openPanel({ title: "Browser", params: panelParams });
+      openPanel({ title: "Browser", params: browserPanelParams });
     },
   });
 });

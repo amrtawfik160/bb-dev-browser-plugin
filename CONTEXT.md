@@ -8,6 +8,14 @@ This context defines the authenticated browser workspace shared by a BB owner an
 The interactive browsing surface opened as a tab in BB's right panel for either a new or existing thread.
 _Avoid_: Right sidebar, browser sidebar
 
+**Browser Card**:
+A live summary of one Browser Profile that an agent embeds in a BB chat reply. It shows current browser state read through owner access and opens the Browser Panel; it is neither a stream nor an agent-authored screenshot.
+_Avoid_: Live view, browser embed
+
+**Sign-in Handoff**:
+A Browser Card in which an agent asks the owner to sign in to one exact origin themselves in the Browser Panel, then reply in the thread. The agent never receives or types the credentials.
+_Avoid_: Login request, credential prompt
+
 **Panel Capability**:
 A single-use, short-lived authorization bound to one owner session, Browser Panel, host, and Browser Profile. It bootstraps a renewable stream connection but never grants agent access.
 _Avoid_: Profile Grant, public browser URL
@@ -19,6 +27,7 @@ _Avoid_: Client browser, server browser
 **Browser Profile**:
 A named, host-local browser identity containing site authentication and storage. A profile may be reused across repositories on the same host but is never synchronized to another host.
 Threads receive separate default profiles; calls without a thread receive a project default. Explicit profile selections opt into sharing. Browser processes remain bounded independently of the number of stored profiles.
+When its thread is archived, a thread's default profile sleeps; when the thread is deleted, the profile becomes an Archived Profile. Explicitly selected profiles are never released by thread lifecycle.
 _Avoid_: Account, global session
 
 **Archived Profile**:
@@ -50,7 +59,7 @@ A stable project-specific `.localhost` hostname used to isolate cookies, site da
 _Avoid_: Raw localhost, public development URL
 
 **Browser Instance**:
-The single disposable running browser process backed by one Browser Profile on a workspace host. Stopping an instance does not discard the profile or its Restorable Session.
+The single disposable running browser process backed by one Browser Profile on a workspace host. Stopping an instance does not discard the profile or its Restorable Session. Sleeping stops the instance without marking its profile stopped; the next use wakes it.
 _Avoid_: Browser Profile, persistent process
 
 **Restorable Session**:

@@ -51,6 +51,10 @@ summarizes the runtime and indexes them.
   At most three instances run, with five-minute idle sleep and a 12-tab cap
   per instance. Active scripts and visible panels prevent capacity eviction.
   (ADRs 0005, 0017)
+- Archiving a thread sleeps its default profile's instance through the host
+  `sleepProfile` operation; deleting a thread archives that profile as a system
+  action. Both skip profiles selected outside the thread's scope and never block
+  the thread transition. (ADR 0018)
 - Local development prefers a stable **Project Loopback Alias** such as
   `p-<project-hash>.localhost:<port>`. Raw localhost is an explicit compatibility
   fallback. (ADR 0013)
@@ -105,6 +109,20 @@ See [safe-login.md](safe-login.md) for the full workflow.
   seconds to reclaim its Control Lease before release. Streams reconnect with
   bounded backoff; profiles never fail over between hosts.
 
+## Browser Cards in chat
+
+- An agent can embed `::browser-live` (a **Browser Card**) or
+  `::browser-sign-in{origin="…"}` (a **Sign-in Handoff**) on its own line in a
+  reply. The app renders them as message directives. (ADR 0019)
+- Cards resolve the thread's Browser Panel profile, or an explicit
+  `profile-id`, and read status, profile names, and tabs through owner RPCs.
+  They stream no pixels; the Browser Panel remains the only stream client.
+- Tabs are read only from an awake browser, and cards refresh for two minutes
+  after mounting or a manual refresh, so a card never wakes a profile or holds
+  it awake indefinitely.
+- A Sign-in Handoff opens the Browser Panel and then makes an ordinary owner
+  navigation to the exact origin. It is not Safe Login Mode.
+
 ## Clipboard, files, and permissions
 
 - Text clipboard exchange is explicit; the plugin never continuously
@@ -155,3 +173,4 @@ is the sole existing authenticated remote transport.
 | [0011](../adr/0011-broker-files-without-mounting-workspaces.md)        | Broker files without mounting workspaces        |
 | [0012](../adr/0012-split-control-state-from-browser-state.md)          | Split control state from browser state          |
 | [0013](../adr/0013-namespace-loopback-origins-by-project.md)           | Namespace loopback origins by project           |
+| [0019](../adr/0019-show-browser-cards-in-chat.md)                      | Show Browser Cards in chat                      |
