@@ -31,6 +31,7 @@ import {
   BROWSER_SCRIPT_MAX_TIMEOUT_MS,
   BROWSER_SCRIPT_MIN_TIMEOUT_MS,
   browserScriptParametersSchema,
+  browserSessionsParametersSchema,
   browserScriptResultSchema,
   type BrowserActivityRecord,
   type BrowserHostChoicesInput,
@@ -54,7 +55,7 @@ import {
 } from "../shared/contracts.js";
 
 const CLI_USAGE = [
-  "Usage: bb browser <open|trust|untrust|grants|grant|revoke|approve|deny|status|diagnostics|script|activity|activity-export|activity-clear|requests|request-status|list|create|rename|select|backup|restore|import|archive|restore-archived|reset|delete|setup|disable|uninstall|purge> [options]",
+  "Usage: bb browser <sessions|open|trust|untrust|grants|grant|revoke|approve|deny|status|diagnostics|script|activity|activity-export|activity-clear|requests|request-status|list|create|rename|select|backup|restore|import|archive|restore-archived|reset|delete|setup|disable|uninstall|purge> [options]",
   "  open <url> [--profile <id>] [--timeout <ms>] [--screenshot] [--json]",
   "  trust|untrust|grants|grant|revoke|approve|deny: authenticated Browser Settings required",
   "  script --purpose <text> --code <source> --origin <origin> [--profile <id>] [--tab <id>] [--timeout <ms>] [--screenshot] [--file-transfer] [--invalid-certificate] [--json]",
@@ -770,7 +771,7 @@ function browserScriptJson(browserResult: unknown) {
  */
 async function agentCliIdentity(
   bb: BbPluginApi,
-  command: "open" | "script",
+  command: "open" | "script" | "sessions",
   context: PluginCliContext,
 ): Promise<{ projectId: string; threadId: string }> {
   if (context.threadId === undefined) {
@@ -2015,11 +2016,92 @@ async function runBrowserScript(
   return response.ok ? toolSuccess(response.result) : toolFailure(response);
 }
 
+function serializeSessions(result: unknown, pretty = false) {
+  const serialized = JSON.stringify(result, null, pretty ? 2 : undefined);
+  if (Buffer.byteLength(serialized, "utf8") > 256 * 1024) {
+    throw new Error(
+      "Session results are too large. Use a site filter or a smaller list limit.",
+    );
+  }
+  return serialized;
+}
+
+async function runSessionsCli(
+  bb: BbPluginApi,
+  browser: BrowserService,
+  argv: string[],
+  context: PluginCliContext,
+) {
+  try {
+    const [action, ...rest] = argv;
+    const input: Record<string, unknown> = { action };
+    let json = false;
+    if (action === "select") input.profileId = rest.shift();
+    if (action === "report") input.origin = rest.shift();
+    const options = new Map([
+      ["--site", "site"],
+      ["--offset", "offset"],
+      ["--limit", "limit"],
+      ["--profile", "profileId"],
+      ["--status", "status"],
+    ]);
+    for (let index = 0; index < rest.length; index += 1) {
+      const argument = rest[index]!;
+      if (argument === "--json") {
+        json = true;
+        continue;
+      }
+      if (argument === "--include-archived") {
+        input.includeArchived = true;
+        continue;
+      }
+      const key = options.get(argument);
+      const value = rest[++index];
+      if (key === undefined || value === undefined || value.startsWith("--"))
+        throw new Error(
+          "Invalid browser sessions arguments. Use list, select <profile-id>, or report <origin> --status <signed-in|signed-out>.",
+        );
+      input[key] = key === "offset" || key === "limit" ? Number(value) : value;
+    }
+    const parameters = browserSessionsParametersSchema.parse(input);
+    const identity = await agentCliIdentity(bb, "sessions", context);
+    const agentContext = {
+      ...context,
+      ...identity,
+      signal: context.signal ?? new AbortController().signal,
+    };
+    const result =
+      parameters.action === "list"
+        ? await browser.sessions(agentContext, parameters)
+        : parameters.action === "select"
+          ? await browser.selectSession(parameters.profileId, agentContext)
+          : await browser.reportSessionSite(parameters, agentContext);
+    return {
+      exitCode: 0,
+      stdout: serializeSessions(result, !json),
+    };
+  } catch (cause) {
+    return {
+      exitCode: 1,
+      stderr:
+        cause instanceof Error
+          ? cause.message
+          : "Browser sessions are unavailable.",
+    };
+  }
+}
+
 function registerCli(bb: BbPluginApi, browser: BrowserService) {
   bb.cli.register({
     name: "browser",
     summary: "Inspect and manage Browser host state",
     commands: [
+      {
+        name: "sessions",
+        summary: "Find and reuse signed-in Browser Profiles",
+        usage:
+          "bb plugin run browser sessions list [--site <query>] [--offset <n>] [--limit <n>] [--include-archived] | select <profile-id> | report <origin> --status <signed-in|signed-out> [--profile <id>] [--json]",
+      },
       {
         name: "open",
         summary: "Open an authorized URL",
@@ -2195,7 +2277,10 @@ function registerCli(bb: BbPluginApi, browser: BrowserService) {
           "bb browser transfer --kind workspace --environment <id> --path <relative-path> | --kind client --file <local-path> | --cancel --transfer-id <id> | --progress --transfer-id <id> [--json]",
       },
     ],
-    run: (argv, context) => runCli(bb, browser, argv, context),
+    run: (argv, context) =>
+      argv[0] === "sessions"
+        ? runSessionsCli(bb, browser, argv.slice(1), context)
+        : runCli(bb, browser, argv, context),
   });
 }
 
@@ -2205,7 +2290,7 @@ function registerAgentTool(bb: BbPluginApi, browser: BrowserService) {
     description:
       "Run Playwright code in the host-local Workspace Browser. Pass destinationOrigin as an exact origin such as https://example.com. The script gets `page` for the active tab; returned values become the tool result.",
     instructions:
-      "Provide a purpose, an exact destinationOrigin, and QuickJS Playwright code. Leave profileId unset to use this thread's separate default profile; explicit profile selections share that profile. `page` is the active tab. `return` values become the result. Calls sharing a profile wait in order for up to 30 seconds before browser_busy; that call has not run. Let the active operation finish before retrying once. The CLI uses the same lease. At most three Browser Instances run on a host; awake-limit means capacity is in use, so wait without stopping another profile. Report typed failures without retrying setup. " +
+      "Provide a purpose, an exact destinationOrigin, and QuickJS Playwright code. Before asking the owner to sign in, use browser_sessions to find and select an existing signed-in profile. Calls without profileId use this thread's selected profile, falling back to its private default; explicit profile selections share cookies. Reusable profiles give each thread its own tab unless tabId is supplied. `page` is that tab. `return` values become the result. Verify authentication on the requested site, then report signed-in or signed-out through browser_sessions; dated confirmations can expire. If several profiles match, preserve the selected profile or ask which account to use. Calls sharing a profile wait in order for up to 30 seconds before browser_busy; that call has not run. Let the active operation finish before retrying once. The CLI uses the same lease. At most three Browser Instances run on a host; awake-limit means capacity is in use, so wait without stopping another profile. Report typed failures without retrying setup. " +
       'If a person is likely watching, put `::browser-live` on its own line in your reply to show this thread\'s browser inline; skip it for unattended work, use at most one card per reply, and add profile-id="<id>" only when you passed profileId. ' +
       'When a site needs the owner to sign in, never ask for credentials in chat or type theirs: end your reply with `::browser-sign-in{origin="https://example.com"}` on its own line, then end the turn. The owner can click Done on the card to send a reply and let you continue; check the browser when they reply. If sign-in is still pending when you check back, embed the card again.',
     presentation: {
@@ -2219,6 +2304,41 @@ function registerAgentTool(bb: BbPluginApi, browser: BrowserService) {
     execute: (parameters, context) =>
       runBrowserScript(browser, parameters, context),
   });
+  bb.agents.registerTool({
+    name: "browser_sessions",
+    description:
+      "Discover saved Browser Profiles and their dated sign-in status on this thread's host. List or search sites, select a profile for this thread, or report authentication after verifying it with browser_script. Does not read or export cookies.",
+    instructions:
+      "Before requesting a new login, list sessions (optionally site: 'salesforce'). Follow nextOffset to see more. sites are owner-confirmed or agent-verified timestamps; recentOrigins are only discovery hints. Prefer the selected matching profile. Select one with action: 'select' and profileId, then use browser_script to check the site. Report signed-in only after seeing an authenticated page; report signed-out if expired. If accounts are ambiguous, ask the owner. Profiles stay on their host and archived profiles cannot be selected. Control Lease and Profile Grant rules still apply.",
+    parameters: browserSessionsParametersSchema,
+    execute: async (parameters, context) => {
+      try {
+        const result =
+          parameters.action === "list"
+            ? await browser.sessions(context, parameters)
+            : parameters.action === "select"
+              ? await browser.selectSession(parameters.profileId, context)
+              : await browser.reportSessionSite(parameters, context);
+        const serialized = serializeSessions(result);
+        return {
+          content: [{ type: "text" as const, text: serialized }],
+        };
+      } catch (cause) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text" as const,
+              text:
+                cause instanceof Error
+                  ? cause.message
+                  : "Browser sessions are unavailable.",
+            },
+          ],
+        };
+      }
+    },
+  });
 }
 
 export default function plugin(bb: BbPluginApi) {
@@ -2230,8 +2350,15 @@ export default function plugin(bb: BbPluginApi) {
         ? browser.selectedStatus(panelIdentity(input))
         : browser.status(panelIdentity(input), input.profileId),
     browser_navigate: (input) => browser.navigate(input),
-    browser_sign_in_done: (input) =>
-      bb.sdk.threads.send({
+    browser_sign_in_done: async (input) => {
+      try {
+        await browser.rememberSignIn(input);
+      } catch {
+        bb.log.warn(
+          "Browser could not save a sign-in confirmation; the agent will still receive the reply.",
+        );
+      }
+      return bb.sdk.threads.send({
         threadId: input.threadId,
         mode: "steer-if-active",
         input: [
@@ -2241,7 +2368,8 @@ export default function plugin(bb: BbPluginApi) {
             text: `I'm done signing in to ${input.origin}${input.profileId === undefined ? "" : ` in Browser Profile ${input.profileId}`}. Please check the browser and continue.`,
           },
         ],
-      }),
+      });
+    },
     browser_history: (input) => browser.history(input),
     browser_panel_visibility: (input) => browser.panelVisibility(input),
     browser_panel_capability: (input) => browser.panelCapability(input),
@@ -2325,7 +2453,7 @@ export default function plugin(bb: BbPluginApi) {
   registerCli(bb, browser);
   registerAgentTool(bb, browser);
   bb.agents.configure(() => ({
-    tools: ["browser_script"],
+    tools: ["browser_script", "browser_sessions"],
     skills: ["browser"],
   }));
 }

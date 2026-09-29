@@ -70,6 +70,8 @@ export type BrowserInstanceTarget = {
 export type BrowserRuntimeTarget = BrowserInstanceTarget & {
   projectId: string;
   tabId?: string;
+  threadPageName?: string;
+  initialOrigin?: string;
   loopbackMode?: LoopbackAddressMode;
 };
 
@@ -1891,7 +1893,10 @@ export function createBrowserInstanceRuntime(
       const executionCode = prepareAgentExecution({
         code,
         tabId: target.tabId,
-        preferredOrigin: preferredTabOrigin(operationOptions.originScope),
+        preferredOrigin:
+          target.initialOrigin ??
+          preferredTabOrigin(operationOptions.originScope),
+        threadPageName: target.threadPageName,
         timeoutMs,
         enforceNonWebNavigation: originPolicy !== undefined,
         activeTabMarker,

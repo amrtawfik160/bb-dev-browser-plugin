@@ -11,7 +11,7 @@ import {
 } from "../src/browser/playwright-runtime.js";
 
 const isolatedHostUrl = pathToFileURL(
-  "/tmp/isolated-host-artifact/host.mjs",
+  "/var/empty/isolated-host-artifact/host.mjs",
 ).href;
 
 async function fakePlaywrightPackage(

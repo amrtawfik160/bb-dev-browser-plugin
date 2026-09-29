@@ -28,3 +28,7 @@ minutes and the tab retention cap becomes 12 pages per instance. Sleeping
 preserves durable storage and restorable tab locations, not transient forms.
 These are process and page bounds, not a total-memory guarantee. Stored
 profiles consume disk until the owner archives or deletes them.
+
+Amended by [ADR 0020](0020-discover-and-reuse-confirmed-sign-ins.md): saved
+profiles expose dated sign-in confirmations, use a named automation tab per
+thread, and survive the deletion of their originating thread.

@@ -48,16 +48,40 @@ summarizes the runtime and indexes them.
 - Browser Tabs belong to a Browser Profile, not a BB thread. Every panel using
   that profile observes the same ordered tab set and one shared active tab.
   Threads have separate default profiles; explicit selections can share one.
+  Automation in shared or saved profiles binds a named tab per thread. This
+  preserves the task page between calls while sharing cookies; an explicit
+  `tabId` overrides the binding. Panels still observe all tabs.
   At most three instances run, with five-minute idle sleep and a 12-tab cap
   per instance. Active scripts and visible panels prevent capacity eviction.
   (ADRs 0005, 0017)
 - Archiving a thread sleeps its default profile's instance through the host
   `sleepProfile` operation; deleting a thread archives that profile as a system
   action. Both skip profiles selected outside the thread's scope and never block
-  the thread transition. (ADR 0018)
+  the thread transition. Saved profiles with a sign-in confirmation survive
+  thread deletion until explicitly archived or deleted. (ADRs 0018, 0020)
 - Local development prefers a stable **Project Loopback Alias** such as
   `p-<project-hash>.localhost:<port>`. Raw localhost is an explicit compatibility
   fallback. (ADR 0013)
+
+## Discovering reusable sign-ins
+
+`browser_sessions` and `bb plugin run browser sessions` list host-local profiles, select
+one for the calling thread, and record an agent's verified sign-in status.
+Listing reads metadata without waking browsers. Old profiles expose recent
+agent-origin activity as discovery hints; historical activity is not proof of
+sign-in. Pagination bounds profile lists.
+
+The owner clicking Done on a Sign-in Handoff records an owner confirmation.
+The host profile manifest stores at most 100 exact-origin hints with status,
+source, and time, and marks profiles with a confirmed sign-in as saved for
+reuse. This explicit metadata amends ADR 0009: there are no account names,
+cookies, full URLs, or page content. Agents verify the actual site before use
+and report expired authentication. Optional manifest fields keep old profiles
+readable without migration. Reset profiles start without confirmations.
+
+Selection changes only the calling thread's preference; project defaults and
+other threads are unaffected. Grant revocation, Safe Login Mode, the Control
+Lease, and the three-instance ceiling still apply. See ADR 0020.
 
 ## Modes
 

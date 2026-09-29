@@ -1048,6 +1048,30 @@ function ProfileCard({
           </Button>
         )}
       </div>
+      {profile.reusable === true ? (
+        <p className="mt-2 text-xs text-muted-foreground">
+          Saved for reuse across threads.
+        </p>
+      ) : null}
+      {(profile.sites ?? []).length === 0 ? null : (
+        <ul
+          aria-label={`Sign-ins for ${profile.name}`}
+          className="mt-2 space-y-1 text-xs text-muted-foreground"
+        >
+          {profile.sites?.map((site) => (
+            <li key={site.origin} className="break-words">
+              {new URL(site.origin).host}:{" "}
+              {site.status === "signed-in" ? "Sign-in confirmed" : "Signed out"}
+              {" · "}
+              {site.source === "owner-confirmed"
+                ? "You confirmed"
+                : "Agent checked"}
+              {" · "}
+              {new Date(site.checkedAt).toLocaleString()}
+            </li>
+          ))}
+        </ul>
+      )}
       <div className="mt-3 grid gap-3 sm:grid-cols-3">
         <Field label="Name">
           <input

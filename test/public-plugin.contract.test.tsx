@@ -2420,6 +2420,7 @@ describe("Browser public plugin contract", () => {
 
     expect(capabilities.tools.map((tool) => tool.name)).toEqual([
       "browser_script",
+      "browser_sessions",
     ]);
     expect(capabilities.skills).toEqual(["browser"]);
     await browser.dispose();

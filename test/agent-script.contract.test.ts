@@ -271,6 +271,91 @@ async function boundPage(input: {
   return { logs, pages, created };
 }
 
+describe("shared profile thread page binding", () => {
+  it("resumes each thread's page, recreates closed tabs, and honors an explicit tab", async () => {
+    const pages = new Map<
+      string,
+      {
+        url: () => string;
+        goto: (url: string) => Promise<void>;
+        bringToFront: () => Promise<void>;
+        context: () => object;
+      }
+    >();
+    let contexts = new Map<string, object>();
+    const createPage = (id: string, initialUrl = "about:blank") => {
+      let url = initialUrl;
+      const context = () => {
+        if (!contexts.has(id))
+          contexts.set(id, {
+            setDefaultNavigationTimeout() {},
+            setDefaultTimeout() {},
+          });
+        return contexts.get(id)!;
+      };
+      const page = {
+        url: () => url,
+        goto: async (next: string) => {
+          url = next;
+        },
+        bringToFront: async () => {},
+        context,
+      };
+      pages.set(id, page);
+      return page;
+    };
+    createPage("owner", "https://example.test/owner");
+    const browser = createPinnedBrowserApi({
+      getPage: async (id: string) => pages.get(id) ?? createPage(id),
+      newPage: async () => createPage("anonymous"),
+      closePage: async (id: string) => {
+        pages.delete(id);
+      },
+      listPages: async () =>
+        [...pages].map(([id, page]) => ({ id, url: page.url() })),
+    });
+    const execute = async (
+      threadPageName: string,
+      code: string,
+      tabId?: string,
+    ) => {
+      contexts = new Map();
+      const logs: string[] = [];
+      const prepared = prepareAgentExecution({
+        threadPageName,
+        preferredOrigin: "https://example.test",
+        code,
+        ...(tabId === undefined ? {} : { tabId }),
+      });
+      await new Function(
+        "browser",
+        "console",
+        `return (async () => {${prepared}})();`,
+      )(browser, { log: (value: unknown) => logs.push(String(value)) });
+      return logs;
+    };
+    expect(await execute("agent-a", "return page.url();")).toEqual([
+      "https://example.test",
+    ]);
+    await execute("agent-a", 'await page.goto("https://example.test/a");');
+    await execute("agent-b", 'await page.goto("https://example.test/b");');
+    expect(await execute("agent-a", "return page.url();")).toEqual([
+      "https://example.test/a",
+    ]);
+    expect(await execute("agent-b", "return page.url();")).toEqual([
+      "https://example.test/b",
+    ]);
+    expect(await execute("agent-a", "return page.url();", "owner")).toEqual([
+      "https://example.test/owner",
+    ]);
+    expect(pages.get("owner")?.url()).toBe("https://example.test/owner");
+    pages.delete("agent-a");
+    expect(await execute("agent-a", "return page.url();")).toEqual([
+      "https://example.test",
+    ]);
+  });
+});
+
 describe("agent page binding", () => {
   it("falls back to the visible tab when no tab is on the preferred origin", async () => {
     const bound = await boundPage({

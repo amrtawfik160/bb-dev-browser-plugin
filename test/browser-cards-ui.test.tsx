@@ -472,6 +472,7 @@ describe("::browser-sign-in", () => {
       threadId: THREAD_ID,
       origin: "https://github.com",
       profileId: "work",
+      hostId: HOST_ID,
     });
     fireEvent.click(card.getByRole("button", { name: "Agent notified" }));
     expect(calls(card, "browser_sign_in_done")).toHaveLength(1);

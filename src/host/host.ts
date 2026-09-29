@@ -2,6 +2,7 @@ import { experimental_defineHostEntry } from "@get-bb/plugin-sdk/host";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { scopedProfileId } from "../shared/profile-scope.js";
 import {
   createActivityOutbox,
   type ActivityOutbox,
@@ -1757,12 +1758,23 @@ export function createBrowserHostEntry(
               return response;
             }
             try {
+              const threadDefaultProfileId = scopedProfileId({
+                projectId: request.projectId,
+                threadId: request.threadId,
+              });
               const browserResult = assertBrowserScriptResultWithinBounds(
                 await browserRuntime.execute(
                   {
                     hostId: request.hostId,
                     profileId: request.profileId,
                     projectId: request.projectId,
+                    ...(profile.reusable === true ||
+                    request.profileId !== threadDefaultProfileId
+                      ? {
+                          threadPageName: `agent-${threadDefaultProfileId}`,
+                          initialOrigin: request.destinationOrigin,
+                        }
+                      : {}),
                     ...(request.tabId === undefined
                       ? {}
                       : { tabId: request.tabId }),
@@ -2021,6 +2033,12 @@ export function createBrowserHostEntry(
         const dataDir = context.experimental_paths.dataDir;
         await requireReadyForProfileMutation(administration(dataDir), request);
         return profiles(dataDir).selectProfile(request);
+      },
+      recordSessionSite: async (request, context) => {
+        retainWorker(context);
+        const dataDir = context.experimental_paths.dataDir;
+        await requireReadyForProfileMutation(administration(dataDir), request);
+        return profiles(dataDir).recordSessionSite(request);
       },
       archiveProfile: async (request, context) => {
         retainWorker(context);

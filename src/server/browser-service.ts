@@ -15,6 +15,7 @@ import {
 import {
   createProfileGrantStore,
   elevationIsActive,
+  scopeMatchesOrigin,
   type BrowserAuthorizationDecision,
   type BrowserAuthorizationSuccess,
 } from "../access/authorization.js";
@@ -58,6 +59,7 @@ import {
   type BrowserProfileRestoreRequest,
   type BrowserProfileSelectRequest,
   type BrowserProfileTarget,
+  type BrowserSessionSiteUpdate,
   type BrowserProfileSelectionRequest,
   type BrowserPurgePlan,
   type BrowserPurgeRequest,
@@ -129,6 +131,7 @@ import { BROWSER_SETTINGS_PROJECT_ID } from "../shared/panel-owner-session.js";
 import { dependencyInventory } from "../shared/dependency-inventory.js";
 import { authorizeFileTransfer } from "../host/transfer-staging.js";
 import { profileScopeKey, scopedProfileId } from "../shared/profile-scope.js";
+import { presentBrowserSessions } from "./browser-sessions.js";
 
 const PROFILE_IMPORT_ACTIVITY_ACTION = ["imp", "ort"].join("");
 const OWNER_SETTINGS_AUTHORITY_ERROR =
@@ -952,6 +955,7 @@ export function createBrowserService(
     );
     if (profile?.state !== "active") return;
     if (profileSelectedOutsideScope(target, preferenceKey)) return;
+    if (profile.reusable === true && release === "archive") return;
     if (release === "sleep") {
       await host.call("sleepProfile", target, { hostId: target.hostId });
       return;
@@ -1530,6 +1534,161 @@ export function createBrowserService(
 
   async function profiles(target: BrowserProfileQuery, signal?: AbortSignal) {
     return profileInventory(target, signal);
+  }
+
+  async function sessions(
+    context: PluginAgentToolContext,
+    options: {
+      site?: string;
+      includeArchived: boolean;
+      offset: number;
+      limit: number;
+    },
+  ) {
+    const target = await resolveTarget(context);
+    const inventory = await profileInventory(
+      { ...context, hostId: target.hostId },
+      context.signal,
+    );
+    return presentBrowserSessions(inventory, options, (profileId) => {
+      const rows = database
+        .prepare(
+          `SELECT destination_origin FROM browser_activity_records
+        WHERE host_id = ? AND profile_id = ? AND destination_origin IS NOT NULL
+          AND actor = 'agent' AND outcome = 'succeeded'
+        GROUP BY destination_origin ORDER BY MAX(occurred_at) DESC LIMIT 100`,
+        )
+        .all(target.hostId, profileId);
+      return rows.map(
+        (row) => (row as { destination_origin: string }).destination_origin,
+      );
+    });
+  }
+
+  async function selectSession(
+    profileId: string,
+    context: PluginAgentToolContext,
+  ) {
+    if (context.threadId === undefined)
+      throw new Error("Selecting a Browser Profile requires a thread.");
+    const target = await resolveTarget(context, profileId);
+    const inventory = await profileInventory(
+      { ...context, hostId: target.hostId },
+      context.signal,
+    );
+    const profile = inventory.profiles.find(
+      (entry) => entry.profileId === profileId && entry.state === "active",
+    );
+    if (profile === undefined)
+      throw new Error(
+        "Select an active Browser Profile from browser_sessions first.",
+      );
+    const scope = await profileScope(context);
+    const snapshot = profileAuthoritySnapshot({
+      ...target,
+      installationId: inventory.installationId,
+    });
+    await withGrantStateSerialization(() => {
+      assertProfileAuthorityCurrent(snapshot);
+      saveSelectedProfilePreference(
+        database,
+        scope.preferenceKey,
+        target.hostId,
+        profileId,
+      );
+    });
+    return {
+      hostId: target.hostId,
+      profileId,
+      name: profile.name,
+      sites: profile.sites ?? [],
+      message:
+        "Selected for this thread. browser_script now uses this profile without profileId. Verify the requested site's authentication before continuing; access grants still apply.",
+    };
+  }
+
+  async function recordSessionSite(
+    request: BrowserSessionSiteUpdate,
+    signal?: AbortSignal,
+  ) {
+    await requireConnectedHost(request.hostId, signal);
+    return host.call("recordSessionSite", request, {
+      hostId: request.hostId,
+      signal,
+    });
+  }
+
+  async function rememberSignIn(input: {
+    threadId: string;
+    profileId?: string;
+    hostId?: string;
+    origin: string;
+  }) {
+    const target = await resolveTarget(
+      { threadId: input.threadId },
+      input.profileId,
+      input.hostId,
+    );
+    return recordSessionSite({
+      ...target,
+      origin: input.origin,
+      status: "signed-in",
+      source: "owner-confirmed",
+    });
+  }
+
+  async function reportSessionSite(
+    input: {
+      profileId?: string;
+      origin: string;
+      status: "signed-in" | "signed-out";
+    },
+    context: PluginAgentToolContext,
+  ) {
+    const target = await resolveTarget(context, input.profileId);
+    const inventory = await profileInventory(
+      { ...context, hostId: target.hostId },
+      context.signal,
+    );
+    const projectId = await profileContextProjectId(bb, context);
+    const snapshot = profileAuthoritySnapshot({
+      ...target,
+      installationId: inventory.installationId,
+    });
+    const profile = await withGrantStateSerialization(async () => {
+      assertProfileAuthorityCurrent(snapshot);
+      const allowed = grantStore
+        .list({
+          ...target,
+          projectId,
+          installationId: inventory.installationId,
+        })
+        .some(
+          (grant) =>
+            grant.revokedAt === null &&
+            scopeMatchesOrigin(grant.originScope, input.origin) &&
+            (!grant.wholeWeb ||
+              elevationIsActive(grant.wholeWebExpiresAt, new Date())),
+        );
+      if (!allowed)
+        throw new Error(
+          "Verify this site with an authorized browser_script before recording its sign-in status.",
+        );
+      return recordSessionSite(
+        {
+          ...target,
+          origin: input.origin,
+          status: input.status,
+          source: "agent-verified",
+        },
+        context.signal,
+      );
+    });
+    return {
+      hostId: target.hostId,
+      profileId: profile.profileId,
+      sites: profile.sites ?? [],
+    };
   }
 
   async function grantTarget(
@@ -2858,6 +3017,10 @@ export function createBrowserService(
 
   return {
     browserScript,
+    sessions,
+    selectSession,
+    reportSessionSite,
+    rememberSignIn,
     navigate,
     history,
     tabAction,

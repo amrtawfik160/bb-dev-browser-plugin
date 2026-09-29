@@ -1,6 +1,6 @@
 ---
 name: browser
-description: Drive a real Chromium on this host — open pages, click, type, read, and screenshot — with Playwright through the browser_script tool or the bb browser CLI. Use for web automation, testing a running app, checking a deployed page, or any task that needs a real browser.
+description: Drive a real Chromium on this host — open pages, click, type, read, and screenshot — with Playwright through the browser_script tool or the bb plugin run browser CLI. Use for web automation, testing a running app, checking a deployed page, or any task that needs a real browser.
 ---
 
 # Browser
@@ -9,12 +9,43 @@ A real Chromium runs on the workspace host under a dedicated user. It keeps its
 own logins and cookies in a Browser Profile, so a site you signed into once
 stays signed in for later automation.
 
-Leave `profileId` unset for an isolated default profile belonging to this BB
-thread. Repeated tool and CLI calls reuse it, and the thread's Browser Panel
-opens it too. Without a thread, the default belongs to the project. Profiles
-start with separate cookies and logins. Specify `profileId` only to deliberately
-share that named profile; owner selections can also opt a project or thread
-into sharing. Calls sharing a profile still take turns under its Control Lease.
+Calls without `profileId` use this thread's selected Browser Profile, falling
+back to its private default. Without a thread, the default belongs to the
+project. Separate profiles have separate cookies. Selecting an existing
+profile shares its logins; each thread gets a named tab in shared or saved
+profiles. Calls on the same profile still take turns under its Control Lease.
+
+## Reuse a sign-in
+
+Before asking the owner to log in, use `browser_sessions`:
+
+1. List with `{action: "list", site: "salesforce"}` (omit `site` to see all).
+   Follow `nextOffset` with `offset` for remaining pages. `sites` contains
+   dated owner confirmations or agent checks. `recentOrigins` only shows
+   prior activity; it does not prove authentication.
+2. Prefer the selected matching profile. If account choice is ambiguous, ask
+   which profile to use. Select with `{action: "select", profileId: "…"}`.
+   Selection affects this thread only; subsequent `browser_script` calls use
+   it without `profileId`.
+3. Open the requested site with `browser_script` and verify an authenticated
+   page. Report `{action: "report", origin: "https://…", status: "signed-in"}`
+   after verification, or `status: "signed-out"` if authentication expired.
+4. Request a Sign-in Handoff only when no suitable profile is authenticated.
+   The owner clicking Done records a confirmation and saves that profile for
+   reuse even after this thread is deleted.
+
+Profiles are host-local. Discovery and selection grant no extra browser
+permissions; the selected profile's Profile Grants remain enforced. Archived
+profiles can be listed with `includeArchived: true` but cannot be selected.
+
+Shell equivalents use the current BB thread. Use `bb plugin run browser`
+to target this plugin even when BB reserves the `bb browser` command:
+
+```text
+bb plugin run browser sessions list --site salesforce --json
+bb plugin run browser sessions select <profile-id> --json
+bb plugin run browser sessions report https://example.my.salesforce.com --status signed-in --json
+```
 
 The host runs at most three Browser Instances. Unpinned profiles sleep after
 five idle minutes and can sleep earlier to make room. `awake-limit` means all
@@ -32,7 +63,7 @@ that access for your project (surface the attached Grant Request and pause
 until they decide in authenticated Browser Settings) or the navigation is
 non-web (no Grant Request; do not retry it).
 
-`bb browser open https://example.com` is the shell equivalent for opening an
+`bb plugin run browser open https://example.com` is the shell equivalent for opening an
 authorized URL: it runs as an agent operation under the same Profile Grant,
 Control Lease, and Activity attribution. The URL is required; no-argument
 opens fail closed before reading host tab state. Use the Browser Panel for
@@ -42,8 +73,9 @@ thread) and rejects `--host`.
 
 ## Automating a page
 
-Use the `browser_script` tool. `page` is the active tab, already bound and
-brought to front. Whatever you `return` becomes the tool result.
+Use the `browser_script` tool. `page` is your thread's named tab in shared
+or saved profiles, or the active tab in a private profile, already brought
+to front. Explicit `tabId` selects that tab instead. Whatever you `return` becomes the tool result.
 
 ```javascript
 await page.goto("https://example.com", { waitUntil: "domcontentloaded" });
@@ -64,7 +96,7 @@ default 30000), `screenshot: true`, `fileTransfer`, `invalidCertificate`.
 The same boundary from a shell:
 
 ```text
-bb browser script --purpose "Read the checkout total" --origin https://shop.example.com \
+bb plugin run browser script --purpose "Read the checkout total" --origin https://shop.example.com \
   --code "return await page.locator('.total').innerText()"
 ```
 
@@ -77,9 +109,11 @@ workspace access.
   or locators.
 - `browser.listPages()` lists tabs; `browser.getPage(id)` binds one. Tab IDs are
   runtime-only and change when the browser restarts.
-- Tab state persists between scripts. If a tab is already on your granted
-  origin, `page` binds to it — read it instead of navigating again. Otherwise
-  `page` is the active tab, or a fresh tab when the profile has none.
+- Tab state persists between scripts. In shared or saved profiles, `page`
+  resumes this thread's named tab; a fresh tab starts at `destinationOrigin`.
+  Private profiles prefer a tab on the granted origin, then the active tab.
+  Navigate when your tab is on another site. Closing a named tab or restarting
+  the browser may require navigating back to the task page.
 - Owner tabs outside your grant are parked on `about:blank` while your script
   runs and come back when it finishes. They are not yours to read; do not
   report them as failures.
@@ -158,14 +192,14 @@ I need you to sign in to GitHub so I can continue.
 | `setup_required`    | Host is not provisioned                         | Report it. Do not retry, install packages, or find another browser                                                     |
 | `safe_login_denied` | Owner-only Safe Login is active                 | Wait for the owner; you cannot see or drive the browser                                                                |
 
-`bb browser status` reports host readiness and live control state; `bb browser
+`bb plugin run browser status` reports host readiness and live control state; `bb plugin run browser
 diagnostics` adds repair detail.
 
 ## Authorization
 
 ```text
-bb browser requests                      # pending grant requests
-bb browser request-status --request <id> # inspect one scoped request
+bb plugin run browser requests                      # pending grant requests
+bb plugin run browser request-status --request <id> # inspect one scoped request
 ```
 
 Your project is granted the whole web on first use. An owner can revoke that
@@ -213,7 +247,7 @@ diagnostics, and the Browser Panel only while the lease is live.
 Activity Records keep metadata and interruption status — never your purpose,
 source code, page contents, or screenshots.
 
-Manage profiles with `bb browser list`, `create`, `rename`, and `select`.
+Manage profiles with `bb plugin run browser list`, `create`, `rename`, and `select`.
 Profiles stay on the workspace host and are never synchronized through BB
 server storage.
 
@@ -226,10 +260,10 @@ operation. Traversal, symlink escape, special files, files changed after
 selection, oversized files, and low disk all fail closed.
 
 ```text
-bb browser transfer --kind workspace --environment <id> --path <relative-path> [--json]
-bb browser transfer --kind client --file <local-path> [--json]
-bb browser transfer --progress --transfer-id <id> [--json]
-bb browser transfer --cancel --transfer-id <id> [--json]
+bb plugin run browser transfer --kind workspace --environment <id> --path <relative-path> [--json]
+bb plugin run browser transfer --kind client --file <local-path> [--json]
+bb plugin run browser transfer --progress --transfer-id <id> [--json]
+bb plugin run browser transfer --cancel --transfer-id <id> [--json]
 ```
 
 Agent-initiated transfers need the `file-transfer` grant and an active Control

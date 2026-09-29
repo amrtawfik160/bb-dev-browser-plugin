@@ -52,6 +52,7 @@ import {
   browserProfileSchema,
   browserProfileSelectRequestSchema,
   browserProfileTargetSchema,
+  browserSessionSiteUpdateSchema,
   browserStatusSchema,
   browserTransferStageInputSchema,
   browserTransferConsumeInputSchema,
@@ -216,6 +217,10 @@ export const browserHostContract = defineRpcContract({
   selectProfile: {
     input: browserProfileSelectRequestSchema,
     output: browserProfileInventorySchema,
+  },
+  recordSessionSite: {
+    input: browserSessionSiteUpdateSchema,
+    output: browserProfileSchema,
   },
   archiveProfile: {
     input: browserProfileTargetSchema,
