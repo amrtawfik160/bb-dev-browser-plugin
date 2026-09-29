@@ -319,7 +319,8 @@ function boundedOperationTimeoutMs(scriptTimeoutMs: number): number {
 
 /**
  * Bind `page` before the agent code runs. An explicit `tabId` must exist or
- * the script fails closed as `tab_invalid`. Otherwise the binding order is:
+ * the script fails closed as `tab_invalid`. Shared profiles then use the
+ * named thread page. Private profiles use this binding order:
  * the visible tab when it is already on the preferred (granted) origin, then
  * any tab on that origin, then the visible tab, then the first tab, and when
  * the profile has no tabs at all a fresh one is opened. Agents expect `page`
@@ -333,6 +334,7 @@ export function agentPagePreamble(
   preferredOrigin?: string,
   enforceNonWebNavigation = false,
   operationTimeoutMs = boundedOperationTimeoutMs(BROWSER_SCRIPT_MAX_TIMEOUT_MS),
+  threadPageName?: string,
 ): string {
   if (tabId !== undefined) {
     return `const __bbTargetPages = await browser.listPages();
@@ -342,6 +344,14 @@ if (!__bbTargetPages.some((entry) => entry.id === ${JSON.stringify(tabId)})) thr
 const page = await browser.getPage(${JSON.stringify(tabId)});
 await page.bringToFront();
 ${cutAgentBrowserRoots("__bbTargetPages", enforceNonWebNavigation, operationTimeoutMs)}`;
+  }
+  if (threadPageName !== undefined) {
+    return `const __bbThreadPages = await browser.listPages();
+const page = await browser.getPage(${JSON.stringify(threadPageName)});
+await page.bringToFront();
+${cutAgentBrowserRoots("__bbThreadPages", enforceNonWebNavigation, operationTimeoutMs)}
+${preferredOrigin === undefined ? "" : `if (page.url() === "about:blank" || page.url() === "chrome://newtab/") await page.goto(${JSON.stringify(preferredOrigin)});`}
+`;
   }
   return `const __bbPages = await browser.listPages();
 let page;
@@ -452,6 +462,7 @@ export function prepareAgentExecution(input: {
   code: string;
   tabId?: string;
   preferredOrigin?: string;
+  threadPageName?: string;
   timeoutMs?: number;
   enforceNonWebNavigation?: boolean;
   activeTabMarker?: string;
@@ -465,6 +476,7 @@ export function prepareAgentExecution(input: {
     input.preferredOrigin,
     input.enforceNonWebNavigation ?? false,
     operationTimeoutMs,
+    input.threadPageName,
   );
   const wrappedUser = wrapAgentScriptResult(input.code, input.activeTabMarker);
   if (input.screenshot === undefined) {

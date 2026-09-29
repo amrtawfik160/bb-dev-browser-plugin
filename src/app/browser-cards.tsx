@@ -417,6 +417,9 @@ function BrowserSignInCardBody({
         ...(targetProfileId === undefined
           ? {}
           : { profileId: targetProfileId }),
+        ...(snapshot?.status.hostId == null
+          ? {}
+          : { hostId: snapshot.status.hostId }),
       });
       if (mounted.current) {
         setNotification({ phase: "sent", delivery: response.delivery });
@@ -442,7 +445,8 @@ function BrowserSignInCardBody({
         An agent needs you to sign in to {origin}
         {view?.profileName == null ? "" : ` in ${view.profileName}`}. Sign in
         yourself in the Browser Panel, then click Done to let the agent
-        continue. Never paste a password into chat.
+        continue. Done also saves this profile for other agents to reuse on this
+        host. Never paste a password into chat.
       </p>
       {onSite ? (
         <p className="mt-1 text-xs text-muted-foreground">

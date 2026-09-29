@@ -34,8 +34,16 @@ with `::browser-live`: the profile, its state, the page it is on, and an
 **Open in panel** button. When a site needs you to sign in, the agent ends its
 reply with a Sign-in Handoff, `::browser-sign-in{origin="https://…"}`. Its
 Open button opens the Browser Panel on that site so you sign in yourself. Click
-**Done** to send a reply and let the agent continue. Cards stream no pixels and
-never wake a sleeping browser.
+**Done** to send a reply and save this profile for other agents to reuse on
+the same host. Cards stream no pixels and never wake a sleeping browser.
+
+**Reuse a login.** Agents use `browser_sessions` to find profiles by site and
+select one for their thread. A Salesforce login can serve another agent on the
+same host. Cookies stay in that profile; each thread gets a separate tab.
+Sign-in confirmations show who checked and when. Agents verify authentication
+before continuing because a session can expire. Existing profiles also show
+origins from recent agent activity, which helps discovery without claiming a
+login is current.
 
 **Browser Settings.** Six sections under Browser in BB settings: **Browser**
 (hosts and readiness), **Agent access** (grants and pending requests),
@@ -57,8 +65,9 @@ Active scripts and visible panels prevent retirement. If all three are busy,
 the request fails with `awake-limit`. Profiles retain at most 12 tabs, closing
 the oldest inactive pages beyond that limit. These bounds reduce resource use;
 they are not a fixed RAM quota. Sleeping profiles retain their data on disk. Archiving a thread puts its browser
-to sleep; deleting a thread archives its browser profile, which stays
-recoverable until it expires.
+to sleep; deleting a thread archives its unsaved browser profile, which stays
+recoverable until it expires. Profiles saved by a confirmed sign-in survive
+thread deletion until you archive or delete them in Browser Settings.
 
 **Automation Mode.** You and granted agents share the stream and take turns
 with input.
@@ -146,12 +155,13 @@ site fights automation.
 
 ### Agent
 
-Use `browser_script` or `bb browser script`; any web origin works by default.
-`page` is the active tab. Whatever you `return` is the result. Pass an exact
-origin every time.
+Use `browser_script` or `bb plugin run browser script`; any web origin works by default.
+`page` is this thread's named tab in shared profiles, or the active tab in
+a private profile. Whatever you `return` is the result. Pass an exact origin
+every time.
 
 ```text
-bb browser script --purpose "Read the page title" \
+bb plugin run browser script --purpose "Read the page title" \
   --origin https://example.com \
   --code "return await page.title()"
 ```

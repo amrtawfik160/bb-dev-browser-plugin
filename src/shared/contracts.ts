@@ -312,6 +312,35 @@ export const browserProfileNameSchema = z.string().trim().min(1).max(80);
 export const browserProfileLocaleSchema = z.string().trim().min(2).max(64);
 export const browserProfileTimezoneSchema = z.string().trim().min(1).max(128);
 
+export const browserExactOriginSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(2048)
+  .superRefine((candidate, context) => {
+    try {
+      normalizeBrowserOrigin(candidate);
+    } catch (error) {
+      context.addIssue({
+        code: "custom",
+        message:
+          error instanceof Error ? error.message : "Invalid browser origin.",
+      });
+    }
+  })
+  .transform(normalizeBrowserOrigin);
+
+export const browserSessionSiteSchema = z
+  .object({
+    origin: browserExactOriginSchema,
+    status: z.enum(["signed-in", "signed-out"]),
+    source: z.enum(["owner-confirmed", "agent-verified"]),
+    checkedAt: z.string().datetime(),
+  })
+  .strict();
+
+export type BrowserSessionSite = z.infer<typeof browserSessionSiteSchema>;
+
 export const browserProfileStartupSchema = z
   .object({
     initialTabUrl: z.literal("about:blank"),
@@ -344,6 +373,8 @@ const browserProfileManifestBaseSchema = z
     updatedAt: z.string().datetime(),
     startup: browserProfileStartupSchema,
     storage: browserProfileStorageSchema,
+    sites: z.array(browserSessionSiteSchema).max(100).optional(),
+    reusable: z.boolean().optional(),
   })
   .strict();
 
@@ -423,6 +454,41 @@ export const browserProfileTargetSchema = z
     profileId: browserProfileIdSchema,
   })
   .strict();
+
+export const browserSessionSiteUpdateSchema = browserProfileTargetSchema
+  .extend({
+    origin: browserExactOriginSchema,
+    status: z.enum(["signed-in", "signed-out"]),
+    source: z.enum(["owner-confirmed", "agent-verified"]),
+  })
+  .strict();
+
+export type BrowserSessionSiteUpdate = z.infer<
+  typeof browserSessionSiteUpdateSchema
+>;
+
+export const browserSessionsParametersSchema = z.discriminatedUnion("action", [
+  z
+    .object({
+      action: z.literal("list"),
+      site: z.string().trim().min(1).max(2048).optional(),
+      includeArchived: z.boolean().default(false),
+      offset: z.number().int().min(0).default(0),
+      limit: z.number().int().min(1).max(50).default(25),
+    })
+    .strict(),
+  z
+    .object({ action: z.literal("select"), profileId: browserProfileIdSchema })
+    .strict(),
+  z
+    .object({
+      action: z.literal("report"),
+      profileId: browserProfileIdSchema.optional(),
+      origin: browserExactOriginSchema,
+      status: z.enum(["signed-in", "signed-out"]),
+    })
+    .strict(),
+]);
 
 export const browserProfileResetRequestSchema = browserProfileTargetSchema
   .extend({ confirmation: z.string().min(1) })
@@ -704,24 +770,6 @@ export const browserOriginScopeSchema = z
   .transform(normalizeBrowserOriginScope);
 
 export type BrowserOriginScope = z.output<typeof browserOriginScopeSchema>;
-
-export const browserExactOriginSchema = z
-  .string()
-  .trim()
-  .min(1)
-  .max(2048)
-  .superRefine((candidate, context) => {
-    try {
-      normalizeBrowserOrigin(candidate);
-    } catch (error) {
-      context.addIssue({
-        code: "custom",
-        message:
-          error instanceof Error ? error.message : "Invalid browser origin.",
-      });
-    }
-  })
-  .transform(normalizeBrowserOrigin);
 
 export const browserProfileGrantIdSchema = z
   .string()
@@ -3107,6 +3155,7 @@ export const rpcContract = defineRpcContract({
       threadId: z.string().min(1),
       origin: browserExactOriginSchema,
       profileId: browserProfileIdSchema.optional(),
+      hostId: z.string().min(1).optional(),
     }),
     output: z.object({
       ok: z.literal(true),

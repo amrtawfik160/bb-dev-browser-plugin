@@ -19,6 +19,7 @@ import {
   browserProfileIdSchema,
   browserProfileManifestSchema,
   browserProfileNameSchema,
+  browserSessionSiteUpdateSchema,
   DEFAULT_PROFILE_ID,
   PROFILE_ARCHIVE_RETENTION_DAYS,
   PROFILE_DEFAULT_LOCALE,
@@ -38,6 +39,7 @@ import {
   type BrowserProfileResetRequest,
   type BrowserProfileSelectRequest,
   type BrowserProfileTarget,
+  type BrowserSessionSiteUpdate,
 } from "../shared/contracts.js";
 import { scopedProfileId } from "../shared/profile-scope.js";
 
@@ -94,6 +96,7 @@ export interface BrowserProfileLifecycleBoundary {
 }
 
 export interface BrowserProfileStore {
+  recordSessionSite(request: BrowserSessionSiteUpdate): Promise<BrowserProfile>;
   listProfiles(hostId: string): Promise<BrowserProfileInventory>;
   initialize(hostId: string): Promise<void>;
   createProfile(request: BrowserProfileCreateRequest): Promise<BrowserProfile>;
@@ -1569,6 +1572,48 @@ export function createFileBrowserProfileStore(
     });
   }
 
+  async function recordSessionSite(input: BrowserSessionSiteUpdate) {
+    const request = browserSessionSiteUpdateSchema.parse(input);
+    return withMutationLock(options, request.hostId, ownership, async () => {
+      const inventory = await listProfilesUnlocked(request.hostId);
+      const current = inventory.profiles.find(
+        ({ profileId }) => profileId === request.profileId,
+      );
+      if (current?.state !== "active") throw profileNotFound(request);
+      const paths = profilePaths(
+        options.rootDirectory,
+        options.installationId,
+        request.hostId,
+        request.profileId,
+      );
+      const manifest = await repairManifest(
+        paths,
+        request.hostId,
+        options.installationId,
+        ownership,
+      );
+      const sites = (manifest.sites ?? []).filter(
+        ({ origin }) => origin !== request.origin,
+      );
+      const checkedAt = clock().toISOString();
+      sites.push({
+        origin: request.origin,
+        status: request.status,
+        source: request.source,
+        checkedAt,
+      });
+      // Keep the most recently checked sites; never store cookies or account details.
+      const updated = browserProfileManifestSchema.parse({
+        ...manifest,
+        sites: sites.slice(-100),
+        reusable: manifest.reusable === true || request.status === "signed-in",
+        updatedAt: checkedAt,
+      });
+      await writeJson(paths.manifestPath, updated, ownership);
+      return profileFromManifest(updated, inventory.selectedProfileId);
+    });
+  }
+
   async function reconcileProfileLifecycleUnlocked(hostId: string) {
     const paths = profilePaths(
       options.rootDirectory,
@@ -1749,6 +1794,7 @@ export function createFileBrowserProfileStore(
   }
 
   return {
+    recordSessionSite,
     listProfiles,
     initialize,
     createProfile,

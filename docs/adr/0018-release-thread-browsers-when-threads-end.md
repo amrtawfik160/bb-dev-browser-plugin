@@ -25,3 +25,7 @@ each connected host that holds the profile. Disconnected hosts are skipped
 with a content-free warning and are not retried later. An instance on such a
 host still sleeps when idle, and its profile remains stored until the owner
 archives it.
+
+Amended by [ADR 0020](0020-discover-and-reuse-confirmed-sign-ins.md): saved
+profiles expose dated sign-in confirmations, use a named automation tab per
+thread, and survive the deletion of their originating thread.

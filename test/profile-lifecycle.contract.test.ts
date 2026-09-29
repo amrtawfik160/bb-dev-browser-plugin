@@ -451,6 +451,7 @@ describe("Browser Profile destructive lifecycle", () => {
         const restarted = createFileBrowserProfileStore({
           rootDirectory: fixture.rootDirectory,
           installationId: fixture.installationId,
+          clock: () => RETENTION_START,
           lifecycle: { stopProfile: async () => undefined },
         });
         await restarted.reconcileProfileLifecycle("host-a");

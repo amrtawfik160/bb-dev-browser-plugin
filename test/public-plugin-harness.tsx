@@ -55,6 +55,7 @@ import {
   browserProfileHostTargetSchema,
   browserProfileImportRequestSchema,
   browserProfileInventorySchema,
+  browserSessionsParametersSchema,
   browserProfileLifecycleResponseSchema,
   browserProfileRenameRequestSchema,
   browserProfileResetRequestSchema,
@@ -664,6 +665,7 @@ export async function createPublicPluginHarness(options?: {
         };
       },
       threads: {
+        send: async () => ({ ok: true, delivery: "sent" }),
         get: async ({ threadId }) => {
           threadLookups.push(threadId);
           if (!KNOWN_HARNESS_THREAD_IDS.has(threadId)) {
@@ -1025,6 +1027,7 @@ export async function createPublicPluginHarness(options?: {
         );
       }
       if (
+        method === "recordSessionSite" ||
         method === "downloadStart" ||
         method === "downloadAppend" ||
         method === "downloadComplete" ||
@@ -2353,6 +2356,16 @@ export async function createPublicPluginHarness(options?: {
     });
   }
 
+  async function runBrowserSessions(
+    input: z.input<typeof browserSessionsParametersSchema>,
+    context: { threadId?: string; projectId?: string } = {},
+  ) {
+    return backend.harness.behavior.callAgentTool("browser_sessions", input, {
+      threadId: context.threadId ?? THREAD_ID,
+      projectId: context.projectId ?? PROJECT_ID,
+    });
+  }
+
   async function dispose() {
     try {
       for (const panel of threadPanels.values()) panel.lifecycle.unmount();
@@ -2499,6 +2512,7 @@ export async function createPublicPluginHarness(options?: {
     runBrowserTabAction,
     runBrowserScript,
     runBrowserScriptWithProfile,
+    runBrowserSessions,
     privilegedExecutor: options?.privilegedExecutor ?? null,
     resolveAgentCapabilities,
     dispose,
