@@ -3102,6 +3102,17 @@ export const rpcContract = defineRpcContract({
     input: browserPanelNavigationRequestSchema,
     output: browserPanelNavigationResponseSchema,
   },
+  browser_sign_in_done: {
+    input: z.object({
+      threadId: z.string().min(1),
+      origin: browserExactOriginSchema,
+      profileId: browserProfileIdSchema.optional(),
+    }),
+    output: z.object({
+      ok: z.literal(true),
+      delivery: z.enum(["sent", "queued", "deferred"]),
+    }),
+  },
   browser_history: {
     input: browserPanelHistoryRequestSchema,
     output: browserPanelNavigationResponseSchema,

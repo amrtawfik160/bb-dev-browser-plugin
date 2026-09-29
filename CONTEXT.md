@@ -13,7 +13,7 @@ A live summary of one Browser Profile that an agent embeds in a BB chat reply. I
 _Avoid_: Live view, browser embed
 
 **Sign-in Handoff**:
-A Browser Card in which an agent asks the owner to sign in to one exact origin themselves in the Browser Panel, then reply in the thread. The agent never receives or types the credentials.
+A Browser Card in which an agent asks the owner to sign in to one exact origin themselves in the Browser Panel, then click Done to send a reply in the thread and let the agent continue. The agent never receives or types the credentials.
 _Avoid_: Login request, credential prompt
 
 **Panel Capability**:

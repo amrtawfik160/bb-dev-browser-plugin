@@ -33,8 +33,9 @@ amber frame and the agent's stated purpose; nothing else uses that colour.
 with `::browser-live`: the profile, its state, the page it is on, and an
 **Open in panel** button. When a site needs you to sign in, the agent ends its
 reply with a Sign-in Handoff, `::browser-sign-in{origin="https://…"}`. Its
-button opens the Browser Panel on that site so you sign in yourself, then you
-reply in the thread. Cards stream no pixels and never wake a sleeping browser.
+Open button opens the Browser Panel on that site so you sign in yourself. Click
+**Done** to send a reply and let the agent continue. Cards stream no pixels and
+never wake a sleeping browser.
 
 **Browser Settings.** Six sections under Browser in BB settings: **Browser**
 (hosts and readiness), **Agent access** (grants and pending requests),

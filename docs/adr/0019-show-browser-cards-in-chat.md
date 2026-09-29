@@ -10,8 +10,11 @@ Card: the profile, its state, the active tab's title and address, and any
 agent purpose, with an action that opens the thread's Browser Panel.
 `::browser-sign-in{origin="…"}` renders a Sign-in Handoff for one exact
 HTTP(S) origin. Its button opens the panel, then navigates it with the same
-owner navigation the address bar uses. The owner signs in and replies in the
-thread. Both cards default to the profile the thread's panel resolves. An
+owner navigation the address bar uses. The owner signs in and clicks Done to
+send a sign-in reply to the card's thread, starting an idle agent or steering
+the reply into its active turn. The card confirms delivery, blocks repeat
+clicks while sending or after success, and allows retry after a send failure.
+Both cards default to the profile the thread's panel resolves. An
 optional `profile-id` opens that profile in its own panel tab without changing
 the thread's selection. Attributes are untrusted and validated before any RPC.
 

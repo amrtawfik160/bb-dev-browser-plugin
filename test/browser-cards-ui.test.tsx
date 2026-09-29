@@ -11,6 +11,8 @@ import {
   type RenderedSlot,
 } from "@get-bb/plugin-sdk/testing/app";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
+import plugin from "../src/server/server.js";
 import {
   DEFAULT_PROFILE_ID,
   type BrowserProfileInventory,
@@ -145,6 +147,7 @@ function stubs(overrides: Handlers = {}): Handlers {
       address: { url: "https://github.com/" },
       tabId: "tab-1",
     }),
+    browser_sign_in_done: () => ({ ok: true, delivery: "sent" }),
     ...overrides,
   };
 }
@@ -432,7 +435,7 @@ describe("::browser-sign-in", () => {
     expect(card.getByText(/Never paste a password into chat\./u)).toBeDefined();
     fireEvent.click(card.getByRole("button", { name: "Open github.com" }));
     await card.findByText(
-      "Opened github.com in the Browser Panel. Reply here once you are signed in.",
+      "Opened github.com in the Browser Panel. Click Done once you are signed in.",
     );
     expect(panelOpens(card)).toHaveLength(1);
     // An owner navigation carries no panel identity: the card is not a panel.
@@ -453,6 +456,95 @@ describe("::browser-sign-in", () => {
     );
     await card.findByText("The browser is on https://github.com/login.");
   });
+
+  it("notifies the card's thread without reopening or navigating the browser", async () => {
+    const card = renderCard(
+      "browser-sign-in",
+      { origin: "https://github.com", "profile-id": "work" },
+      stubs({ browser_status: () => status({ profileId: "work" }) }),
+    );
+    await card.findByText(/in Work\./u);
+    fireEvent.click(card.getByRole("button", { name: "Done" }));
+    await card.findByText(
+      "Agent notified. Your sign-in reply was sent to this thread.",
+    );
+    expect(calls(card, "browser_sign_in_done")[0]?.input).toEqual({
+      threadId: THREAD_ID,
+      origin: "https://github.com",
+      profileId: "work",
+    });
+    fireEvent.click(card.getByRole("button", { name: "Agent notified" }));
+    expect(calls(card, "browser_sign_in_done")).toHaveLength(1);
+    expect(calls(card, "browser_navigate")).toEqual([]);
+    expect(panelOpens(card)).toEqual([]);
+  });
+
+  it("blocks repeated clicks while notifying the agent", async () => {
+    let finish!: (value: { ok: true; delivery: "sent" }) => void;
+    const card = renderCard(
+      "browser-sign-in",
+      { origin: "https://github.com" },
+      stubs({
+        browser_sign_in_done: () =>
+          new Promise((resolve) => {
+            finish = resolve;
+          }),
+      }),
+    );
+    await card.findByText("The browser is on https://github.com/login.");
+    fireEvent.click(card.getByRole("button", { name: "Done" }));
+    const button = card.getByRole("button", { name: "Notifying…" });
+    expect((button as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(button);
+    expect(calls(card, "browser_sign_in_done")).toHaveLength(1);
+    await act(async () => finish({ ok: true, delivery: "sent" }));
+    expect(card.getByRole("button", { name: "Agent notified" })).toBeDefined();
+  });
+
+  it("lets the owner retry a failed notification", async () => {
+    const send = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("Could not send the reply."))
+      .mockResolvedValueOnce({ ok: true, delivery: "sent" });
+    const card = renderCard(
+      "browser-sign-in",
+      { origin: "https://github.com" },
+      stubs({ browser_sign_in_done: send }),
+    );
+    fireEvent.click(card.getByRole("button", { name: "Done" }));
+    await card.findByText("Could not send the reply.");
+    fireEvent.click(card.getByRole("button", { name: "Done" }));
+    await card.findByText(
+      "Agent notified. Your sign-in reply was sent to this thread.",
+    );
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(card.queryByText("Could not send the reply.")).toBeNull();
+  });
+
+  it.each(["queued", "deferred"])(
+    "explains a %s reply even when the browser host is offline",
+    async (delivery) => {
+      const card = renderCard(
+        "browser-sign-in",
+        { origin: "https://github.com" },
+        stubs({
+          browser_status: () =>
+            status({ state: "host-offline", code: "host_offline" }),
+          browser_sign_in_done: () => ({ ok: true, delivery }),
+        }),
+      );
+      await card.findByText(
+        "Reconnect this thread's workspace host to use its browser.",
+      );
+      fireEvent.click(card.getByRole("button", { name: "Done" }));
+      await card.findByText(
+        delivery === "queued"
+          ? "Your sign-in reply is queued for the agent's next turn."
+          : "Your sign-in reply will be delivered when the agent can receive it.",
+      );
+      expect(calls(card, "browser_sign_in_done")).toHaveLength(1);
+    },
+  );
 
   it("does not navigate when the thread has no side panel", async () => {
     const card = renderCard(
@@ -517,6 +609,84 @@ describe("::browser-sign-in", () => {
     fireEvent.click(card.getByRole("button", { name: "Open in panel" }));
     expect(panelOpens(card)).toHaveLength(1);
     expect(calls(card, "browser_navigate")).toEqual([]);
+  });
+});
+
+describe("Sign-in Handoff notification RPC", () => {
+  it.each(["sent", "queued", "deferred"] as const)(
+    "sends an owner reply to the requested thread and returns %s delivery",
+    async (delivery) => {
+      const send = vi.fn().mockResolvedValue({ ok: true, delivery });
+      const { bb, harness } = createFakePluginHost({
+        sdk: { subscribe: () => () => {}, threads: { send } },
+      });
+      try {
+        plugin(bb);
+        expect(
+          await harness.behavior.callRpc("browser_sign_in_done", {
+            threadId: THREAD_ID,
+            origin: "https://GitHub.com/",
+            profileId: "work",
+          }),
+        ).toEqual({ ok: true, delivery });
+        expect(send).toHaveBeenCalledWith({
+          threadId: THREAD_ID,
+          mode: "steer-if-active",
+          input: [
+            {
+              type: "text",
+              mentions: [],
+              text: "I'm done signing in to https://github.com in Browser Profile work. Please check the browser and continue.",
+            },
+          ],
+        });
+      } finally {
+        await harness.lifecycle.dispose();
+      }
+    },
+  );
+
+  it("rejects invalid origins before sending a reply", async () => {
+    const send = vi.fn();
+    const { bb, harness } = createFakePluginHost({
+      sdk: { subscribe: () => () => {}, threads: { send } },
+    });
+    try {
+      plugin(bb);
+      await expect(
+        harness.behavior.callRpc("browser_sign_in_done", {
+          threadId: THREAD_ID,
+          origin: "https://github.com/login",
+        }),
+      ).rejects.toThrow();
+      expect(send).not.toHaveBeenCalled();
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it("reports a send failure to the card", async () => {
+    const { bb, harness } = createFakePluginHost({
+      sdk: {
+        subscribe: () => () => {},
+        threads: {
+          send: async () => {
+            throw new Error("Thread is archived.");
+          },
+        },
+      },
+    });
+    try {
+      plugin(bb);
+      await expect(
+        harness.behavior.callRpc("browser_sign_in_done", {
+          threadId: THREAD_ID,
+          origin: "https://github.com",
+        }),
+      ).rejects.toThrow("Thread is archived.");
+    } finally {
+      await harness.lifecycle.dispose();
+    }
   });
 });
 

@@ -1087,6 +1087,15 @@ export async function createPublicPluginHarness(options?: {
       backend.harness.behavior.callRpc("browser_navigate", input) as Promise<
         ReturnType<typeof browserNavigationResponseSchema.parse>
       >,
+    browser_sign_in_done: (
+      input: Parameters<typeof rpcContract.browser_sign_in_done.input.parse>[0],
+    ) =>
+      backend.harness.behavior.callRpc(
+        "browser_sign_in_done",
+        input,
+      ) as Promise<
+        ReturnType<typeof rpcContract.browser_sign_in_done.output.parse>
+      >,
     browser_history: (input: BrowserPanelHistoryInput) =>
       backend.harness.behavior.callRpc("browser_history", input) as Promise<
         ReturnType<typeof browserNavigationResponseSchema.parse>

@@ -139,7 +139,8 @@ I need you to sign in to GitHub so I can continue.
 - `origin` is an exact origin: no path, query, or credentials.
 - Make the card the last thing in your reply and end your turn. Starting a long
   wait after it collapses the turn and buries the card.
-- When the owner replies, check with `browser_script`. If sign-in is still
+- The owner can click Done on the card to send a reply and let you continue.
+  When the owner replies, check with `browser_script`. If sign-in is still
   pending, embed the card again as the last thing in that reply.
 - Never ask for a password or code in chat, and never type the owner's
   credentials yourself.
