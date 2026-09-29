@@ -322,6 +322,12 @@ type HandoffPhase =
   | { phase: "opened" }
   | { phase: "failed"; message: string };
 
+type NotificationPhase =
+  | { phase: "idle" }
+  | { phase: "sending" }
+  | { phase: "sent"; delivery: "sent" | "queued" | "deferred" }
+  | { phase: "failed"; message: string };
+
 function BrowserSignInCardBody({
   threadId,
   origin,
@@ -338,6 +344,10 @@ function BrowserSignInCardBody({
   );
   const openPanel = useOpenBrowserPanel();
   const [handoff, setHandoff] = useState<HandoffPhase>({ phase: "idle" });
+  const [notification, setNotification] = useState<NotificationPhase>({
+    phase: "idle",
+  });
+  const notificationStarted = useRef(false);
   const mounted = useRef(true);
   useEffect(() => {
     mounted.current = true;
@@ -395,6 +405,33 @@ function BrowserSignInCardBody({
     }
   }
 
+  async function notifyDone() {
+    if (notificationStarted.current) return;
+    notificationStarted.current = true;
+    setNotification({ phase: "sending" });
+    try {
+      const targetProfileId = snapshot?.status.profileId ?? profileId;
+      const response = await rpc.call("browser_sign_in_done", {
+        threadId,
+        origin,
+        ...(targetProfileId === undefined
+          ? {}
+          : { profileId: targetProfileId }),
+      });
+      if (mounted.current) {
+        setNotification({ phase: "sent", delivery: response.delivery });
+      }
+    } catch (cause) {
+      notificationStarted.current = false;
+      if (mounted.current) {
+        setNotification({
+          phase: "failed",
+          message: administrationErrorMessage(cause),
+        });
+      }
+    }
+  }
+
   return (
     <CardFrame
       label={`Sign in to ${site}`}
@@ -404,8 +441,8 @@ function BrowserSignInCardBody({
       <p className="mt-1">
         An agent needs you to sign in to {origin}
         {view?.profileName == null ? "" : ` in ${view.profileName}`}. Sign in
-        yourself in the Browser Panel, then reply in this thread when you are
-        done. Never paste a password into chat.
+        yourself in the Browser Panel, then click Done to let the agent
+        continue. Never paste a password into chat.
       </p>
       {onSite ? (
         <p className="mt-1 text-xs text-muted-foreground">
@@ -415,12 +452,26 @@ function BrowserSignInCardBody({
       <CardNotes view={view} error={error} />
       {handoff.phase === "opened" ? (
         <p role="status" className="mt-1 text-xs text-muted-foreground">
-          Opened {site} in the Browser Panel. Reply here once you are signed in.
+          Opened {site} in the Browser Panel. Click Done once you are signed in.
         </p>
       ) : null}
       {handoff.phase === "failed" ? (
         <p role="alert" className="mt-1 text-xs text-destructive-text">
           {handoff.message}
+        </p>
+      ) : null}
+      {notification.phase === "sent" ? (
+        <p role="status" className="mt-1 text-xs text-muted-foreground">
+          {notification.delivery === "sent"
+            ? "Agent notified. Your sign-in reply was sent to this thread."
+            : notification.delivery === "queued"
+              ? "Your sign-in reply is queued for the agent's next turn."
+              : "Your sign-in reply will be delivered when the agent can receive it."}
+        </p>
+      ) : null}
+      {notification.phase === "failed" ? (
+        <p role="alert" className="mt-1 text-xs text-destructive-text">
+          {notification.message}
         </p>
       ) : null}
       <div className="mt-2 flex flex-wrap items-center gap-2">
@@ -433,6 +484,22 @@ function BrowserSignInCardBody({
           onClick={() => void openSignIn()}
         >
           {handoff.phase === "opening" ? "Opening…" : `Open ${site}`}
+        </Button>
+        <Button
+          variant="secondary"
+          size="sm"
+          disabled={
+            handoff.phase === "opening" ||
+            notification.phase === "sending" ||
+            notification.phase === "sent"
+          }
+          onClick={() => void notifyDone()}
+        >
+          {notification.phase === "sending"
+            ? "Notifying…"
+            : notification.phase === "sent"
+              ? "Agent notified"
+              : "Done"}
         </Button>
         {view !== null && !view.canNavigate ? (
           <Button

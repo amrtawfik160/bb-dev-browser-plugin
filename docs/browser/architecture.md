@@ -122,6 +122,9 @@ See [safe-login.md](safe-login.md) for the full workflow.
   it awake indefinitely.
 - A Sign-in Handoff opens the Browser Panel and then makes an ordinary owner
   navigation to the exact origin. It is not Safe Login Mode.
+- Its Done button sends an owner reply to the card's thread through the BB SDK,
+  starting an idle agent or steering the reply into its active turn. Sending and
+  success disable repeat clicks; failures show an error and allow retry.
 
 ## Clipboard, files, and permissions
 

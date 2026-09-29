@@ -2207,7 +2207,7 @@ function registerAgentTool(bb: BbPluginApi, browser: BrowserService) {
     instructions:
       "Provide a purpose, an exact destinationOrigin, and QuickJS Playwright code. Leave profileId unset to use this thread's separate default profile; explicit profile selections share that profile. `page` is the active tab. `return` values become the result. Calls sharing a profile wait in order for up to 30 seconds before browser_busy; that call has not run. Let the active operation finish before retrying once. The CLI uses the same lease. At most three Browser Instances run on a host; awake-limit means capacity is in use, so wait without stopping another profile. Report typed failures without retrying setup. " +
       'If a person is likely watching, put `::browser-live` on its own line in your reply to show this thread\'s browser inline; skip it for unattended work, use at most one card per reply, and add profile-id="<id>" only when you passed profileId. ' +
-      'When a site needs the owner to sign in, never ask for credentials in chat or type theirs: end your reply with `::browser-sign-in{origin="https://example.com"}` on its own line, then end the turn. If sign-in is still pending when you check back, embed the card again.',
+      'When a site needs the owner to sign in, never ask for credentials in chat or type theirs: end your reply with `::browser-sign-in{origin="https://example.com"}` on its own line, then end the turn. The owner can click Done on the card to send a reply and let you continue; check the browser when they reply. If sign-in is still pending when you check back, embed the card again.',
     presentation: {
       label: {
         pending: "Running browser script",
@@ -2230,6 +2230,18 @@ export default function plugin(bb: BbPluginApi) {
         ? browser.selectedStatus(panelIdentity(input))
         : browser.status(panelIdentity(input), input.profileId),
     browser_navigate: (input) => browser.navigate(input),
+    browser_sign_in_done: (input) =>
+      bb.sdk.threads.send({
+        threadId: input.threadId,
+        mode: "steer-if-active",
+        input: [
+          {
+            type: "text",
+            mentions: [],
+            text: `I'm done signing in to ${input.origin}${input.profileId === undefined ? "" : ` in Browser Profile ${input.profileId}`}. Please check the browser and continue.`,
+          },
+        ],
+      }),
     browser_history: (input) => browser.history(input),
     browser_panel_visibility: (input) => browser.panelVisibility(input),
     browser_panel_capability: (input) => browser.panelCapability(input),
