@@ -32,19 +32,34 @@ other threads or project defaults, or bypass Default Access revocation and
 Profile Grants. Same-host projects can deliberately share a profile; profiles
 remain bound to their workspace host as in ADRs 0001 and 0012.
 
-For shared or saved profiles, automation binds `page` to a named tab derived
-from project and thread identity. Tabs share one BrowserContext and cookies,
+On every profile, automation binds `page` to a named tab derived from project
+and thread identity, starting with the thread's first script call. Waiting
+until a profile is saved changes its binding mid-workflow; an unsaved default
+can also be explicitly shared while its originating thread still uses the
+active tab. A stable binding prevents both cases. Private default profiles
+retain separate cookies. Tabs within a profile share one BrowserContext and cookies,
 but default automation resumes its own tab between calls. An explicit tab
 ID takes precedence. Browser Panels retain the shared tab inventory and
 active tab; agents can explicitly manipulate other permitted tabs, so this
 is workflow preservation rather than a security isolation boundary. Closed
 or unrestored named tabs are recreated at the requested origin. This amends
-ADR 0017's shared-profile tab binding while preserving private defaults.
+ADR 0017's tab binding while preserving private default profiles and amends
+ADR 0005's active-tab automation default.
 
 A profile becomes saved for reuse after any confirmed sign-in. Saved profiles
 survive their originating thread's deletion, amending ADR 0018; archiving the
-thread may still sleep its Browser Instance. The owner can archive or delete
+thread may still sleep its Browser Instance. Automatic deletion checks the
+saved flag under the same host storage mutation lock as sign-in confirmation;
+only an actual archive revokes grants and releases profile resources. A stale
+inventory must not archive a newly saved login. The owner can archive or delete
 the profile in Browser Settings. Expired sign-in hints do not remove profile
 data automatically. The Control Lease, Safe Login Mode, three-instance
 ceiling, idle sleep, and 12-tab retention cap remain effective. Metadata
 failures during Done must not prevent notifying the agent.
+
+Automatic deletion also rechecks whether another thread selected the profile
+inside the grant-state serialization queue. A selection that committed while
+cleanup waited must preserve that shared profile.
+
+Done uses the host and profile opened by that Sign-in Handoff, even when the
+thread's selected profile changes before the owner finishes signing in.

@@ -423,6 +423,33 @@ describe("::browser-live", () => {
 });
 
 describe("::browser-sign-in", () => {
+  it("notifies Done for the profile opened even after the thread selection changes", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    let selectedProfileId = THREAD_PROFILE_ID;
+    const card = renderCard(
+      "browser-sign-in",
+      { origin: "https://github.com" },
+      stubs({
+        browser_status: () => status({ profileId: selectedProfileId }),
+      }),
+    );
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    fireEvent.click(card.getByRole("button", { name: "Open github.com" }));
+    await act(async () => undefined);
+    selectedProfileId = "work";
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(BROWSER_CARD_REFRESH_INTERVAL_MS);
+    });
+    fireEvent.click(card.getByRole("button", { name: "Done" }));
+    await act(async () => undefined);
+    expect(calls(card, "browser_sign_in_done")[0]?.input).toMatchObject({
+      profileId: THREAD_PROFILE_ID,
+      hostId: HOST_ID,
+    });
+  });
+
   it("hands the sign-in to the owner through their own navigation", async () => {
     const card = renderCard(
       "browser-sign-in",

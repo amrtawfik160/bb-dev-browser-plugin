@@ -1,9 +1,12 @@
-# `bb browser` CLI reference
+# `bb plugin run browser` CLI reference
 
 Every command below is the exact surface handled in `server.ts` and was
 verified against the source. The plugin namespace is `browser`. Flag names are
 not interchangeable — for example, `transfer` uses `--environment <id>
 --path <relative-path>`, not `--source`/`--environment-root`.
+
+Use the explicit plugin path below: BB's core `bb browser` commands take
+precedence over this plugin's contributed command.
 
 Common conventions:
 
@@ -14,10 +17,24 @@ Common conventions:
 - `--profile <id>` (where shown) selects a Browser Profile; omit it to use the
   selected profile.
 
+## Reusing sign-ins
+
+```text
+bb plugin run browser sessions list [--site <query>] [--offset <n>] [--limit <n>] [--include-archived] [--json]
+bb plugin run browser sessions select <profile-id> [--json]
+bb plugin run browser sessions report <origin> --status <signed-in|signed-out> [--profile <id>] [--json]
+```
+
+These commands require thread context and derive the workspace host from it.
+Listing reads metadata without waking a browser. Follow `nextOffset` to page
+results. `sites` contains dated confirmations; `recentOrigins` contains
+unverified prior activity. Selection affects this thread only. Verify actual
+authentication through an authorized script before reporting status.
+
 ## Opening the browser
 
 ```text
-bb browser open <url> [--profile <id>] [--timeout <ms>] [--screenshot] [--json]
+bb plugin run browser open <url> [--profile <id>] [--timeout <ms>] [--screenshot] [--json]
 ```
 
 With an HTTP(S) URL, navigates the active tab and reports the resulting URL,
@@ -34,8 +51,8 @@ searches in the Browser Panel.
 ## Readiness and diagnostics
 
 ```text
-bb browser status [--profile <id>] [--host <id>] [--json]
-bb browser diagnostics [--profile <id>] [--host <id>] [--json]
+bb plugin run browser status [--profile <id>] [--host <id>] [--json]
+bb plugin run browser diagnostics [--profile <id>] [--host <id>] [--json]
 ```
 
 - `status` prints the label, message, and a nine-capability checklist (`✓`
@@ -48,7 +65,7 @@ bb browser diagnostics [--profile <id>] [--host <id>] [--json]
 ## Agent script
 
 ```text
-bb browser script --purpose <text> --code <source> --origin <origin> \
+bb plugin run browser script --purpose <text> --code <source> --origin <origin> \
   [--profile <id>] [--tab <id>] [--timeout <ms>] \
   [--screenshot] [--file-transfer] [--invalid-certificate] [--json]
 ```
@@ -56,15 +73,16 @@ bb browser script --purpose <text> --code <source> --origin <origin> \
 `--purpose`, `--code`, and `--origin` are required. `--origin` must be an exact
 web origin such as `https://example.com`. `--timeout` must be an integer from
 1000 to 30000. `--host` and `--confirm` are invalid for `script`. The script
-runs with Playwright `page` bound to the active tab; `return` values print as
+runs with Playwright `page` bound to this thread's named tab from its first
+script call; `--tab` overrides that binding. `return` values print as
 the result. See [agent-reference.md](agent-reference.md) for typed results.
 
 ## Activity records
 
 ```text
-bb browser activity [--profile <id>] [--host <id>] [--json]
-bb browser activity-export [--profile <id>] [--host <id>] [--json]
-bb browser activity-clear [--profile <id>] --confirm "Clear Browser activity records" [--json]
+bb plugin run browser activity [--profile <id>] [--host <id>] [--json]
+bb plugin run browser activity-export [--profile <id>] [--host <id>] [--json]
+bb plugin run browser activity-clear [--profile <id>] --confirm "Clear Browser activity records" [--json]
 ```
 
 `activity-clear` requires the literal confirmation text shown above.
@@ -72,8 +90,8 @@ bb browser activity-clear [--profile <id>] --confirm "Clear Browser activity rec
 ## Grants and grant requests
 
 ```text
-bb browser requests [--json]
-bb browser request-status --request <id> [--json]
+bb plugin run browser requests [--json]
+bb plugin run browser request-status --request <id> [--json]
 ```
 
 These are project-scoped, metadata-only request reads. Profile Grant creation,
@@ -89,10 +107,10 @@ subdomain patterns (`https://*.example.com`), or `*`; paths are not grantable.
 ## Profiles
 
 ```text
-bb browser list [--host <id>] [--json]
-bb browser create --name <name> [--locale <locale>] [--timezone <zone>] [--host <id>] [--json]
-bb browser rename --profile <id> --name <name> [--locale <locale>] [--timezone <zone>] [--host <id>] [--json]
-bb browser select --profile <id> [--host <id>] [--json]
+bb plugin run browser list [--host <id>] [--json]
+bb plugin run browser create --name <name> [--locale <locale>] [--timezone <zone>] [--host <id>] [--json]
+bb plugin run browser rename --profile <id> --name <name> [--locale <locale>] [--timezone <zone>] [--host <id>] [--json]
+bb plugin run browser select --profile <id> [--host <id>] [--json]
 ```
 
 `--name` is valid for `create`, `rename`, and `import` only. `--locale` and
@@ -101,9 +119,9 @@ bb browser select --profile <id> [--host <id>] [--json]
 ## Profile recovery (owner operations)
 
 ```text
-bb browser backup  --profile <id> --archive <path> [--host <id>] [--json]
-bb browser restore --profile <id> --archive <path> [--host <id>] [--json]
-bb browser import  --name <name> --source <path> [--host <id>] [--json]
+bb plugin run browser backup  --profile <id> --archive <path> [--host <id>] [--json]
+bb plugin run browser restore --profile <id> --archive <path> [--host <id>] [--json]
+bb plugin run browser import  --name <name> --source <path> [--host <id>] [--json]
 ```
 
 `--archive` is valid for `backup` and `restore` only. `--source` is valid for
@@ -114,10 +132,10 @@ to the same host and BB installation; no cross-host restore.
 ## Profile lifecycle (owner operations)
 
 ```text
-bb browser archive --profile <id> [--host <id>] [--json]
-bb browser restore-archived --profile <id> [--host <id>] [--json]
-bb browser reset --profile <id> --confirm <text> [--host <id>] [--json]
-bb browser delete --profile <id> --confirm <name> [--host <id>] [--json]
+bb plugin run browser archive --profile <id> [--host <id>] [--json]
+bb plugin run browser restore-archived --profile <id> [--host <id>] [--json]
+bb plugin run browser reset --profile <id> --confirm <text> [--host <id>] [--json]
+bb plugin run browser delete --profile <id> --confirm <name> [--host <id>] [--json]
 ```
 
 - `archive` shows Archived Profile state; mutation requires owner Settings.
@@ -129,10 +147,10 @@ bb browser delete --profile <id> --confirm <name> [--host <id>] [--json]
 ## Setup, lifecycle, and purge
 
 ```text
-bb browser setup [--step <id> --confirm <text>] [--json]
-bb browser disable  --confirm "Stop Browser processes"
-bb browser uninstall --confirm "Stop Browser processes"
-bb browser purge [--confirm <text>] [--json]
+bb plugin run browser setup [--step <id> --confirm <text>] [--json]
+bb plugin run browser disable  --confirm "Stop Browser processes"
+bb plugin run browser uninstall --confirm "Stop Browser processes"
+bb plugin run browser purge [--confirm <text>] [--json]
 ```
 
 - `setup` without `--step` shows the consent-gated plan; applying a step requires
@@ -147,10 +165,10 @@ bb browser purge [--confirm <text>] [--json]
 ## File transfer
 
 ```text
-bb browser transfer --kind workspace --environment <id> --path <relative-path> [--actor owner|agent] [--profile <id>] [--host <id>] [--transfer-id <id>] [--json]
-bb browser transfer --kind client --file <local-path> [--transfer-id <id>] [--profile <id>] [--host <id>] [--json]
-bb browser transfer --cancel --transfer-id <id> [--profile <id>] [--host <id>] [--json]
-bb browser transfer --progress --transfer-id <id> [--profile <id>] [--host <id>] [--json]
+bb plugin run browser transfer --kind workspace --environment <id> --path <relative-path> [--actor owner|agent] [--profile <id>] [--host <id>] [--transfer-id <id>] [--json]
+bb plugin run browser transfer --kind client --file <local-path> [--transfer-id <id>] [--profile <id>] [--host <id>] [--json]
+bb plugin run browser transfer --cancel --transfer-id <id> [--profile <id>] [--host <id>] [--json]
+bb plugin run browser transfer --progress --transfer-id <id> [--profile <id>] [--host <id>] [--json]
 ```
 
 Output is privacy-safe: transfer id, kind, size, and content type only. The
@@ -161,13 +179,13 @@ lifecycle operations.
 ## Downloads
 
 ```text
-bb browser downloads list [--profile <id>] [--host <id>] [--json]
-bb browser downloads progress --download-id <id> [--profile <id>] [--host <id>] [--json]
-bb browser downloads cancel --download-id <id> [--profile <id>] [--host <id>] [--json]
-bb browser downloads export-client --download-id <id> [--actor owner|agent] [--profile <id>] [--host <id>] [--json]
-bb browser downloads export-workspace --download-id <id> --environment <id> --path <relative-path> [--overwrite] [--actor owner|agent] [--profile <id>] [--host <id>] [--json]
-bb browser downloads limits [--max-file-bytes <n>] [--max-profile-bytes <n>] [--expiry-ms <n>] [--profile <id>] [--host <id>] [--json]
-bb browser downloads purge [--profile <id>] [--host <id>] [--json]
+bb plugin run browser downloads list [--profile <id>] [--host <id>] [--json]
+bb plugin run browser downloads progress --download-id <id> [--profile <id>] [--host <id>] [--json]
+bb plugin run browser downloads cancel --download-id <id> [--profile <id>] [--host <id>] [--json]
+bb plugin run browser downloads export-client --download-id <id> [--actor owner|agent] [--profile <id>] [--host <id>] [--json]
+bb plugin run browser downloads export-workspace --download-id <id> --environment <id> --path <relative-path> [--overwrite] [--actor owner|agent] [--profile <id>] [--host <id>] [--json]
+bb plugin run browser downloads limits [--max-file-bytes <n>] [--max-profile-bytes <n>] [--expiry-ms <n>] [--profile <id>] [--host <id>] [--json]
+bb plugin run browser downloads purge [--profile <id>] [--host <id>] [--json]
 ```
 
 Downloads are untrusted quarantine objects: never auto-opened or executed.

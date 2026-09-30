@@ -48,7 +48,8 @@ summarizes the runtime and indexes them.
 - Browser Tabs belong to a Browser Profile, not a BB thread. Every panel using
   that profile observes the same ordered tab set and one shared active tab.
   Threads have separate default profiles; explicit selections can share one.
-  Automation in shared or saved profiles binds a named tab per thread. This
+  Automation binds a named tab per thread from its first script call on every
+  profile, so saving or sharing a profile keeps the same task page. This
   preserves the task page between calls while sharing cookies; an explicit
   `tabId` overrides the binding. Panels still observe all tabs.
   At most three instances run, with five-minute idle sleep and a 12-tab cap
@@ -117,7 +118,7 @@ See [safe-login.md](safe-login.md) for the full workflow.
   profile records a whole-web grant automatically; revoking it in Settings puts
   that project on the Grant Request flow (ADR 0015).
 - Agent access is exposed through a native `browser_script` tool, an equivalent
-  `bb browser` CLI, and a bundled skill. Those boundaries enforce profile,
+  `bb plugin run browser` CLI, and a bundled skill. Those boundaries enforce profile,
   project, origin, timeout, and lease policy. (ADR 0008)
 
 ## Transport
@@ -149,6 +150,7 @@ See [safe-login.md](safe-login.md) for the full workflow.
 - Its Done button sends an owner reply to the card's thread through the BB SDK,
   starting an idle agent or steering the reply into its active turn. Sending and
   success disable repeat clicks; failures show an error and allow retry.
+  Done confirms the profile opened by the handoff even if thread selection changes.
 
 ## Clipboard, files, and permissions
 

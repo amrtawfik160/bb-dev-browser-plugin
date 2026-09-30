@@ -130,7 +130,7 @@ bb plugin install path:. --yes
 Then provision the OS user and browser binaries:
 
 ```text
-bb browser setup
+bb plugin run browser setup
 ```
 
 Until that finishes, the panel shows **Setup required**.
@@ -144,20 +144,21 @@ access is on by default; review or revoke it under **Agent access** in
 authenticated Browser Settings.
 
 ```text
-bb browser status
-bb browser list
-bb browser create --name "Work"
-bb browser select --profile <id>
+bb plugin run browser status
+bb plugin run browser list
+bb plugin run browser create --name "Work"
+bb plugin run browser select --profile <id>
 ```
 
-The default profile is `bb-personal`. Use **Safe Login** in the panel when a
+Threads use separate default profiles; Browser Settings defaults to `bb-personal`.
+Use **Safe Login** in the panel when a
 site fights automation.
 
 ### Agent
 
 Use `browser_script` or `bb plugin run browser script`; any web origin works by default.
-`page` is this thread's named tab in shared profiles, or the active tab in
-a private profile. Whatever you `return` is the result. Pass an exact origin
+`page` is this thread's named tab from its first script call on every profile.
+Saving or sharing the profile preserves that binding. Whatever you `return` is the result. Pass an exact origin
 every time.
 
 ```text
@@ -187,10 +188,10 @@ commands accept `--json`.
 Workspace files stage through a BB environment id, not a raw host path:
 
 ```text
-bb browser transfer --kind workspace --environment <id> --path <relative-path>
-bb browser transfer --kind client --file <local-path>
-bb browser transfer --progress --transfer-id <id>
-bb browser transfer --cancel --transfer-id <id>
+bb plugin run browser transfer --kind workspace --environment <id> --path <relative-path>
+bb plugin run browser transfer --kind client --file <local-path>
+bb plugin run browser transfer --progress --transfer-id <id>
+bb plugin run browser transfer --cancel --transfer-id <id>
 ```
 
 ## Development
@@ -277,7 +278,7 @@ Threat model: [`docs/browser/security.md`](docs/browser/security.md).
 | [operators.md](docs/browser/operators.md)                     | Setup, repair, retention, backups    |
 | [security.md](docs/browser/security.md)                       | Trust boundaries and threat model    |
 | [agent-reference.md](docs/browser/agent-reference.md)         | `browser_script`, CLI, typed results |
-| [cli-reference.md](docs/browser/cli-reference.md)             | Complete `bb browser` flags          |
+| [cli-reference.md](docs/browser/cli-reference.md)             | Complete plugin CLI flags            |
 | [safe-login.md](docs/browser/safe-login.md)                   | Owner-only Safe Login Mode           |
 | [architecture.md](docs/browser/architecture.md)               | Runtime and ADR index                |
 | [permissions.md](docs/browser/permissions.md)                 | Host, OS-user, and data permissions  |

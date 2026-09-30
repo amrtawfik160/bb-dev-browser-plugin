@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { scopedProfileId } from "../src/shared/profile-scope.js";
 import { browserSessionSiteSchema } from "../src/shared/contracts.js";
@@ -59,6 +59,125 @@ async function fixture() {
 }
 
 describe("discovering and reusing signed-in Browser Profiles", () => {
+  it("preserves an unsaved profile selected while thread cleanup waits in the grant queue", async () => {
+    const browser = await createPublicPluginHarness({
+      status: healthyBrowserStatus,
+      browserRuntime: createTabInventoryRuntime(),
+      sharedProfile: false,
+      deferSessionSiteUpdate: true,
+      deferProfileInventory: true,
+      deferProfileInventoryAfterCalls: 3,
+    });
+    try {
+      await browser.runBrowserScriptWithProfile(undefined, {
+        destinationOrigin: origin,
+      });
+      const report = browser.runBrowserSessions({
+        action: "report",
+        origin,
+        status: "signed-out",
+      });
+      await browser.sessionSiteUpdateStarted;
+      const selection = browser.runBrowserSessions(
+        { action: "select", profileId },
+        { threadId: "thread-second" },
+      );
+      await vi.waitFor(() => {
+        expect(
+          browser.hostRpcCalls.filter((method) => method === "listProfiles"),
+        ).toHaveLength(3);
+      });
+      const deletion = browser.emitThreadEvent("thread.deleted");
+      await browser.profileInventoryStarted;
+      browser.releaseProfileInventory();
+      // Selection is queued ahead of cleanup while the report holds the queue.
+      browser.releaseSessionSiteUpdate();
+      resultJson(await report);
+      resultJson(await selection);
+      await deletion;
+      const inventory = await browser.runBrowserProfiles(hostId);
+      expect(
+        inventory.profiles.find((entry) => entry.profileId === profileId),
+      ).toMatchObject({ state: "active", reusable: false });
+      const catalog = catalogSchema.parse(
+        resultJson(
+          await browser.runBrowserSessions(
+            { action: "list" },
+            { threadId: "thread-second" },
+          ),
+        ),
+      );
+      expect(catalog.selectedProfileId).toBe(profileId);
+    } finally {
+      browser.releaseSessionSiteUpdate();
+      browser.releaseProfileInventory();
+      await browser.dispose();
+    }
+  });
+
+  it("keeps a sign-in saved after thread deletion reads an older inventory", async () => {
+    const browser = await createPublicPluginHarness({
+      status: healthyBrowserStatus,
+      browserRuntime: createTabInventoryRuntime(),
+      sharedProfile: false,
+      deferProfileInventory: true,
+      deferProfileInventoryAfterCalls: 1,
+    });
+    try {
+      await browser.runBrowserScriptWithProfile(undefined, {
+        destinationOrigin: origin,
+      });
+      const deletion = browser.emitThreadEvent("thread.deleted");
+      await browser.profileInventoryStarted;
+      await browser.rpc.browser_sign_in_done({ threadId, profileId, origin });
+      browser.releaseProfileInventory();
+      await deletion;
+      const inventory = await browser.runBrowserProfiles(hostId);
+      expect(
+        inventory.profiles.find((entry) => entry.profileId === profileId),
+      ).toMatchObject({ state: "active", reusable: true });
+      expect(await browser.listBrowserGrants({ profileId })).toHaveLength(1);
+    } finally {
+      browser.releaseProfileInventory();
+      await browser.dispose();
+    }
+  });
+
+  it("binds the originating thread consistently before sharing and saving its default", async () => {
+    const { browser, calls } = await fixture();
+    try {
+      resultJson(
+        await browser.runBrowserSessions(
+          { action: "select", profileId },
+          { threadId: "thread-second" },
+        ),
+      );
+      await browser.runBrowserScriptWithProfile(undefined, {
+        threadId: "thread-second",
+        destinationOrigin: origin,
+      });
+      await browser.runBrowserScriptWithProfile(undefined, {
+        destinationOrigin: origin,
+      });
+      expect(calls[0]?.threadPageName).toBeDefined();
+      expect(calls[0]?.threadPageName).toBe(calls[2]?.threadPageName);
+      expect(calls[1]?.threadPageName).not.toBe(calls[2]?.threadPageName);
+      resultJson(
+        await browser.runBrowserSessions({
+          action: "report",
+          origin,
+          status: "signed-in",
+        }),
+      );
+      await browser.runBrowserScriptWithProfile(undefined, {
+        destinationOrigin: origin,
+      });
+      expect(calls[3]?.threadPageName).toBe(calls[0]?.threadPageName);
+    } finally {
+      await browser.dispose();
+    }
+  });
+
   it("lets another thread find the owner's login and reuse its profile with a separate tab", async () => {
     const { browser, calls } = await fixture();
     try {
@@ -107,7 +226,7 @@ describe("discovering and reusing signed-in Browser Profiles", () => {
         profileId,
         profileId,
       ]);
-      expect(calls[0]?.threadPageName).toBeUndefined();
+      expect(calls[0]?.threadPageName).toBe(calls[2]?.threadPageName);
       expect(calls[1]?.threadPageName).not.toBe(calls[2]?.threadPageName);
       expect(calls[1]?.initialOrigin).toBe(origin);
       expect(calls[2]?.initialOrigin).toBe(origin);

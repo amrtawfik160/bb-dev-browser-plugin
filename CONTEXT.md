@@ -26,7 +26,7 @@ _Avoid_: Client browser, server browser
 
 **Browser Profile**:
 A named, host-local browser identity containing site authentication and storage. A profile may be reused across repositories on the same host but is never synchronized to another host.
-Threads receive separate default profiles; calls without a thread receive a project default. Explicit profile selections, including an agent's thread selection through `browser_sessions`, opt into sharing cookies. Shared or saved profiles give each thread a named Browser Tab for its multi-call workflow. Browser processes remain bounded independently of the number of stored profiles.
+Threads receive separate default profiles; calls without a thread receive a project default. Explicit profile selections, including an agent's thread selection through `browser_sessions`, opt into sharing cookies. Automation gives each thread a named Browser Tab from its first script call, so saving or sharing a profile preserves its multi-call workflow. Browser processes remain bounded independently of the number of stored profiles.
 When its thread is archived, a thread's default profile sleeps; when the thread is deleted, an unsaved profile becomes an Archived Profile. Profiles with a confirmed sign-in are saved for reuse and stay active until the owner archives or deletes them. Explicitly selected profiles are never released by thread lifecycle.
 _Avoid_: Account, global session
 
@@ -75,7 +75,7 @@ The exclusive, temporary right of either the owner or an agent to send input to 
 _Avoid_: Shared cursor, simultaneous control
 
 **Browser Tab**:
-A page belonging to a Browser Profile's shared tab set and visible from every Browser Panel using that profile. Each profile has one active tab shared across its panels. Shared-profile automation binds each thread to a named tab, while every panel can still see and control those tabs. An explicit tab ID overrides that binding.
+A page belonging to a Browser Profile's shared tab set and visible from every Browser Panel using that profile. Each profile has one active tab shared across its panels. Automation binds each thread to a named tab from its first script call, while every panel can still see and control those tabs. An explicit tab ID overrides that binding.
 _Avoid_: Thread tab, panel-local page
 
 **Automation Mode**:

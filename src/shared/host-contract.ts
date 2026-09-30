@@ -226,6 +226,10 @@ export const browserHostContract = defineRpcContract({
     input: browserProfileTargetSchema,
     output: browserProfileLifecycleResponseSchema,
   },
+  archiveUnsavedProfile: {
+    input: browserProfileTargetSchema,
+    output: browserProfileLifecycleResponseSchema.nullable(),
+  },
   restoreArchivedProfile: {
     input: browserProfileTargetSchema,
     output: browserProfileLifecycleResponseSchema,

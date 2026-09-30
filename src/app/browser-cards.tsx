@@ -348,6 +348,9 @@ function BrowserSignInCardBody({
     phase: "idle",
   });
   const notificationStarted = useRef(false);
+  const handoffTarget = useRef<{ hostId: string; profileId: string } | null>(
+    null,
+  );
   const mounted = useRef(true);
   useEffect(() => {
     mounted.current = true;
@@ -390,6 +393,12 @@ function BrowserSignInCardBody({
         input: origin,
       });
       if (!mounted.current) return;
+      if (!isPanelIdentityRejection(response)) {
+        handoffTarget.current = {
+          hostId: status.hostId,
+          profileId: status.profileId,
+        };
+      }
       setHandoff(
         isPanelIdentityRejection(response)
           ? { phase: "failed", message: response.message }
@@ -410,16 +419,19 @@ function BrowserSignInCardBody({
     notificationStarted.current = true;
     setNotification({ phase: "sending" });
     try {
-      const targetProfileId = snapshot?.status.profileId ?? profileId;
+      const targetProfileId =
+        handoffTarget.current?.profileId ??
+        snapshot?.status.profileId ??
+        profileId;
+      const targetHostId =
+        handoffTarget.current?.hostId ?? snapshot?.status.hostId;
       const response = await rpc.call("browser_sign_in_done", {
         threadId,
         origin,
         ...(targetProfileId === undefined
           ? {}
           : { profileId: targetProfileId }),
-        ...(snapshot?.status.hostId == null
-          ? {}
-          : { hostId: snapshot.status.hostId }),
+        ...(targetHostId == null ? {} : { hostId: targetHostId }),
       });
       if (mounted.current) {
         setNotification({ phase: "sent", delivery: response.delivery });
