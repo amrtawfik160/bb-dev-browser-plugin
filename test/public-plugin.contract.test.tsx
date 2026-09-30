@@ -918,7 +918,7 @@ describe("Browser public plugin contract", () => {
         "--request",
         "grant-request-foreign",
       ]);
-      expect(decisionCommand.stderr).toContain("Usage: bb browser");
+      expect(decisionCommand.stderr).toContain("Usage: bb plugin run browser");
       expect(decisionCommand.stderr).not.toContain("owner Settings");
 
       const decisionOption = await browser.runBrowserCli([
@@ -943,7 +943,7 @@ describe("Browser public plugin contract", () => {
       ).toEqual({
         name: "requests",
         summary: "List Browser Grant Requests",
-        usage: "bb browser requests [--json]",
+        usage: "bb plugin run browser requests [--json]",
       });
       const parsed = await browser.runBrowserCli(["requests", "--json"]);
       expect(parsed).toMatchObject({ exitCode: 0, stdout: "[]" });
@@ -1890,7 +1890,7 @@ describe("Browser public plugin contract", () => {
         "--json",
       ]);
       expect(cliDecision.exitCode).toBe(1);
-      expect(cliDecision.stderr).toContain("Usage: bb browser");
+      expect(cliDecision.stderr).toContain("Usage: bb plugin run browser");
       expect(
         (await browser.inspectBrowserGrantRequest(requestId))?.status,
       ).toBe("pending");
@@ -1901,7 +1901,7 @@ describe("Browser public plugin contract", () => {
         "--json",
       ]);
       expect(cliRevoke.exitCode).toBe(1);
-      expect(cliRevoke.stderr).toContain("Usage: bb browser");
+      expect(cliRevoke.stderr).toContain("Usage: bb plugin run browser");
 
       const approved = await browser.decideBrowserGrantRequest({
         requestId,

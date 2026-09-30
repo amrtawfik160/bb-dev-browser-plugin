@@ -960,9 +960,31 @@ export function createBrowserService(
       await host.call("sleepProfile", target, { hostId: target.hostId });
       return;
     }
-    await archiveListedProfile(target, inventory, {
-      actor: "system",
-      projectId,
+    await withGrantStateSerialization(async () => {
+      // A queued selection may have committed since the inventory check.
+      if (profileSelectedOutsideScope(target, preferenceKey)) return;
+      // The host checks reusable under its storage mutation lock. Revocation
+      // follows only an actual archive; a stale inventory cannot revoke a
+      // sign-in saved while thread cleanup was waiting.
+      const response = await host.call("archiveUnsavedProfile", target, {
+        hostId: target.hostId,
+      });
+      if (response === null) return;
+      await recordProfileLifecycleActivity(
+        target,
+        "archive",
+        async () => {
+          const authority = {
+            ...target,
+            installationId: inventory.installationId,
+          };
+          markProfileAuthorityInactive(authority);
+          revokeProfileAuthority(authority, "profile-archived");
+          replaceProfilePreferences(target, inventory);
+          return response;
+        },
+        { actor: "system", projectId },
+      );
     });
   }
 

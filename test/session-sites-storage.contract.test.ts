@@ -9,6 +9,54 @@ import {
 import { RESET_PROFILE_CONFIRMATION } from "../src/shared/contracts.js";
 
 describe("host-local sign-in metadata", () => {
+  it("preserves a saved profile at the atomic archive boundary while allowing owner archive", async () => {
+    const rootDirectory = await mkdtemp(
+      join(tmpdir(), "browser-session-archive-"),
+    );
+    let stopped = 0;
+    const store = createFileBrowserProfileStore({
+      rootDirectory,
+      installationId: "session-test",
+      lifecycle: {
+        stopProfile: async () => {
+          stopped += 1;
+        },
+      },
+    });
+    try {
+      const profile = await store.ensureScopedProfile({
+        hostId: "host-a",
+        projectId: "project-a",
+        threadId: "thread-a",
+      });
+      const target = { hostId: "host-a", profileId: profile.profileId };
+      const older = await store.listProfiles(target.hostId);
+      expect(
+        older.profiles.find((entry) => entry.profileId === profile.profileId)
+          ?.reusable,
+      ).not.toBe(true);
+      await store.recordSessionSite({
+        ...target,
+        origin: "https://example.test",
+        status: "signed-in",
+        source: "owner-confirmed",
+      });
+      expect(await store.archiveUnsavedProfile(target)).toBeNull();
+      expect(stopped).toBe(0);
+      expect(
+        (await store.listProfiles(target.hostId)).profiles.find(
+          (entry) => entry.profileId === profile.profileId,
+        ),
+      ).toMatchObject({ state: "active", reusable: true });
+      expect(await store.archiveProfile(target)).toMatchObject({
+        outcome: "archived",
+      });
+      expect(stopped).toBe(1);
+    } finally {
+      await rm(rootDirectory, { recursive: true, force: true });
+    }
+  });
+
   it("persists concurrent confirmations with profile ownership and clears metadata on reset", async () => {
     const rootDirectory = await mkdtemp(
       join(tmpdir(), "browser-session-sites-"),
@@ -47,6 +95,7 @@ describe("host-local sign-in metadata", () => {
       ]);
       const paths = profileStoragePaths({ ...options, ...target });
       expect((await stat(paths.manifestPath)).mode & 0o777).toBe(0o600);
+      expect((await stat(paths.profileDirectory)).mode & 0o777).toBe(0o700);
       expect(await readFile(paths.manifestPath, "utf8")).not.toMatch(
         /cookie|password|token|email/iu,
       );

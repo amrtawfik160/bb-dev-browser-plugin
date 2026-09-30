@@ -1768,13 +1768,8 @@ export function createBrowserHostEntry(
                     hostId: request.hostId,
                     profileId: request.profileId,
                     projectId: request.projectId,
-                    ...(profile.reusable === true ||
-                    request.profileId !== threadDefaultProfileId
-                      ? {
-                          threadPageName: `agent-${threadDefaultProfileId}`,
-                          initialOrigin: request.destinationOrigin,
-                        }
-                      : {}),
+                    threadPageName: `agent-${threadDefaultProfileId}`,
+                    initialOrigin: request.destinationOrigin,
                     ...(request.tabId === undefined
                       ? {}
                       : { tabId: request.tabId }),
@@ -2062,6 +2057,20 @@ export function createBrowserHostEntry(
         const dataDir = context.experimental_paths.dataDir;
         await requireReadyForProfileMutation(administration(dataDir), request);
         return profiles(dataDir).restoreArchivedProfile(request);
+      },
+      archiveUnsavedProfile: async (request, context) => {
+        retainWorker(context);
+        const dataDir = context.experimental_paths.dataDir;
+        await requireReadyForProfileMutation(administration(dataDir), request);
+        const response = await profiles(dataDir).archiveUnsavedProfile(request);
+        if (response === null) return null;
+        await transferStaging(dataDir)
+          ?.purgeAll()
+          .catch(() => undefined);
+        await hostDownloads(dataDir)
+          ?.purge({ hostId: request.hostId, profileId: request.profileId })
+          .catch(() => undefined);
+        return response;
       },
       sleepProfile: async (request, context) => {
         retainWorker(context);

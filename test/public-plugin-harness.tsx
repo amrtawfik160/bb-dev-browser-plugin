@@ -415,6 +415,7 @@ export async function createPublicPluginHarness(options?: {
   deferProfileInventory?: boolean;
   deferProfileInventoryAfterCalls?: number;
   deferProfileSelection?: boolean;
+  deferSessionSiteUpdate?: boolean;
   deferGrantRequestRpc?: (
     requests: BrowserGrantRequest[],
     callIndex: number,
@@ -477,6 +478,20 @@ export async function createPublicPluginHarness(options?: {
     options?.deferProfileSelection === true
       ? new Promise<void>((resolve) => {
           releaseProfileSelectionGate = resolve;
+        })
+      : Promise.resolve();
+  let resolveSessionSiteUpdateStarted: (() => void) | undefined;
+  let releaseSessionSiteUpdateGate: (() => void) | undefined;
+  const sessionSiteUpdateStarted =
+    options?.deferSessionSiteUpdate === true
+      ? new Promise<void>((resolve) => {
+          resolveSessionSiteUpdateStarted = resolve;
+        })
+      : Promise.resolve();
+  const sessionSiteUpdateGate =
+    options?.deferSessionSiteUpdate === true
+      ? new Promise<void>((resolve) => {
+          releaseSessionSiteUpdateGate = resolve;
         })
       : Promise.resolve();
   const hostRpcFailures = new Map<string, string>();
@@ -905,6 +920,13 @@ export async function createPublicPluginHarness(options?: {
         }
         return inventory;
       }
+      if (method === "archiveUnsavedProfile") {
+        return host.experimental_call(
+          "archiveUnsavedProfile",
+          browserProfileTargetSchema.parse(input),
+          { signal },
+        );
+      }
       if (method === "createProfile") {
         return host.experimental_call(
           "createProfile",
@@ -1026,8 +1048,14 @@ export async function createPublicPluginHarness(options?: {
           { signal },
         );
       }
+      if (method === "recordSessionSite") {
+        resolveSessionSiteUpdateStarted?.();
+        await sessionSiteUpdateGate;
+        return host.experimental_call(method, input as never, {
+          signal,
+        }) as Promise<unknown>;
+      }
       if (
-        method === "recordSessionSite" ||
         method === "downloadStart" ||
         method === "downloadAppend" ||
         method === "downloadComplete" ||
@@ -2460,6 +2488,10 @@ export async function createPublicPluginHarness(options?: {
     profileSelectionStarted,
     releaseProfileSelection() {
       releaseProfileSelectionGate?.();
+    },
+    sessionSiteUpdateStarted,
+    releaseSessionSiteUpdate() {
+      releaseSessionSiteUpdateGate?.();
     },
     seedHostActivityEvent,
     runStatusCli,

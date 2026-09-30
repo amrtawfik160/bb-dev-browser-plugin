@@ -96,6 +96,9 @@ export interface BrowserProfileLifecycleBoundary {
 }
 
 export interface BrowserProfileStore {
+  archiveUnsavedProfile(
+    request: BrowserProfileTarget,
+  ): Promise<BrowserProfileLifecycleResponse | null>;
   recordSessionSite(request: BrowserSessionSiteUpdate): Promise<BrowserProfile>;
   listProfiles(hostId: string): Promise<BrowserProfileInventory>;
   initialize(hostId: string): Promise<void>;
@@ -1667,12 +1670,34 @@ export function createFileBrowserProfileStore(
   }
 
   async function archiveProfile(request: BrowserProfileTarget) {
+    return archiveProfileWhen(request, false);
+  }
+
+  async function archiveUnsavedProfile(request: BrowserProfileTarget) {
+    return archiveProfileWhen(request, true);
+  }
+
+  function archiveProfileWhen(
+    request: BrowserProfileTarget,
+    preserveReusable: false,
+  ): Promise<BrowserProfileLifecycleResponse>;
+  function archiveProfileWhen(
+    request: BrowserProfileTarget,
+    preserveReusable: true,
+  ): Promise<BrowserProfileLifecycleResponse | null>;
+  async function archiveProfileWhen(
+    request: BrowserProfileTarget,
+    preserveReusable: boolean,
+  ) {
     return withMutationLock(options, request.hostId, ownership, async () => {
       const inventory = await reconcileBeforeLifecycle(request.hostId);
       const current = inventory.profiles.find(
         (profile) => profile.profileId === request.profileId,
       );
       if (current === undefined) throw profileNotFound(request);
+      // Thread cleanup and sign-in updates share this lock. An owner archive
+      // remains unconditional, but cleanup must not discard a saved login.
+      if (preserveReusable && current.reusable === true) return null;
       if (current.state === "archived") {
         return lifecycleProfileResponse("already-archived", current);
       }
@@ -1794,6 +1819,7 @@ export function createFileBrowserProfileStore(
   }
 
   return {
+    archiveUnsavedProfile,
     recordSessionSite,
     listProfiles,
     initialize,

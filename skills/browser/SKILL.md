@@ -12,8 +12,9 @@ stays signed in for later automation.
 Calls without `profileId` use this thread's selected Browser Profile, falling
 back to its private default. Without a thread, the default belongs to the
 project. Separate profiles have separate cookies. Selecting an existing
-profile shares its logins; each thread gets a named tab in shared or saved
-profiles. Calls on the same profile still take turns under its Control Lease.
+profile shares its logins; each thread gets a named tab from its first script
+call on every profile. Saving or sharing the profile keeps that binding.
+Calls on the same profile still take turns under its Control Lease.
 
 ## Reuse a sign-in
 
@@ -73,9 +74,9 @@ thread) and rejects `--host`.
 
 ## Automating a page
 
-Use the `browser_script` tool. `page` is your thread's named tab in shared
-or saved profiles, or the active tab in a private profile, already brought
-to front. Explicit `tabId` selects that tab instead. Whatever you `return` becomes the tool result.
+Use the `browser_script` tool. `page` is your thread's named tab on every
+profile, already brought to front. Explicit `tabId` selects that tab instead.
+Whatever you `return` becomes the tool result.
 
 ```javascript
 await page.goto("https://example.com", { waitUntil: "domcontentloaded" });
@@ -109,9 +110,8 @@ workspace access.
   or locators.
 - `browser.listPages()` lists tabs; `browser.getPage(id)` binds one. Tab IDs are
   runtime-only and change when the browser restarts.
-- Tab state persists between scripts. In shared or saved profiles, `page`
-  resumes this thread's named tab; a fresh tab starts at `destinationOrigin`.
-  Private profiles prefer a tab on the granted origin, then the active tab.
+- Tab state persists between scripts. `page` resumes this thread's named tab
+  even after saving or sharing its profile; a fresh tab starts at `destinationOrigin`.
   Navigate when your tab is on another site. Closing a named tab or restarting
   the browser may require navigating back to the task page.
 - Owner tabs outside your grant are parked on `about:blank` while your script

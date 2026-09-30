@@ -52,7 +52,8 @@ async function threadHarness(sharedProfile = false) {
   }
   function lifecycleCalls() {
     return browser.hostRpcCalls.filter(
-      (method) => method === "sleepProfile" || method === "archiveProfile",
+      (method) =>
+        method === "sleepProfile" || method === "archiveUnsavedProfile",
     );
   }
   return {
@@ -126,7 +127,7 @@ describe("thread lifecycle releases thread browsers", () => {
         ),
       ).toBe(false);
       await browser.emitThreadEvent("thread.deleted");
-      expect(lifecycleCalls()).toEqual(["archiveProfile"]);
+      expect(lifecycleCalls()).toEqual(["archiveUnsavedProfile"]);
     } finally {
       await browser.dispose();
     }

@@ -1,16 +1,17 @@
 # Browser agent reference
 
 This is the agent-facing reference for the **Browser** plugin. It documents the
-`browser_script` agent tool, the equivalent `bb browser` CLI, the bundled skill,
+`browser_script` agent tool, the equivalent `bb plugin run browser` CLI, the bundled skill,
 typed results, runtime tab identifiers, purposes, time/result bounds, contention,
 grants, and explicit retry after denial. All behavior is verified against
 `server.ts`, `contracts.ts`, and `skills/browser/SKILL.md`.
 
 ## The `browser_script` tool
 
-`browser_script` is a **statically registered** native agent tool. It remains
-callable without restarting provider sessions; authorization changes never
-require a restart. It derives host and project from BB context and enforces
+`browser_script` and `browser_sessions` are **statically registered** native
+agent tools. Tool-set changes apply on the next provider session start;
+authorization changes apply to the next call without a restart. They derive
+host and project from BB context and enforce
 profile, project, origin, timeout, and lease policy at runtime before delegating
 to `dev-browser`.
 
@@ -23,16 +24,17 @@ Parameters are defined by `browserScriptParametersSchema` (`.strict()`):
 | `purpose`            | yes      | string, trimmed, 1–200 chars      | Human-readable reason. Shown to the owner only while the Control Lease is live, then discarded.                                                                                                                                                            |
 | `code`               | yes      | string, non-empty                 | QuickJS Playwright code. No Node, modules, process, or filesystem access.                                                                                                                                                                                  |
 | `destinationOrigin`  | no       | exact `scheme://host:port` origin | Omitting it returns `origin_denied`. Any web origin is allowed by default; the first call records a whole-web grant for this project and profile. Once the owner revokes that grant, access waits on their approval. Grant changes apply to the next call. |
-| `profileId`          | no       | string                            | Host-local Browser Profile ID. Omit to use the selected profile (`bb-personal` by default).                                                                                                                                                                |
-| `tabId`              | no       | string                            | Opaque runtime-only tab ID from `browser.listPages()`. Omit to use the active tab.                                                                                                                                                                         |
+| `profileId`          | no       | string                            | Host-local Browser Profile ID. Omit to use this thread's selection, falling back to its private default.                                                                                                                                                   |
+| `tabId`              | no       | string                            | Opaque runtime-only tab ID from `browser.listPages()`. Omit to use this thread's named tab.                                                                                                                                                                |
 | `timeoutMs`          | no       | integer 1000–30000                | Default `30000`; the minimum is `BROWSER_SCRIPT_MIN_TIMEOUT_MS`.                                                                                                                                                                                           |
 | `screenshot`         | no       | boolean (default false)           | Request up to 3 native screenshots explicitly.                                                                                                                                                                                                             |
 | `fileTransfer`       | no       | boolean (default false)           | Separate elevation; needs its own owner grant.                                                                                                                                                                                                             |
 | `invalidCertificate` | no       | boolean (default false)           | Per-origin opt-in; the host bypasses certificate validation only for the exact approved origin.                                                                                                                                                            |
 
 The script runs with Playwright `page` bound to the explicit `tabId`, else to
-a tab already on the granted origin, else to the active tab; a profile with no
-tabs gets a fresh one. `return` values become the tool result. There is no
+this thread's named tab from its first script call on every profile. Saving
+or sharing its profile preserves the binding. A closed or unrestored named
+tab is recreated at `destinationOrigin`. `return` values become the tool result. There is no
 `document` global. Owner tabs outside the grant are parked on `about:blank`
 for the length of the call and restored afterwards.
 
@@ -50,7 +52,7 @@ return await page.title();
 ```
 
 ```text
-bb browser script --purpose "Read the page title" --code "return await page.title()" \
+bb plugin run browser script --purpose "Read the page title" --code "return await page.title()" \
   --origin https://example.com \
   [--profile <id>] [--tab <id>] [--timeout <ms>] \
   [--screenshot] [--file-transfer] [--invalid-certificate] [--json]
@@ -67,9 +69,9 @@ The CLI derives project and host from BB context and does **not** accept
 ## The bundled skill
 
 The bundled skill lives at [`skills/browser/SKILL.md`](../../skills/browser/SKILL.md)
-and is configured for agents via `bb.agents.configure(() => ({ tools: ["browser_script"], skills: ["browser"] }))`.
+and is configured for agents via `bb.agents.configure(() => ({ tools: ["browser_script", "browser_sessions"], skills: ["browser"] }))`.
 It opens with the `browser_script` authorization flow and the agent-scoped
-`bb browser open <url>` equivalent, followed by automation recipes and the
+`bb plugin run browser open <url>` equivalent, followed by automation recipes and the
 failure table. It carries the gotchas that cost real time:
 overlays that swallow clicks, keeping one script under ~25 seconds, preferring
 `fill` over `click` on inputs, and waiting on conditions rather than timers.
@@ -125,7 +127,7 @@ The `error` is one of:
 1. **`BrowserStatus`** — a blocking host/instance state such as
    `setup_required`, `host_offline`, `repair_required`, `unsupported`, or
    `safe_login_elsewhere`. `setup_required` is final for the current call.
-   `sleeping` and `waking` appear on `bb browser status` while the instance is
+   `sleeping` and `waking` appear on `bb plugin run browser status` while the instance is
    idle or starting; they do not fail `browser_script`. The instance wakes on
    demand.
 2. **Origin denied** (`state: "origin-denied"`, `code: "origin_denied"`) —
@@ -151,8 +153,8 @@ Each runtime error carries a `label`, `hostId`, `profileId`, and a bounded
 ## Runtime tab identifiers
 
 Tab identifiers are **opaque and runtime-only**. They do not survive a browser
-or worker restart — list tabs again after any restart. Omitting `tabId` uses the
-active tab; targeting another makes it visibly active.
+or worker restart — list tabs again after any restart. Omitting `tabId` uses
+this thread's named tab; targeting another makes it visibly active.
 
 ## Purposes
 
@@ -222,16 +224,16 @@ Stage a workspace file from a thread (exact flags in
 [cli-reference.md](cli-reference.md)):
 
 ```text
-bb browser transfer --kind workspace --environment <id> --path <relative-path> [--json]
-bb browser transfer --cancel --transfer-id <id> [--json]
-bb browser transfer --progress --transfer-id <id> [--json]
+bb plugin run browser transfer --kind workspace --environment <id> --path <relative-path> [--json]
+bb plugin run browser transfer --cancel --transfer-id <id> [--json]
+bb plugin run browser transfer --progress --transfer-id <id> [--json]
 ```
 
 ## Operational diagnostics for agents
 
 ```text
-bb browser status [--profile <id>] [--host <id>] [--json]
-bb browser diagnostics [--profile <id>] [--host <id>] [--json]
+bb plugin run browser status [--profile <id>] [--host <id>] [--json]
+bb plugin run browser diagnostics [--profile <id>] [--host <id>] [--json]
 ```
 
 The live actor and purpose appear in status, diagnostics, and the Browser Panel

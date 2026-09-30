@@ -55,7 +55,10 @@ import {
 } from "../shared/contracts.js";
 
 const CLI_USAGE = [
-  "Usage: bb browser <sessions|open|trust|untrust|grants|grant|revoke|approve|deny|status|diagnostics|script|activity|activity-export|activity-clear|requests|request-status|list|create|rename|select|backup|restore|import|archive|restore-archived|reset|delete|setup|disable|uninstall|purge> [options]",
+  "Usage: bb plugin run browser <sessions|open|trust|untrust|grants|grant|revoke|approve|deny|status|diagnostics|script|activity|activity-export|activity-clear|requests|request-status|list|create|rename|select|backup|restore|import|archive|restore-archived|reset|delete|setup|disable|uninstall|purge> [options]",
+  "  sessions list [--site <query>] [--offset <n>] [--limit <n>] [--include-archived] [--json]",
+  "  sessions select <profile-id> [--json]",
+  "  sessions report <origin> --status <signed-in|signed-out> [--profile <id>] [--json]",
   "  open <url> [--profile <id>] [--timeout <ms>] [--screenshot] [--json]",
   "  trust|untrust|grants|grant|revoke|approve|deny: authenticated Browser Settings required",
   "  script --purpose <text> --code <source> --origin <origin> [--profile <id>] [--tab <id>] [--timeout <ms>] [--screenshot] [--file-transfer] [--invalid-certificate] [--json]",
@@ -946,7 +949,7 @@ async function currentOpenTab(
     // A sleeping or freshly restarted instance reports no tabs until something
     // navigates it, and there is nothing to report after an authorized open.
     throw new Error(
-      "This Browser Profile has no open tab yet. Pass a URL to open one: bb browser open <url>",
+      "This Browser Profile has no open tab yet. Pass a URL to open one: bb plugin run browser open <url>",
     );
   }
   return {
@@ -1455,7 +1458,7 @@ async function runCli(
 }
 
 const TRANSFER_CLI_USAGE = [
-  "Usage: bb browser transfer <stage|cancel|progress> [options]",
+  "Usage: bb plugin run browser transfer <stage|cancel|progress> [options]",
   "  stage (workspace): --kind workspace --environment <id> --path <relative-path> [--actor owner|agent] [--profile <id>] [--host <id>] [--transfer-id <id>] [--json]",
   "  stage (client):    --kind client --file <local-path> [--transfer-id <id>] [--profile <id>] [--host <id>] [--json]",
   "  cancel:            --cancel --transfer-id <id> [--profile <id>] [--host <id>] [--json]",
@@ -1694,7 +1697,7 @@ async function runTransferCli(
 }
 
 const DOWNLOADS_CLI_USAGE = [
-  "Usage: bb browser downloads <list|progress|cancel|export-client|export-workspace|limits|purge> [options]",
+  "Usage: bb plugin run browser downloads <list|progress|cancel|export-client|export-workspace|limits|purge> [options]",
   "  list:               [--profile <id>] [--host <id>] [--json]",
   "  progress:           --download-id <id> [--profile <id>] [--host <id>] [--json]",
   "  cancel:             --download-id <id> [--profile <id>] [--host <id>] [--json]",
@@ -2106,7 +2109,7 @@ function registerCli(bb: BbPluginApi, browser: BrowserService) {
         name: "open",
         summary: "Open an authorized URL",
         usage:
-          "bb browser open <url> [--profile <id>] [--timeout <ms>] [--screenshot] [--json]",
+          "bb plugin run browser open <url> [--profile <id>] [--timeout <ms>] [--screenshot] [--json]",
       },
       {
         name: "trust",
@@ -2146,135 +2149,143 @@ function registerCli(bb: BbPluginApi, browser: BrowserService) {
       {
         name: "status",
         summary: "Report Browser host readiness",
-        usage: "bb browser status [--profile <id>] [--host <id>] [--json]",
+        usage:
+          "bb plugin run browser status [--profile <id>] [--host <id>] [--json]",
       },
       {
         name: "diagnostics",
         summary: "Generate redacted Browser host diagnostics",
-        usage: "bb browser diagnostics [--profile <id>] [--host <id>] [--json]",
+        usage:
+          "bb plugin run browser diagnostics [--profile <id>] [--host <id>] [--json]",
       },
       {
         name: "script",
         summary: "Run bounded Playwright code in the host-local Browser",
         usage:
-          "bb browser script --purpose <text> --code <source> --origin <origin> [--profile <id>] [--tab <id>] [--timeout <ms>] [--screenshot] [--file-transfer] [--invalid-certificate] [--json]",
+          "bb plugin run browser script --purpose <text> --code <source> --origin <origin> [--profile <id>] [--tab <id>] [--timeout <ms>] [--screenshot] [--file-transfer] [--invalid-certificate] [--json]",
       },
       {
         name: "activity",
         summary: "List retained Browser activity records",
-        usage: "bb browser activity [--profile <id>] [--host <id>] [--json]",
+        usage:
+          "bb plugin run browser activity [--profile <id>] [--host <id>] [--json]",
       },
       {
         name: "activity-export",
         summary: "Export retained Browser activity metadata",
         usage:
-          "bb browser activity-export [--profile <id>] [--host <id>] [--json]",
+          "bb plugin run browser activity-export [--profile <id>] [--host <id>] [--json]",
       },
       {
         name: "activity-clear",
         summary: "Clear retained Browser activity metadata",
         usage:
-          'bb browser activity-clear [--profile <id>] [--host <id>] --confirm "Clear Browser activity records" [--json]',
+          'bb plugin run browser activity-clear [--profile <id>] [--host <id>] --confirm "Clear Browser activity records" [--json]',
       },
       {
         name: "requests",
         summary: "List Browser Grant Requests",
-        usage: "bb browser requests [--json]",
+        usage: "bb plugin run browser requests [--json]",
       },
       {
         name: "request-status",
         summary: "Inspect a Browser Grant Request",
-        usage: "bb browser request-status --request <id> [--json]",
+        usage: "bb plugin run browser request-status --request <id> [--json]",
       },
       {
         name: "list",
         summary: "List host-local Browser Profiles",
-        usage: "bb browser list [--host <id>] [--json]",
+        usage: "bb plugin run browser list [--host <id>] [--json]",
       },
       {
         name: "create",
         summary: "Create a host-local Browser Profile",
         usage:
-          "bb browser create --name <name> [--locale <locale>] [--timezone <zone>] [--host <id>] [--json]",
+          "bb plugin run browser create --name <name> [--locale <locale>] [--timezone <zone>] [--host <id>] [--json]",
       },
       {
         name: "rename",
         summary: "Rename a host-local Browser Profile",
         usage:
-          "bb browser rename --profile <id> --name <name> [--locale <locale>] [--timezone <zone>] [--host <id>] [--json]",
+          "bb plugin run browser rename --profile <id> --name <name> [--locale <locale>] [--timezone <zone>] [--host <id>] [--json]",
       },
       {
         name: "select",
         summary: "Select a host-local Browser Profile",
-        usage: "bb browser select --profile <id> [--host <id>] [--json]",
+        usage:
+          "bb plugin run browser select --profile <id> [--host <id>] [--json]",
       },
       {
         name: "backup",
         summary: "Create a stopped Browser Profile backup",
         usage:
-          "bb browser backup --profile <id> --archive <path> [--host <id>] [--json]",
+          "bb plugin run browser backup --profile <id> --archive <path> [--host <id>] [--json]",
       },
       {
         name: "restore",
         summary: "Restore a stopped Browser Profile backup",
         usage:
-          "bb browser restore --profile <id> --archive <path> [--host <id>] [--json]",
+          "bb plugin run browser restore --profile <id> --archive <path> [--host <id>] [--json]",
       },
       {
         name: PROFILE_IMPORT_COMMAND,
         summary: "Import a stopped dev-browser profile",
         usage:
-          "bb browser import --name <name> --source <path> [--host <id>] [--json]",
+          "bb plugin run browser import --name <name> --source <path> [--host <id>] [--json]",
       },
       {
         name: "archive",
         summary:
           "Show Archived Profile state; mutation requires owner Settings",
-        usage: "bb browser archive --profile <id> [--host <id>] [--json]",
+        usage:
+          "bb plugin run browser archive --profile <id> [--host <id>] [--json]",
       },
       {
         name: "restore-archived",
         summary: "Restore within 30 days through authenticated owner Settings",
         usage:
-          "bb browser restore-archived --profile <id> [--host <id>] [--json]",
+          "bb plugin run browser restore-archived --profile <id> [--host <id>] [--json]",
       },
       {
         name: "reset",
         summary: "Reset credentials through authenticated owner Settings",
         usage:
-          "bb browser reset --profile <id> --confirm <text> [--host <id>] [--json]",
+          "bb plugin run browser reset --profile <id> --confirm <text> [--host <id>] [--json]",
       },
       {
         name: "delete",
         summary: "Permanently delete through authenticated owner Settings",
         usage:
-          "bb browser delete --profile <id> --confirm <name> [--host <id>] [--json]",
+          "bb plugin run browser delete --profile <id> --confirm <name> [--host <id>] [--json]",
       },
       {
         name: "setup",
         summary: "Show or apply the consent-gated Browser setup plan",
-        usage: "bb browser setup [--step <id> --confirm <text>] [--json]",
+        usage:
+          "bb plugin run browser setup [--step <id> --confirm <text>] [--json]",
       },
       {
         name: "disable",
         summary: "Stop Browser-owned processes and retain profiles",
-        usage: 'bb browser disable --confirm "Stop Browser processes"',
+        usage:
+          'bb plugin run browser disable --confirm "Stop Browser processes"',
       },
       {
         name: "uninstall",
         summary: "Stop Browser-owned processes and retain profiles",
-        usage: 'bb browser uninstall --confirm "Stop Browser processes"',
+        usage:
+          'bb plugin run browser uninstall --confirm "Stop Browser processes"',
       },
       {
         name: "purge",
         summary: "Show or apply the destructive Browser purge plan",
-        usage: "bb browser purge [--confirm <text>] [--json]",
+        usage: "bb plugin run browser purge [--confirm <text>] [--json]",
       },
       {
         name: "transfer",
         summary: "Stage, cancel, or watch a workspace/client file transfer",
         usage:
-          "bb browser transfer --kind workspace --environment <id> --path <relative-path> | --kind client --file <local-path> | --cancel --transfer-id <id> | --progress --transfer-id <id> [--json]",
+          "bb plugin run browser transfer --kind workspace --environment <id> --path <relative-path> | --kind client --file <local-path> | --cancel --transfer-id <id> | --progress --transfer-id <id> [--json]",
       },
     ],
     run: (argv, context) =>
@@ -2288,9 +2299,9 @@ function registerAgentTool(bb: BbPluginApi, browser: BrowserService) {
   bb.agents.registerTool({
     name: "browser_script",
     description:
-      "Run Playwright code in the host-local Workspace Browser. Pass destinationOrigin as an exact origin such as https://example.com. The script gets `page` for the active tab; returned values become the tool result.",
+      "Run Playwright code in the host-local Workspace Browser. Pass destinationOrigin as an exact origin such as https://example.com. The script gets `page` for this thread's named tab, or an explicit tabId; returned values become the tool result.",
     instructions:
-      "Provide a purpose, an exact destinationOrigin, and QuickJS Playwright code. Before asking the owner to sign in, use browser_sessions to find and select an existing signed-in profile. Calls without profileId use this thread's selected profile, falling back to its private default; explicit profile selections share cookies. Reusable profiles give each thread its own tab unless tabId is supplied. `page` is that tab. `return` values become the result. Verify authentication on the requested site, then report signed-in or signed-out through browser_sessions; dated confirmations can expire. If several profiles match, preserve the selected profile or ask which account to use. Calls sharing a profile wait in order for up to 30 seconds before browser_busy; that call has not run. Let the active operation finish before retrying once. The CLI uses the same lease. At most three Browser Instances run on a host; awake-limit means capacity is in use, so wait without stopping another profile. Report typed failures without retrying setup. " +
+      "Provide a purpose, an exact destinationOrigin, and QuickJS Playwright code. Before asking the owner to sign in, use browser_sessions to find and select an existing signed-in profile. Calls without profileId use this thread's selected profile, falling back to its private default; explicit profile selections share cookies. Every profile gives each thread a stable named tab from its first script call unless tabId is supplied. `page` is that tab. `return` values become the result. Verify authentication on the requested site, then report signed-in or signed-out through browser_sessions; dated confirmations can expire. If several profiles match, preserve the selected profile or ask which account to use. Calls sharing a profile wait in order for up to 30 seconds before browser_busy; that call has not run. Let the active operation finish before retrying once. The CLI uses the same lease. At most three Browser Instances run on a host; awake-limit means capacity is in use, so wait without stopping another profile. Report typed failures without retrying setup. " +
       'If a person is likely watching, put `::browser-live` on its own line in your reply to show this thread\'s browser inline; skip it for unattended work, use at most one card per reply, and add profile-id="<id>" only when you passed profileId. ' +
       'When a site needs the owner to sign in, never ask for credentials in chat or type theirs: end your reply with `::browser-sign-in{origin="https://example.com"}` on its own line, then end the turn. The owner can click Done on the card to send a reply and let you continue; check the browser when they reply. If sign-in is still pending when you check back, embed the card again.',
     presentation: {

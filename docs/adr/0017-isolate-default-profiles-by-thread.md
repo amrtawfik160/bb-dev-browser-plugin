@@ -30,5 +30,6 @@ These are process and page bounds, not a total-memory guarantee. Stored
 profiles consume disk until the owner archives or deletes them.
 
 Amended by [ADR 0020](0020-discover-and-reuse-confirmed-sign-ins.md): saved
-profiles expose dated sign-in confirmations, use a named automation tab per
-thread, and survive the deletion of their originating thread.
+profiles expose dated sign-in confirmations and survive the deletion of their
+originating thread. Every profile now uses a stable named automation tab per
+thread from its first script call, including before it is saved or shared.
