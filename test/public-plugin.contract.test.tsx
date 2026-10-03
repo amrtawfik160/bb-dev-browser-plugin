@@ -484,6 +484,119 @@ describe("Browser public plugin contract", () => {
     await browser.dispose();
   });
 
+  it("links a script failure to bounded, redacted operation timings", async () => {
+    const runtime = publicRuntime(async () => {
+      throw new BrowserScriptExecutionError(
+        "tab_invalid",
+        "Error: QuickJS promise rejected: Browser Tab is invalid or belongs to a previous runtime at <anonymous> (user-script.js:15:93)",
+      );
+    });
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+      browserRuntime: runtime,
+    });
+    try {
+      const result = await browser.runBrowserScriptWithProfile(
+        DEFAULT_PROFILE_ID,
+        {
+          purpose: "secret-purpose-do-not-retain",
+          code: "return 'secret-script-do-not-retain';",
+          tabId: "stale-tab-do-not-retain",
+          destinationOrigin: "https://example.com",
+        },
+      );
+      const failure = browserScriptFailureSchema.parse(
+        JSON.parse(result.content[0]!.text),
+      );
+      expect(failure.error.state).toBe("runtime-error");
+      if (failure.error.state !== "runtime-error")
+        throw new Error("Unexpected failure state");
+      expect(failure.error.traceId).toBeTruthy();
+      expect(failure.error.message).toContain(
+        `Trace: ${failure.error.traceId}`,
+      );
+      const cli = await browser.runBrowserCli([
+        "diagnostics",
+        "--profile",
+        DEFAULT_PROFILE_ID,
+        "--json",
+      ]);
+      const diagnostics = browserDiagnosticsSchema.parse(
+        JSON.parse(cli.stdout!),
+      );
+      expect(diagnostics.operationTraces?.traces).toContainEqual(
+        expect.objectContaining({
+          traceId: failure.error.traceId,
+          operation: "browser-script",
+          errorCode: "tab_invalid",
+          targetedTab: true,
+          state: "failed",
+          stages: expect.arrayContaining([
+            expect.objectContaining({
+              stage: "lease-wait",
+              state: "succeeded",
+            }),
+            expect.objectContaining({
+              stage: "browser-execute",
+              state: "failed",
+            }),
+          ]),
+        }),
+      );
+      expect(JSON.stringify(diagnostics.operationTraces)).not.toMatch(
+        /secret-|stale-tab|example.com|QuickJS/u,
+      );
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("refreshes a stale owner tab and links the failure to diagnostics", async () => {
+    const runtime = publicRuntime(async () => "unused");
+    runtime.focusPage = async () => {
+      throw new BrowserScriptExecutionError(
+        "tab_invalid",
+        "Browser Tab is invalid or belongs to a previous runtime",
+      );
+    };
+    runtime.listPages = async () => [
+      { id: "current-tab", url: "about:blank", title: "", openerTabId: null },
+    ];
+    runtime.activeTabId = async () => "current-tab";
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+      browserRuntime: runtime,
+    });
+    try {
+      await expect(
+        browser.runBrowserTabAction("activate", { tabId: "old-tab" }),
+      ).rejects.toThrow(/Select a current tab.*\nTrace:/u);
+      expect(await browser.runBrowserTabs("host-browser-test")).toMatchObject({
+        tabs: [{ tabId: "current-tab" }],
+        activeTabId: "current-tab",
+      });
+      const cli = await browser.runBrowserCli([
+        "diagnostics",
+        "--profile",
+        DEFAULT_PROFILE_ID,
+        "--json",
+      ]);
+      const diagnostics = browserDiagnosticsSchema.parse(
+        JSON.parse(cli.stdout!),
+      );
+      expect(diagnostics.operationTraces?.traces).toContainEqual(
+        expect.objectContaining({
+          operation: "tab-activate",
+          state: "failed",
+          errorCode: "tab_invalid",
+          tabCount: 1,
+        }),
+      );
+    } finally {
+      await browser.dispose();
+    }
+  });
+
   it("routes owner address-field navigation from the Browser Panel to the host", async () => {
     const browser = await createPublicPluginHarness({
       status: healthyStatus,

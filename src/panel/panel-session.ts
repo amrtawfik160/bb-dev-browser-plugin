@@ -173,6 +173,7 @@ function createSessionStreamFanout() {
         sink = undefined;
       },
       setViewport: real.setViewport?.bind(real),
+      captureScreenshot: real.captureScreenshot?.bind(real),
       subscribeDialogs: real.subscribeDialogs?.bind(real),
       respondToDialog: real.respondToDialog?.bind(real),
       dismissOpenDialogs: real.dismissOpenDialogs?.bind(real),

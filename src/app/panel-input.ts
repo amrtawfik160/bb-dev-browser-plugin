@@ -1,5 +1,4 @@
 import { useEffect, useRef, type RefObject } from "react";
-import { isBbGlobalShortcut } from "./panel-chrome.js";
 
 type Modifiers = {
   altKey: boolean;
@@ -24,22 +23,23 @@ export function browserPagePoint(
   clientY: number,
 ) {
   const rect = canvas.getBoundingClientRect();
-  const scale = Math.min(
-    rect.width / canvas.width,
-    rect.height / canvas.height,
-  );
+  const width = Number(canvas.dataset.viewportWidth) || canvas.width;
+  const height = Number(canvas.dataset.viewportHeight) || canvas.height;
+  const scale = Math.min(rect.width / width, rect.height / height);
   if (!Number.isFinite(scale) || scale <= 0) return null;
-  const x =
-    (clientX - rect.left - (rect.width - canvas.width * scale) / 2) / scale;
-  const y =
-    (clientY - rect.top - (rect.height - canvas.height * scale) / 2) / scale;
-  if (x < 0 || y < 0 || x >= canvas.width || y >= canvas.height) return null;
+  const x = (clientX - rect.left - (rect.width - width * scale) / 2) / scale;
+  const y = (clientY - rect.top - (rect.height - height * scale) / 2) / scale;
+  if (x < 0 || y < 0 || x >= width || y >= height) return null;
   return { x, y, scale };
 }
 
 function keyPayload(event: KeyboardEvent, action: "keyDown" | "keyUp") {
   const text =
-    action === "keyDown" && !event.isComposing && event.key.length === 1
+    action === "keyDown" &&
+    !event.isComposing &&
+    !event.ctrlKey &&
+    !event.metaKey &&
+    event.key.length === 1
       ? event.key
       : undefined;
   return {
@@ -123,7 +123,7 @@ export function useBrowserPageInput(
         event.deltaMode === 1
           ? 16
           : event.deltaMode === 2
-            ? canvas.height
+            ? Number(canvas.dataset.viewportHeight) || canvas.height
             : 1 / point.scale;
       emit({
         kind: "wheel",
@@ -135,26 +135,32 @@ export function useBrowserPageInput(
       });
     }
     function keyDown(event: KeyboardEvent) {
-      if (
-        isBbGlobalShortcut(event) ||
-        event.isComposing ||
-        event.key === "Process"
-      )
-        return;
+      // The focused page owns its shortcuts. Letting modified keys bubble
+      // can run BB's panel-toggle/close commands and remove the input surface.
+      event.stopPropagation();
+      if (event.isComposing || event.key === "Process") return;
       // Escape back to BB without trapping the owner inside a pixel surface.
       if (event.key === "Escape" && event.shiftKey) {
+        event.preventDefault();
         textInput.blur();
         return;
       }
+      // Keep the native clipboard paste event, but keep the shortcut inside
+      // this surface. The paste handler sends the clipboard text once.
+      if (
+        (event.ctrlKey || event.metaKey) &&
+        !event.altKey &&
+        event.key.toLowerCase() === "v"
+      )
+        return;
       event.preventDefault();
-      event.stopPropagation();
       keys.set(event.code || event.key, event);
       emit(keyPayload(event, "keyDown"));
     }
     function keyUp(event: KeyboardEvent) {
+      event.stopPropagation();
       if (!keys.delete(event.code || event.key)) return;
       event.preventDefault();
-      event.stopPropagation();
       emit(keyPayload(event, "keyUp"));
     }
     function releaseInput() {
@@ -172,6 +178,7 @@ export function useBrowserPageInput(
       textInput.focus({ preventScroll: true });
     }
     function paste(event: ClipboardEvent) {
+      event.stopPropagation();
       const text = event.clipboardData?.getData("text/plain");
       if (!text) return;
       event.preventDefault();

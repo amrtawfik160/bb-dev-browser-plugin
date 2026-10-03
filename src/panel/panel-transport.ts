@@ -1,4 +1,9 @@
 import { WebSocketServer, type WebSocket } from "ws";
+import {
+  PANEL_SCREENSHOT_CHUNK_LENGTH,
+  PANEL_SCREENSHOT_MAX_BASE64_LENGTH,
+  PanelScreenshotCaptureError,
+} from "../shared/panel-screenshot.js";
 import { createServer, type Server } from "node:http";
 import type { PanelGateway } from "./panel-gateway.js";
 import type { PanelStreamAdapter } from "./panel-stream.js";
@@ -46,6 +51,8 @@ export type ScreencastFrame = {
 export type ScreencastInputPayload = unknown;
 
 export interface ScreencastSource {
+  /** Capture the selected page as PNG for an explicit owner download. */
+  captureScreenshot?(fullPage: boolean): Promise<string>;
   /**
    * Produce frames by invoking {@link onFrame}. Resolves when the source stops
    * (the abort signal fires) or the source naturally ends. Must not invoke
@@ -229,6 +236,7 @@ export function createPanelTransportServer(
   const openDialogs = new Map<string, BrowserDialogEvent>();
   /** A pending context-menu query awaiting the source's element inspection. */
   let pendingContextQueryId: string | null = null;
+  let screenshotInFlight = false;
   /**
    * Timer that fails an open dialog closed if the controller does not reclaim
    * within the bounded reconnect window, so a stranded prompt leaves no
@@ -257,6 +265,13 @@ export function createPanelTransportServer(
   function gatewayRawForProtocol(
     message: PanelProtocolMessage,
   ): string | undefined {
+    if (message.type === "screenshot_request") {
+      return JSON.stringify({
+        type: message.type,
+        requestId: message.requestId,
+        fullPage: message.fullPage,
+      });
+    }
     if (message.type === "redeem") {
       return JSON.stringify(toBrowserPanelRedeemMessage(message));
     }
@@ -518,6 +533,92 @@ export function createPanelTransportServer(
     }
     if (!acceptsGeneration()) {
       rejectProtocol(panelProtocolErrorMessage("stale-generation"));
+      return;
+    }
+    if (message.kind === "screenshot_request") {
+      const replyError = (text: string) =>
+        sendProtocol(socket, {
+          protocolVersion: PANEL_PROTOCOL_VERSION,
+          type: "screenshot_error",
+          requestId: message.requestId,
+          message: text,
+        });
+      if (!canInput()) {
+        replyError("Take control before capturing a screenshot.");
+        return;
+      }
+      if (screenshotInFlight) {
+        replyError("A screenshot is already being captured.");
+        return;
+      }
+      if (source.captureScreenshot === undefined) {
+        replyError("Screenshot capture is unavailable for this browser.");
+        return;
+      }
+      screenshotInFlight = true;
+      void source
+        .captureScreenshot(message.fullPage)
+        .then(async (data) => {
+          if (
+            data.length === 0 ||
+            data.length > PANEL_SCREENSHOT_MAX_BASE64_LENGTH
+          ) {
+            throw new Error("Screenshot exceeds the size limit.");
+          }
+          const deadline = Date.now() + 25_000;
+          for (
+            let offset = 0;
+            offset < data.length;
+            offset += PANEL_SCREENSHOT_CHUNK_LENGTH
+          ) {
+            if (
+              connection !== socket ||
+              !authorized ||
+              !acceptsGeneration() ||
+              !canInput()
+            )
+              return;
+            while (
+              socket.bufferedAmount > PANEL_SCREENSHOT_CHUNK_LENGTH * 2 ||
+              !gateway.admitOutputBytes(
+                Math.min(PANEL_SCREENSHOT_CHUNK_LENGTH, data.length - offset) +
+                  256,
+              )
+            ) {
+              if (Date.now() > deadline)
+                throw new Error("Screenshot delivery timed out.");
+              await new Promise<void>((resolve) => setTimeout(resolve, 25));
+              if (
+                connection !== socket ||
+                !authorized ||
+                !acceptsGeneration() ||
+                !canInput()
+              )
+                return;
+            }
+            sendProtocol(socket, {
+              protocolVersion: PANEL_PROTOCOL_VERSION,
+              type: "screenshot_chunk",
+              requestId: message.requestId,
+              index: offset / PANEL_SCREENSHOT_CHUNK_LENGTH,
+              last: offset + PANEL_SCREENSHOT_CHUNK_LENGTH >= data.length,
+              data: data.slice(offset, offset + PANEL_SCREENSHOT_CHUNK_LENGTH),
+            });
+            // Yield between chunks so capture does not monopolize input delivery.
+            await new Promise<void>((resolve) => setImmediate(resolve));
+          }
+        })
+        .catch((error: unknown) => {
+          if (connection === socket && authorized && acceptsGeneration())
+            replyError(
+              error instanceof PanelScreenshotCaptureError
+                ? error.message
+                : "Could not capture this page. Try a viewport screenshot or retry.",
+            );
+        })
+        .finally(() => {
+          screenshotInFlight = false;
+        });
       return;
     }
     if (message.kind === "input") {

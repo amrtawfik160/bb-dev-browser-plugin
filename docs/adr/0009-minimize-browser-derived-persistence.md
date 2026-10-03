@@ -5,3 +5,10 @@ Chrome's own profile provides tab and session restoration, so the plugin does no
 Amended by [ADR 0020](0020-discover-and-reuse-confirmed-sign-ins.md): saved
 profiles expose dated sign-in confirmations, use a named automation tab per
 thread, and survive the deletion of their originating thread.
+
+The host also keeps bounded operation traces in memory for troubleshooting:
+30 minutes, 200 traces per profile, and 1,000 per worker. They record random
+trace IDs, operation and error codes, timings, reconnect counts, and tab counts;
+they exclude scripts, purposes, page data, URLs, tab IDs, and exception text.
+Existing owner diagnostic exports include them. A worker restart clears them;
+the plugin adds no durable browsing or trace store.

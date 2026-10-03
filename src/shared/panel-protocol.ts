@@ -1,5 +1,10 @@
 import { z } from "zod";
 import {
+  panelScreenshotRequestSchema,
+  panelScreenshotChunkSchema,
+  panelScreenshotErrorSchema,
+} from "./panel-screenshot.js";
+import {
   PANEL_GATEWAY_MESSAGE_MAX_BYTES,
   PANEL_PROTOCOL_VERSION,
   browserClipboardCopyMessageSchema,
@@ -188,6 +193,15 @@ export type PanelProtocolPingMessage = {
 };
 
 export type PanelProtocolMessage =
+  | (z.infer<typeof panelScreenshotRequestSchema> & {
+      protocolVersion: typeof PANEL_PROTOCOL_VERSION;
+    })
+  | (z.infer<typeof panelScreenshotChunkSchema> & {
+      protocolVersion: typeof PANEL_PROTOCOL_VERSION;
+    })
+  | (z.infer<typeof panelScreenshotErrorSchema> & {
+      protocolVersion: typeof PANEL_PROTOCOL_VERSION;
+    })
   | PanelProtocolRedeemMessage
   | PanelProtocolReadyMessage
   | PanelProtocolFrameMessage
@@ -227,6 +241,9 @@ export type PanelProtocolDecodeResult =
 const utf8 = new TextEncoder();
 
 const PROTOCOL_TYPES = [
+  "screenshot_request",
+  "screenshot_chunk",
+  "screenshot_error",
   "redeem",
   "ready",
   "frame",
@@ -253,6 +270,9 @@ const PROTOCOL_TYPES = [
 type PanelProtocolType = (typeof PROTOCOL_TYPES)[number];
 
 const MESSAGE_DIRECTION: Record<PanelProtocolType, PanelProtocolDirection> = {
+  screenshot_request: "client-to-host",
+  screenshot_chunk: "host-to-client",
+  screenshot_error: "host-to-client",
   redeem: "client-to-host",
   input: "client-to-host",
   ack: "client-to-host",
@@ -278,6 +298,9 @@ const MESSAGE_DIRECTION: Record<PanelProtocolType, PanelProtocolDirection> = {
 
 const MESSAGE_PHASES: Record<PanelProtocolType, readonly PanelProtocolPhase[]> =
   {
+    screenshot_request: ["authenticated"],
+    screenshot_chunk: ["authenticated"],
+    screenshot_error: ["authenticated"],
     redeem: ["pre-redemption"],
     protocol_error: ["pre-redemption", "authenticated"],
     ready: ["authenticated"],
@@ -806,6 +829,30 @@ function parseAuxiliaryMessage(
   type: PanelProtocolType,
   value: Record<string, unknown>,
 ): PanelProtocolDecodeResult {
+  if (type === "screenshot_request") {
+    return parseAccepted(
+      panelScreenshotRequestSchema
+        .extend({ protocolVersion: protocolVersionField })
+        .safeParse(value),
+      (message) => ({ ...message, protocolVersion: PANEL_PROTOCOL_VERSION }),
+    );
+  }
+  if (type === "screenshot_chunk") {
+    return parseAccepted(
+      panelScreenshotChunkSchema
+        .extend({ protocolVersion: protocolVersionField })
+        .safeParse(value),
+      (message) => ({ ...message, protocolVersion: PANEL_PROTOCOL_VERSION }),
+    );
+  }
+  if (type === "screenshot_error") {
+    return parseAccepted(
+      panelScreenshotErrorSchema
+        .extend({ protocolVersion: protocolVersionField })
+        .safeParse(value),
+      (message) => ({ ...message, protocolVersion: PANEL_PROTOCOL_VERSION }),
+    );
+  }
   if (type === "dialog") {
     return parseAccepted(dialogSchema.safeParse(value), normalizeDialog);
   }

@@ -127,6 +127,16 @@ function launchFixture(
       if (request.screenshot !== undefined) {
         compileFunction(`return async function () {\n${request.code}\n}`);
       }
+      const requestedPage = request.code.match(
+        /^const page = await browser\.getPage\(("(?:[^"\\]|\\.)*")\)/mu,
+      )?.[1];
+      if (request.code.includes("console.log(JSON.stringify({ tabId,")) {
+        if (requestedPage !== undefined) {
+          activeTabId = JSON.parse(requestedPage);
+          pages.add(activeTabId);
+        }
+        return JSON.stringify({ tabId: activeTabId, url: "about:blank" });
+      }
       if (
         request.code.includes("document.visibilityState") &&
         (request.code.includes("active ?? pages[0]") ||
@@ -139,9 +149,6 @@ function launchFixture(
           name: null,
         });
       }
-      const requestedPage = request.code.match(
-        /^const page = await browser\.getPage\(("(?:[^"\\]|\\.)*")\)/mu,
-      )?.[1];
       if (requestedPage !== undefined) {
         activeTabId = JSON.parse(requestedPage);
         pages.add(activeTabId);
@@ -238,6 +245,61 @@ async function runtimeFixture(
 }
 
 describe("Browser Instance runtime", () => {
+  it.each(["navigate", "history"] as const)(
+    "%s resolves the foreground again when the automation connection restarts before the action",
+    async (operation) => {
+      const fixture = await runtimeFixture();
+      let liveTabId = "before-reconnect";
+      let replaced = false;
+      const actions: string[] = [];
+      fixture.processFixture.boundary.execute = async (request) => {
+        const isAction =
+          request.code.includes("page.goto(") ||
+          request.code.includes("location.reload()");
+        if (isAction && !replaced) {
+          replaced = true;
+          liveTabId = "after-reconnect";
+          throw new Error(
+            "connectOverCDP: connect ECONNREFUSED 127.0.0.1:12001",
+          );
+        }
+        let output = "";
+        const run = compileFunction(
+          `return (async () => { ${request.code} })();`,
+          ["browser", "console"],
+        );
+        await run(
+          {
+            listPages: async () => [{ id: liveTabId, url: "about:blank" }],
+            getPage: async (id: string) => ({
+              bringToFront: async () => {},
+              evaluate: async (fn: () => unknown) => {
+                if (String(fn).includes("location.reload")) actions.push(id);
+                return true;
+              },
+              goto: async () => actions.push(id),
+              url: () => "about:blank",
+            }),
+          },
+          { log: (value: string) => (output = value) },
+        );
+        return output;
+      };
+      try {
+        const response =
+          operation === "navigate"
+            ? await fixture.runtime.navigate(
+                fixture.target,
+                "https://fixture.example/reconnected",
+              )
+            : await fixture.runtime.history(fixture.target, "reload");
+        expect(response.tabId).toBe("after-reconnect");
+        expect(actions).toEqual(["after-reconnect"]);
+      } finally {
+        await fixture.dispose();
+      }
+    },
+  );
   it.each(["navigate", "reload"] as const)(
     "%s opens a tab when the Browser Profile has no pages",
     async (operation) => {
@@ -1185,7 +1247,7 @@ describe("Browser Instance runtime", () => {
         "keyboard.press",
       );
       expect(fixture.processFixture.executions.at(-1)?.code).toContain(
-        'browser.getPage("tab-a")',
+        "browser.getPage(tabId)",
       );
     } finally {
       await fixture.dispose();
@@ -1227,7 +1289,7 @@ describe("Browser Instance runtime", () => {
         "await page.bringToFront()",
       );
       expect(fixture.processFixture.executions.at(-1)?.code).toContain(
-        'browser.getPage("tab-agent")',
+        "browser.getPage(tabId)",
       );
     } finally {
       await fixture.dispose();
@@ -1250,7 +1312,7 @@ describe("Browser Instance runtime", () => {
       );
 
       expect(fixture.processFixture.executions.at(-1)?.code).toContain(
-        'browser.getPage("agent-selected-tab")',
+        "browser.getPage(tabId)",
       );
     } finally {
       await fixture.dispose();

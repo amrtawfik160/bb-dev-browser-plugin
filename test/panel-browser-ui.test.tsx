@@ -361,6 +361,34 @@ describe("Browser Panel", () => {
     }
   });
 
+  it("downloads diagnostics for the profile shown in the panel", async () => {
+    const browser = await createPublicPluginHarness({
+      status: healthyBrowserStatus,
+    });
+    try {
+      const panel = browser.renderPanel();
+      fireEvent.click(
+        await panel.findByRole("button", { name: "Browser options" }),
+      );
+      fireEvent.click(
+        await panel.findByRole("menuitem", { name: /download diagnostics/iu }),
+      );
+      await waitFor(() => {
+        expect(panel.inspection.rpcCalls).toContainEqual(
+          expect.objectContaining({
+            method: "browser_diagnostics",
+            input: {
+              hostId: healthyBrowserStatus.hostId,
+              profileId: healthyBrowserStatus.profileId,
+            },
+          }),
+        );
+      });
+    } finally {
+      await browser.dispose();
+    }
+  });
+
   it("drives the overflow menu from the keyboard and gives focus back", async () => {
     const browser = await createPublicPluginHarness({
       status: healthyBrowserStatus,
@@ -376,9 +404,10 @@ describe("Browser Panel", () => {
       const menu = await panel.findByRole("menu", { name: "Browser options" });
       expect(trigger.getAttribute("aria-expanded")).toBe("true");
       // The menu's own items, in the order the owner meets them: the session
-      // action, then the compatibility toggle. The trailing note is not one.
+      // action, diagnostics, then the compatibility toggle.
       const items = [
         within(menu).getByRole("menuitem", { name: /take over/iu }),
+        within(menu).getByRole("menuitem", { name: /download diagnostics/iu }),
         within(menu).getByRole("menuitemcheckbox", {
           name: /plain localhost/iu,
         }),
@@ -388,6 +417,8 @@ describe("Browser Panel", () => {
       await waitFor(() => expect(document.activeElement).toBe(items[0]));
       fireEvent.keyDown(menu, { key: "ArrowDown" });
       expect(document.activeElement).toBe(items[1]);
+      fireEvent.keyDown(menu, { key: "ArrowDown" });
+      expect(document.activeElement).toBe(items[2]);
       fireEvent.keyDown(menu, { key: "End" });
       expect(document.activeElement).toBe(items[items.length - 1]);
       fireEvent.keyDown(menu, { key: "Home" });

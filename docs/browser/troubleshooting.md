@@ -17,6 +17,20 @@ bb browser diagnostics [--profile <id>] [--host <id>] [--json]
 Browser Settings the same bundle downloads as a file from the **Maintenance**
 section.
 
+Browser options → **Download diagnostics** exports the same bundle without
+leaving the Browser Panel. Browser runtime failures include a `Trace:` ID;
+find that ID under `operationTraces.traces` in the JSON download. Each trace
+contains its operation, outcome, error code, stage offsets and durations in
+milliseconds, reconnect count, and tab-inventory counts. A `running` trace
+shows which stage is still waiting. Compare `lease-wait`, `browser-start`,
+`browser-execute`, and `tab-reconcile` to locate slow work.
+
+Traces are metadata-only and stay in the current host worker's memory for
+30 minutes, with at most 200 traces per profile and 1,000 across the worker.
+Download them before a plugin reload or worker restart, which clears them.
+`workerId` distinguishes worker generations. Traces never retain URLs, tab
+IDs, scripts, purposes, exception messages, page content, or screenshots.
+
 ## State reference
 
 ### `setup-required` (code `setup_required`)
@@ -102,7 +116,10 @@ Connect session, panel capability redemption) and reconnect behavior.
   controlling the page, wait for them to release control. The CLI uses the same
   lease and cannot bypass contention.
 - **Tab not found** — `tab_invalid`: tab IDs are runtime-only. List tabs again
-  after any browser or worker restart and retry with a fresh ID.
+  after any browser or worker restart and retry with a fresh ID. Untargeted
+  owner navigation and history resolve the foreground inside the action, so
+  reconnect recovery cannot reuse an ID selected before the restart. A stale
+  tab-selection failure refreshes the shared tab list; select a current tab.
 - **Script syntax error** — QuickJS reports `expecting ','` without a
   position. The `script_failed` message appends a `Syntax check:` line from
   Node's parser naming the script line to fix.

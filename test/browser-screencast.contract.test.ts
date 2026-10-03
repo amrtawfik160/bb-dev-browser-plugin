@@ -159,24 +159,46 @@ async function waitForStartScreencast(
 }
 
 describe("CDP screencast source contract", () => {
-  it("applies the controller viewport to the screencast capture rather than the maximum", async () => {
+  it("preserves logical layout while capturing at higher density within pixel bounds", async () => {
     const stub = createCdpEndpointStub();
     const controller = new AbortController();
     const source = createCdpScreencastSource({
       resolveEndpoint: async () => stub.endpoint,
       viewport: { width: 1280, height: 720 },
     });
+    // Abort can race the final startup acknowledgement. Consume that expected
+    // cancellation and await the background operation during teardown.
+    const streaming = source
+      .start(() => undefined, controller.signal)
+      .catch((error: unknown) => {
+        if (!controller.signal.aborted) throw error;
+      });
     try {
-      // Drive the source in the background; it stays open until aborted.
-      void source.start(() => undefined, controller.signal);
       await waitForStartScreencast(stub);
       expect(stub.startScreencastCalls[0]).toMatchObject({
-        maxWidth: 1280,
-        maxHeight: 720,
+        maxWidth: 1920,
+        maxHeight: 1080,
+        quality: 95,
+      });
+      expect(stub.commands).toContainEqual({
+        method: "Emulation.setDeviceMetricsOverride",
+        params: {
+          width: 1280,
+          height: 720,
+          deviceScaleFactor: 1.5,
+          scale: 1.5,
+          dontSetVisibleSize: true,
+          mobile: false,
+        },
+      });
+      expect(stub.commands).toContainEqual({
+        method: "Emulation.setVisibleSize",
+        params: { width: 1920, height: 1080 },
       });
     } finally {
       controller.abort();
       await source.stop();
+      await streaming;
       await stub.close();
     }
   });
@@ -186,14 +208,14 @@ describe("CDP screencast source contract", () => {
     const controller = new AbortController();
     const source = createCdpScreencastSource({
       resolveEndpoint: async () => stub.endpoint,
-      viewport: { width: 1280, height: 720 },
+      viewport: { width: 500, height: 400 },
     });
     try {
       void source.start(() => undefined, controller.signal);
       await waitForStartScreencast(stub);
       expect(stub.startScreencastCalls[0]).toMatchObject({
-        maxWidth: 1280,
-        maxHeight: 720,
+        maxWidth: 1000,
+        maxHeight: 800,
       });
       // The controller drives layout; a viewport change restarts the capture at
       // the new dimensions so spectators letterbox the exact controller viewport.
@@ -201,7 +223,7 @@ describe("CDP screencast source contract", () => {
       await waitForStartScreencast(stub, 2);
       expect(
         stub.startScreencastCalls.some(
-          (call) => call.maxWidth === 1600 && call.maxHeight === 900,
+          (call) => call.maxWidth === 1920 && call.maxHeight === 1080,
         ),
       ).toBe(true);
     } finally {

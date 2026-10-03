@@ -150,6 +150,7 @@ function BrowserOptionsMenu({
         ref={triggerRef}
         label="Browser options"
         glyph="more"
+        size="compact"
         aria-haspopup="menu"
         aria-expanded={open}
         onClick={() => setOpen((current) => !current)}
@@ -318,6 +319,7 @@ export function BrowserToolbar({
   reducedMotion,
   onStatusSelect,
   statusHint,
+  screenshot,
 }: {
   status: BrowserStatus;
   navigation: BrowserToolbarNavigation;
@@ -327,6 +329,11 @@ export function BrowserToolbar({
   onStatusSelect: () => void;
   /** Shown when the owner asks the status indicator for detail. */
   statusHint: string | null;
+  screenshot?: {
+    disabled: boolean;
+    pending: boolean;
+    onCapture: (fullPage: boolean) => void;
+  };
 }) {
   const settling = browserStateIsSettling(status.state);
   const isController = control.role === "controller";
@@ -338,16 +345,19 @@ export function BrowserToolbar({
             <IconButton
               label="Go back"
               glyph="back"
+              size="compact"
               onClick={() => navigation.onHistory("back")}
             />
             <IconButton
               label="Go forward"
               glyph="forward"
+              size="compact"
               onClick={() => navigation.onHistory("forward")}
             />
             <IconButton
               label="Reload page"
               glyph="reload"
+              size="compact"
               onClick={() => navigation.onHistory("reload")}
             />
             <BrowserOmnibox
@@ -403,6 +413,28 @@ export function BrowserToolbar({
             label={status.label}
           />
         </Button>
+        {screenshot === undefined ? null : (
+          <>
+            <IconButton
+              label="Take screenshot"
+              glyph="camera"
+              size="compact"
+              disabled={screenshot.disabled}
+              aria-busy={screenshot.pending}
+              title="Download viewport screenshot as PNG"
+              onClick={() => screenshot.onCapture(false)}
+            />
+            <IconButton
+              label="Take full-page screenshot"
+              glyph="full-page"
+              size="compact"
+              disabled={screenshot.disabled}
+              aria-busy={screenshot.pending}
+              title="Download full-page screenshot as PNG"
+              onClick={() => screenshot.onCapture(true)}
+            />
+          </>
+        )}
         <BrowserOptionsMenu options={options} reducedMotion={reducedMotion} />
       </div>
       {control.agentPurpose === null ? null : (

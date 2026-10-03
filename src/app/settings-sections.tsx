@@ -2111,8 +2111,8 @@ function DiagnosticsControls({ status }: { status: AttachedStatus }) {
     <section aria-label={`Browser diagnostics for host ${status.hostId}`}>
       <Subheading>Diagnostics</Subheading>
       <p className="mt-2 text-sm text-muted-foreground">
-        A redacted snapshot of host state for troubleshooting. It never includes
-        URLs, cookies, scripts, screenshots, or form contents.
+        Host state, recent errors, and operation timings for troubleshooting. It
+        never includes URLs, cookies, scripts, screenshots, or form contents.
       </p>
       <Button
         variant="secondary"

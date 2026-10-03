@@ -1,4 +1,10 @@
 import { WebSocket } from "ws";
+import {
+  PANEL_SCREENSHOT_MAX_BYTES,
+  PANEL_SCREENSHOT_MAX_BASE64_LENGTH,
+  PANEL_SCREENSHOT_MAX_PIXELS,
+  PanelScreenshotCaptureError,
+} from "../shared/panel-screenshot.js";
 import { browserInputCommand } from "./browser-input.js";
 import type { BrowserTabStripStore } from "./browser-tabs.js";
 import type {
@@ -64,7 +70,7 @@ type CdpResponse = {
 type CdpEvent = { method: string; params?: unknown; sessionId?: string };
 
 const SCREENCAST_FORMAT = "jpeg" as const;
-const SCREENCAST_QUALITY = 60;
+const SCREENCAST_QUALITY = 95;
 // Frame acknowledgements provide pacing; capture every available update.
 const SCREENCAST_EVERY_NTH_FRAME = 1;
 
@@ -88,6 +94,8 @@ export function createCdpScreencastSource(
   let unsubscribeTabs: (() => void) | undefined;
   let switching = Promise.resolve();
   let screencastStarted = false;
+  let screenshotPending = false;
+  let viewScale = 1;
   let stopped = false;
   let finishStream: (() => void) | undefined;
   let captureTimer: ReturnType<typeof setTimeout> | undefined;
@@ -111,7 +119,12 @@ export function createCdpScreencastSource(
   /** Registered context actions keyed by id for later execution. */
   const contextActions = new Map<string, BrowserContextAction>();
 
-  function send(method: string, params: unknown, targetSessionId?: string) {
+  function send(
+    method: string,
+    params: unknown,
+    targetSessionId?: string,
+    timeoutMs?: number,
+  ) {
     return new Promise<unknown>((resolve, reject) => {
       if (socket === null || socket.readyState !== WebSocket.OPEN) {
         reject(new Error("The CDP screencast socket is not connected."));
@@ -119,7 +132,27 @@ export function createCdpScreencastSource(
       }
       const id = nextId;
       nextId += 1;
-      pending.set(id, { resolve, reject });
+      const timer =
+        timeoutMs === undefined
+          ? undefined
+          : setTimeout(() => {
+              pending.delete(id);
+              reject(
+                new PanelScreenshotCaptureError(
+                  "Screenshot capture timed out. Try again.",
+                ),
+              );
+            }, timeoutMs);
+      pending.set(id, {
+        resolve: (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        reject: (error) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      });
       const message: Record<string, unknown> = { id, method, params };
       if (targetSessionId !== undefined) message.sessionId = targetSessionId;
       socket.send(JSON.stringify(message));
@@ -206,13 +239,33 @@ export function createCdpScreencastSource(
 
   async function startScreencast(session: string) {
     const clamped = clampScreencastViewport(viewport);
+    // Render small panels at up to 2x density while retaining the stream's
+    // physical pixel bounds. Page layout and input remain in CSS pixels.
+    const density = Math.min(
+      2,
+      PANEL_MAX_VIEWPORT_WIDTH / clamped.width,
+      PANEL_MAX_VIEWPORT_HEIGHT / clamped.height,
+    );
+    viewScale = density;
     await send(
       "Emulation.setDeviceMetricsOverride",
       {
         width: clamped.width,
         height: clamped.height,
-        deviceScaleFactor: 1,
+        deviceScaleFactor: density,
+        scale: density,
+        dontSetVisibleSize: true,
         mobile: false,
+      },
+      session,
+    );
+    // DPR alone affects screenshots, but screencast reads the visible surface.
+    // Size that surface explicitly while keeping the page's CSS viewport.
+    await send(
+      "Emulation.setVisibleSize",
+      {
+        width: Math.round(clamped.width * density),
+        height: Math.round(clamped.height * density),
       },
       session,
     );
@@ -221,8 +274,8 @@ export function createCdpScreencastSource(
       {
         format: SCREENCAST_FORMAT,
         quality: SCREENCAST_QUALITY,
-        maxWidth: clamped.width,
-        maxHeight: clamped.height,
+        maxWidth: Math.round(clamped.width * density),
+        maxHeight: Math.round(clamped.height * density),
         everyNthFrame: SCREENCAST_EVERY_NTH_FRAME,
       },
       session,
@@ -257,7 +310,15 @@ export function createCdpScreencastSource(
 
   async function dispatchInput(payload: unknown, session: string) {
     const command = browserInputCommand(payload);
-    if (command !== null) await send(command.method, command.params, session);
+    if (command === null) return;
+    if (command.method === "Input.dispatchMouseEvent") {
+      // CDP mouse coordinates refer to the scaled surface, not CSS layout.
+      const params: Record<string, unknown> = { ...command.params };
+      for (const field of ["x", "y", "deltaX", "deltaY"]) {
+        if (typeof params[field] === "number") params[field] *= viewScale;
+      }
+      await send(command.method, params, session);
+    } else await send(command.method, command.params, session);
   }
 
   function mapDialogType(cdType: unknown): BrowserDialogEvent["type"] | null {
@@ -535,11 +596,95 @@ export function createCdpScreencastSource(
           socket?.close();
         });
     },
-    /**
-     * Apply the controller's logical viewport to the screencast. If the
-     * screencast is already running, restart it at the new dimensions so the
-     * capture tracks the controller viewport rather than an independent size.
-     */
+    async captureScreenshot(fullPage) {
+      if (screenshotPending)
+        throw new PanelScreenshotCaptureError(
+          "A screenshot is already being captured.",
+        );
+      screenshotPending = true;
+      try {
+        const session = sessionId;
+        if (session === undefined || stopped)
+          throw new PanelScreenshotCaptureError(
+            "The browser is not connected.",
+          );
+        const metrics = (await send(
+          "Page.getLayoutMetrics",
+          {},
+          session,
+          10_000,
+        )) as {
+          cssContentSize: {
+            x: number;
+            y: number;
+            width: number;
+            height: number;
+          };
+          cssVisualViewport: {
+            pageX: number;
+            pageY: number;
+            clientWidth: number;
+            clientHeight: number;
+          };
+        };
+        const content = metrics.cssContentSize;
+        const visible = metrics.cssVisualViewport;
+        const clip = fullPage
+          ? {
+              x: content.x,
+              y: content.y,
+              width: content.width,
+              height: content.height,
+              scale: 1,
+            }
+          : {
+              x: visible.pageX,
+              y: visible.pageY,
+              width: visible.clientWidth,
+              height: visible.clientHeight,
+              scale: 1,
+            };
+        // Device density is at most 2, so bound allocation before asking Chrome.
+        if (
+          !Number.isFinite(clip.width * clip.height) ||
+          clip.width <= 0 ||
+          clip.height <= 0 ||
+          clip.width * clip.height * 4 > PANEL_SCREENSHOT_MAX_PIXELS
+        ) {
+          throw new PanelScreenshotCaptureError(
+            "This page is too large to capture. Try a viewport screenshot.",
+          );
+        }
+        const result = (await send(
+          "Page.captureScreenshot",
+          {
+            format: "png",
+            fromSurface: true,
+            captureBeyondViewport: fullPage,
+            clip,
+          },
+          session,
+          20_000,
+        )) as { data: string };
+        if (sessionId !== session || stopped)
+          throw new PanelScreenshotCaptureError(
+            "The browser tab changed during capture. Try again.",
+          );
+        if (
+          typeof result.data !== "string" ||
+          result.data.length > PANEL_SCREENSHOT_MAX_BASE64_LENGTH ||
+          Buffer.byteLength(result.data, "base64") > PANEL_SCREENSHOT_MAX_BYTES
+        ) {
+          throw new PanelScreenshotCaptureError(
+            "This screenshot is too large. Try a viewport screenshot.",
+          );
+        }
+        return result.data;
+      } finally {
+        screenshotPending = false;
+      }
+    },
+    /** Restart capture at the controller's new logical viewport. */
     setViewport(next: { width: number; height: number }) {
       viewport = clampScreencastViewport(next);
       if (screencastStarted && sessionId !== undefined) {

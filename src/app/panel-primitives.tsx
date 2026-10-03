@@ -12,6 +12,8 @@ export type GlyphName =
   | "back"
   | "forward"
   | "reload"
+  | "camera"
+  | "full-page"
   | "plus"
   | "close"
   | "more"
@@ -27,6 +29,8 @@ const GLYPH_PATHS: Record<GlyphName, string> = {
   back: "M10 3 5 8l5 5M5 8h8",
   forward: "m6 3 5 5-5 5M11 8H3",
   reload: "M13 8a5 5 0 1 1-1.5-3.6M13 3v2.5h-2.5",
+  camera: "M2 5h3l1-2h4l1 2h3v8H2ZM10.5 9a2.5 2.5 0 1 1-5 0 2.5 2.5 0 0 1 5 0",
+  "full-page": "M3 2h10v12H3ZM8 4v8M6 6l2-2 2 2M6 10l2 2 2-2",
   plus: "M8 3v10M3 8h10",
   close: "m4 4 8 8M12 4l-8 8",
   more: "M4 8h.01M8 8h.01M12 8h.01",
@@ -105,7 +109,7 @@ export function Button({
 /**
  * A button that is only a glyph. The label is what assistive technology
  * reads and what the tooltip shows; the hit area is the panel's 28px control
- * height, or 36px for the medium size.
+ * height, 40px for medium, or 25px for compact toolbar controls.
  */
 export function IconButton({
   label,
@@ -116,20 +120,27 @@ export function IconButton({
 }: ComponentProps<"button"> & {
   label: string;
   glyph: GlyphName;
-  size?: ButtonSize;
+  size?: ButtonSize | "compact";
 }) {
-  const box = size === "sm" ? "h-7 w-7" : "h-9 w-9";
+  const box =
+    size === "compact"
+      ? "size-[25px]"
+      : size === "sm"
+        ? "h-7 w-7"
+        : "h-10 w-10";
   return (
-    <Button
-      variant="ghost"
-      size={size}
+    <button
+      type="button"
       aria-label={label}
       title={label}
-      className={`${box} shrink-0 px-0 ${className}`}
+      className={`${BUTTON_BASE} ${BUTTON_VARIANTS.ghost} ${box} shrink-0 px-0 ${className}`}
       {...rest}
     >
-      <Glyph name={glyph} />
-    </Button>
+      <Glyph
+        name={glyph}
+        className={size === "md" ? "size-6 shrink-0" : "size-4 shrink-0"}
+      />
+    </button>
   );
 }
 
