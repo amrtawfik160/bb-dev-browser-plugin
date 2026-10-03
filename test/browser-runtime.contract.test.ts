@@ -1301,11 +1301,15 @@ describe("Browser Instance runtime", () => {
       untargetedAgentTabId: "agent-selected-tab",
     });
     try {
-      await fixture.runtime.execute(
+      const onActiveTab = vi.fn();
+      const result = await fixture.runtime.execute(
         { ...fixture.target, projectId: "project-a" },
         "return page.url()",
         5_000,
+        { onActiveTab },
       );
+      expect(onActiveTab).toHaveBeenCalledExactlyOnceWith("agent-selected-tab");
+      expect(result).toEqual({ output: "attached" });
       await fixture.runtime.navigate(
         { ...fixture.target, projectId: "project-a" },
         "https://fixture.example/after-agent",

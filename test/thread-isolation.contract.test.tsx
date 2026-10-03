@@ -1,14 +1,100 @@
 // @vitest-environment jsdom
 import { describe, expect, it, vi } from "vitest";
+import { act, fireEvent, waitFor } from "@testing-library/react";
 import {
   createPublicPluginHarness,
   createTabInventoryRuntime,
   healthyBrowserStatus,
 } from "./public-plugin-harness.js";
-import { DEFAULT_PROFILE_ID } from "../src/shared/contracts.js";
+import {
+  DEFAULT_PROFILE_ID,
+  BROWSER_PROFILE_SELECTION_CHANGED,
+} from "../src/shared/contracts.js";
 import { BrowserInstanceError } from "../src/browser/browser-runtime.js";
 
 describe("default Browser Profile isolation", () => {
+  it.each(["focus", "selection", "reconnect"])(
+    "shows the agent's selected profile in an already-open panel after %s",
+    async (trigger) => {
+      const runtime = createTabInventoryRuntime();
+      runtime.listPages = async (target) => [
+        {
+          id: `tab-${target.profileId}`,
+          url: "https://example.com/agent-work",
+          title: `Work in ${target.profileId}`,
+          openerTabId: null,
+        },
+      ];
+      runtime.activeTabId = async (target) => `tab-${target.profileId}`;
+      const browser = await createPublicPluginHarness({
+        status: healthyBrowserStatus,
+        browserRuntime: runtime,
+        sharedProfile: false,
+      });
+      try {
+        const panel = browser.renderPanel();
+        await waitFor(() =>
+          expect(panel.queryByText("Checking Browser setup…")).toBeNull(),
+        );
+        const shared = await browser.createBrowserProfile({
+          hostId: "host-browser-test",
+          name: "Shared agent browser",
+        });
+        await act(async () => {
+          await browser.runBrowserSessions({
+            action: "select",
+            profileId: shared.profileId,
+          });
+          await browser.runBrowserScriptWithProfile(undefined, {
+            destinationOrigin: "https://example.com",
+          });
+        });
+        if (trigger === "focus") fireEvent(window, new Event("focus"));
+        else if (trigger === "selection") {
+          const statusCalls = () =>
+            panel.inspection.rpcCalls.filter(
+              (call) => call.method === "browser_status",
+            ).length;
+          const before = statusCalls();
+          await panel.behavior.emitRealtime(BROWSER_PROFILE_SELECTION_CHANGED, {
+            hostId: "host-browser-test",
+            threadId: "another-thread",
+          });
+          expect(statusCalls()).toBe(before);
+          const signal = browser.realtimeSignals.find(
+            (signal) => signal.channel === BROWSER_PROFILE_SELECTION_CHANGED,
+          );
+          expect(signal?.payload).toEqual({
+            hostId: "host-browser-test",
+            threadId: "thread-browser-test",
+          });
+          await panel.behavior.emitRealtime(
+            BROWSER_PROFILE_SELECTION_CHANGED,
+            signal!.payload,
+          );
+        } else {
+          await panel.behavior.setRealtimeConnectionState("reconnecting");
+          await panel.behavior.setRealtimeConnectionState("connected");
+        }
+        await waitFor(() => {
+          expect(panel.inspection.rpcCalls).toContainEqual(
+            expect.objectContaining({
+              method: "browser_panel_control",
+              input: expect.objectContaining({ profileId: shared.profileId }),
+            }),
+          );
+        });
+        expect(
+          await panel.findByRole("button", {
+            name: `Work in ${shared.profileId}`,
+          }),
+        ).toBeTruthy();
+      } finally {
+        await browser.dispose();
+      }
+    },
+  );
+
   it("returns a typed capacity failure when every running browser is busy", async () => {
     const runtime = createTabInventoryRuntime();
     runtime.execute = async () => {
@@ -30,6 +116,59 @@ describe("default Browser Profile isolation", () => {
       expect(JSON.parse(result.content[0].text)).toMatchObject({
         error: { code: "awake-limit" },
       });
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("keeps a panel opened for a specific profile on that profile after selection changes", async () => {
+    const browser = await createPublicPluginHarness({
+      status: healthyBrowserStatus,
+      browserRuntime: createTabInventoryRuntime(),
+      sharedProfile: false,
+    });
+    try {
+      const pinned = await browser.createBrowserProfile({
+        hostId: "host-browser-test",
+        name: "Pinned browser",
+      });
+      const selected = await browser.createBrowserProfile({
+        hostId: "host-browser-test",
+        name: "Selected browser",
+      });
+      const panel = browser.renderPanel({ profileId: pinned.profileId });
+      await waitFor(() =>
+        expect(panel.inspection.rpcCalls).toContainEqual(
+          expect.objectContaining({
+            method: "browser_panel_control",
+            input: expect.objectContaining({ profileId: pinned.profileId }),
+          }),
+        ),
+      );
+      await browser.runBrowserSessions({
+        action: "select",
+        profileId: selected.profileId,
+      });
+      const signal = browser.realtimeSignals.find(
+        (signal) => signal.channel === BROWSER_PROFILE_SELECTION_CHANGED,
+      )!;
+      await panel.behavior.emitRealtime(signal.channel, signal.payload);
+      fireEvent(window, new Event("focus"));
+      await waitFor(() =>
+        expect(
+          panel.inspection.rpcCalls.filter(
+            (call) => call.method === "browser_status",
+          ),
+        ).toHaveLength(2),
+      );
+      expect(
+        panel.inspection.rpcCalls
+          .filter((call) => call.method === "browser_status")
+          .map((call) => call.input),
+      ).toEqual([
+        expect.objectContaining({ profileId: pinned.profileId }),
+        expect.objectContaining({ profileId: pinned.profileId }),
+      ]);
     } finally {
       await browser.dispose();
     }

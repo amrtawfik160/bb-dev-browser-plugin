@@ -563,6 +563,13 @@ export const browserProfileSelectionRequestSchema =
     .extend(browserProfileContextSchema.shape)
     .strict();
 
+export const BROWSER_PROFILE_SELECTION_CHANGED =
+  "browser-profile-selection-changed";
+export const browserProfileSelectionChangedSchema = z.object({
+  hostId: z.string().min(1),
+  threadId: z.string().min(1).optional(),
+});
+
 export const browserProfileInventorySchema = z
   .object({
     hostId: z.string().min(1),

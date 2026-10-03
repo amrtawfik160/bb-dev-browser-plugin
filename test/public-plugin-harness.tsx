@@ -1695,11 +1695,15 @@ export async function createPublicPluginHarness(options?: {
    * controller and a view-only spectator observable through the assembled
    * interface rather than through re-declared components.
    */
-  function renderPanel(options: { surface?: "thread" | "new-thread" } = {}) {
+  function renderPanel(
+    options: { surface?: "thread" | "new-thread"; profileId?: string } = {},
+  ) {
     const panel =
       options.surface === "new-thread"
         ? renderNewThreadPanel({ profileId: DEFAULT_PROFILE_ID })
-        : renderExistingPanel({ profileId: DEFAULT_PROFILE_ID });
+        : renderExistingPanel({
+            profileId: options.profileId ?? DEFAULT_PROFILE_ID,
+          });
     renderedPanels.push(panel);
     // Queries from a render are bound to the whole document, so with two
     // panels mounted a query for "the omnibox" would answer with whichever
@@ -2462,6 +2466,9 @@ export async function createPublicPluginHarness(options?: {
     },
     get hostRpcCalls() {
       return [...hostRpcCalls];
+    },
+    get realtimeSignals() {
+      return [...backend.harness.realtimeSignals];
     },
     get hostConnectionRequests() {
       return [...hostConnectionRequests];

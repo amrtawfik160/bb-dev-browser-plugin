@@ -1840,6 +1840,7 @@ export function createBrowserHostEntry(
             }
             try {
               const leaseSignal = lease.signal;
+              let agentActiveTabId: string | undefined;
               const threadDefaultProfileId = scopedProfileId({
                 projectId: request.projectId,
                 threadId: request.threadId,
@@ -1863,6 +1864,9 @@ export function createBrowserHostEntry(
                     request.timeoutMs,
                     {
                       trace,
+                      onActiveTab: (tabId) => {
+                        agentActiveTabId = tabId;
+                      },
                       signal: context.signal,
                       leaseSignal,
                       screenshot: request.screenshot,
@@ -1882,7 +1886,16 @@ export function createBrowserHostEntry(
               if (lease.signal.aborted) {
                 leaseRevokedAfterCompletion = true;
               }
-              await reconcileRuntimeTabs(dataDir, target, undefined, trace);
+              if (agentActiveTabId === undefined)
+                agentActiveTabId = await browserRuntime
+                  .activeTabId?.(target)
+                  .catch(() => undefined);
+              await reconcileRuntimeTabs(
+                dataDir,
+                target,
+                agentActiveTabId,
+                trace,
+              );
               response = {
                 ok: true as const,
                 result: browserResult,
