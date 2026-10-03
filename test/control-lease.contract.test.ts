@@ -3,6 +3,96 @@ import { createControlLeaseManager } from "../src/browser/control-lease.js";
 import { BROWSER_SCRIPT_MAX_TIMEOUT_MS } from "../src/shared/contracts.js";
 
 describe("Browser Control Lease", () => {
+  it("serializes repeated owner actions without cancelling the active action", async () => {
+    const manager = createControlLeaseManager();
+    const key = "host-a\0profile-a";
+    try {
+      const first = await manager.acquireOwner(key);
+      const granted: number[] = [];
+      const second = manager.acquireOwner(key).then((lease) => {
+        granted.push(2);
+        return lease;
+      });
+      const third = manager.acquireOwner(key).then((lease) => {
+        granted.push(3);
+        return lease;
+      });
+      expect(first.signal.aborted).toBe(false);
+      expect(granted).toEqual([]);
+      first.release();
+      const next = await second;
+      expect(granted).toEqual([2]);
+      expect(next.signal.aborted).toBe(false);
+      next.release();
+      (await third).release();
+      expect(granted).toEqual([2, 3]);
+      expect(manager.state(key)).toBeUndefined();
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it("serializes owners that interrupt the same agent", async () => {
+    const manager = createControlLeaseManager();
+    const key = "host-a\0profile-a";
+    try {
+      const agent = await manager.acquireAgent(key, "Inspect the page");
+      const granted: number[] = [];
+      const first = manager.acquireOwner(key).then((lease) => {
+        granted.push(1);
+        return lease;
+      });
+      const second = manager.acquireOwner(key).then((lease) => {
+        granted.push(2);
+        return lease;
+      });
+      expect(agent.signal.aborted).toBe(true);
+      agent.release();
+      const owner = await first;
+      expect(granted).toEqual([1]);
+      owner.release();
+      (await second).release();
+      expect(granted).toEqual([1, 2]);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it("removes a cancelled owner request without interrupting another owner", async () => {
+    const manager = createControlLeaseManager();
+    const key = "host-a\0profile-a";
+    const controller = new AbortController();
+    try {
+      const first = await manager.acquireOwner(key);
+      const cancelled = expect(
+        manager.acquireOwner(key, controller.signal),
+      ).rejects.toMatchObject({ code: "browser_busy" });
+      controller.abort();
+      await cancelled;
+      expect(first.signal.aborted).toBe(false);
+      first.release();
+      expect(manager.state(key)).toBeUndefined();
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it("does not grant waiting owner requests after disposal", async () => {
+    const manager = createControlLeaseManager();
+    const key = "host-a\0profile-a";
+    try {
+      await manager.acquireOwner(key);
+      const waiting = expect(manager.acquireOwner(key)).rejects.toMatchObject({
+        code: "browser_busy",
+      });
+      manager.dispose();
+      await waiting;
+      expect(manager.state(key)).toBeUndefined();
+    } finally {
+      manager.dispose();
+    }
+  });
+
   it("waits for a normal 20-second agent operation instead of returning browser_busy after five seconds", async () => {
     vi.useFakeTimers();
     const manager = createControlLeaseManager();

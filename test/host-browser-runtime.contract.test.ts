@@ -1856,9 +1856,7 @@ it("keeps the owner's selected Browser Tab when inventory still reports a differ
       throw new Error("not used");
     },
     stop: async () => {},
-    execute: async () => {
-      throw new Error("not used");
-    },
+    execute: async () => "agent output",
     navigate: async () => {
       throw new Error("not used");
     },
@@ -1939,6 +1937,25 @@ it("keeps the owner's selected Browser Tab when inventory still reports a differ
       profileId: DEFAULT_PROFILE_ID,
     })) as { activeTabId: string | null };
     expect(strip.activeTabId).toBe("page-1");
+
+    // Automation brings its own tab forward. An existing panel must follow
+    // that explicit action, while ordinary inventory reads preserve selection.
+    await host.experimental_call("browserScript", {
+      hostId: HOST_ID,
+      profileId: DEFAULT_PROFILE_ID,
+      projectId: "project-tab-keep-selected",
+      threadId: "thread-agent-tab",
+      purpose: "Inspect the agent tab",
+      code: "return page.url()",
+      activityEventId: "agent-tab-event",
+      activityOccurredAt: "2026-10-03T00:00:00.000Z",
+      timeoutMs: 5_000,
+    });
+    const afterAgent = await host.experimental_call("tabs", {
+      hostId: HOST_ID,
+      profileId: DEFAULT_PROFILE_ID,
+    });
+    expect(afterAgent).toMatchObject({ activeTabId: "page-0" });
   } finally {
     await host.experimental_dispose();
     await rm(rootDirectory, { recursive: true, force: true });

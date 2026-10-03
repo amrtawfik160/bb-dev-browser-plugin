@@ -118,6 +118,8 @@ export type BrowserExecutionRequest = {
 
 export type BrowserOperationOptions = {
   trace?: BrowserOperationTrace;
+  /** Report the tab brought forward by a completed agent script. */
+  onActiveTab?: (tabId: string) => void;
   signal?: AbortSignal;
   leaseSignal?: AbortSignal;
   screenshot?: boolean;
@@ -1967,6 +1969,8 @@ export function createBrowserInstanceRuntime(
           const browserResult = assertBrowserScriptResultWithinBounds(
             activeTab.result,
           );
+          if (activeTab.activeTabId !== undefined)
+            operationOptions.onActiveTab?.(activeTab.activeTabId);
           return browserResult;
         } catch (error) {
           const classified = classifyExecutionError(

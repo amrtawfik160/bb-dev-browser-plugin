@@ -33,6 +33,7 @@ import {
   RESET_PROFILE_CONFIRMATION,
   browserProfileUnavailableStatus,
   DEFAULT_PROFILE_ID,
+  BROWSER_PROFILE_SELECTION_CHANGED,
   hostOfflineStatus,
   hostProbeFailedStatus,
   hostCanDispatchAutomation,
@@ -1619,6 +1620,10 @@ export function createBrowserService(
         profileId,
       );
     });
+    bb.realtime.publish(BROWSER_PROFILE_SELECTION_CHANGED, {
+      hostId: target.hostId,
+      threadId: context.threadId,
+    });
     return {
       hostId: target.hostId,
       profileId,
@@ -2045,6 +2050,12 @@ export function createBrowserService(
             request.hostId,
             request.profileId,
           );
+        });
+        bb.realtime.publish(BROWSER_PROFILE_SELECTION_CHANGED, {
+          hostId: request.hostId,
+          ...(request.threadId === undefined
+            ? {}
+            : { threadId: request.threadId }),
         });
         return inventoryWithSelectedProfile(inventory, request.profileId);
       },

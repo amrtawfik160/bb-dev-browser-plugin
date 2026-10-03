@@ -249,14 +249,21 @@ export function createControlLeaseManager() {
     signal?: AbortSignal,
   ): Promise<ControlLease> {
     assertAvailable();
-    const current = active.get(key);
-    if (current !== undefined) {
+    if (signal?.aborted) throw rejectedOwnerRequest();
+    let current = active.get(key);
+    while (current !== undefined) {
       rejectPending(
         key,
         leaseBusy("Owner control took priority over queued Browser agents."),
       );
-      current.controller.abort();
+      // Owner priority interrupts agents, not an earlier owner action. Rapid
+      // tab selections must finish in order instead of cancelling browser work.
+      if (current.actor === "agent") current.controller.abort();
       await waitForLease(current, signal);
+      assertAvailable();
+      // Other owners can be waiting on the same lease. Only the first waiter
+      // may acquire it; the rest must wait for that owner's work to finish.
+      current = active.get(key);
     }
     if (signal?.aborted) throw rejectedOwnerRequest();
     const lease = createActiveLease(key, "owner", null);

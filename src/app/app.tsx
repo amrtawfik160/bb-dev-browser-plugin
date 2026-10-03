@@ -3,7 +3,13 @@ import {
   PANEL_SCREENSHOT_MAX_BASE64_LENGTH,
   type PanelScreenshotRequest,
 } from "../shared/panel-screenshot.js";
-import { definePluginApp, useBbContext, useRpc } from "@get-bb/plugin-sdk/app";
+import {
+  definePluginApp,
+  useBbContext,
+  useRpc,
+  useRealtime,
+  useRealtimeConnectionState,
+} from "@get-bb/plugin-sdk/app";
 import type {
   PluginNewThreadPanelProps,
   PluginThreadPanelProps,
@@ -11,6 +17,8 @@ import type {
 import {
   BROWSER_WHOLE_WEB_ORIGIN_SCOPE,
   DEFAULT_PROFILE_ID,
+  BROWSER_PROFILE_SELECTION_CHANGED,
+  browserProfileSelectionChangedSchema,
   browserProfileIdSchema,
   PERSIST_BROWSER_ELEVATED_ACCESS_CONFIRMATION,
   BROWSER_PANEL_STREAM_DISCLOSURE,
@@ -1332,8 +1340,13 @@ function usePanelControlSession({
 
 function BrowserPanel({ request }: { request: BrowserStatusInput }) {
   const rpc = useRpc<typeof rpcContract>();
+  const realtimeConnection = useRealtimeConnectionState();
+  const previousRealtimeConnection = useRef(realtimeConnection);
   const ownerSessionId = ownerSessionIdFromContext(useBbContext());
   const [status, setStatus] = useState<BrowserStatus | null>(null);
+  const statusRef = useRef(status);
+  statusRef.current = status;
+  const refreshStatusRef = useRef<(() => void) | null>(null);
   const [selectedHostId, setSelectedHostId] = useState(request.hostId);
   const [hostChoices, setHostChoices] = useState<BrowserHostChoice[]>([]);
   const [profiles, setProfiles] = useState<BrowserProfileInventory | null>(
@@ -1398,6 +1411,20 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
     selectedHostId === undefined
       ? { ...request, ...profileSelection }
       : { ...request, hostId: selectedHostId, ...profileSelection };
+
+  useRealtime(BROWSER_PROFILE_SELECTION_CHANGED, (payload) => {
+    if (request.profileId !== DEFAULT_PROFILE_ID) return;
+    const parsed = browserProfileSelectionChangedSchema.safeParse(payload);
+    if (!parsed.success) return;
+    if (statusRef.current?.hostId !== parsed.data.hostId) return;
+    if (
+      parsed.data.threadId !== undefined &&
+      (request.surface !== "thread" ||
+        request.threadId !== parsed.data.threadId)
+    )
+      return;
+    refreshStatusRef.current?.();
+  });
 
   function profileContext() {
     return request.surface === "thread"
@@ -1490,8 +1517,53 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
 
   useEffect(() => {
     setStatus(null);
-    void rpc.call("browser_status", statusRequest).then(setStatus);
+    let disposed = false;
+    let generation = 0;
+    const refresh = () => {
+      const current = ++generation;
+      void rpc
+        .call("browser_status", statusRequest)
+        .then((next) => {
+          if (disposed || current !== generation) return;
+          const previous = statusRef.current;
+          if (
+            previous?.hostId !== next.hostId ||
+            previous?.profileId !== next.profileId
+          ) {
+            setTabStrip(null);
+            setControl(null);
+            setLastNavigation(null);
+          }
+          setStatus(next);
+        })
+        .catch((error: unknown) => {
+          if (!disposed && current === generation)
+            setProfileError(administrationErrorMessage(error));
+        });
+    };
+    refreshStatusRef.current = refresh;
+    const onVisible = () => {
+      if (document.visibilityState === "visible") refresh();
+    };
+    refresh();
+    window.addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      disposed = true;
+      refreshStatusRef.current = null;
+      window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
   }, [request, selectedHostId, rpc]);
+
+  useEffect(() => {
+    if (
+      realtimeConnection === "connected" &&
+      previousRealtimeConnection.current !== "connected"
+    )
+      refreshStatusRef.current?.();
+    previousRealtimeConnection.current = realtimeConnection;
+  }, [realtimeConnection]);
 
   useEffect(() => {
     if (status === null) return;
