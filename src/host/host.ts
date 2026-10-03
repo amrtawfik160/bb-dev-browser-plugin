@@ -3,6 +3,13 @@ import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { scopedProfileId } from "../shared/profile-scope.js";
+import { createBrowserOperationTraces } from "./browser-operation-traces.js";
+import {
+  measureBrowserStage,
+  type BrowserOperationTrace,
+  type BrowserOperationTraceRecord,
+  type BrowserTraceErrorCode,
+} from "../shared/browser-operation-trace.js";
 import {
   createActivityOutbox,
   type ActivityOutbox,
@@ -394,13 +401,14 @@ function withoutStackFrames(message: string) {
  * Cutting only the head discarded exactly the line that explains the failure,
  * so the bound now spends part of its budget on the tail.
  */
-export function boundScriptFailureMessage(message: string) {
+export function boundScriptFailureMessage(
+  message: string,
+  limit = SCRIPT_FAILURE_MESSAGE_LIMIT,
+) {
   const trimmed = withoutStackFrames(message.trim());
-  if (trimmed.length <= SCRIPT_FAILURE_MESSAGE_LIMIT) return trimmed;
+  if (trimmed.length <= limit) return trimmed;
   const tailLength =
-    SCRIPT_FAILURE_MESSAGE_LIMIT -
-    SCRIPT_FAILURE_MESSAGE_HEAD -
-    SCRIPT_FAILURE_ELISION.length;
+    limit - SCRIPT_FAILURE_MESSAGE_HEAD - SCRIPT_FAILURE_ELISION.length;
   return [
     trimmed.slice(0, SCRIPT_FAILURE_MESSAGE_HEAD).trimEnd(),
     trimmed.slice(trimmed.length - tailLength).trimStart(),
@@ -411,6 +419,7 @@ function scriptRuntimeFailure(
   request: BrowserScriptRequest,
   error: unknown,
   lease?: ControlLease,
+  traceId?: string,
 ): BrowserScriptResponse {
   const code =
     lease?.signal.aborted === true
@@ -422,8 +431,12 @@ function scriptRuntimeFailure(
     error instanceof Error && error.message.length > 0
       ? error.message
       : "The Browser script failed.";
+  const traceSuffix = traceId === undefined ? "" : `\nTrace: ${traceId}`;
   const boundedMessage =
-    boundScriptFailureMessage(message) || "The Browser script failed.";
+    (boundScriptFailureMessage(
+      message,
+      SCRIPT_FAILURE_MESSAGE_LIMIT - traceSuffix.length,
+    ) || "The Browser script failed.") + traceSuffix;
   return {
     ok: false,
     error: {
@@ -433,6 +446,7 @@ function scriptRuntimeFailure(
       hostId: request.hostId,
       profileId: request.profileId,
       message: boundedMessage,
+      ...(traceId === undefined ? {} : { traceId }),
     },
   };
 }
@@ -681,6 +695,43 @@ export function createBrowserHostEntry(
   panelStream?: BrowserHostPanelStreamOptions,
 ) {
   let workerLease: { dispose(): Promise<void> } | undefined;
+  const operationTraces = createBrowserOperationTraces();
+
+  function traceErrorCode(error: unknown): BrowserTraceErrorCode {
+    if (error instanceof BrowserOriginScopeDeniedError) return "origin_denied";
+    if (error instanceof ControlLeaseError) return error.code;
+    if (error instanceof BrowserScriptExecutionError) return error.code;
+    if (error instanceof BrowserInstanceError && error.code === "awake-limit")
+      return "awake-limit";
+    return "runtime_failed";
+  }
+
+  async function tracedOwnerOperation<T>(
+    target: { hostId: string; profileId: string; tabId?: string },
+    operation: BrowserOperationTraceRecord["operation"],
+    run: (trace: BrowserOperationTrace) => Promise<T>,
+  ): Promise<T> {
+    const trace = operationTraces.start(
+      target,
+      operation,
+      target.tabId !== undefined,
+    );
+    try {
+      const result = await run(trace);
+      trace.finish();
+      return result;
+    } catch (error) {
+      trace.finish(traceErrorCode(error));
+      const message =
+        error instanceof BrowserScriptExecutionError &&
+        error.code === "tab_invalid"
+          ? "This Browser Tab is no longer open or was replaced during restart. Select a current tab and try again."
+          : error instanceof Error
+            ? boundScriptFailureMessage(error.message)
+            : "The browser operation failed.";
+      throw new Error(`${message}\nTrace: ${trace.traceId}`, { cause: error });
+    }
+  }
   let retainedBoundary: HostAdministrationBoundary | undefined;
   let retainedProfiles: BrowserProfileStore | undefined;
   let retainedRecovery: BrowserProfileRecovery | undefined;
@@ -783,17 +834,16 @@ export function createBrowserHostEntry(
     dataDir: string,
     target: { hostId: string; profileId: string },
     activeTabId?: string,
+    trace?: BrowserOperationTrace,
   ) {
     const browserRuntime = runtime(dataDir);
     if (browserRuntime === undefined) return;
     const strip = browserTabStrip(target);
     try {
-      await synchronizeRuntimeTabStrip(
-        browserRuntime,
-        strip,
-        target,
-        activeTabId,
+      await measureBrowserStage(trace, "tab-reconcile", () =>
+        synchronizeRuntimeTabStrip(browserRuntime, strip, target, activeTabId),
       );
+      trace?.tabInventory(strip.snapshot().tabs.length, strip.generation);
     } catch {
       // Without a readable inventory and verified foreground, leave the prior
       // strip intact until the next operation can reconcile it safely.
@@ -1066,42 +1116,44 @@ export function createBrowserHostEntry(
     request: BrowserNavigationRequest,
     dataDir: string,
     signal?: AbortSignal,
+    trace?: BrowserOperationTrace,
   ) {
     const target = { hostId: request.hostId, profileId: request.profileId };
-    const readiness = await administration(dataDir).inspect(target);
+    const readiness = await measureBrowserStage(trace, "readiness", async () =>
+      administration(dataDir).inspect(target),
+    );
     if (readiness.state !== "healthy") throw new Error(readiness.message);
-    const profile = await resolveActiveProfile(
-      dataDir,
-      request.hostId,
-      request.profileId,
+    const profile = await measureBrowserStage(trace, "profile", () =>
+      resolveActiveProfile(dataDir, request.hostId, request.profileId),
     );
     const browserRuntime = runtime(dataDir);
     if (browserRuntime === undefined) {
       throw new Error("The Workspace Browser runtime is unavailable.");
     }
-    const lease = await controlLeases.acquireOwner(
-      controlLeaseKey(target),
-      signal,
+    const lease = await measureBrowserStage(trace, "lease-wait", () =>
+      controlLeases.acquireOwner(controlLeaseKey(target), signal),
     );
     // An owner navigation ends the agent's Control Lease: dismiss any open
     // agent dialog so it cannot strand behind an invisible modal block.
     dismissOpenDialogsForProfile(target);
     try {
-      const response = await browserRuntime.navigate(
-        {
-          ...target,
-          projectId: request.projectId,
-          ...(request.tabId === undefined ? {} : { tabId: request.tabId }),
-          loopbackMode: request.rawLocalhost
-            ? "raw-localhost"
-            : "project-alias",
-          locale: profile.locale,
-          timezone: profile.timezone,
-        },
-        request.input,
-        { signal, leaseSignal: lease.signal },
+      const response = await measureBrowserStage(trace, "browser-execute", () =>
+        browserRuntime.navigate(
+          {
+            ...target,
+            projectId: request.projectId,
+            ...(request.tabId === undefined ? {} : { tabId: request.tabId }),
+            loopbackMode: request.rawLocalhost
+              ? "raw-localhost"
+              : "project-alias",
+            locale: profile.locale,
+            timezone: profile.timezone,
+          },
+          request.input,
+          { signal, leaseSignal: lease.signal, trace },
+        ),
       );
-      await reconcileRuntimeTabs(dataDir, target, response.tabId);
+      await reconcileRuntimeTabs(dataDir, target, response.tabId, trace);
       return response;
     } finally {
       lease.release();
@@ -1111,39 +1163,41 @@ export function createBrowserHostEntry(
     request: BrowserHistoryRequest,
     dataDir: string,
     signal?: AbortSignal,
+    trace?: BrowserOperationTrace,
   ) {
     const target = { hostId: request.hostId, profileId: request.profileId };
-    const readiness = await administration(dataDir).inspect(target);
+    const readiness = await measureBrowserStage(trace, "readiness", async () =>
+      administration(dataDir).inspect(target),
+    );
     if (readiness.state !== "healthy") throw new Error(readiness.message);
-    const profile = await resolveActiveProfile(
-      dataDir,
-      request.hostId,
-      request.profileId,
+    const profile = await measureBrowserStage(trace, "profile", () =>
+      resolveActiveProfile(dataDir, request.hostId, request.profileId),
     );
     const browserRuntime = runtime(dataDir);
     if (browserRuntime === undefined) {
       throw new Error("The Workspace Browser runtime is unavailable.");
     }
-    const lease = await controlLeases.acquireOwner(
-      controlLeaseKey(target),
-      signal,
+    const lease = await measureBrowserStage(trace, "lease-wait", () =>
+      controlLeases.acquireOwner(controlLeaseKey(target), signal),
     );
     // An owner history action ends the agent's Control Lease: dismiss any open
     // agent dialog so it cannot strand behind an invisible modal block.
     dismissOpenDialogsForProfile(target);
     try {
-      const response = await browserRuntime.history(
-        {
-          ...target,
-          projectId: request.projectId,
-          ...(request.tabId === undefined ? {} : { tabId: request.tabId }),
-          locale: profile.locale,
-          timezone: profile.timezone,
-        },
-        request.direction,
-        { signal, leaseSignal: lease.signal },
+      const response = await measureBrowserStage(trace, "browser-execute", () =>
+        browserRuntime.history(
+          {
+            ...target,
+            projectId: request.projectId,
+            ...(request.tabId === undefined ? {} : { tabId: request.tabId }),
+            locale: profile.locale,
+            timezone: profile.timezone,
+          },
+          request.direction,
+          { signal, leaseSignal: lease.signal, trace },
+        ),
       );
-      await reconcileRuntimeTabs(dataDir, target, response.tabId);
+      await reconcileRuntimeTabs(dataDir, target, response.tabId, trace);
       return response;
     } finally {
       lease.release();
@@ -1192,14 +1246,15 @@ export function createBrowserHostEntry(
     request: BrowserTabActionRequest,
     dataDir: string,
     signal?: AbortSignal,
+    trace?: BrowserOperationTrace,
   ): Promise<BrowserTabStrip> {
     const target = { hostId: request.hostId, profileId: request.profileId };
-    const readiness = await administration(dataDir).inspect(target);
+    const readiness = await measureBrowserStage(trace, "readiness", async () =>
+      administration(dataDir).inspect(target),
+    );
     if (readiness.state !== "healthy") throw new Error(readiness.message);
-    const profile = await resolveActiveProfile(
-      dataDir,
-      request.hostId,
-      request.profileId,
+    const profile = await measureBrowserStage(trace, "profile", () =>
+      resolveActiveProfile(dataDir, request.hostId, request.profileId),
     );
     const browserRuntime = runtime(dataDir);
     if (browserRuntime === undefined) {
@@ -1211,20 +1266,18 @@ export function createBrowserHostEntry(
       locale: profile.locale,
       timezone: profile.timezone,
     };
-    const lease = await controlLeases.acquireOwner(
-      controlLeaseKey(target),
-      signal,
+    const lease = await measureBrowserStage(trace, "lease-wait", () =>
+      controlLeases.acquireOwner(controlLeaseKey(target), signal),
     );
     // A tab command is owner interaction: it ends an agent's Control Lease, so
     // dismiss any open agent dialog rather than stranding it behind the tab
     // the owner just moved to.
     dismissOpenDialogsForProfile(target);
     try {
-      const operationOptions = { signal, leaseSignal: lease.signal };
+      const operationOptions = { signal, leaseSignal: lease.signal, trace };
       if (request.action === "open") {
-        const opened = await browserRuntime.openPage(
-          instanceTarget,
-          operationOptions,
+        const opened = await measureBrowserStage(trace, "browser-execute", () =>
+          browserRuntime.openPage(instanceTarget, operationOptions),
         );
         strip.openTab(opened.url, opened.title, opened.id);
         const evicted = strip.takeEvictedTabIds();
@@ -1237,14 +1290,26 @@ export function createBrowserHostEntry(
         throw new Error("Switching or closing a Browser Tab requires a tab.");
       }
       if (request.action === "activate") {
-        await browserRuntime.focusPage(instanceTarget, tabId, operationOptions);
+        await measureBrowserStage(trace, "browser-execute", () =>
+          browserRuntime.focusPage(instanceTarget, tabId, operationOptions),
+        );
         strip.activateTab(tabId);
         return strip.snapshot() as BrowserTabStrip;
       }
       strip.closeTab(tabId);
-      await browserRuntime.closePages(target, [tabId]);
+      await measureBrowserStage(trace, "browser-execute", () =>
+        browserRuntime.closePages(target, [tabId]),
+      );
       return strip.snapshot() as BrowserTabStrip;
+    } catch (error) {
+      if (
+        error instanceof BrowserScriptExecutionError &&
+        error.code === "tab_invalid"
+      )
+        await reconcileRuntimeTabs(dataDir, target, undefined, trace);
+      throw error;
     } finally {
+      trace?.tabInventory(strip.snapshot().tabs.length, strip.generation);
       lease.release();
     }
   }
@@ -1648,9 +1713,11 @@ export function createBrowserHostEntry(
             context.experimental_paths.dataDir,
           ).diagnostics(target);
           const controlLease = controlLeases.state(controlLeaseKey(target));
-          return controlLease === undefined
-            ? diagnostics
-            : { ...diagnostics, controlLease };
+          return {
+            ...diagnostics,
+            ...(controlLease === undefined ? {} : { controlLease }),
+            operationTraces: operationTraces.snapshot(target),
+          };
         })();
       },
       setupPlan: (target, context) => {
@@ -1706,6 +1773,11 @@ export function createBrowserHostEntry(
           hostId: request.hostId,
           profileId: request.profileId,
         };
+        const trace = operationTraces.start(
+          target,
+          "browser-script",
+          request.tabId !== undefined,
+        );
         const leaseKey = controlLeaseKey(target);
         let lease: ControlLease | undefined;
         let response: BrowserScriptResponse | undefined;
@@ -1724,13 +1796,15 @@ export function createBrowserHostEntry(
             }
             throw error;
           }
-          const readiness = await administration(dataDir).inspect(target);
+          const readiness = await trace.measure("readiness", async () =>
+            administration(dataDir).inspect(target),
+          );
           if (readiness.state !== "healthy") {
             response = { ok: false as const, error: readiness };
             return response;
           }
-          const inventory = await profiles(dataDir).listProfiles(
-            request.hostId,
+          const inventory = await trace.measure("profile", () =>
+            profiles(dataDir).listProfiles(request.hostId),
           );
           const profile = inventory.profiles.find(
             (candidate) =>
@@ -1747,57 +1821,68 @@ export function createBrowserHostEntry(
           const browserRuntime = runtime(dataDir);
           if (browserRuntime !== undefined) {
             try {
-              lease = await controlLeases.acquireAgent(
-                leaseKey,
-                request.purpose,
-                context.signal,
+              lease = await trace.measure("lease-wait", () =>
+                controlLeases.acquireAgent(
+                  leaseKey,
+                  request.purpose,
+                  context.signal,
+                ),
               );
             } catch (error) {
               if (!(error instanceof ControlLeaseError)) throw error;
-              response = scriptRuntimeFailure(request, error);
+              response = scriptRuntimeFailure(
+                request,
+                error,
+                undefined,
+                trace.traceId,
+              );
               return response;
             }
             try {
+              const leaseSignal = lease.signal;
               const threadDefaultProfileId = scopedProfileId({
                 projectId: request.projectId,
                 threadId: request.threadId,
               });
               const browserResult = assertBrowserScriptResultWithinBounds(
-                await browserRuntime.execute(
-                  {
-                    hostId: request.hostId,
-                    profileId: request.profileId,
-                    projectId: request.projectId,
-                    threadPageName: `agent-${threadDefaultProfileId}`,
-                    initialOrigin: request.destinationOrigin,
-                    ...(request.tabId === undefined
-                      ? {}
-                      : { tabId: request.tabId }),
-                    locale: profile.locale,
-                    timezone: profile.timezone,
-                  },
-                  request.code,
-                  request.timeoutMs,
-                  {
-                    signal: context.signal,
-                    leaseSignal: lease.signal,
-                    screenshot: request.screenshot,
-                    ...(request.originScope === undefined
-                      ? {}
-                      : { originScope: request.originScope }),
-                    ...(request.invalidCertificateOrigins === undefined
-                      ? {}
-                      : {
-                          invalidCertificateOrigins:
-                            request.invalidCertificateOrigins,
-                        }),
-                  },
+                await trace.measure("browser-execute", () =>
+                  browserRuntime.execute(
+                    {
+                      hostId: request.hostId,
+                      profileId: request.profileId,
+                      projectId: request.projectId,
+                      threadPageName: `agent-${threadDefaultProfileId}`,
+                      initialOrigin: request.destinationOrigin,
+                      ...(request.tabId === undefined
+                        ? {}
+                        : { tabId: request.tabId }),
+                      locale: profile.locale,
+                      timezone: profile.timezone,
+                    },
+                    request.code,
+                    request.timeoutMs,
+                    {
+                      trace,
+                      signal: context.signal,
+                      leaseSignal,
+                      screenshot: request.screenshot,
+                      ...(request.originScope === undefined
+                        ? {}
+                        : { originScope: request.originScope }),
+                      ...(request.invalidCertificateOrigins === undefined
+                        ? {}
+                        : {
+                            invalidCertificateOrigins:
+                              request.invalidCertificateOrigins,
+                          }),
+                    },
+                  ),
                 ),
               );
               if (lease.signal.aborted) {
                 leaseRevokedAfterCompletion = true;
               }
-              await reconcileRuntimeTabs(dataDir, target);
+              await reconcileRuntimeTabs(dataDir, target, undefined, trace);
               response = {
                 ok: true as const,
                 result: browserResult,
@@ -1816,7 +1901,12 @@ export function createBrowserHostEntry(
               ) {
                 throw error;
               }
-              response = scriptRuntimeFailure(request, error, lease);
+              response = scriptRuntimeFailure(
+                request,
+                error,
+                lease,
+                trace.traceId,
+              );
               return response;
             } finally {
               lease.release();
@@ -1831,6 +1921,19 @@ export function createBrowserHostEntry(
           };
           return response;
         } finally {
+          trace.finish(
+            response?.ok === true
+              ? undefined
+              : response?.error.state === "runtime-error"
+                ? response.error.code
+                : response?.error.state === "origin-denied"
+                  ? "origin_denied"
+                  : context.signal.aborted
+                    ? "cancelled"
+                    : response === undefined
+                      ? "runtime_failed"
+                      : "not_ready",
+          );
           await recordScriptActivity(
             outbox(dataDir),
             request,
@@ -1847,29 +1950,42 @@ export function createBrowserHostEntry(
       },
       navigate: async (request, context) => {
         retainWorker(context);
-        assertPanelMayDriveBrowser(request);
-        return navigateBrowser(
-          request,
-          context.experimental_paths.dataDir,
-          context.signal,
-        );
+        return tracedOwnerOperation(request, "navigate", async (trace) => {
+          assertPanelMayDriveBrowser(request);
+          return navigateBrowser(
+            request,
+            context.experimental_paths.dataDir,
+            context.signal,
+            trace,
+          );
+        });
       },
       history: async (request, context) => {
         retainWorker(context);
-        assertPanelMayDriveBrowser(request);
-        return historyBrowser(
-          request,
-          context.experimental_paths.dataDir,
-          context.signal,
-        );
+        return tracedOwnerOperation(request, "history", async (trace) => {
+          assertPanelMayDriveBrowser(request);
+          return historyBrowser(
+            request,
+            context.experimental_paths.dataDir,
+            context.signal,
+            trace,
+          );
+        });
       },
       tabAction: async (request, context) => {
         retainWorker(context);
-        assertPanelMayDriveBrowser(request);
-        return applyTabAction(
+        return tracedOwnerOperation(
           request,
-          context.experimental_paths.dataDir,
-          context.signal,
+          `tab-${request.action}`,
+          async (trace) => {
+            assertPanelMayDriveBrowser(request);
+            return applyTabAction(
+              request,
+              context.experimental_paths.dataDir,
+              context.signal,
+              trace,
+            );
+          },
         );
       },
       panelVisibility: async (request, context) => {
@@ -1878,7 +1994,13 @@ export function createBrowserHostEntry(
       },
       panelTransport: (request, context) => {
         retainWorker(context);
-        return openPanelTransport(request, context.experimental_paths.dataDir);
+        return tracedOwnerOperation(request, "panel-connect", async (trace) => {
+          const response = await trace.measure("panel-transport", () =>
+            openPanelTransport(request, context.experimental_paths.dataDir),
+          );
+          if (response.outcome !== "opened") trace.finish("not_ready");
+          return response;
+        });
       },
       panelRelease: (request, context) => {
         retainWorker(context);

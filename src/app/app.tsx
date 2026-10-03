@@ -1,4 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  PANEL_SCREENSHOT_MAX_BASE64_LENGTH,
+  type PanelScreenshotRequest,
+} from "../shared/panel-screenshot.js";
 import { definePluginApp, useBbContext, useRpc } from "@get-bb/plugin-sdk/app";
 import type {
   PluginNewThreadPanelProps,
@@ -40,6 +44,7 @@ import { Field, inputClassName } from "./panel-primitives.js";
 import {
   administrationErrorMessage,
   saveExportedBytes,
+  saveJsonFile,
 } from "./browser-client-utils.js";
 import {
   ActivitySection,
@@ -206,6 +211,8 @@ function PanelStreamSurface({
   agentDriven,
   onControlState,
   onLiveChange,
+  screenshotRequest,
+  onScreenshotComplete,
 }: {
   status: BrowserStatus;
   panelId: string;
@@ -232,6 +239,8 @@ function PanelStreamSurface({
    * it is not, the panel has to ask for control state instead of being told.
    */
   onLiveChange?: (live: boolean) => void;
+  screenshotRequest?: PanelScreenshotRequest | null;
+  onScreenshotComplete?: () => void;
 }) {
   const rpc = useRpc<typeof rpcContract>();
   const bbContext = useBbContext();
@@ -253,6 +262,14 @@ function PanelStreamSurface({
   const textInputRef = useRef<HTMLTextAreaElement | null>(null);
   const streamRef = useRef<PanelStreamAdapter | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
+  const screenshotRef = useRef<{
+    request: PanelScreenshotRequest;
+    chunks: string[];
+    length: number;
+  } | null>(null);
+  const screenshotCompleteRef = useRef(onScreenshotComplete);
+  screenshotCompleteRef.current = onScreenshotComplete;
+  const [screenshotError, setScreenshotError] = useState<string | null>(null);
   const reducedMotion = usePrefersReducedMotion();
   const [dialog, setDialog] = useState<BrowserDialogEvent | null>(null);
   const [contextError, setContextError] = useState<string | null>(null);
@@ -385,11 +402,20 @@ function PanelStreamSurface({
       if (pendingSocket !== null) pendingSocket.close();
     }
 
+    let newestFrame = 0;
     function drawFrame(frame: { mimeType: string; data: string }) {
       const canvas = canvasRef.current;
       if (canvas === null) return;
       const image = new Image();
+      const order = ++newestFrame;
       image.addEventListener("load", () => {
+        if (disposed || order !== newestFrame) return;
+        // Keep the encoded frame's pixels. Drawing into the logical viewport
+        // first discarded the extra density before CSS displayed the canvas.
+        if (canvas.width !== image.naturalWidth)
+          canvas.width = image.naturalWidth;
+        if (canvas.height !== image.naturalHeight)
+          canvas.height = image.naturalHeight;
         const context = canvas.getContext("2d");
         if (context === null) return;
         context.clearRect(0, 0, canvas.width, canvas.height);
@@ -468,6 +494,48 @@ function PanelStreamSurface({
             mimeType: message.mimeType,
             data: message.data,
           });
+          return;
+        }
+        if (message.type === "screenshot_error") {
+          if (screenshotRef.current?.request.requestId !== message.requestId)
+            return;
+          screenshotRef.current = null;
+          setScreenshotError(message.message);
+          screenshotCompleteRef.current?.();
+          return;
+        }
+        if (message.type === "screenshot_chunk") {
+          const capture = screenshotRef.current;
+          if (
+            capture === null ||
+            capture.request.requestId !== message.requestId
+          )
+            return;
+          if (
+            message.index !== capture.chunks.length ||
+            capture.length + message.data.length >
+              PANEL_SCREENSHOT_MAX_BASE64_LENGTH
+          ) {
+            screenshotRef.current = null;
+            setScreenshotError("Screenshot download failed. Try again.");
+            screenshotCompleteRef.current?.();
+            return;
+          }
+          capture.chunks.push(message.data);
+          capture.length += message.data.length;
+          if (message.last) {
+            screenshotRef.current = null;
+            try {
+              saveExportedBytes(
+                `browser-${capture.request.fullPage ? "full-page" : "viewport"}-${Date.now()}.png`,
+                "image/png",
+                capture.chunks.join(""),
+              );
+            } catch {
+              setScreenshotError("Screenshot download failed. Try again.");
+            }
+            screenshotCompleteRef.current?.();
+          }
           return;
         }
         if (message.type === "protocol_error") {
@@ -735,6 +803,36 @@ function PanelStreamSurface({
     if (encoded.outcome === "encoded") socket.send(encoded.raw);
   }
 
+  useEffect(() => {
+    if (screenshotRequest == null) return;
+    setScreenshotError(null);
+    if (!isController || !livePush) {
+      setScreenshotError(
+        "The browser disconnected or control changed. Try again.",
+      );
+      screenshotCompleteRef.current?.();
+      return;
+    }
+    screenshotRef.current = {
+      request: screenshotRequest,
+      chunks: [],
+      length: 0,
+    };
+    sendStream({
+      ...screenshotRequest,
+      protocolVersion: PANEL_PROTOCOL_VERSION,
+    });
+    const timer = setTimeout(() => {
+      screenshotRef.current = null;
+      setScreenshotError("Screenshot capture timed out. Try again.");
+      screenshotCompleteRef.current?.();
+    }, 30_000);
+    return () => {
+      clearTimeout(timer);
+      screenshotRef.current = null;
+    };
+  }, [screenshotRequest, isController, livePush]);
+
   function handleContext(event: React.MouseEvent<HTMLCanvasElement>) {
     // The controller opens common link/image actions without native Chrome
     // context menus. Translate the canvas point to the shared logical
@@ -892,12 +990,24 @@ function PanelStreamSurface({
           aria-label="Browser page view"
           role="img"
           tabIndex={inputEnabled ? 0 : -1}
-          width={controllerViewport?.width ?? PANEL_MAX_VIEWPORT_WIDTH}
-          height={controllerViewport?.height ?? PANEL_MAX_VIEWPORT_HEIGHT}
+          data-viewport-width={
+            controllerViewport?.width ?? PANEL_MAX_VIEWPORT_WIDTH
+          }
+          data-viewport-height={
+            controllerViewport?.height ?? PANEL_MAX_VIEWPORT_HEIGHT
+          }
           className="h-full w-full bg-muted object-contain"
           onContextMenu={handleContext}
         />
       ) : null}
+      {screenshotError === null ? null : (
+        <p
+          role="alert"
+          className="absolute inset-x-0 top-0 border-b bg-background p-2 text-sm"
+        >
+          {screenshotError}
+        </p>
+      )}
       <p
         className={
           streamState === "streaming"
@@ -1231,6 +1341,7 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
   );
   const [grantRequests, setGrantRequests] = useState<BrowserGrantRequest[]>([]);
   const [profileError, setProfileError] = useState<string | null>(null);
+  const [diagnosticsPending, setDiagnosticsPending] = useState(false);
   const [rawLocalhost, setRawLocalhost] = useState(false);
   /**
    * Where the last navigation this panel drove ended up, remembered against
@@ -1252,6 +1363,15 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
   // Whether the stream is pushing control state to this panel, or the panel has
   // to ask for it.
   const [streamIsLive, setStreamIsLive] = useState(false);
+  const [screenshotRequest, setScreenshotRequest] =
+    useState<PanelScreenshotRequest | null>(null);
+  useEffect(() => {
+    if (!streamIsLive || status?.state !== "healthy")
+      setScreenshotRequest(null);
+  }, [streamIsLive, status?.state]);
+  useEffect(() => {
+    setScreenshotRequest(null);
+  }, [status?.hostId, status?.profileId]);
   const [panelId] = useState(() => `browser-panel-${nextBrowserPanelId++}`);
   const reducedMotion = usePrefersReducedMotion();
   // The page surface is measured, not guessed: its size is the viewport this
@@ -1517,6 +1637,32 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
       );
   }
 
+  function downloadDiagnostics() {
+    if (
+      status?.hostId === null ||
+      status?.hostId === undefined ||
+      diagnosticsPending
+    )
+      return;
+    setDiagnosticsPending(true);
+    setProfileError(null);
+    void rpc
+      .call("browser_diagnostics", {
+        hostId: status.hostId,
+        profileId: status.profileId,
+      })
+      .then((diagnostics) => {
+        saveJsonFile(
+          `browser-diagnostics-${diagnostics.profileId}.json`,
+          diagnostics,
+        );
+      })
+      .catch((error: unknown) => {
+        setProfileError(administrationErrorMessage(error));
+      })
+      .finally(() => setDiagnosticsPending(false));
+  }
+
   function navigateHistory(direction: "back" | "forward" | "reload") {
     const hostId = status?.hostId;
     const profileId = status?.profileId;
@@ -1702,11 +1848,13 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
     rawLocalhost,
     transferPending: controlSession.transferPending,
     showStatusDetail,
+    diagnosticsPending,
   });
   const sessionOptions = attachPresentedOptions(view.options, {
     takeControl: controlSession.takeControl,
     releaseControl: controlSession.releaseControl,
     setRawLocalhost,
+    downloadDiagnostics,
   });
 
   if (view.replacesPage) {
@@ -1753,6 +1901,17 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
         reducedMotion={reducedMotion}
         statusHint={view.statusHint}
         onStatusSelect={() => setShowStatusDetail((shown) => !shown)}
+        screenshot={{
+          disabled:
+            !streamIsLive || !view.canDrive || screenshotRequest !== null,
+          pending: screenshotRequest !== null,
+          onCapture: (fullPage) =>
+            setScreenshotRequest({
+              type: "screenshot_request",
+              requestId: crypto.randomUUID(),
+              fullPage,
+            }),
+        }}
       />
       <BrowserTabStripView
         tabs={tabStrip?.tabs ?? []}
@@ -1798,6 +1957,8 @@ function BrowserPanel({ request }: { request: BrowserStatusInput }) {
           agentDriven={view.agentDriven}
           onControlState={applySessionSnapshot}
           onLiveChange={setStreamIsLive}
+          screenshotRequest={screenshotRequest}
+          onScreenshotComplete={() => setScreenshotRequest(null)}
         />
         {view.showsNewTabSurface ? (
           <div className="absolute inset-0">
@@ -1815,16 +1976,18 @@ function attachPresentedOptions(
     takeControl: () => void;
     releaseControl: () => void;
     setRawLocalhost: (checked: boolean) => void;
+    downloadDiagnostics: () => void;
   },
 ): BrowserPanelOption[] {
   return options.map((option) => {
     if (option.kind === "action") {
       return {
         ...option,
-        onSelect:
-          option.id === "take-control"
-            ? handlers.takeControl
-            : handlers.releaseControl,
+        onSelect: {
+          "take-control": handlers.takeControl,
+          "release-control": handlers.releaseControl,
+          "download-diagnostics": handlers.downloadDiagnostics,
+        }[option.id],
       };
     }
     if (option.kind === "toggle") {

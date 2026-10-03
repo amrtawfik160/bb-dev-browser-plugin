@@ -63,8 +63,10 @@ type TrackedSocket = NodeWebSocket & { url: string };
 function createDeterministicPanelFrameSource(
   receivedInputs: unknown[],
   contextActions: BrowserContextAction[] = [],
+  captureScreenshot?: ScreencastSource["captureScreenshot"],
 ): ScreencastSource {
   return {
+    captureScreenshot,
     async start(onFrame, signal) {
       // An already-aborted stream subscription cannot recover a live frame.
       // Reusing cancellation state from a prior physical connection therefore
@@ -131,6 +133,7 @@ export async function createPublicPanelLifecycleHarness(options?: {
   browserRuntime?: BrowserInstanceRuntime;
   contextActions?: BrowserContextAction[];
   transport?: "loopback" | "tunnel";
+  captureScreenshot?: ScreencastSource["captureScreenshot"];
 }) {
   let now = Date.parse("2026-08-31T12:00:00.000Z");
   const clock = { now: () => now };
@@ -316,6 +319,7 @@ export async function createPublicPanelLifecycleHarness(options?: {
       createDeterministicPanelFrameSource(
         receivedInputs,
         options?.contextActions,
+        options?.captureScreenshot,
       ),
   });
   const ownerSessionId = ownerSessionIdFromContext({

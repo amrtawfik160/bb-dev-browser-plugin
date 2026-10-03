@@ -45,7 +45,10 @@ export function saveExportedBytes(
   data: string | undefined,
 ) {
   if (data === undefined) return;
-  const bytes = new Uint8Array(Buffer.from(data, "base64"));
+  const decoded = atob(data);
+  const bytes = Uint8Array.from(decoded, (character) =>
+    character.charCodeAt(0),
+  );
   saveBlob(
     safeName,
     new Blob([bytes], {

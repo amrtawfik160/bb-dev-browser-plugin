@@ -15,6 +15,7 @@ it("delivers page input, viewport changes, and frames from real Chromium", async
   const profile = await mkdtemp(join(tmpdir(), "browser-screencast-audit-"));
   const context = await chromium.launchPersistentContext(profile, {
     headless: true,
+    executablePath: process.env.BB_BROWSER_TEST_EXECUTABLE,
     args: ["--remote-debugging-port=0"],
   });
   const page = context.pages()[0]!;
@@ -38,9 +39,11 @@ it("delivers page input, viewport changes, and frames from real Chromium", async
   });
   const abort = new AbortController();
   let frames = 0;
+  let latestFrameUrl = "";
   const encodedFrames: string[] = [];
   const streaming = source.start((frame) => {
     frames += 1;
+    latestFrameUrl = `data:${frame.mimeType};base64,${Buffer.from(frame.data).toString("base64")}`;
     encodedFrames.push(
       encodePanelProtocolMessage({
         ...frame,
@@ -55,6 +58,37 @@ it("delivers page input, viewport changes, and frames from real Chromium", async
     expect(
       await page.evaluate(() => ({ width: innerWidth, height: innerHeight })),
     ).toEqual({ width: 800, height: 600 });
+    expect(await page.evaluate(() => devicePixelRatio)).toBeCloseTo(1.8);
+    await expect
+      .poll(() =>
+        page.evaluate(async (url) => {
+          const image = new Image();
+          image.src = url;
+          await image.decode();
+          return { width: image.naturalWidth, height: image.naturalHeight };
+        }, latestFrameUrl),
+      )
+      .toEqual({ width: 1440, height: 1080 });
+    const viewportPng = Buffer.from(
+      await source.captureScreenshot!(false),
+      "base64",
+    );
+    const fullPagePng = Buffer.from(
+      await source.captureScreenshot!(true),
+      "base64",
+    );
+    expect(viewportPng.subarray(1, 4).toString()).toBe("PNG");
+    expect(viewportPng.readUInt32BE(16)).toBe(1440);
+    expect(viewportPng.readUInt32BE(20)).toBe(1080);
+    expect(fullPagePng.readUInt32BE(16)).toBe(1440);
+    expect(fullPagePng.readUInt32BE(20)).toBeGreaterThan(7200);
+    expect(
+      await page.evaluate(() => ({
+        width: innerWidth,
+        height: innerHeight,
+        y: scrollY,
+      })),
+    ).toEqual({ width: 800, height: 600, y: 0 });
     await page.getByRole("textbox").focus();
     source.input({
       kind: "key",
@@ -120,6 +154,11 @@ it("delivers page input, viewport changes, and frames from real Chromium", async
       .toBe("yes");
     source.input({ kind: "wheel", x: 400, y: 300, deltaX: 0, deltaY: 240 });
     await expect.poll(() => page.evaluate(() => scrollY)).toBeGreaterThan(0);
+    const scrolledPng = Buffer.from(
+      await source.captureScreenshot!(false),
+      "base64",
+    );
+    expect(scrolledPng.readUInt32BE(20)).toBe(1080);
     source.setViewport?.({ width: 640, height: 480 });
     await expect
       .poll(() =>
@@ -151,6 +190,16 @@ it("delivers page input, viewport changes, and frames from real Chromium", async
     await expect
       .poll(() => page.getByRole("textbox").inputValue())
       .toBe("a café\n first tab");
+    await page.setContent('<div style="height:30000px"></div>');
+    await expect(source.captureScreenshot!(true)).rejects.toThrow(
+      "This page is too large to capture",
+    );
+    const smallCapture = Buffer.from(
+      await source.captureScreenshot!(false),
+      "base64",
+    );
+    expect(smallCapture.readUInt32BE(16)).toBe(1280);
+    expect(smallCapture.readUInt32BE(20)).toBe(960);
     await context.close();
     await streaming;
   } finally {

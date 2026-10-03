@@ -1,5 +1,6 @@
 import { defineRpcContract } from "@get-bb/plugin-sdk";
 import { z } from "zod";
+import { browserOperationTracesSchema } from "./browser-operation-trace.js";
 
 export const DEFAULT_PROFILE_ID = "bb-personal";
 export const PROFILE_MANIFEST_VERSION = 1 as const;
@@ -1421,6 +1422,7 @@ export const browserDiagnosticsSchema = z
       .strict(),
     exitLogs: z.array(z.string().max(500)).max(50),
     controlLease: browserControlLeaseSchema.optional(),
+    operationTraces: browserOperationTracesSchema.optional(),
   })
   .strict();
 
@@ -3467,6 +3469,7 @@ export const browserScriptRuntimeErrorSchema = z
     profileId: z.string().min(1),
     message: z.string().trim().min(1).max(500),
     grantRequest: z.never().optional(),
+    traceId: z.string().uuid().optional(),
   })
   .strict();
 

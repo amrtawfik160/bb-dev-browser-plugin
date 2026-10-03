@@ -25,7 +25,7 @@ export type BrowserPanelConnectionPhase =
 export type BrowserPanelOptionDescriptor =
   | {
       kind: "action";
-      id: "release-control" | "take-control";
+      id: "release-control" | "take-control" | "download-diagnostics";
       label: string;
       description?: string;
       disabled: boolean;
@@ -77,6 +77,7 @@ export function presentBrowserPanel(state: {
   rawLocalhost: boolean;
   transferPending: boolean;
   showStatusDetail: boolean;
+  diagnosticsPending?: boolean;
 }): BrowserPanelView {
   const session = presentControlSession(state.control, state.panelId);
   const tabs = state.tabStrip?.tabs ?? [];
@@ -97,6 +98,7 @@ export function presentBrowserPanel(state: {
       isController: session.canDrive,
       transferPending: state.transferPending,
       rawLocalhost: state.rawLocalhost,
+      diagnosticsPending: state.diagnosticsPending ?? false,
     }),
   };
 }
@@ -178,6 +180,7 @@ function presentSessionOptions(input: {
   isController: boolean;
   transferPending: boolean;
   rawLocalhost: boolean;
+  diagnosticsPending: boolean;
 }): BrowserPanelOptionDescriptor[] {
   const sessionAction: BrowserPanelOptionDescriptor = input.isController
     ? {
@@ -195,6 +198,13 @@ function presentSessionOptions(input: {
       };
   return [
     sessionAction,
+    {
+      kind: "action",
+      id: "download-diagnostics",
+      label: "Download diagnostics",
+      description: "Errors, operation timings, and host state.",
+      disabled: input.diagnosticsPending,
+    },
     {
       kind: "toggle",
       id: "raw-localhost",

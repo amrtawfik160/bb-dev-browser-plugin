@@ -1,4 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
+import {
+  measureBrowserStage,
+  type BrowserOperationTrace,
+} from "../shared/browser-operation-trace.js";
 import { constants } from "node:fs";
 import {
   access,
@@ -113,6 +117,7 @@ export type BrowserExecutionRequest = {
 };
 
 export type BrowserOperationOptions = {
+  trace?: BrowserOperationTrace;
   signal?: AbortSignal;
   leaseSignal?: AbortSignal;
   screenshot?: boolean;
@@ -1004,6 +1009,22 @@ function parseActiveTabId(activeTabOutput: unknown) {
   return active.id;
 }
 
+function parseNavigationTabId(output: string) {
+  const location = JSON.parse(output) as unknown;
+  if (
+    typeof location !== "object" ||
+    location === null ||
+    !("tabId" in location) ||
+    typeof location.tabId !== "string" ||
+    location.tabId === ""
+  ) {
+    throw new Error(
+      "Automation Mode returned an invalid Browser Tab location.",
+    );
+  }
+  return location.tabId;
+}
+
 /**
  * A tab command runs one short scripted step in the instance the owner is
  * already looking at, so it is held to a shorter deadline than the 30-second
@@ -1666,6 +1687,7 @@ export function createBrowserInstanceRuntime(
   async function executeAgainstLiveBrowser(
     held: HeldBrowserInstance,
     request: BrowserExecutionRequest,
+    trace?: BrowserOperationTrace,
   ): Promise<{ result: unknown; held: HeldBrowserInstance }> {
     try {
       return {
@@ -1674,8 +1696,13 @@ export function createBrowserInstanceRuntime(
       };
     } catch (error) {
       if (!isUnreachableAutomationEndpoint(error)) throw error;
+      trace?.connectionRetried();
       await abandonUnreachableBrowser(held);
-      const replacement = await heldInstance(held.target);
+      const replacement = await measureBrowserStage(
+        trace,
+        "browser-start",
+        () => heldInstance(held.target),
+      );
       return {
         result: await options.launchBoundary.execute({
           ...request,
@@ -1864,7 +1891,11 @@ export function createBrowserInstanceRuntime(
       timeoutMs: number,
       operationOptions: BrowserOperationOptions = {},
     ) {
-      const original = await heldInstance(target);
+      const original = await measureBrowserStage(
+        operationOptions.trace,
+        "browser-start",
+        () => heldInstance(target),
+      );
       let held = original;
       const key = runtimeKey(target);
       original.activeLeases += 1;
@@ -1905,7 +1936,11 @@ export function createBrowserInstanceRuntime(
       const operationSignal = linkedOperationSignal(operationOptions);
       try {
         try {
-          await enforceRendererProcessLimit(key, held);
+          await measureBrowserStage(
+            operationOptions.trace,
+            "renderer-check",
+            () => enforceRendererProcessLimit(key, held),
+          );
           const executed = await executeAgainstLiveBrowser(
             held,
             executionRequest(
@@ -1917,9 +1952,14 @@ export function createBrowserInstanceRuntime(
               screenshot,
               originPolicy,
             ),
+            operationOptions.trace,
           );
           held = executed.held;
-          await enforceRendererProcessLimit(key, held);
+          await measureBrowserStage(
+            operationOptions.trace,
+            "renderer-check",
+            () => enforceRendererProcessLimit(key, held),
+          );
           const activeTab = extractActiveTabMarker(
             executed.result,
             activeTabMarker,
@@ -1953,7 +1993,11 @@ export function createBrowserInstanceRuntime(
       operationOptions: BrowserOperationOptions = {},
     ) {
       const requestedAddress = resolveBrowserAddress(input);
-      let held = await heldInstance(target);
+      let held = await measureBrowserStage(
+        operationOptions.trace,
+        "browser-start",
+        () => heldInstance(target),
+      );
       const address =
         requestedAddress.kind === "search"
           ? {
@@ -1977,21 +2021,11 @@ export function createBrowserInstanceRuntime(
       // changed since the last operation or closed outside the panel.
       let tabId = target.tabId;
       try {
-        await enforceRendererProcessLimit(key, held);
-        if (tabId === undefined) {
-          const discovered = await executeAgainstLiveBrowser(
-            held,
-            executionRequest(
-              held,
-              target.profileId,
-              activeBrowserTabScript({ openIfEmpty: true }),
-              30_000,
-              operationSignal.signal,
-            ),
-          );
-          held = discovered.held;
-          tabId = parseActiveTabId(browserResultOutput(discovered.result));
-        }
+        await measureBrowserStage(
+          operationOptions.trace,
+          "renderer-check",
+          () => enforceRendererProcessLimit(key, held),
+        );
         const location = await executeAgainstLiveBrowser(
           held,
           executionRequest(
@@ -2001,11 +2035,19 @@ export function createBrowserInstanceRuntime(
             30_000,
             operationSignal.signal,
           ),
+          operationOptions.trace,
         );
         held = location.held;
-        await enforceRendererProcessLimit(key, held);
+        tabId ??= parseNavigationTabId(browserResultOutput(location.result));
+        await measureBrowserStage(
+          operationOptions.trace,
+          "renderer-check",
+          () => enforceRendererProcessLimit(key, held),
+        );
         noteActivity(key, held);
         return { address, location: location.result, tabId };
+      } catch (error) {
+        throw classifyExecutionError(error, false);
       } finally {
         operationSignal.dispose();
       }
@@ -2015,26 +2057,20 @@ export function createBrowserInstanceRuntime(
       direction: "back" | "forward" | "reload",
       operationOptions: BrowserOperationOptions = {},
     ) {
-      let held = await heldInstance(target);
+      let held = await measureBrowserStage(
+        operationOptions.trace,
+        "browser-start",
+        () => heldInstance(target),
+      );
       const key = runtimeKey(target);
       const operationSignal = linkedOperationSignal(operationOptions);
       let tabId = target.tabId;
       try {
-        await enforceRendererProcessLimit(key, held);
-        if (tabId === undefined) {
-          const discovered = await executeAgainstLiveBrowser(
-            held,
-            executionRequest(
-              held,
-              target.profileId,
-              activeBrowserTabScript({ openIfEmpty: true }),
-              30_000,
-              operationSignal.signal,
-            ),
-          );
-          held = discovered.held;
-          tabId = parseActiveTabId(browserResultOutput(discovered.result));
-        }
+        await measureBrowserStage(
+          operationOptions.trace,
+          "renderer-check",
+          () => enforceRendererProcessLimit(key, held),
+        );
         const location = await executeAgainstLiveBrowser(
           held,
           executionRequest(
@@ -2044,9 +2080,15 @@ export function createBrowserInstanceRuntime(
             30_000,
             operationSignal.signal,
           ),
+          operationOptions.trace,
         );
         held = location.held;
-        await enforceRendererProcessLimit(key, held);
+        tabId ??= parseNavigationTabId(browserResultOutput(location.result));
+        await measureBrowserStage(
+          operationOptions.trace,
+          "renderer-check",
+          () => enforceRendererProcessLimit(key, held),
+        );
         noteActivity(key, held);
         const address = {
           kind: "address" as const,
@@ -2057,6 +2099,8 @@ export function createBrowserInstanceRuntime(
               : "about:blank",
         };
         return { address, location: location.result, tabId };
+      } catch (error) {
+        throw classifyExecutionError(error, false);
       } finally {
         operationSignal.dispose();
       }
@@ -2109,11 +2153,19 @@ export function createBrowserInstanceRuntime(
       target: BrowserInstanceTarget,
       operationOptions: BrowserOperationOptions = {},
     ): Promise<RuntimeBrowserPage> {
-      let held = await heldInstance(target);
+      let held = await measureBrowserStage(
+        operationOptions.trace,
+        "browser-start",
+        () => heldInstance(target),
+      );
       const key = runtimeKey(target);
       const operationSignal = linkedOperationSignal(operationOptions);
       try {
-        await enforceRendererProcessLimit(key, held);
+        await measureBrowserStage(
+          operationOptions.trace,
+          "renderer-check",
+          () => enforceRendererProcessLimit(key, held),
+        );
         const executed = await executeAgainstLiveBrowser(
           held,
           executionRequest(
@@ -2123,6 +2175,7 @@ export function createBrowserInstanceRuntime(
             PAGE_COMMAND_TIMEOUT_MS,
             operationSignal.signal,
           ),
+          operationOptions.trace,
         );
         held = executed.held;
         const opened = parseOpenedPage(
@@ -2131,7 +2184,11 @@ export function createBrowserInstanceRuntime(
         // The tab the owner just opened is the one later owner navigation
         // targets, exactly as if they had navigated in it.
         noteActivity(key, held);
-        await enforceRendererProcessLimit(key, held);
+        await measureBrowserStage(
+          operationOptions.trace,
+          "renderer-check",
+          () => enforceRendererProcessLimit(key, held),
+        );
         return opened;
       } finally {
         operationSignal.dispose();
@@ -2147,11 +2204,19 @@ export function createBrowserInstanceRuntime(
       tabId: string,
       operationOptions: BrowserOperationOptions = {},
     ): Promise<void> {
-      let held = await heldInstance(target);
+      let held = await measureBrowserStage(
+        operationOptions.trace,
+        "browser-start",
+        () => heldInstance(target),
+      );
       const key = runtimeKey(target);
       const operationSignal = linkedOperationSignal(operationOptions);
       try {
-        await enforceRendererProcessLimit(key, held);
+        await measureBrowserStage(
+          operationOptions.trace,
+          "renderer-check",
+          () => enforceRendererProcessLimit(key, held),
+        );
         const executed = await executeAgainstLiveBrowser(
           held,
           executionRequest(
@@ -2161,10 +2226,17 @@ export function createBrowserInstanceRuntime(
             PAGE_COMMAND_TIMEOUT_MS,
             operationSignal.signal,
           ),
+          operationOptions.trace,
         );
         held = executed.held;
         noteActivity(key, held);
-        await enforceRendererProcessLimit(key, held);
+        await measureBrowserStage(
+          operationOptions.trace,
+          "renderer-check",
+          () => enforceRendererProcessLimit(key, held),
+        );
+      } catch (error) {
+        throw classifyExecutionError(error, false);
       } finally {
         operationSignal.dispose();
       }

@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { newTabId } from "./browser-tabs.js";
+import { TAB_INVALID_MESSAGE } from "./agent-script.js";
 import {
   isBrowserLoopbackHostname,
   isRawLocalhostHostname,
@@ -69,21 +70,32 @@ export function projectLoopbackAddress(
   return url.href;
 }
 
+function ownerPagePreamble(tabId?: string) {
+  if (tabId === undefined) {
+    return `${activeBrowserPagePreamble({ openIfEmpty: true })}
+const tabId = active.id;
+const page = await browser.getPage(tabId);
+await page.bringToFront();`;
+  }
+  return `const pages = await browser.listPages();
+if (!pages.some((entry) => entry.id === ${JSON.stringify(tabId)})) throw new Error(${JSON.stringify(TAB_INVALID_MESSAGE)});
+const tabId = ${JSON.stringify(tabId)};
+const page = await browser.getPage(${JSON.stringify(tabId)});
+await page.bringToFront();`;
+}
+
 export function browserNavigationScript(
   address: Extract<BrowserAddress, { kind: "address" }>,
-  tabId: string,
+  tabId?: string,
 ) {
-  return `const pages = await browser.listPages();
-if (!pages.some((entry) => entry.id === ${JSON.stringify(tabId)})) throw new Error("Browser Tab is invalid or belongs to a previous runtime");
-const page = await browser.getPage(${JSON.stringify(tabId)});
-await page.bringToFront();
+  return `${ownerPagePreamble(tabId)}
 await page.goto(${JSON.stringify(address.url)});
-console.log(JSON.stringify({ tabId: ${JSON.stringify(tabId)}, url: page.url() }));`;
+console.log(JSON.stringify({ tabId, url: page.url() }));`;
 }
 
 export function browserHistoryScript(
   direction: "back" | "forward" | "reload",
-  tabId: string,
+  tabId?: string,
 ) {
   const action =
     direction === "back"
@@ -91,12 +103,9 @@ export function browserHistoryScript(
       : direction === "forward"
         ? "history.forward()"
         : "location.reload()";
-  return `const pages = await browser.listPages();
-if (!pages.some((entry) => entry.id === ${JSON.stringify(tabId)})) throw new Error("Browser Tab is invalid or belongs to a previous runtime");
-const page = await browser.getPage(${JSON.stringify(tabId)});
-await page.bringToFront();
+  return `${ownerPagePreamble(tabId)}
 await page.evaluate(() => ${action});
-console.log(JSON.stringify({ tabId: ${JSON.stringify(tabId)}, url: page.url() }));`;
+console.log(JSON.stringify({ tabId, url: page.url() }));`;
 }
 
 /**
@@ -138,7 +147,7 @@ console.log(JSON.stringify({ tabId: ${JSON.stringify(tabId)}, url: page.url() })
  * Owner actions may open a blank tab for an empty profile; inventory reads
  * leave the tab set unchanged.
  */
-export function activeBrowserTabScript({
+function activeBrowserPagePreamble({
   openIfEmpty = false,
 }: { openIfEmpty?: boolean } = {}) {
   return `let pages = await browser.listPages();
@@ -167,5 +176,11 @@ if (active === null) {
   active = pages[0];
   await (await browser.getPage(active.id)).bringToFront();
 }
-console.log(JSON.stringify(active));`;
+`;
+}
+
+export function activeBrowserTabScript(
+  options: { openIfEmpty?: boolean } = {},
+) {
+  return `${activeBrowserPagePreamble(options)}console.log(JSON.stringify(active));`;
 }

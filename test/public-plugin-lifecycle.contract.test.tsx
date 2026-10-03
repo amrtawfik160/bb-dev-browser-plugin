@@ -256,17 +256,32 @@ describe("public Browser Panel lifecycle seam", () => {
       fireEvent.mouseDown(otherCanvas, { clientX: 490, clientY: 290 });
       fireEvent.keyDown(otherCanvas, { key: "x" });
       fireEvent.wheel(otherCanvas, { deltaY: 120 });
-      fireEvent.keyDown(textInput, { key: "k", ctrlKey: true });
+      fireEvent.keyDown(textInput, {
+        key: "j",
+        code: "KeyJ",
+        ctrlKey: true,
+      });
+      fireEvent.keyUp(textInput, { key: "j", code: "KeyJ", ctrlKey: true });
+      await waitFor(() => expect(browser.receivedInputs).toHaveLength(7));
+      expect(browser.receivedInputs.slice(-2)).toEqual([
+        expect.objectContaining({
+          kind: "key",
+          action: "keyDown",
+          key: "j",
+          modifiers: 2,
+        }),
+        expect.objectContaining({ kind: "key", action: "keyUp", key: "j" }),
+      ]);
       await act(async () => {
         await new Promise((resolve) => setTimeout(resolve, 30));
       });
-      expect(browser.receivedInputs).toHaveLength(5);
+      expect(browser.receivedInputs).toHaveLength(7);
       await browser.forcePhysicalSocketLoss(owner);
       await owner.findByText("Reconnecting to the browser…");
       fireEvent.mouseDown(canvas, { clientX: 490, clientY: 290 });
       fireEvent.keyDown(textInput, { key: "x" });
       fireEvent.wheel(canvas, { clientX: 490, clientY: 290, deltaY: 120 });
-      expect(browser.receivedInputs).toHaveLength(5);
+      expect(browser.receivedInputs).toHaveLength(7);
     } finally {
       await browser.dispose();
     }

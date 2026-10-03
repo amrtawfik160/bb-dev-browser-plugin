@@ -1,4 +1,5 @@
 import { randomInt } from "node:crypto";
+import { panelScreenshotRequestSchema } from "../shared/panel-screenshot.js";
 import {
   PANEL_GATEWAY_BIND_HOST,
   PANEL_GATEWAY_BANDWIDTH_BYTES_PER_SECOND,
@@ -25,6 +26,7 @@ import type { PanelCapabilityStore } from "./panel-capability.js";
  */
 
 export type PanelGatewayMessage =
+  | { kind: "screenshot_request"; requestId: string; fullPage: boolean }
   | { kind: "redeem"; message: BrowserPanelRedeemMessage }
   | { kind: "input"; sequence: number; payload: unknown }
   | { kind: "frame"; sequence: number; bytes: number; deadlineAt: number }
@@ -163,6 +165,18 @@ export function createPanelGateway(options: PanelGatewayOptions) {
       frameState.windowStart = now;
       frameState.pendingBytesInWindow = 0;
     }
+  }
+
+  function admitOutputBytes(bytes: number): boolean {
+    resetBandwidthWindow(clock.now());
+    if (
+      !Number.isFinite(bytes) ||
+      bytes <= 0 ||
+      frameState.pendingBytesInWindow + bytes > bandwidthBytesPerSecond
+    )
+      return false;
+    frameState.pendingBytesInWindow += bytes;
+    return true;
   }
 
   function validate(raw: string): PanelGatewayValidationResult {
@@ -304,18 +318,13 @@ export function createPanelGateway(options: PanelGatewayOptions) {
           message: "Panel gateway frame exceeded its deadline and was dropped.",
         };
       }
-      resetBandwidthWindow(now);
-      if (
-        frameState.pendingBytesInWindow + frame.bytes >
-        bandwidthBytesPerSecond
-      ) {
+      if (!admitOutputBytes(frame.bytes)) {
         return {
           outcome: "rejected",
           reason: "bandwidth-exceeded",
           message: `Panel gateway frame exceeded the ${bandwidthBytesPerSecond}-bytes-per-second bandwidth cap.`,
         };
       }
-      frameState.pendingBytesInWindow += frame.bytes;
       frameState.lastEmittedSequence = frame.sequence;
       acceptedFrames.push(frame.sequence);
       return {
@@ -368,6 +377,31 @@ export function createPanelGateway(options: PanelGatewayOptions) {
           dialogId: dialogResult.data.dialogId,
           accept: dialogResult.data.accept,
           text: dialogResult.data.text,
+        },
+      };
+    }
+    if (envelope.type === "screenshot_request") {
+      const request = panelScreenshotRequestSchema.safeParse(parsed);
+      if (!request.success) {
+        return {
+          outcome: "rejected",
+          reason: "malformed",
+          message: "Screenshot request failed shape validation.",
+        };
+      }
+      if (!admitChromeAction(clock.now())) {
+        return {
+          outcome: "rejected",
+          reason: "rate-limited",
+          message: "Too many screenshot requests.",
+        };
+      }
+      return {
+        outcome: "accepted",
+        message: {
+          kind: "screenshot_request",
+          requestId: request.data.requestId,
+          fullPage: request.data.fullPage,
         },
       };
     }
@@ -534,6 +568,7 @@ export function createPanelGateway(options: PanelGatewayOptions) {
     declaredBindHost,
     choosePort,
     validate,
+    admitOutputBytes,
     close,
     get redeemedCapabilityId() {
       return redeemedCapabilityId;
