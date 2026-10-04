@@ -130,6 +130,18 @@ function createCdpEndpointStub(
     set rejectNextEvaluate(value: boolean) {
       rejectNextEvaluate = value;
     },
+    /** Emit a Page.screencastFrame event to the attached session. */
+    emitScreencastFrame(params: unknown) {
+      for (const [client] of server.clients.entries()) {
+        client.send(
+          JSON.stringify({
+            method: "Page.screencastFrame",
+            params,
+            sessionId: "session-1",
+          }),
+        );
+      }
+    },
     /** Emit a Page.javascriptDialogOpening event to the attached session. */
     emitDialog(params: unknown) {
       for (const [client] of server.clients.entries()) {
@@ -195,6 +207,43 @@ describe("CDP screencast source contract", () => {
         method: "Emulation.setVisibleSize",
         params: { width: 1920, height: 1080 },
       });
+    } finally {
+      controller.abort();
+      await source.stop();
+      await streaming;
+      await stub.close();
+    }
+  });
+
+  it("forwards the browser frame without decoding it", async () => {
+    const stub = createCdpEndpointStub();
+    const controller = new AbortController();
+    const source = createCdpScreencastSource({
+      resolveEndpoint: async () => stub.endpoint,
+      viewport: { width: 1280, height: 720 },
+    });
+    const frames: Array<{ data: Uint8Array; wireData?: string }> = [];
+    const streaming = source
+      .start((frame) => {
+        frames.push(frame);
+      }, controller.signal)
+      .catch((error: unknown) => {
+        if (!controller.signal.aborted) throw error;
+      });
+    try {
+      await waitForStartScreencast(stub);
+      const jpeg = Buffer.from("jpeg-bytes").toString("base64");
+      stub.emitScreencastFrame({
+        data: jpeg,
+        metadata: { deviceWidth: 10, deviceHeight: 10 },
+        sessionId: 1,
+      });
+      await waitFor(() => (frames.length > 0 ? true : undefined), {
+        timeoutMs: 2_000,
+        intervalMs: 5,
+      });
+      expect(frames[0]?.wireData).toBe(jpeg);
+      expect(frames[0]?.data.byteLength).toBe(0);
     } finally {
       controller.abort();
       await source.stop();

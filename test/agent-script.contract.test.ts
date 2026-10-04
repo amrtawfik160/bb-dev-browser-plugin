@@ -209,6 +209,8 @@ async function boundPage(input: {
   pages: readonly { id: string; url: string; visible?: boolean }[];
   preferredOrigin?: string;
   activeTabMarker?: string;
+  threadPageName?: string;
+  tabId?: string;
 }) {
   const context = {
     setDefaultNavigationTimeout: () => undefined,
@@ -234,10 +236,12 @@ async function boundPage(input: {
     makePage(entry.id, entry.url, entry.visible ?? false);
   }
   let created = 0;
+  let gets = 0;
   const fakeBrowser = createPinnedBrowserApi<BoundPage>({
     listPages: async () =>
       [...pages.values()].map((page) => ({ id: page.id, url: page.url })),
     getPage: async (id: string) => {
+      gets += 1;
       const page = pages.get(id);
       if (page !== undefined) return page;
       created += 1;
@@ -258,6 +262,10 @@ async function boundPage(input: {
     ...(input.activeTabMarker === undefined
       ? {}
       : { activeTabMarker: input.activeTabMarker }),
+    ...(input.threadPageName === undefined
+      ? {}
+      : { threadPageName: input.threadPageName }),
+    ...(input.tabId === undefined ? {} : { tabId: input.tabId }),
   });
   const run = new Function(
     "browser",
@@ -268,7 +276,7 @@ async function boundPage(input: {
     console: { log: (value: unknown) => void },
   ) => Promise<void>;
   await run(fakeBrowser, { log: (value) => logs.push(String(value)) });
-  return { logs, pages, created };
+  return { logs, pages, created, gets };
 }
 
 describe("shared profile thread page binding", () => {
@@ -429,6 +437,38 @@ describe("agent page binding", () => {
       '{"__bbActiveTabMarker":"marker-2","id":"front"}',
       "front",
     ]);
+  });
+
+  it("reports a visible thread page without scanning every tab again", async () => {
+    const bound = await boundPage({
+      pages: [
+        { id: "agent-a", url: "https://app.example.test/", visible: true },
+        { id: "other", url: "https://other.example.test/" },
+      ],
+      threadPageName: "agent-a",
+      activeTabMarker: "marker-3",
+    });
+    expect(bound.logs).toEqual([
+      '{"__bbActiveTabMarker":"marker-3","id":"agent-a"}',
+      "agent-a",
+    ]);
+    // One getPage binds the thread page. The boundary then reads each listed
+    // page once. The report must not read them again.
+    expect(bound.gets).toBe(3);
+  });
+
+  it("still reports another visible tab when the thread page is hidden", async () => {
+    const bound = await boundPage({
+      pages: [
+        { id: "agent-a", url: "https://app.example.test/" },
+        { id: "front", url: "https://other.example.test/", visible: true },
+      ],
+      threadPageName: "agent-a",
+      activeTabMarker: "marker-4",
+    });
+    expect(bound.logs[0]).toBe(
+      '{"__bbActiveTabMarker":"marker-4","id":"front"}',
+    );
   });
 });
 
@@ -661,5 +701,76 @@ throw new Error("later script failure");`,
     expect(prepared.indexOf("try {")).toBeLessThan(
       prepared.indexOf("page.screenshot"),
     );
+  });
+});
+
+describe("shared browser context close", () => {
+  it("does not throw when the browser has no browser type", async () => {
+    class SharedBrowser {
+      readonly _contexts = new Set<SharedContext>();
+      readonly _browserType: { _contexts: Set<SharedContext> } | undefined =
+        undefined;
+
+      contexts() {
+        return [...this._contexts];
+      }
+    }
+
+    class SharedContext {
+      _closingStatus = "none";
+      _browser: SharedBrowser | null;
+
+      constructor(browser: SharedBrowser) {
+        this._browser = browser;
+      }
+
+      setDefaultNavigationTimeout() {}
+
+      setDefaultTimeout() {}
+
+      _onClose() {
+        this._closingStatus = "closed";
+        this._browser?._contexts.delete(this);
+        if (this._browser == null) return;
+        (
+          this._browser._browserType as { _contexts: Set<SharedContext> }
+        )._contexts.delete(this);
+      }
+    }
+
+    const sharedBrowser = new SharedBrowser();
+    const bound = new SharedContext(sharedBrowser);
+    sharedBrowser._contexts.add(bound);
+    const probe = new SharedContext(sharedBrowser);
+    expect(() => probe._onClose()).toThrow(/_contexts/u);
+    const sibling = new SharedContext(sharedBrowser);
+    const page = {
+      extra: sibling,
+      context: () => bound,
+      evaluate: async () => "visible",
+      bringToFront: async () => undefined,
+      url: () => "https://example.com/",
+    };
+    const fakeBrowser = createPinnedBrowserApi<typeof page>({
+      listPages: async () => [{ id: "tab-1", url: "https://example.com/" }],
+      getPage: async () => page,
+      newPage: async () => page,
+      closePage: async () => undefined,
+    });
+    const logs: string[] = [];
+    const prepared = prepareAgentExecution({
+      code: "page.extra._onClose(); return page.extra._closingStatus;",
+    });
+    const run = new Function(
+      "browser",
+      "console",
+      `return (async () => {\n${prepared}\n})();`,
+    ) as (
+      browser: typeof fakeBrowser,
+      console: { log: (value: unknown) => void },
+    ) => Promise<void>;
+    await run(fakeBrowser, { log: (value) => logs.push(String(value)) });
+    expect(logs).toEqual(["closed"]);
+    expect(sibling._browser).toBeNull();
   });
 });

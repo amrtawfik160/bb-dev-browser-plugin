@@ -45,8 +45,30 @@ import {
 export type ScreencastFrame = {
   sequence: number;
   mimeType: "image/png" | "image/jpeg" | "image/webp";
+  /** Decoded pixels. Empty when `wireData` already holds the browser bytes. */
   data: Uint8Array;
+  /**
+   * Base64 image from the browser. The panel sends this string unchanged so a
+   * live view does not decode and encode the same JPEG on every frame.
+   */
+  wireData?: string;
 };
+
+export function panelFramePayload(frame: ScreencastFrame): {
+  bytes: number;
+  data: string;
+} {
+  if (frame.wireData !== undefined) {
+    return {
+      bytes: Buffer.byteLength(frame.wireData, "base64"),
+      data: frame.wireData,
+    };
+  }
+  return {
+    bytes: frame.data.byteLength,
+    data: Buffer.from(frame.data).toString("base64"),
+  };
+}
 
 export type ScreencastInputPayload = unknown;
 
@@ -485,10 +507,11 @@ export function createPanelTransportServer(
     const now = clock.now();
     // Validate the frame metadata through the gateway so the bandwidth cap and
     // stale-frame policy apply before pixels are delivered.
+    const payload = panelFramePayload(frame);
     const envelope = JSON.stringify({
       type: "frame",
       sequence: frame.sequence,
-      bytes: frame.data.byteLength,
+      bytes: payload.bytes,
       deadlineAt: now + frameDeadlineMs,
     });
     const result = gateway.validate(envelope);
@@ -499,7 +522,7 @@ export function createPanelTransportServer(
       type: "frame",
       sequence: frame.sequence,
       mimeType: frame.mimeType,
-      data: Buffer.from(frame.data).toString("base64"),
+      data: payload.data,
     });
   }
 
