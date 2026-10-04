@@ -43,13 +43,16 @@ it("delivers page input, viewport changes, and frames from real Chromium", async
   const encodedFrames: string[] = [];
   const streaming = source.start((frame) => {
     frames += 1;
-    latestFrameUrl = `data:${frame.mimeType};base64,${Buffer.from(frame.data).toString("base64")}`;
+    const encoded =
+      frame.wireData ?? Buffer.from(frame.data).toString("base64");
+    latestFrameUrl = `data:${frame.mimeType};base64,${encoded}`;
     encodedFrames.push(
       encodePanelProtocolMessage({
-        ...frame,
-        data: Buffer.from(frame.data).toString("base64"),
         protocolVersion: PANEL_PROTOCOL_VERSION,
         type: "frame",
+        sequence: frame.sequence,
+        mimeType: frame.mimeType,
+        data: encoded,
       }).outcome,
     );
   }, abort.signal);

@@ -36,6 +36,37 @@ export function preferredTabOrigin(originScope?: string): string | undefined {
 const NAVIGATION_TIMEOUT_HEADROOM_MS = 5_000;
 
 /**
+ * The script runner's shared browser never gets a browser type. Context close
+ * still reads `_browserType._contexts` and fails the script from inside the
+ * transport receiver. Drop that link before the original close runs.
+ */
+const SANDBOX_CONTEXT_CLOSE_GUARD = `function __bbGuardSandboxContextClose(context) {
+  if (context == null || (typeof context !== "object" && typeof context !== "function")) return;
+  const prototype = Object.getPrototypeOf(context);
+  if (prototype == null || prototype.__bbContextCloseGuarded === true) return;
+  const original = prototype._onClose;
+  if (typeof original !== "function") return;
+  Object.defineProperty(prototype, "_onClose", {
+    configurable: true,
+    enumerable: false,
+    writable: true,
+    value: function () {
+      if (this != null && this._browser != null && this._browser._browserType == null) {
+        this._browser = null;
+      }
+      return original.call(this);
+    },
+  });
+  Object.defineProperty(prototype, "__bbContextCloseGuarded", {
+    configurable: true,
+    enumerable: false,
+    writable: false,
+    value: true,
+  });
+}
+`;
+
+/**
  * Remove every context-creating Playwright capability reachable through the
  * sandbox's page API. The pinned client exposes Browser, BrowserType, private
  * aliases, and its connection as enumerable objects; `browser.newPage()`
@@ -162,6 +193,7 @@ const __bbAgentBrowserBoundary = (() => {
     if (context === null || typeof context !== "object") return;
     if (__bbHardenedContexts.has(context)) return;
     __bbHardenedContexts.add(context);
+    __bbGuardSandboxContextClose(context);
     __bbPatchPrototype(context, "browser", __bbNullBrowser);
     __bbDefineImmutable(context, "browser", __bbNullBrowser);
     __bbDefineImmutable(context, "_browser", null);
@@ -337,23 +369,25 @@ export function agentPagePreamble(
   threadPageName?: string,
 ): string {
   if (tabId !== undefined) {
-    return `const __bbTargetPages = await browser.listPages();
+    return `${SANDBOX_CONTEXT_CLOSE_GUARD}const __bbTargetPages = await browser.listPages();
 if (!__bbTargetPages.some((entry) => entry.id === ${JSON.stringify(tabId)})) throw new Error(${JSON.stringify(
       TAB_INVALID_MESSAGE,
     )});
 const page = await browser.getPage(${JSON.stringify(tabId)});
+__bbGuardSandboxContextClose(page.context());
 await page.bringToFront();
 ${cutAgentBrowserRoots("__bbTargetPages", enforceNonWebNavigation, operationTimeoutMs)}`;
   }
   if (threadPageName !== undefined) {
-    return `const __bbThreadPages = await browser.listPages();
+    return `${SANDBOX_CONTEXT_CLOSE_GUARD}const __bbThreadPages = await browser.listPages();
 const page = await browser.getPage(${JSON.stringify(threadPageName)});
+__bbGuardSandboxContextClose(page.context());
 await page.bringToFront();
 ${cutAgentBrowserRoots("__bbThreadPages", enforceNonWebNavigation, operationTimeoutMs)}
 ${preferredOrigin === undefined ? "" : `if (page.url() === "about:blank" || page.url() === "chrome://newtab/") await page.goto(${JSON.stringify(preferredOrigin)});`}
 `;
   }
-  return `const __bbPages = await browser.listPages();
+  return `${SANDBOX_CONTEXT_CLOSE_GUARD}const __bbPages = await browser.listPages();
 let page;
 const __bbPreferred = ${JSON.stringify(preferredOrigin ?? null)};
 const __bbEntryOrigin = (entry) => {
@@ -375,6 +409,7 @@ let __bbVisibleEntry;
 let __bbVisiblePage;
 for (const __bbEntry of __bbPages) {
   const __bbCandidate = await browser.getPage(__bbEntry.id);
+  __bbGuardSandboxContextClose(__bbCandidate.context());
   if (await __bbIsVisible(__bbCandidate)) {
     __bbVisibleEntry = __bbEntry;
     __bbVisiblePage = __bbCandidate;
@@ -388,14 +423,21 @@ if (__bbPreferred !== null) {
     for (const __bbEntry of __bbPages) {
       if (__bbEntryOrigin(__bbEntry) === __bbPreferred) {
         page = await browser.getPage(__bbEntry.id);
+        if (page != null) __bbGuardSandboxContextClose(page.context());
         break;
       }
     }
   }
 }
 if (page === undefined) page = __bbVisiblePage;
-if (page === undefined && __bbPages.length > 0) page = await browser.getPage(__bbPages[0].id);
-if (page === undefined) page = await browser.getPage(${JSON.stringify(newTabId())});
+if (page === undefined && __bbPages.length > 0) {
+  page = await browser.getPage(__bbPages[0].id);
+  if (page != null) __bbGuardSandboxContextClose(page.context());
+}
+if (page === undefined) {
+  page = await browser.getPage(${JSON.stringify(newTabId())});
+  if (page != null) __bbGuardSandboxContextClose(page.context());
+}
 if (page === undefined) throw new Error(${JSON.stringify(ACTIVE_TAB_UNAVAILABLE_MESSAGE)});
 await page.bringToFront();
 ${cutAgentBrowserRoots("__bbPages", enforceNonWebNavigation, operationTimeoutMs)}`;
@@ -406,19 +448,35 @@ ${cutAgentBrowserRoots("__bbPages", enforceNonWebNavigation, operationTimeoutMs)
  * can keep the shared strip's active tab in step with the browser. A script
  * that closed its last tab, or left every page hidden, has still succeeded:
  * the report is skipped rather than turning a good result into a failure.
+ *
+ * When the script was bound to a known page, check that page first. Scanning
+ * every tab is the fallback for a page that is hidden or gone.
  */
-function activeTabReport(activeTabMarker: string) {
-  return `const __bbActivePages = await browser.listPages();
-let __bbActiveTabId;
-for (const __bbActiveEntry of __bbActivePages) {
-  try {
-    const __bbActiveCandidate = await browser.getPage(__bbActiveEntry.id);
-    if (await __bbActiveCandidate.evaluate(() => document.visibilityState === "visible")) {
-      __bbActiveTabId = __bbActiveEntry.id;
-      break;
+function activeTabReport(activeTabMarker: string, preferredPageId?: string) {
+  const preferredCheck =
+    preferredPageId === undefined
+      ? ""
+      : `try {
+  if (await page.evaluate(() => document.visibilityState === "visible")) {
+    __bbActiveTabId = ${JSON.stringify(preferredPageId)};
+  }
+} catch {
+  // The bound page can close during the script. The scan below still finds a visible tab.
+}
+`;
+  return `let __bbActiveTabId;
+${preferredCheck}if (__bbActiveTabId === undefined) {
+  const __bbActivePages = await browser.listPages();
+  for (const __bbActiveEntry of __bbActivePages) {
+    try {
+      const __bbActiveCandidate = await browser.getPage(__bbActiveEntry.id);
+      if (await __bbActiveCandidate.evaluate(() => document.visibilityState === "visible")) {
+        __bbActiveTabId = __bbActiveEntry.id;
+        break;
+      }
+    } catch {
+      continue;
     }
-  } catch {
-    continue;
   }
 }
 if (__bbActiveTabId !== undefined) {
@@ -429,9 +487,12 @@ if (__bbActiveTabId !== undefined) {
 export function wrapAgentScriptResult(
   code: string,
   activeTabMarker?: string,
+  preferredPageId?: string,
 ): string {
   const activeReport =
-    activeTabMarker === undefined ? "" : activeTabReport(activeTabMarker);
+    activeTabMarker === undefined
+      ? ""
+      : activeTabReport(activeTabMarker, preferredPageId);
   return `let __bbResult;
 let __bbScriptError;
 let __bbScriptFailed = false;
@@ -478,7 +539,11 @@ export function prepareAgentExecution(input: {
     operationTimeoutMs,
     input.threadPageName,
   );
-  const wrappedUser = wrapAgentScriptResult(input.code, input.activeTabMarker);
+  const wrappedUser = wrapAgentScriptResult(
+    input.code,
+    input.activeTabMarker,
+    input.tabId ?? input.threadPageName,
+  );
   if (input.screenshot === undefined) {
     return `${pagePreamble}${wrappedUser}`;
   }

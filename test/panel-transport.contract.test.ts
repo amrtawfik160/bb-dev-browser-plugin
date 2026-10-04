@@ -27,6 +27,7 @@ import {
 } from "../src/panel/panel-stream.js";
 import {
   createPanelTransportServer,
+  panelFramePayload,
   type ScreencastFrame,
   type ScreencastSource,
 } from "../src/panel/panel-transport.js";
@@ -160,6 +161,31 @@ function collectMessages(socket: WebSocket) {
       waitFor(() => messages.find(predicate), { timeoutMs }),
   };
 }
+
+describe("panel frame payload", () => {
+  it("sends the browser base64 without encoding the pixels again", () => {
+    const wire = Buffer.from("jpeg-bytes").toString("base64");
+    const payload = panelFramePayload({
+      sequence: 1,
+      mimeType: "image/jpeg",
+      data: new Uint8Array(),
+      wireData: wire,
+    });
+    expect(payload.data).toBe(wire);
+    expect(payload.bytes).toBe(Buffer.from("jpeg-bytes").length);
+  });
+
+  it("encodes pixel bytes when the browser did not supply base64", () => {
+    const data = Buffer.from("frame-1");
+    const payload = panelFramePayload({
+      sequence: 1,
+      mimeType: "image/jpeg",
+      data,
+    });
+    expect(payload.data).toBe(data.toString("base64"));
+    expect(payload.bytes).toBe(data.byteLength);
+  });
+});
 
 describe("Panel transport server contract", () => {
   it("binds a real loopback gateway port and redeems the capability in the first message", async () => {

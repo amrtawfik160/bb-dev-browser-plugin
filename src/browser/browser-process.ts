@@ -10,6 +10,7 @@ import {
   open,
   readFile,
   readdir,
+  stat,
   symlink,
   unlink,
 } from "node:fs/promises";
@@ -41,6 +42,10 @@ import {
   BROWSER_STORAGE_ROOT,
 } from "../shared/contracts.js";
 import { DEV_BROWSER_PACKAGE_VERSION } from "./dev-browser-runtime.js";
+import {
+  patchSandboxClientBinary,
+  patchSandboxClientFile,
+} from "./sandbox-client-patch.js";
 
 const DEVTOOLS_PORT_FILE = "DevToolsActivePort";
 const MAX_BROWSER_RESULT_BYTES = BROWSER_SCRIPT_RESULT_LIMIT_BYTES;
@@ -121,8 +126,30 @@ async function stagedDevBrowserExecutable(
     );
     await chmod(stagedExecutable, 0o755);
   }
-  await chownTree(stagedDirectory, identity.userId, identity.groupId);
+  await patchStagedDevBrowser(stagedDirectory);
+  await chownTreeOnce(stagedDirectory, identity.userId, identity.groupId);
   return stagedExecutable;
+}
+
+async function patchStagedDevBrowser(stagedDirectory: string) {
+  await patchSandboxClientFile(
+    join(stagedDirectory, "daemon", "dist", "sandbox-client.js"),
+  );
+  let names: string[];
+  try {
+    names = await readdir(join(stagedDirectory, "bin"));
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      return;
+    }
+    throw error;
+  }
+  for (const name of names) {
+    if (!name.startsWith("dev-browser-")) continue;
+    const binaryPath = join(stagedDirectory, "bin", name);
+    const changed = await patchSandboxClientBinary(binaryPath);
+    if (changed) await chmod(binaryPath, 0o755);
+  }
 }
 
 async function stageDevBrowserNodeModules(
@@ -139,6 +166,37 @@ async function stageDevBrowserNodeModules(
   }
   await cp(join(sourceRoot, "@jitl"), join(targetRoot, "@jitl"), {
     recursive: true,
+  });
+}
+
+type OwnedTree = {
+  dev: number;
+  ino: number;
+  userId: number;
+  groupId: number;
+};
+
+const ownedTrees = new Map<string, OwnedTree>();
+
+async function chownTreeOnce(path: string, userId: number, groupId: number) {
+  const current = await stat(path);
+  const previous = ownedTrees.get(path);
+  if (
+    previous !== undefined &&
+    previous.dev === current.dev &&
+    previous.ino === current.ino &&
+    previous.userId === userId &&
+    previous.groupId === groupId
+  ) {
+    return;
+  }
+  await chownTree(path, userId, groupId);
+  const after = await stat(path);
+  ownedTrees.set(path, {
+    dev: after.dev,
+    ino: after.ino,
+    userId,
+    groupId,
   });
 }
 
@@ -1392,7 +1450,88 @@ async function prepareHelperRuntime(
       identity,
     );
   }
+  const clientPath = join(helperHome, ".dev-browser", "sandbox-client.js");
+  let clientPatched = false;
+  try {
+    clientPatched = await patchSandboxClientFile(clientPath);
+  } catch (error) {
+    if (!(
+      error instanceof Error &&
+      "code" in error &&
+      error.code === "ENOENT"
+    )) {
+      throw error;
+    }
+  }
+  if (clientPatched) await recycleHelperDaemon(helperHome);
   return { executable, helperHome, identity };
+}
+
+/**
+ * Stop a script runner that already loaded the unpatched client.
+ *
+ * `dev-browser stop` closes the connected browser. A direct signal leaves the
+ * Browser Instance running and lets the next launch read the patched client.
+ */
+async function recycleHelperDaemon(helperHome: string) {
+  const daemonDirectory = join(helperHome, ".dev-browser");
+  const pidPath = join(daemonDirectory, "daemon.pid");
+  let pidText: string;
+  try {
+    pidText = await readFile(pidPath, "utf8");
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      return;
+    }
+    throw error;
+  }
+  const pid = Number(pidText.trim());
+  if (!Number.isSafeInteger(pid) || pid <= 1) return;
+  const expectedCommand = join(daemonDirectory, "daemon.mjs");
+  const command = await readFile(`/proc/${pid}/cmdline`, "utf8").catch(
+    (error: unknown) => {
+      if (
+        error instanceof Error &&
+        "code" in error &&
+        error.code === "ENOENT"
+      ) {
+        return undefined;
+      }
+      throw error;
+    },
+  );
+  if (command === undefined) return;
+  if (!command.replaceAll("\0", "").includes(expectedCommand)) return;
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ESRCH") {
+      return;
+    }
+    throw error;
+  }
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    try {
+      process.kill(pid, 0);
+    } catch {
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  for (const path of [join(daemonDirectory, "daemon.sock"), pidPath]) {
+    try {
+      await unlink(path);
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        "code" in error &&
+        error.code === "ENOENT"
+      ) {
+        continue;
+      }
+      throw error;
+    }
+  }
 }
 
 function spawnDevBrowserHelper(

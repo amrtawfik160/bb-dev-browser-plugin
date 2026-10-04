@@ -23,7 +23,7 @@ import {
  * A CDP-backed screencast source. It connects to the Workspace Browser's
  * loopback CDP endpoint, attaches to the active page target, drives
  * `Page.startScreencast` within the Automation Mode viewport and FPS bounds,
- * decodes `Page.screencastFrame` events into frames, and dispatches forwarded
+ * forwards `Page.screencastFrame` bytes without decoding them, and dispatches
  * input payloads as CDP `Input.*` commands. It only ever reaches the loopback
  * CDP endpoint the browser runtime owns; it never binds externally.
  */
@@ -71,6 +71,8 @@ type CdpEvent = { method: string; params?: unknown; sessionId?: string };
 
 const SCREENCAST_FORMAT = "jpeg" as const;
 const SCREENCAST_QUALITY = 95;
+/** Shared empty payload. The JPEG stays in `wireData` as base64. */
+const UNDECODED_FRAME_BYTES = new Uint8Array();
 // Frame acknowledgements provide pacing; capture every available update.
 const SCREENCAST_EVERY_NTH_FRAME = 1;
 
@@ -293,7 +295,8 @@ export function createCdpScreencastSource(
     const frame: ScreencastFrame = {
       sequence: ++frameSequence,
       mimeType: "image/jpeg",
-      data: Buffer.from(params.data, "base64"),
+      data: UNDECODED_FRAME_BYTES,
+      wireData: params.data,
     };
     onFrame(frame);
     // Acknowledge the actual frame ID after pacing; a synthetic ID stalls CDP.
