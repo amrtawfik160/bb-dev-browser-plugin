@@ -18,9 +18,9 @@ Agents run chrome-devtools-axi itself.
   running, so axi's bridge keeps one address across sleep and restarts.
   Commands keep the instance awake; idle sessions let it sleep.
 - **axi, unchanged.** `bb plugin run browser axi <command…>` (and the
-  `browser_axi` tool) run the plugin's pinned `chrome-devtools-axi` with
+  `browser_axi` tool) run the plugin's bundled `chrome-devtools-axi` with
   `CHROME_DEVTOOLS_AXI_BROWSER_URL` set to the session's proxy,
-  `CHROME_DEVTOOLS_AXI_SESSION` set to a per-thread name, and the pinned
+  `CHROME_DEVTOOLS_AXI_SESSION` set to a per-thread name, and the bundled
   `chrome-devtools-mcp`, in the caller's working directory. Output is axi's
   own; its `chrome-devtools-axi …` hints are rewritten to the BB launcher so
   they stay runnable. Only `update` and `setup`, which would change the pinned
@@ -33,6 +33,12 @@ Agents run chrome-devtools-axi itself.
   `devtools:`, `view-source:`) plus uploads, drags, or download folders inside
   the browser's own profile storage. Profile grants, setup, host readiness,
   and Safe Login are checked before every axi command.
+
+- **Bundled, not installed.** Both ship inside the plugin under
+  `vendor/node_modules/`: axi and its libraries bundled into its CLI and
+  bridge files, chrome-devtools-mcp as published (it has no runtime
+  dependencies). `scripts/vendor-axi.mjs` rebuilds them for a version bump.
+  Nothing is installed on the host and no global axi is used.
 
 ## Consequences
 

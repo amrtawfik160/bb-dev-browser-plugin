@@ -32,8 +32,6 @@
     "release-gate": "bash scripts/release-gate.sh"
   },
   "dependencies": {
-    "chrome-devtools-axi": "0.1.39",
-    "chrome-devtools-mcp": "1.10.1",
     "dev-browser": "0.2.9",
     "playwright": "1.58.2",
     "ws": "8.21.3",

@@ -158,7 +158,7 @@ site fights automation.
 ### Agent
 
 Agents drive their own tabs with [chrome-devtools-axi](https://github.com/kunchenguid/chrome-devtools-axi),
-unchanged (ADR 0022):
+unchanged and bundled inside the plugin (ADR 0022):
 
 ```bash
 bb plugin run browser axi open https://example.com

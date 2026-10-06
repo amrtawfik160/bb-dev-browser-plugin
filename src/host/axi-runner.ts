@@ -1,9 +1,8 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
-import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 
 /**
  * Agents drive the Workspace Browser with chrome-devtools-axi itself, so every
@@ -32,16 +31,33 @@ const REFUSED_COMMANDS = new Set(["update", "setup"]);
 
 export type AxiRuntimePaths = { axiBin: string; mcpBin: string };
 
-function resolveManifest(packageName: string, origins: readonly string[]) {
-  for (const origin of origins) {
-    try {
-      return createRequire(origin).resolve(`${packageName}/package.json`);
-    } catch {
-      continue;
+/**
+ * The vendored package, found under `vendor/node_modules/` beside the plugin source: next
+ * to this file in development, beside `dist/` once built, or in the plugin
+ * source and host data roots the host also searches for its helper.
+ */
+function vendoredManifest(
+  packageName: string,
+  startDirectories: readonly string[],
+) {
+  for (const start of startDirectories) {
+    let directory = start;
+    for (let depth = 0; depth < 5; depth += 1) {
+      const candidate = join(
+        directory,
+        "vendor",
+        "node_modules",
+        packageName,
+        "package.json",
+      );
+      if (existsSync(candidate)) return candidate;
+      const parent = dirname(directory);
+      if (parent === directory) break;
+      directory = parent;
     }
   }
   throw new Error(
-    `${packageName} is not installed beside the Browser plugin. Run npm install in the plugin source.`,
+    `The Browser plugin's bundled ${packageName} is missing; reinstall the plugin.`,
   );
 }
 
@@ -49,47 +65,42 @@ function packageBin(
   packageName: string,
   version: string,
   bin: string,
-  origins: readonly string[],
+  startDirectories: readonly string[],
 ): string {
-  const manifestPath = resolveManifest(packageName, origins);
+  const manifestPath = vendoredManifest(packageName, startDirectories);
   const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
     version?: unknown;
     bin?: Record<string, string> | string;
   };
   if (manifest.version !== version) {
     throw new Error(
-      `${packageName} ${String(manifest.version)} is installed; the Browser plugin needs ${version}.`,
+      `The bundled ${packageName} is ${String(manifest.version)}; the Browser plugin needs ${version}.`,
     );
   }
   const relative =
     typeof manifest.bin === "string" ? manifest.bin : manifest.bin?.[bin];
-  if (relative === undefined)
+  if (relative === undefined) {
     throw new Error(`${packageName} has no ${bin} executable.`);
+  }
   return join(dirname(manifestPath), relative);
 }
 
 /**
- * The plugin's pinned axi and chrome-devtools-mcp executables. Built host
- * artifacts have no node_modules beside them, so the plugin source and host
- * data roots are searched as well, as for the dev-browser helper.
+ * The plugin's bundled axi and chrome-devtools-mcp executables
+ * (`vendor/`, rebuilt by `scripts/vendor-axi.mjs`).
  */
 export function resolveAxiRuntime(
   searchRoots: readonly string[] = [],
   fromFileUrl: string = import.meta.url,
 ): AxiRuntimePaths {
-  const origins = [
-    fromFileUrl,
-    ...searchRoots.map(
-      (root) => pathToFileURL(join(root, "package.json")).href,
-    ),
-  ];
+  const starts = [dirname(fileURLToPath(fromFileUrl)), ...searchRoots];
   return {
-    axiBin: packageBin(AXI_PACKAGE, AXI_PACKAGE_VERSION, AXI_PACKAGE, origins),
+    axiBin: packageBin(AXI_PACKAGE, AXI_PACKAGE_VERSION, AXI_PACKAGE, starts),
     mcpBin: packageBin(
       DEVTOOLS_MCP_PACKAGE,
       DEVTOOLS_MCP_PACKAGE_VERSION,
       DEVTOOLS_MCP_PACKAGE,
-      origins,
+      starts,
     ),
   };
 }
