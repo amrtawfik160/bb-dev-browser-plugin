@@ -2,10 +2,25 @@ import { readFile } from "node:fs/promises";
 import { experimental_scanPublicSdkOnly } from "@get-bb/plugin-sdk/testing";
 import { describe, expect, it } from "vitest";
 
+/**
+ * BB drops a skill whose header does not parse. An unquoted YAML value may not
+ * contain ": " or " #", so check that rule on every header line.
+ */
+function unparsableSkillHeaderLines(skill: string) {
+  const header = /^---\n([\s\S]*?)\n---/u.exec(skill)?.[1];
+  if (header === undefined) return ["missing --- header"];
+  return header.split("\n").filter((line) => {
+    const value = /^[A-Za-z_][\w-]*:\s(.*)$/u.exec(line)?.[1];
+    if (value === undefined || /^["'|>]/u.test(value)) return false;
+    return value.includes(": ") || value.includes(" #");
+  });
+}
+
 describe("Browser package contract", () => {
   it("declares the accepted identity, pins, entry points, and skill", async () => {
     const packageJson = JSON.parse(await readFile("package.json", "utf8"));
     const skill = await readFile("skills/browser/SKILL.md", "utf8");
+    expect(unparsableSkillHeaderLines(skill)).toEqual([]);
 
     expect(packageJson).toMatchObject({
       name: "bb-plugin-browser",

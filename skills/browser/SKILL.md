@@ -1,6 +1,6 @@
 ---
 name: browser
-description: Control a real Chrome on this host with chrome-devtools-axi - navigate, snapshot, click, fill forms, run JavaScript, inspect console and network, take screenshots, audit performance - through `bb plugin run browser axi <command>` (or the browser_axi tool). Use whenever a task needs a real browser: opening or testing a web page, clicking through a flow, extracting page content, or debugging a website.
+description: "Control a real Chrome on this host with chrome-devtools-axi - navigate, snapshot, click, fill forms, run JavaScript, inspect console and network, take screenshots, audit performance - through `bb plugin run browser axi <command>` (or the browser_axi tool). Use whenever a task needs a real browser: opening or testing a web page, clicking through a flow, extracting page content, or debugging a website."
 ---
 
 # Browser
