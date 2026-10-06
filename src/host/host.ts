@@ -1133,9 +1133,8 @@ export function createBrowserHostEntry(
     const lease = await measureBrowserStage(trace, "lease-wait", () =>
       controlLeases.acquireOwner(controlLeaseKey(target), signal),
     );
-    // An owner navigation ends the agent's Control Lease: dismiss any open
-    // agent dialog so it cannot strand behind an invisible modal block.
-    dismissOpenDialogsForProfile(target);
+    // Owner actions run in the owner's lane. Agents keep their tabs and any
+    // dialog they opened; only profile stop dismisses dialogs for everyone.
     try {
       const response = await measureBrowserStage(trace, "browser-execute", () =>
         browserRuntime.navigate(
@@ -1180,9 +1179,8 @@ export function createBrowserHostEntry(
     const lease = await measureBrowserStage(trace, "lease-wait", () =>
       controlLeases.acquireOwner(controlLeaseKey(target), signal),
     );
-    // An owner history action ends the agent's Control Lease: dismiss any open
-    // agent dialog so it cannot strand behind an invisible modal block.
-    dismissOpenDialogsForProfile(target);
+    // Owner actions run in the owner's lane. Agents keep their tabs and any
+    // dialog they opened; only profile stop dismisses dialogs for everyone.
     try {
       const response = await measureBrowserStage(trace, "browser-execute", () =>
         browserRuntime.history(
@@ -1269,10 +1267,8 @@ export function createBrowserHostEntry(
     const lease = await measureBrowserStage(trace, "lease-wait", () =>
       controlLeases.acquireOwner(controlLeaseKey(target), signal),
     );
-    // A tab command is owner interaction: it ends an agent's Control Lease, so
-    // dismiss any open agent dialog rather than stranding it behind the tab
-    // the owner just moved to.
-    dismissOpenDialogsForProfile(target);
+    // Owner actions run in the owner's lane. Agents keep their tabs and any
+    // dialog they opened; only profile stop dismisses dialogs for everyone.
     try {
       const operationOptions = { signal, leaseSignal: lease.signal, trace };
       if (request.action === "open") {
@@ -1821,11 +1817,21 @@ export function createBrowserHostEntry(
           const browserRuntime = runtime(dataDir);
           if (browserRuntime !== undefined) {
             try {
+              // Each agent session works in its own lane: one thread's tab,
+              // or the one tab it named. Other agents and the owner keep going.
+              const agentLane =
+                request.tabId === undefined
+                  ? `thread:${scopedProfileId({
+                      projectId: request.projectId,
+                      threadId: request.threadId,
+                    })}`
+                  : `tab:${request.tabId}`;
               lease = await trace.measure("lease-wait", () =>
                 controlLeases.acquireAgent(
                   leaseKey,
                   request.purpose,
                   context.signal,
+                  agentLane,
                 ),
               );
             } catch (error) {

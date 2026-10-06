@@ -549,7 +549,7 @@ describe("Browser host runtime boundary", () => {
         hostId: string;
         profileId: string;
       }) => ({
-        state: "sleeping" as const,
+        state: "running" as const,
         hostId,
         profileId,
       }),
@@ -589,12 +589,11 @@ describe("Browser host runtime boundary", () => {
         timeoutMs: 5_000,
       });
       await started;
-      await host.experimental_call("navigate", {
+      // Owner browsing no longer revokes agents; putting the profile to sleep
+      // still stops every agent session on it.
+      await host.experimental_call("sleepProfile", {
         hostId: HOST_ID,
         profileId: DEFAULT_PROFILE_ID,
-        projectId: "project-lease-race",
-        input: "https://example.com/owner-takes-control",
-        rawLocalhost: false,
       });
       const response = await operation;
       expect(response).toEqual({
@@ -743,7 +742,7 @@ it("issue #16 feeds the shared tab strip from real browser page events and norma
   }
 });
 
-it("issue #16 interrupts an active agent Control Lease when the owner takes control", async () => {
+it("lets the owner take control while an agent script keeps running in its tab", async () => {
   const rootDirectory = await mkdtemp(join(tmpdir(), "host-agent-contention-"));
   const profiles = createFileBrowserProfileStore({
     rootDirectory,
@@ -754,6 +753,11 @@ it("issue #16 interrupts an active agent Control Lease when the owner takes cont
   const started = new Promise<void>((resolve) => {
     executionStarted = resolve;
   });
+  let finishScript!: () => void;
+  const scriptMayFinish = new Promise<void>((resolve) => {
+    finishScript = resolve;
+  });
+  let agentLeaseSignal: AbortSignal | undefined;
   const runtime = {
     start: async () => {
       throw new Error("not used");
@@ -765,17 +769,10 @@ it("issue #16 interrupts an active agent Control Lease when the owner takes cont
       _timeoutMs: number,
       options: { leaseSignal?: AbortSignal } | undefined,
     ) => {
-      await new Promise<void>((resolve) => {
-        if (options?.leaseSignal?.aborted) {
-          resolve();
-          return;
-        }
-        executionStarted();
-        options?.leaseSignal?.addEventListener("abort", () => resolve(), {
-          once: true,
-        });
-      });
-      return "agent work interrupted by owner takeover";
+      agentLeaseSignal = options?.leaseSignal;
+      executionStarted();
+      await scriptMayFinish;
+      return "agent work finished alongside the owner";
     },
     navigate: async (target: { tabId?: string }, input: string) => ({
       address: { kind: "address" as const, url: input },
@@ -854,18 +851,20 @@ it("issue #16 interrupts an active agent Control Lease when the owner takes cont
       timeoutMs: 5_000,
     });
     await started;
-    // The owner explicitly takes control; the agent lease is interrupted while
-    // the script is in flight so automation never races a human controller.
+    // The owner takes control of the view while the agent works in its tab;
+    // the agent is not interrupted.
     await host.experimental_call("takeControl", {
       hostId: HOST_ID,
       profileId: DEFAULT_PROFILE_ID,
       panelId: "panel-owner",
       ownerSessionId: "owner-session-contention",
     });
+    expect(agentLeaseSignal?.aborted).toBe(false);
+    finishScript();
     const response = await operation;
     expect(response).toEqual({
       ok: true,
-      result: "agent work interrupted by owner takeover",
+      result: "agent work finished alongside the owner",
     });
     const outboxState = JSON.parse(
       await readFile(
@@ -878,8 +877,7 @@ it("issue #16 interrupts an active agent Control Lease when the owner takes cont
     );
     expect(scriptEvent).toMatchObject({
       outcome: "succeeded",
-      interrupted: true,
-      interruptionReason: "control-lease-revoked",
+      interrupted: false,
     });
   } finally {
     await host.experimental_dispose();

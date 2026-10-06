@@ -135,7 +135,7 @@ describe("Panel Control State", () => {
     });
   });
 
-  it("interrupts an active agent Control Lease when the owner takes control", async () => {
+  it("lets the owner take control of the view while an agent keeps working in its tab", async () => {
     const { session, controlLeases } = setup();
     session.connectPanel("panel-1", "session-1");
     session.connectPanel("panel-2", "session-2");
@@ -152,11 +152,12 @@ describe("Panel Control State", () => {
     expect(agentLease.signal.aborted).toBe(false);
     expect(session.state().agentPurpose).toBe("Inspect the fixture");
 
-    // Owner interaction takes priority and interrupts the agent lease.
+    // Taking control picks the driving panel; the agent is not interrupted.
     await session.takeControl("panel-2", { width: 1280, height: 720 });
-    expect(agentLease.signal.aborted).toBe(true);
-    expect(session.state().agentPurpose).toBeNull();
+    expect(agentLease.signal.aborted).toBe(false);
+    expect(session.state().agentPurpose).toBe("Inspect the fixture");
     expect(session.state().controllerPanelId).toBe("panel-2");
+    agentLease.release();
     session.dispose();
   });
 
