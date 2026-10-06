@@ -183,6 +183,8 @@ export async function runAxiCommand(
       CHROME_DEVTOOLS_AXI_BROWSER_URL: request.endpoint,
       CHROME_DEVTOOLS_AXI_SESSION: request.session,
       CHROME_DEVTOOLS_AXI_MCP_PATH: paths.mcpBin,
+      // Agent browsing is the owner's business: no usage statistics to Google.
+      CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS: "1",
       NO_COLOR: "1",
     },
     stdio: ["ignore", "pipe", "pipe"],

@@ -63,6 +63,18 @@ export function navigableUrl(address: string): boolean {
   }
 }
 
+/**
+ * The browser's HTTP DevTools origin. Chromium's own endpoint is reported as
+ * `ws://127.0.0.1:<port>/devtools/browser/<id>`; the proxy reads
+ * `/json/*` from the same host and port over HTTP.
+ */
+export function upstreamHttpOrigin(endpoint: string): URL {
+  const url = new URL(endpoint);
+  if (url.protocol === "ws:") url.protocol = "http:";
+  else if (url.protocol === "wss:") url.protocol = "https:";
+  return new URL(url.origin);
+}
+
 function pathDenied(path: string, prefixes: readonly string[]) {
   const normalized = path.replace(/\/+$/u, "");
   return prefixes.some((prefix) => {
@@ -880,7 +892,7 @@ export async function startSessionCdpProxy(
     throw new Error("The session CDP proxy only binds to loopback.");
   }
   const resolveUpstream = async () =>
-    new URL(
+    upstreamHttpOrigin(
       typeof options.upstreamEndpoint === "string"
         ? options.upstreamEndpoint
         : await options.upstreamEndpoint(),
