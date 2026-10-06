@@ -35,8 +35,10 @@ The script runs with Playwright `page` bound to the explicit `tabId`, else to
 this thread's named tab from its first script call on every profile. Saving
 or sharing its profile preserves the binding. A closed or unrestored named
 tab is recreated at `destinationOrigin`. `return` values become the tool result. There is no
-`document` global. Owner tabs outside the grant are parked on `about:blank`
-for the length of the call and restored afterwards.
+`document` global. Your session connects through its own Session CDP Proxy:
+`browser.listPages()` and `browser.getPage()` reach only your tabs and the
+popups they open, never the owner's or another thread's. For browsing, use
+chrome-devtools-axi: `bb plugin run browser axi <command>` (ADR 0022).
 
 The host applies `BrowserContext.setDefaultTimeout` and
 `BrowserContext.setDefaultNavigationTimeout` to the shared context, reserving

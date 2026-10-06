@@ -1,6 +1,6 @@
 ---
 name: browser
-description: Drive a real Chromium on this host — open pages, click, type, read, and screenshot — with Playwright through the browser_script tool or the bb plugin run browser CLI. Use for web automation, testing a running app, checking a deployed page, or any task that needs a real browser.
+description: Control a real Chrome on this host with chrome-devtools-axi - navigate, snapshot, click, fill forms, run JavaScript, inspect console and network, take screenshots, audit performance - through `bb plugin run browser axi <command>` (or the browser_axi tool). Use whenever a task needs a real browser: opening or testing a web page, clicking through a flow, extracting page content, or debugging a website.
 ---
 
 # Browser
@@ -14,7 +14,9 @@ back to its private default. Without a thread, the default belongs to the
 project. Separate profiles have separate cookies. Selecting an existing
 profile shares its logins; each thread gets a named tab from its first script
 call on every profile. Saving or sharing the profile keeps that binding.
-Calls on the same profile still take turns under its Control Lease.
+Your tab works in the background: the owner keeps browsing their own tabs,
+other threads work in theirs, and nobody interrupts anyone. Only your own
+thread's calls take turns.
 
 ## Reuse a sign-in
 
@@ -26,9 +28,9 @@ Before asking the owner to log in, use `browser_sessions`:
    prior activity; it does not prove authentication.
 2. Prefer the selected matching profile. If account choice is ambiguous, ask
    which profile to use. Select with `{action: "select", profileId: "…"}`.
-   Selection affects this thread only; subsequent `browser_script` calls use
+   Selection affects this thread only; subsequent `bb plugin run browser axi` calls use
    it without `profileId`.
-3. Open the requested site with `browser_script` and verify an authenticated
+3. Open the requested site with `bb plugin run browser axi open <url>` and verify an authenticated
    page. Report `{action: "report", origin: "https://…", status: "signed-in"}`
    after verification, or `status: "signed-out"` if authentication expired.
 4. Request a Sign-in Handoff only when no suitable profile is authenticated.
@@ -55,9 +57,38 @@ do not close another agent's tabs or stop its profile. Keep only needed tabs:
 the 12-tab retention cap closes the oldest inactive pages. Sleeping preserves
 site storage and tab locations, but transient form state can be lost.
 
-## Start here
+## Start here: chrome-devtools-axi
 
-Use `browser_script` with the exact HTTP(S) origin you need. Any web origin
+This browser is driven with [chrome-devtools-axi](https://github.com/kunchenguid/chrome-devtools-axi),
+unchanged. Run it through BB so it reaches this thread's own tabs:
+
+```text
+bb plugin run browser axi <command> [flags]
+```
+
+That is exactly `chrome-devtools-axi <command> [flags]`: same commands, flags,
+output, refs, and hints, and relative output paths (screenshots, traces, heap
+snapshots, network bodies) resolve in your working directory. Without a shell,
+call the `browser_axi` tool with `args` (use absolute paths for files).
+
+Do not follow command or flag lists from this file - they go stale. Get the
+current source of truth from the CLI:
+
+- `bb plugin run browser axi --help` for commands, flags, and environment
+- `bb plugin run browser axi <command> --help` for per-command usage
+- Follow axi's own next-step hints after each command; they are already
+  written as `bb plugin run browser axi …`
+
+Your session sees only its own tabs. The owner keeps browsing their tabs and
+other threads keep theirs; nobody interrupts anyone, and the owner can watch
+your tabs in the Browser Panel. Only web pages open (`http`, `https`, `data`,
+`about:blank`); local files and `chrome://` pages do not.
+
+## Playwright scripts (opt-in)
+
+`browser_script` is off by default; axi's `eval` covers most needs. When a
+project enables it, use it for multi-step Playwright logic with the exact
+HTTP(S) origin you need. Any web origin
 works by default: your project's first call records a whole-web grant the
 owner can see in Browser Settings. `origin_denied` means the owner withdrew
 that access for your project (surface the attached Grant Request and pause
@@ -75,7 +106,8 @@ thread) and rejects `--host`.
 ## Automating a page
 
 Use the `browser_script` tool. `page` is your thread's named tab on every
-profile, already brought to front. Explicit `tabId` selects that tab instead.
+profile. It stays in the background, so the owner's view never jumps to it.
+Explicit `tabId` selects that tab instead.
 Whatever you `return` becomes the tool result.
 
 ```javascript
@@ -108,15 +140,15 @@ workspace access.
 
 - No `document` global — read the DOM with `page.evaluate(() => document.title)`
   or locators.
-- `browser.listPages()` lists tabs; `browser.getPage(id)` binds one. Tab IDs are
+- `browser.listPages()` lists your session's tabs; `browser.getPage(id)` binds
+  one. The owner's and other threads' tabs are not visible to you. Tab IDs are
   runtime-only and change when the browser restarts.
 - Tab state persists between scripts. `page` resumes this thread's named tab
   even after saving or sharing its profile; a fresh tab starts at `destinationOrigin`.
   Navigate when your tab is on another site. Closing a named tab or restarting
   the browser may require navigating back to the task page.
-- Owner tabs outside your grant are parked on `about:blank` while your script
-  runs and come back when it finishes. They are not yours to read; do not
-  report them as failures.
+- Your tab runs in the background (`document.visibilityState` is `hidden`).
+  The owner keeps browsing their own tabs meanwhile and never interrupts you.
 - The host applies Playwright `BrowserContext` action and navigation defaults
   with 25% headroom (capped at 5 seconds) inside the host deadline. The defaults
   cover existing pages and later pages from `browser.getPage` or
@@ -174,7 +206,7 @@ I need you to sign in to GitHub so I can continue.
 - Make the card the last thing in your reply and end your turn. Starting a long
   wait after it collapses the turn and buries the card.
 - The owner can click Done on the card to send a reply and let you continue.
-  When the owner replies, check with `browser_script`. If sign-in is still
+  When the owner replies, check with `bb plugin run browser axi snapshot`. If sign-in is still
   pending, embed the card again as the last thing in that reply.
 - Never ask for a password or code in chat, and never type the owner's
   credentials yourself.
@@ -236,11 +268,12 @@ creates a page in the guarded context.
 
 ## Control, profiles, and records
 
-Every script holds one atomic Control Lease per host and profile. Owner
-navigation wins immediately. Competing agents wait in arrival order for up to
-30 seconds before `browser_busy`; cancelled or expired waiting calls never run.
-The wait is separate from the script's execution timeout. Use sequential calls
-when working with one profile. Switching to the CLI uses the same Control Lease.
+Every call holds an atomic Control Lease in your session's own lane. The owner
+and other threads have their own lanes, so nobody waits on or cancels anyone
+else. Your own calls run in arrival order and wait up to 30 seconds before
+`browser_busy`; cancelled or expired waiting calls never run. The wait is
+separate from the script's execution timeout. The CLI uses the same lane.
+Profile stop, Safe Login, and revoked access still stop your calls.
 Your purpose and identity are visible in status,
 diagnostics, and the Browser Panel only while the lease is live.
 

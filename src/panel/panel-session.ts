@@ -4,10 +4,7 @@ import {
   PANEL_RECLAIM_WINDOW_MS,
   type BrowserControlLease,
 } from "../shared/contracts.js";
-import {
-  ControlLeaseError,
-  type ControlLeaseManager,
-} from "../browser/control-lease.js";
+import type { ControlLeaseManager } from "../browser/control-lease.js";
 import {
   createBrowserTabStrip,
   type BrowserTabStrip,
@@ -494,16 +491,6 @@ export function createPanelSession(options: PanelSessionOptions = {}) {
     return true;
   }
 
-  async function interruptAgentForOwner() {
-    if (leaseKey === undefined || controlLeases === undefined) return;
-    try {
-      const lease = await controlLeases.acquireOwner(leaseKey);
-      lease.release();
-    } catch (error) {
-      if (!(error instanceof ControlLeaseError)) throw error;
-    }
-  }
-
   function reclaimControl(panelId: string) {
     expireReclaim();
     const member = panels.get(panelId);
@@ -538,7 +525,6 @@ export function createPanelSession(options: PanelSessionOptions = {}) {
         member.viewport = clampPanelViewport(viewport);
         controllerViewport = member.viewport;
       }
-      await interruptAgentForOwner();
       emit();
       return true;
     }
@@ -553,8 +539,9 @@ export function createPanelSession(options: PanelSessionOptions = {}) {
     }
     clearControlReclaim();
     if (viewport !== undefined) member.viewport = clampPanelViewport(viewport);
+    // Taking control picks which panel drives the owner's view. Agents keep
+    // working in their own tabs; profile stop and Safe Login still stop them.
     becomeController(panelId, member);
-    await interruptAgentForOwner();
     emit();
     return true;
   }

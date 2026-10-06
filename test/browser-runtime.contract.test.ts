@@ -1269,7 +1269,47 @@ describe("Browser Instance runtime", () => {
     }
   });
 
-  it("makes an explicitly targeted agent tab the shared active tab", async () => {
+  it("connects each agent session through its own Session CDP Proxy", async () => {
+    const fixture = await runtimeFixture();
+    try {
+      await fixture.runtime.execute(
+        { ...fixture.target, projectId: "project-a", agentLane: "thread:a" },
+        "return page.url()",
+        5_000,
+      );
+      await fixture.runtime.execute(
+        { ...fixture.target, projectId: "project-a", agentLane: "thread:a" },
+        "return page.url()",
+        5_000,
+      );
+      await fixture.runtime.execute(
+        { ...fixture.target, projectId: "project-a", agentLane: "thread:b" },
+        "return page.url()",
+        5_000,
+      );
+      await fixture.runtime.execute(
+        { ...fixture.target, projectId: "project-a" },
+        "return page.url()",
+        5_000,
+      );
+      const [a1, a2, b, direct] = fixture.processFixture.executions;
+      // The same lane reuses its proxy and helper connection…
+      expect(a1!.endpoint).toBe(a2!.endpoint);
+      expect(a1!.browserName).toBe(a2!.browserName);
+      // …another lane gets its own…
+      expect(b!.endpoint).not.toBe(a1!.endpoint);
+      expect(b!.browserName).not.toBe(a1!.browserName);
+      // …and neither is the unfiltered browser endpoint other callers use.
+      expect(a1!.endpoint).not.toBe(direct!.endpoint);
+      expect(b!.endpoint).not.toBe(direct!.endpoint);
+      expect(a1!.endpoint).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
+      expect(direct!.browserName).toBe(`bb-${fixture.target.profileId}`);
+    } finally {
+      await fixture.dispose();
+    }
+  });
+
+  it("drives an explicitly targeted agent tab without bringing it to the front", async () => {
     const fixture = await runtimeFixture();
     try {
       await fixture.runtime.execute(
@@ -1285,8 +1325,8 @@ describe("Browser Instance runtime", () => {
       expect(fixture.processFixture.executions[0]?.code).toContain(
         'browser.getPage("tab-agent")',
       );
-      expect(fixture.processFixture.executions[0]?.code).toContain(
-        "await page.bringToFront()",
+      expect(fixture.processFixture.executions[0]?.code).not.toContain(
+        "bringToFront",
       );
       expect(fixture.processFixture.executions.at(-1)?.code).toContain(
         "browser.getPage(tabId)",

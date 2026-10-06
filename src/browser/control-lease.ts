@@ -24,6 +24,24 @@ export class ControlLeaseError extends Error {
 
 type LeaseKey = string;
 
+/**
+ * Control is held per lane, not per profile. The owner has one lane; each
+ * agent session (one thread's tab, or one explicit tab) has its own. Lanes on
+ * the same profile run side by side, so the owner keeps browsing while agents
+ * work, and two agents never wait on each other's tabs. Work inside one lane
+ * still runs in arrival order.
+ */
+const OWNER_LANE = "\u0001owner";
+const DEFAULT_AGENT_LANE = "agent";
+
+function laneKey(profileKey: LeaseKey, lane: string): LeaseKey {
+  return `${profileKey}\0${lane}`;
+}
+
+function belongsToProfile(key: LeaseKey, profileKey: LeaseKey) {
+  return key.startsWith(`${profileKey}\0`);
+}
+
 type ActiveLease = {
   key: LeaseKey;
   token: symbol;
@@ -153,7 +171,7 @@ export function createControlLeaseManager() {
         removePending(pending);
         reject(
           leaseBusy(
-            "Another agent still holds browser control after 30 seconds. This call did not run. Wait for the other operation to finish, then retry once.",
+            "An earlier call in this browser session still holds its tab after 30 seconds. This call did not run. Wait for that call to finish, then retry once.",
           ),
         );
       }, CONTROL_LEASE_AGENT_WAIT_MS);
@@ -224,20 +242,18 @@ export function createControlLeaseManager() {
   }
 
   async function acquireAgent(
-    key: LeaseKey,
+    profileKey: LeaseKey,
     purpose: string,
     signal?: AbortSignal,
+    lane: string = DEFAULT_AGENT_LANE,
   ): Promise<ControlLease> {
     assertAvailable();
     if (signal?.aborted) {
       throw leaseBusy("The Browser script request was cancelled.");
     }
+    // The owner's own browsing never blocks an agent: it works in its lane.
+    const key = laneKey(profileKey, lane);
     const current = active.get(key);
-    if (current?.actor === "owner") {
-      throw leaseBusy(
-        "Owner control currently holds the Browser Control Lease.",
-      );
-    }
     if (current !== undefined) return enqueueAgent(key, purpose, signal);
     const lease = createActiveLease(key, "agent", purpose);
     active.set(key, lease);
@@ -245,24 +261,20 @@ export function createControlLeaseManager() {
   }
 
   async function acquireOwner(
-    key: LeaseKey,
+    profileKey: LeaseKey,
     signal?: AbortSignal,
   ): Promise<ControlLease> {
     assertAvailable();
     if (signal?.aborted) throw rejectedOwnerRequest();
+    // Owner actions serialize with each other, never with agents: browsing in
+    // the owner's tabs does not interrupt or cancel an agent's work.
+    const key = laneKey(profileKey, OWNER_LANE);
     let current = active.get(key);
     while (current !== undefined) {
-      rejectPending(
-        key,
-        leaseBusy("Owner control took priority over queued Browser agents."),
-      );
-      // Owner priority interrupts agents, not an earlier owner action. Rapid
-      // tab selections must finish in order instead of cancelling browser work.
-      if (current.actor === "agent") current.controller.abort();
+      // Rapid tab selections must finish in order instead of cancelling
+      // earlier owner work. Only the first waiter acquires the lane.
       await waitForLease(current, signal);
       assertAvailable();
-      // Other owners can be waiting on the same lease. Only the first waiter
-      // may acquire it; the rest must wait for that owner's work to finish.
       current = active.get(key);
     }
     if (signal?.aborted) throw rejectedOwnerRequest();
@@ -271,28 +283,54 @@ export function createControlLeaseManager() {
     return publicLease(lease, () => releaseLease(lease));
   }
 
-  function state(key: LeaseKey): BrowserControlLease | undefined {
-    const lease = active.get(key);
-    return lease === undefined || lease.controller.signal.aborted
-      ? undefined
-      : { actor: lease.actor, purpose: lease.purpose };
+  /**
+   * What the profile is doing now: a working agent takes precedence in the
+   * report, so the panel can say an agent is busy in its own tab.
+   */
+  function state(profileKey: LeaseKey): BrowserControlLease | undefined {
+    let owner: BrowserControlLease | undefined;
+    for (const lease of active.values()) {
+      if (!belongsToProfile(lease.key, profileKey)) continue;
+      if (lease.controller.signal.aborted) continue;
+      if (lease.actor === "agent") {
+        return { actor: lease.actor, purpose: lease.purpose };
+      }
+      owner = { actor: lease.actor, purpose: lease.purpose };
+    }
+    return owner;
   }
 
-  function revoke(key: LeaseKey) {
+  function revokeKey(key: LeaseKey) {
     rejectPending(key, leaseBusy("Browser control was revoked."));
     active.get(key)?.controller.abort();
+  }
+
+  /** Stop every lane on a profile: profile stop, Safe Login, revoked access. */
+  function revoke(profileKey: LeaseKey) {
+    for (const key of new Set([...active.keys(), ...waiting.keys()])) {
+      if (belongsToProfile(key, profileKey)) revokeKey(key);
+    }
+  }
+
+  /** Stop only the agent lanes on a profile, leaving owner actions to finish. */
+  function revokeAgents(profileKey: LeaseKey) {
+    for (const key of new Set([...active.keys(), ...waiting.keys()])) {
+      if (!belongsToProfile(key, profileKey)) continue;
+      if (key === laneKey(profileKey, OWNER_LANE)) continue;
+      revokeKey(key);
+    }
   }
 
   function revokeHost(hostId: string) {
     const prefix = `${hostId}\0`;
     for (const key of new Set([...active.keys(), ...waiting.keys()])) {
-      if (key.startsWith(prefix)) revoke(key);
+      if (key.startsWith(prefix)) revokeKey(key);
     }
   }
 
   function revokeAll() {
     for (const key of new Set([...active.keys(), ...waiting.keys()])) {
-      revoke(key);
+      revokeKey(key);
     }
   }
 
@@ -312,6 +350,7 @@ export function createControlLeaseManager() {
     acquireOwner,
     state,
     revoke,
+    revokeAgents,
     revokeHost,
     revokeAll,
     dispose,

@@ -335,7 +335,7 @@ describe("shared Panel session per Browser Profile", () => {
     await sessions.dispose();
   });
 
-  it("shows agent-held control and owner interruption on the shared session state", async () => {
+  it("shows a working agent on the shared session state while the owner takes control", async () => {
     const controlLeases = createControlLeaseManager();
     const { sessions } = setup({ controlLeases });
     const session = sessions.sessionFor({
@@ -353,7 +353,9 @@ describe("shared Panel session per Browser Profile", () => {
 
     expect(session.state().agentPurpose).toBe("Inspect the fixture");
     await session.takeControl("panel-1");
-    expect(lease.signal.aborted).toBe(true);
+    expect(lease.signal.aborted).toBe(false);
+    expect(session.state().agentPurpose).toBe("Inspect the fixture");
+    lease.release();
     expect(session.state().agentPurpose).toBeNull();
     controlLeases.dispose();
     await sessions.dispose();

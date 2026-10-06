@@ -32,27 +32,91 @@ describe("Browser Control Lease", () => {
     }
   });
 
-  it("serializes owners that interrupt the same agent", async () => {
+  it("lets the owner act while an agent works, without interrupting it", async () => {
     const manager = createControlLeaseManager();
     const key = "host-a\0profile-a";
     try {
-      const agent = await manager.acquireAgent(key, "Inspect the page");
-      const granted: number[] = [];
-      const first = manager.acquireOwner(key).then((lease) => {
-        granted.push(1);
-        return lease;
+      const agent = await manager.acquireAgent(
+        key,
+        "Inspect the page",
+        undefined,
+        "thread:a",
+      );
+      const owner = await manager.acquireOwner(key);
+      expect(agent.signal.aborted).toBe(false);
+      expect(owner.signal.aborted).toBe(false);
+      // The panel still reports the working agent while the owner browses.
+      expect(manager.state(key)).toEqual({
+        actor: "agent",
+        purpose: "Inspect the page",
       });
-      const second = manager.acquireOwner(key).then((lease) => {
-        granted.push(2);
-        return lease;
-      });
-      expect(agent.signal.aborted).toBe(true);
-      agent.release();
-      const owner = await first;
-      expect(granted).toEqual([1]);
       owner.release();
-      (await second).release();
-      expect(granted).toEqual([1, 2]);
+      agent.release();
+      expect(manager.state(key)).toBeUndefined();
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it("runs agent sessions in their own tabs side by side and queues calls within one session", async () => {
+    const manager = createControlLeaseManager();
+    const key = "host-a\0profile-a";
+    try {
+      const a = await manager.acquireAgent(
+        key,
+        "Thread A",
+        undefined,
+        "thread:a",
+      );
+      const b = await manager.acquireAgent(
+        key,
+        "Thread B",
+        undefined,
+        "thread:b",
+      );
+      expect(a.signal.aborted).toBe(false);
+      expect(b.signal.aborted).toBe(false);
+      let secondA = false;
+      const nextA = manager
+        .acquireAgent(key, "Thread A again", undefined, "thread:a")
+        .then((lease) => {
+          secondA = true;
+          return lease;
+        });
+      await Promise.resolve();
+      expect(secondA).toBe(false);
+      a.release();
+      (await nextA).release();
+      expect(secondA).toBe(true);
+      b.release();
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it("stops every agent session when the profile's control is revoked, and only agents when asked", async () => {
+    const manager = createControlLeaseManager();
+    const key = "host-a\0profile-a";
+    try {
+      const a = await manager.acquireAgent(
+        key,
+        "Thread A",
+        undefined,
+        "thread:a",
+      );
+      const owner = await manager.acquireOwner(key);
+      manager.revokeAgents(key);
+      expect(a.signal.aborted).toBe(true);
+      expect(owner.signal.aborted).toBe(false);
+      const b = await manager.acquireAgent(
+        key,
+        "Thread B",
+        undefined,
+        "thread:b",
+      );
+      manager.revoke(key);
+      expect(b.signal.aborted).toBe(true);
+      expect(owner.signal.aborted).toBe(true);
     } finally {
       manager.dispose();
     }
@@ -180,34 +244,6 @@ describe("Browser Control Lease", () => {
       first.release();
       expect(manager.state(key)).toBeUndefined();
       await vi.advanceTimersByTimeAsync(30_000);
-      expect(manager.state(key)).toBeUndefined();
-    } finally {
-      manager.dispose();
-      vi.useRealTimers();
-    }
-  });
-
-  it("gives owner takeover priority over waiting agents", async () => {
-    vi.useFakeTimers();
-    const manager = createControlLeaseManager();
-    const key = "host-a\0profile-a";
-    try {
-      const first = await manager.acquireAgent(key, "Active operation");
-      first.signal.addEventListener("abort", () => first.release(), {
-        once: true,
-      });
-      const waiting = expect(
-        manager.acquireAgent(key, "Waiting operation"),
-      ).rejects.toMatchObject({ code: "browser_busy" });
-      await vi.advanceTimersByTimeAsync(10_000);
-      const owner = await manager.acquireOwner(key);
-      await waiting;
-      expect(first.signal.aborted).toBe(true);
-      expect(manager.state(key)?.actor).toBe("owner");
-      await expect(
-        manager.acquireAgent(key, "Another operation"),
-      ).rejects.toMatchObject({ code: "browser_busy" });
-      owner.release();
       expect(manager.state(key)).toBeUndefined();
     } finally {
       manager.dispose();

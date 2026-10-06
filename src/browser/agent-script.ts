@@ -375,14 +375,12 @@ if (!__bbTargetPages.some((entry) => entry.id === ${JSON.stringify(tabId)})) thr
     )});
 const page = await browser.getPage(${JSON.stringify(tabId)});
 __bbGuardSandboxContextClose(page.context());
-await page.bringToFront();
 ${cutAgentBrowserRoots("__bbTargetPages", enforceNonWebNavigation, operationTimeoutMs)}`;
   }
   if (threadPageName !== undefined) {
     return `${SANDBOX_CONTEXT_CLOSE_GUARD}const __bbThreadPages = await browser.listPages();
 const page = await browser.getPage(${JSON.stringify(threadPageName)});
 __bbGuardSandboxContextClose(page.context());
-await page.bringToFront();
 ${cutAgentBrowserRoots("__bbThreadPages", enforceNonWebNavigation, operationTimeoutMs)}
 ${preferredOrigin === undefined ? "" : `if (page.url() === "about:blank" || page.url() === "chrome://newtab/") await page.goto(${JSON.stringify(preferredOrigin)});`}
 `;
@@ -439,7 +437,6 @@ if (page === undefined) {
   if (page != null) __bbGuardSandboxContextClose(page.context());
 }
 if (page === undefined) throw new Error(${JSON.stringify(ACTIVE_TAB_UNAVAILABLE_MESSAGE)});
-await page.bringToFront();
 ${cutAgentBrowserRoots("__bbPages", enforceNonWebNavigation, operationTimeoutMs)}`;
 }
 

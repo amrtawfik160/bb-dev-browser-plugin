@@ -92,7 +92,8 @@ All panels receive live state, but only one owner client or agent holds the
 
 - A second owner client is **view-only** until it explicitly chooses
   **Take control**.
-- **Owner interaction has priority** and may interrupt an agent at any time.
+- **You and agents work side by side.** Agents use their own background tabs;
+  your browsing never cancels them and they never move your view. (ADR 0021)
 - On connection loss, input freezes immediately and the same panel has
   **ten seconds** to reclaim its Control Lease before it is released.
 - The controlling panel drives one shared logical viewport (up to 1920×1080);

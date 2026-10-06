@@ -58,6 +58,10 @@ import {
   type BrowserScriptResult,
   type BrowserScriptRuntimeError,
 } from "../shared/contracts.js";
+import {
+  startSessionCdpProxy,
+  type SessionCdpProxy,
+} from "./session-cdp-proxy.js";
 
 export type BrowserExecutable = {
   kind: "chrome-stable" | "playwright-chromium";
@@ -73,6 +77,11 @@ export type BrowserInstanceTarget = {
 
 export type BrowserRuntimeTarget = BrowserInstanceTarget & {
   projectId: string;
+  /**
+   * The agent session's lane. An agent script connects through that lane's
+   * Session CDP Proxy, so it sees and drives only its own tabs.
+   */
+  agentLane?: string;
   tabId?: string;
   threadPageName?: string;
   initialOrigin?: string;
@@ -410,6 +419,12 @@ async function browserArguments(
     "--disable-extensions",
     "--disable-notifications",
     "--disable-save-password-bubble",
+    // Agents work in background tabs while the owner keeps the foreground, so
+    // a background tab must run at full speed: no timer throttling, no
+    // renderer backgrounding, no occluded-window pause.
+    "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding",
     // BackForwardCache is off so that going back to a document is always a
     // network navigation the Origin Scope route can see: an owner tab parked on
     // about:blank during an agent call cannot be restored from cache behind the
@@ -864,6 +879,14 @@ function heldBrowserInstance(input: {
     activeLeases: 0,
     lastActivityAt: Date.now(),
   };
+}
+
+/**
+ * The helper keeps one browser connection per name. Each agent lane gets its
+ * own name so its connection, named pages, and proxy stay separate.
+ */
+function laneBrowserName(profileId: string, lane: string) {
+  return `bb-${profileId}-${createHash("sha256").update(lane).digest("hex").slice(0, 12)}`;
 }
 
 function executionRequest(
@@ -1686,10 +1709,51 @@ export function createBrowserInstanceRuntime(
     }
   }
 
+  /**
+   * One Session CDP Proxy per agent session (profile + lane). Its address is
+   * stable for the life of the runtime: each new connection wakes the browser
+   * and reaches whichever instance is running, so an agent's tools keep one
+   * endpoint across sleep and restarts. Commands keep the instance awake.
+   */
+  const sessionProxies = new Map<string, Promise<SessionCdpProxy>>();
+
+  async function sessionProxy(
+    target: BrowserInstanceTarget,
+    lane: string,
+    tabId?: string,
+  ): Promise<SessionCdpProxy> {
+    const key = runtimeKey(target);
+    const proxyKey = `${key}\0${lane}`;
+    let proxy = sessionProxies.get(proxyKey);
+    if (proxy === undefined) {
+      proxy = startSessionCdpProxy({
+        upstreamEndpoint: async () => {
+          const held = await heldInstance(target);
+          noteActivity(key, held);
+          return held.publicState.automationEndpoint;
+        },
+        onActivity: () => {
+          void starts
+            .get(key)
+            ?.then((held) => noteActivity(key, held))
+            .catch(() => undefined);
+        },
+        // The browser's own profile storage never reaches a page or download.
+        deniedPathPrefixes: [options.rootDirectory],
+      });
+      sessionProxies.set(proxyKey, proxy);
+      proxy.catch(() => sessionProxies.delete(proxyKey));
+    }
+    const ready = await proxy;
+    if (tabId !== undefined) ready.grantTarget(tabId);
+    return ready;
+  }
+
   async function executeAgainstLiveBrowser(
     held: HeldBrowserInstance,
     request: BrowserExecutionRequest,
     trace?: BrowserOperationTrace,
+    endpointFor?: (held: HeldBrowserInstance) => Promise<string>,
   ): Promise<{ result: unknown; held: HeldBrowserInstance }> {
     try {
       return {
@@ -1708,7 +1772,12 @@ export function createBrowserInstanceRuntime(
       return {
         result: await options.launchBoundary.execute({
           ...request,
-          endpoint: replacement.publicState.automationEndpoint,
+          // An agent session reconnects through the replacement's own proxy,
+          // never the unfiltered endpoint.
+          endpoint:
+            endpointFor === undefined
+              ? replacement.publicState.automationEndpoint
+              : await endpointFor(replacement),
           runtimeDirectory: replacement.runtimeDirectory,
         }),
         held: replacement,
@@ -1922,7 +1991,10 @@ export function createBrowserInstanceRuntime(
                 operationOptions.invalidCertificateOrigins ?? [],
               timeoutMs,
             };
-      const activeTabMarker = randomUUID();
+      // Agents work in a background tab, so the owner's foreground tab is
+      // left alone. Only a caller that asks for the agent's tab gets a report.
+      const activeTabMarker =
+        operationOptions.onActiveTab === undefined ? undefined : randomUUID();
       const executionCode = prepareAgentExecution({
         code,
         tabId: target.tabId,
@@ -1943,18 +2015,36 @@ export function createBrowserInstanceRuntime(
             "renderer-check",
             () => enforceRendererProcessLimit(key, held),
           );
+          // An agent session connects through its lane's Session CDP Proxy:
+          // the helper and the Origin Scope guard see only its own tabs, so
+          // the owner's tabs are never read, parked, or held to its scope.
+          const agentLane = target.agentLane;
+          const laneEndpoint =
+            agentLane === undefined
+              ? undefined
+              : (await sessionProxy(target, agentLane, target.tabId)).endpoint;
+          const endpointFor =
+            laneEndpoint === undefined ? undefined : async () => laneEndpoint;
+          const request = executionRequest(
+            held,
+            target.profileId,
+            executionCode,
+            timeoutMs,
+            operationSignal.signal,
+            screenshot,
+            originPolicy,
+          );
           const executed = await executeAgainstLiveBrowser(
             held,
-            executionRequest(
-              held,
-              target.profileId,
-              executionCode,
-              timeoutMs,
-              operationSignal.signal,
-              screenshot,
-              originPolicy,
-            ),
+            endpointFor === undefined
+              ? request
+              : {
+                  ...request,
+                  endpoint: laneEndpoint!,
+                  browserName: laneBrowserName(target.profileId, agentLane!),
+                },
             operationOptions.trace,
+            endpointFor,
           );
           held = executed.held;
           await measureBrowserStage(
@@ -1962,10 +2052,10 @@ export function createBrowserInstanceRuntime(
             "renderer-check",
             () => enforceRendererProcessLimit(key, held),
           );
-          const activeTab = extractActiveTabMarker(
-            executed.result,
-            activeTabMarker,
-          );
+          const activeTab =
+            activeTabMarker === undefined
+              ? { result: executed.result, activeTabId: undefined }
+              : extractActiveTabMarker(executed.result, activeTabMarker);
           const browserResult = assertBrowserScriptResultWithinBounds(
             activeTab.result,
           );
@@ -2279,8 +2369,21 @@ export function createBrowserInstanceRuntime(
       const closed = Number.parseInt(String(raw).trim(), 10);
       return Number.isSafeInteger(closed) && closed >= 0 ? closed : 0;
     },
+    /**
+     * The stable DevTools address of one agent session. Tools such as
+     * chrome-devtools-axi connect here and see only the session's own tabs.
+     */
+    async agentSessionEndpoint(target: BrowserInstanceTarget, lane: string) {
+      assertHostConnected(target.hostId);
+      return (await sessionProxy(target, lane)).endpoint;
+    },
     async dispose() {
       disposed = true;
+      const proxies = [...sessionProxies.values()];
+      sessionProxies.clear();
+      await Promise.allSettled(
+        proxies.map(async (proxy) => (await proxy).close()),
+      );
       await capacityChanges;
       const instances = await Promise.allSettled(starts.values());
       await Promise.all(

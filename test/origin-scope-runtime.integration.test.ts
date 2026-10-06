@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { originScopeMatcher } from "../src/access/authorization.js";
+import { startSessionCdpProxy } from "../src/browser/session-cdp-proxy.js";
 import {
   BrowserOriginScopeDeniedError,
   installHostOriginScopeGuard,
@@ -128,6 +129,84 @@ describe("pinned Chromium Origin Scope runtime", () => {
       await expect
         .poll(() => ownerTab.locator("h1").textContent())
         .toBe("owner");
+    } finally {
+      await context.close();
+      await rm(userDataDir, { recursive: true, force: true });
+      await close(server);
+    }
+  });
+
+  it("leaves the owner's tabs alone when the guard protects only the agent's session", async () => {
+    const server = createServer((request, response) => {
+      response.setHeader("content-type", "text/html");
+      response.end(
+        `<title>${request.headers.host}</title><h1>${request.url}</h1>`,
+      );
+    });
+    const port = await listen(server);
+    const userDataDir = await mkdtemp(join(tmpdir(), "bb-origin-scope-"));
+    const context = await chromium.launchPersistentContext(userDataDir, {
+      headless: true,
+      args: ["--remote-debugging-port=0"],
+    });
+    const ownerUrl = `http://localhost:${port}/owner`;
+    try {
+      const agentTab = context.pages()[0]!;
+      const ownerTab = await context.newPage();
+      await agentTab.goto(`http://127.0.0.1:${port}/agent`);
+      await ownerTab.goto(ownerUrl);
+      const devToolsPort = (
+        await readFile(join(userDataDir, "DevToolsActivePort"), "utf8")
+      ).split("\n")[0]!;
+      const guardBrowser = await chromium.connectOverCDP(
+        `http://127.0.0.1:${devToolsPort}`,
+      );
+      // The guard connects through the agent session's proxy, exactly as the
+      // helper does, so it only ever sees the agent's own tab.
+      const realBrowser = await chromium.connectOverCDP(
+        `http://127.0.0.1:${devToolsPort}`,
+      );
+      const agentTargetId = await (async () => {
+        const cdp = await realBrowser.contexts()[0]!.newCDPSession(
+          realBrowser
+            .contexts()[0]!
+            .pages()
+            .find((page) => page.url().endsWith("/agent"))!,
+        );
+        const { targetInfo } = (await cdp.send("Target.getTargetInfo")) as {
+          targetInfo: { targetId: string };
+        };
+        await cdp.detach();
+        return targetInfo.targetId;
+      })();
+      await realBrowser.close();
+      const proxy = await startSessionCdpProxy({
+        upstreamEndpoint: `http://127.0.0.1:${devToolsPort}`,
+        initialTargetIds: [agentTargetId],
+      });
+      const guard = await installHostOriginScopeGuard(
+        proxy.endpoint,
+        policy(`http://127.0.0.1:${port}`),
+      ).finally(() => guardBrowser.close());
+      try {
+        expect(guard.deniedError()).toBeNull();
+        // The owner's out-of-scope tab is never parked…
+        expect(ownerTab.url()).toBe(ownerUrl);
+        // …and the owner can keep browsing anywhere during the agent's call.
+        await ownerTab.goto(`http://localhost:${port}/owner-elsewhere`);
+        await expect
+          .poll(() => ownerTab.locator("h1").textContent())
+          .toBe("/owner-elsewhere");
+        // The agent's own tab is still held to its scope.
+        await expect(
+          agentTab.goto(`http://localhost:${port}/agent-next`),
+        ).rejects.toThrow();
+        expect(guard.deniedError()).not.toBeNull();
+      } finally {
+        await guard.dispose();
+        await proxy.close();
+      }
+      expect(ownerTab.url()).toBe(`http://localhost:${port}/owner-elsewhere`);
     } finally {
       await context.close();
       await rm(userDataDir, { recursive: true, force: true });

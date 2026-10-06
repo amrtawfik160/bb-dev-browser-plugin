@@ -120,6 +120,7 @@ function publicRuntime(
   }),
 ): BrowserInstanceRuntime {
   return {
+    agentSessionEndpoint: async () => "http://127.0.0.1:9333",
     start: async (target) => ({
       state: "running",
       hostId: target.hostId,
@@ -2526,13 +2527,13 @@ describe("Browser public plugin contract", () => {
     }
   });
 
-  it("selects the static browser_script tool and bundled Browser skill", async () => {
+  it("selects the chrome-devtools-axi tool and bundled Browser skill", async () => {
     const browser = await createPublicPluginHarness();
 
     const capabilities = await browser.resolveAgentCapabilities();
 
     expect(capabilities.tools.map((tool) => tool.name)).toEqual([
-      "browser_script",
+      "browser_axi",
       "browser_sessions",
     ]);
     expect(capabilities.skills).toEqual(["browser"]);
@@ -3072,54 +3073,7 @@ describe("Browser public plugin contract", () => {
     }
   });
 
-  it("surfaces a result that completes before the Control Lease revokes it (issue #13)", async () => {
-    let executionStarted!: () => void;
-    const started = new Promise<void>((resolve) => {
-      executionStarted = resolve;
-    });
-    const runtime = publicRuntime(
-      async (_target, _code, _timeoutMs, options) => {
-        await new Promise<void>((resolve) => {
-          if (options?.leaseSignal?.aborted) {
-            resolve();
-            return;
-          }
-          executionStarted();
-          options?.leaseSignal?.addEventListener("abort", () => resolve(), {
-            once: true,
-          });
-        });
-        return "completed despite the lease revoking";
-      },
-    );
-    const browser = await createPublicPluginHarness({
-      snapshot: preparedSnapshot,
-      browserRuntime: runtime,
-    });
-
-    try {
-      await grantDefaultProfileOrigin(browser, "https://example.com");
-      const operation = browser.runBrowserScriptWithProfile(undefined, {
-        purpose: "Complete just before the owner takes over",
-        code: "return page.url();",
-        destinationOrigin: "https://example.com",
-      });
-      await started;
-      await browser.runBrowserNavigation(
-        "https://example.com/owner-takes-control-after-completion",
-      );
-      const result = await operation;
-      expect(result.isError).toBe(false);
-      expect(result.content[0]?.type).toBe("text");
-      expect((result.content[0] as { text: string }).text).toBe(
-        "completed despite the lease revoking",
-      );
-    } finally {
-      await browser.dispose();
-    }
-  });
-
-  it("derives the project and host target, exposes the live lease, and gives owner navigation priority", async () => {
+  it("derives the project and host target, exposes the live lease, and lets the owner browse without interrupting the agent", async () => {
     let resolveExecution!: () => void;
     let executionStarted!: () => void;
     let observedTarget!: Parameters<BrowserInstanceRuntime["execute"]>[0];
@@ -3183,17 +3137,25 @@ describe("Browser public plugin contract", () => {
         },
       });
 
+      // The owner browses while the agent works in its own tab.
       await expect(
-        browser.runBrowserNavigation("https://example.com/owner-takes-control"),
+        browser.runBrowserNavigation(
+          "https://example.com/owner-keeps-browsing",
+        ),
       ).resolves.toMatchObject({ tabId: "public-tab" });
-      const revoked = await operation;
-      const failure = browserScriptFailureSchema.parse(
-        JSON.parse(revoked.content[0]!.text),
+      expect(
+        await browser.runBrowserStatus({
+          surface: "thread",
+          threadId: "thread-browser-test",
+          profileId: DEFAULT_PROFILE_ID,
+        }),
+      ).toMatchObject({ controlLease: { actor: "agent" } });
+      resolveExecution();
+      const finished = await operation;
+      expect(finished.isError).toBe(false);
+      expect((finished.content[0] as { text: string }).text).toBe(
+        "agent output",
       );
-      expect(failure.error).toMatchObject({
-        state: "runtime-error",
-        code: "lease_revoked",
-      });
       expect(
         await browser.runBrowserStatus({
           surface: "thread",
@@ -3205,7 +3167,7 @@ describe("Browser public plugin contract", () => {
         (await browser.runBrowserActivityRecords()).some(
           (record) => record.interrupted && record.action === "browser-script",
         ),
-      ).toBe(true);
+      ).toBe(false);
     } finally {
       resolveExecution?.();
       await browser.dispose();
