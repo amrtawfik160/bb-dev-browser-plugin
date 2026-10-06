@@ -9,7 +9,10 @@ import {
   resolveAxiRuntime,
   rewriteAxiHints,
 } from "../src/host/axi-runner.js";
-import { navigableUrl } from "../src/browser/session-cdp-proxy.js";
+import {
+  navigableUrl,
+  upstreamHttpOrigin,
+} from "../src/browser/session-cdp-proxy.js";
 
 describe("chrome-devtools-axi launcher", () => {
   it("resolves the pinned axi and chrome-devtools-mcp executables", () => {
@@ -39,6 +42,15 @@ describe("chrome-devtools-axi launcher", () => {
         }),
       ).not.toThrow();
     }
+  });
+
+  it("reads the browser's DevTools over HTTP from the ws:// endpoint Chromium reports", () => {
+    expect(
+      upstreamHttpOrigin("ws://127.0.0.1:9222/devtools/browser/abc").href,
+    ).toBe("http://127.0.0.1:9222/");
+    expect(upstreamHttpOrigin("http://127.0.0.1:9222").href).toBe(
+      "http://127.0.0.1:9222/",
+    );
   });
 
   it("names one stable axi session per agent session", () => {

@@ -49,8 +49,16 @@ describe.skipIf(!real)(
       const devToolsPort = (
         await readFile(join(userDataDir, "DevToolsActivePort"), "utf8")
       ).split("\n")[0]!;
+      // The runtime reports Chromium's endpoint as ws://…/devtools/browser/…,
+      // exactly as Chromium prints it; the proxy must accept that form.
+      const browserSocket = (
+        (await (
+          await fetch(`http://127.0.0.1:${devToolsPort}/json/version`)
+        ).json()) as { webSocketDebuggerUrl: string }
+      ).webSocketDebuggerUrl;
+      expect(browserSocket).toMatch(/^ws:\/\//u);
       const proxy = await startSessionCdpProxy({
-        upstreamEndpoint: async () => `http://127.0.0.1:${devToolsPort}`,
+        upstreamEndpoint: async () => browserSocket,
       });
       const paths = resolveAxiRuntime();
       const session = axiSessionName(`thread:${work}`);
