@@ -2526,13 +2526,14 @@ describe("Browser public plugin contract", () => {
     }
   });
 
-  it("selects the static browser_script tool and bundled Browser skill", async () => {
+  it("selects the browser_command and browser_script tools and bundled Browser skill", async () => {
     const browser = await createPublicPluginHarness();
 
     const capabilities = await browser.resolveAgentCapabilities();
 
     expect(capabilities.tools.map((tool) => tool.name)).toEqual([
       "browser_script",
+      "browser_command",
       "browser_sessions",
     ]);
     expect(capabilities.skills).toEqual(["browser"]);

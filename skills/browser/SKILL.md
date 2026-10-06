@@ -1,6 +1,6 @@
 ---
 name: browser
-description: Drive a real Chromium on this host — open pages, click, type, read, and screenshot — with Playwright through the browser_script tool or the bb plugin run browser CLI. Use for web automation, testing a running app, checking a deployed page, or any task that needs a real browser.
+description: Drive a real Chromium on this host — open pages, click, type, read, and screenshot — with short commands through the browser_command tool (open, snapshot, click @ref, fill, press…), Playwright code through browser_script, or the bb plugin run browser CLI. Use for web automation, testing a running app, checking a deployed page, or any task that needs a real browser.
 ---
 
 # Browser
@@ -14,7 +14,9 @@ back to its private default. Without a thread, the default belongs to the
 project. Separate profiles have separate cookies. Selecting an existing
 profile shares its logins; each thread gets a named tab from its first script
 call on every profile. Saving or sharing the profile keeps that binding.
-Calls on the same profile still take turns under its Control Lease.
+Your tab works in the background: the owner keeps browsing their own tabs,
+other threads work in theirs, and nobody interrupts anyone. Only your own
+thread's calls take turns.
 
 ## Reuse a sign-in
 
@@ -55,9 +57,45 @@ do not close another agent's tabs or stop its profile. Keep only needed tabs:
 the 12-tab retention cap closes the oldest inactive pages. Sleeping preserves
 site storage and tab locations, but transient form state can be lost.
 
-## Start here
+## Start here: browser commands
 
-Use `browser_script` with the exact HTTP(S) origin you need. Any web origin
+Use `browser_command` for almost everything. Send one short command; get back
+the page, a compact snapshot whose interactive elements carry refs, and the
+next commands you could run:
+
+```text
+open https://example.com
+→ page: {title: "Example Domain", url: "https://example.com/", refs: 1}
+  snapshot:
+  heading "Example Domain" [level=1]
+  paragraph: This domain is for use in illustrative examples…
+  uid=g1:e6 link "Learn more"
+  help[2]:
+    Run `click @g1:e6` to click the "Learn more" link
+click @g1:e6
+```
+
+| Command | What it does |
+| --- | --- |
+| `open <url>` | Go to a URL in your tab and snapshot it |
+| `snapshot` | Read the current page and get fresh refs |
+| `click @ref` / `hover @ref` | Act on an element from the latest snapshot |
+| `fill @ref <text>` / `select @ref <value>` | Fill a field or choose an option |
+| `type <text>` / `press <key>` | Type at the focus or press a key (`Enter`, `Tab`…) |
+| `scroll up\|down\|top\|bottom`, `back` | Move around |
+| `wait <ms>` / `wait <text>` | Wait for time or for text to appear |
+| `eval <js>` | Evaluate an expression or function; returns its value |
+| `screenshot` | Snapshot plus an image of your tab |
+
+Refs look like `@g3:e5`: pass them back exactly as printed. They go stale after
+every command, and a stale ref fails with `STALE_REF` instead of clicking the
+wrong thing — run `snapshot` and retry. Check a state change with the snapshot
+that comes back (or `eval`) before reporting success. From a shell:
+`bb plugin run browser do click @g3:e5`.
+
+## Playwright scripts
+
+Use `browser_script` for multi-step logic, with the exact HTTP(S) origin you need. Any web origin
 works by default: your project's first call records a whole-web grant the
 owner can see in Browser Settings. `origin_denied` means the owner withdrew
 that access for your project (surface the attached Grant Request and pause
@@ -75,7 +113,8 @@ thread) and rejects `--host`.
 ## Automating a page
 
 Use the `browser_script` tool. `page` is your thread's named tab on every
-profile, already brought to front. Explicit `tabId` selects that tab instead.
+profile. It stays in the background, so the owner's view never jumps to it.
+Explicit `tabId` selects that tab instead.
 Whatever you `return` becomes the tool result.
 
 ```javascript

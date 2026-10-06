@@ -3428,6 +3428,18 @@ export const browserScriptParametersSchema = z
   })
   .strict();
 
+/** One short Browser Command, as an agent or the CLI sends it. */
+export const browserCommandParametersSchema = z
+  .object({
+    command: z.string().trim().min(1).max(8_000),
+    profileId: z.string().min(1).optional(),
+  })
+  .strict();
+
+export type BrowserCommandParameters = z.infer<
+  typeof browserCommandParametersSchema
+>;
+
 export const browserScriptRequestSchema = browserScriptParametersSchema
   .extend({
     hostId: z.string().min(1),
