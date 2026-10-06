@@ -410,6 +410,12 @@ async function browserArguments(
     "--disable-extensions",
     "--disable-notifications",
     "--disable-save-password-bubble",
+    // Agents work in background tabs while the owner keeps the foreground, so
+    // a background tab must run at full speed: no timer throttling, no
+    // renderer backgrounding, no occluded-window pause.
+    "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding",
     // BackForwardCache is off so that going back to a document is always a
     // network navigation the Origin Scope route can see: an owner tab parked on
     // about:blank during an agent call cannot be restored from cache behind the
@@ -1922,7 +1928,10 @@ export function createBrowserInstanceRuntime(
                 operationOptions.invalidCertificateOrigins ?? [],
               timeoutMs,
             };
-      const activeTabMarker = randomUUID();
+      // Agents work in a background tab, so the owner's foreground tab is
+      // left alone. Only a caller that asks for the agent's tab gets a report.
+      const activeTabMarker =
+        operationOptions.onActiveTab === undefined ? undefined : randomUUID();
       const executionCode = prepareAgentExecution({
         code,
         tabId: target.tabId,
@@ -1962,10 +1971,10 @@ export function createBrowserInstanceRuntime(
             "renderer-check",
             () => enforceRendererProcessLimit(key, held),
           );
-          const activeTab = extractActiveTabMarker(
-            executed.result,
-            activeTabMarker,
-          );
+          const activeTab =
+            activeTabMarker === undefined
+              ? { result: executed.result, activeTabId: undefined }
+              : extractActiveTabMarker(executed.result, activeTabMarker);
           const browserResult = assertBrowserScriptResultWithinBounds(
             activeTab.result,
           );

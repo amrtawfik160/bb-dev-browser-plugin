@@ -1936,8 +1936,8 @@ it("keeps the owner's selected Browser Tab when inventory still reports a differ
     })) as { activeTabId: string | null };
     expect(strip.activeTabId).toBe("page-1");
 
-    // Automation brings its own tab forward. An existing panel must follow
-    // that explicit action, while ordinary inventory reads preserve selection.
+    // Automation works in its own background tab. The owner's selected tab
+    // stays selected while the agent runs and after it finishes.
     await host.experimental_call("browserScript", {
       hostId: HOST_ID,
       profileId: DEFAULT_PROFILE_ID,
@@ -1953,7 +1953,7 @@ it("keeps the owner's selected Browser Tab when inventory still reports a differ
       hostId: HOST_ID,
       profileId: DEFAULT_PROFILE_ID,
     });
-    expect(afterAgent).toMatchObject({ activeTabId: "page-0" });
+    expect(afterAgent).toMatchObject({ activeTabId: "page-1" });
   } finally {
     await host.experimental_dispose();
     await rm(rootDirectory, { recursive: true, force: true });

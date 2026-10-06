@@ -373,7 +373,7 @@ describe("agent page binding", () => {
       preferredOrigin: "https://app.example.test",
     });
     expect(bound.logs).toEqual(["signin"]);
-    expect(bound.pages.get("signin")?.broughtToFront).toBe(true);
+    expect(bound.pages.get("signin")?.broughtToFront).toBe(false);
     expect(bound.created).toBe(0);
   });
 
@@ -397,7 +397,7 @@ describe("agent page binding", () => {
       preferredOrigin: "https://app.example.test",
     });
     expect(bound.logs).toEqual(["granted"]);
-    expect(bound.pages.get("granted")?.broughtToFront).toBe(true);
+    expect(bound.pages.get("granted")?.broughtToFront).toBe(false);
   });
 
   it("uses the first tab when no tab reports itself visible", async () => {
@@ -408,7 +408,7 @@ describe("agent page binding", () => {
       ],
     });
     expect(bound.logs).toEqual(["first"]);
-    expect(bound.pages.get("first")?.broughtToFront).toBe(true);
+    expect(bound.pages.get("first")?.broughtToFront).toBe(false);
   });
 
   it("opens a tab when the profile has none instead of failing", async () => {
@@ -503,7 +503,7 @@ describe("agent script convenience wrapping", () => {
     expect(prepared.indexOf('browser.getPage("tab-checkout")')).toBeLessThan(
       prepared.indexOf("return page.url()"),
     );
-    expect(prepared).toContain("await page.bringToFront()");
+    expect(prepared).not.toContain("bringToFront");
     expect(prepared).toContain("__bbResult");
   });
 
@@ -515,7 +515,7 @@ describe("agent script convenience wrapping", () => {
     expect(prepared.indexOf("visibilityState")).toBeLessThan(
       prepared.indexOf("return page.url()"),
     );
-    expect(prepared).toContain("await page.bringToFront()");
+    expect(prepared).not.toContain("bringToFront");
   });
 
   it("issue #64 runs user code with the pinned frozen dev-browser API", async () => {

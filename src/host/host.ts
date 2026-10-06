@@ -1846,7 +1846,6 @@ export function createBrowserHostEntry(
             }
             try {
               const leaseSignal = lease.signal;
-              let agentActiveTabId: string | undefined;
               const threadDefaultProfileId = scopedProfileId({
                 projectId: request.projectId,
                 threadId: request.threadId,
@@ -1870,9 +1869,6 @@ export function createBrowserHostEntry(
                     request.timeoutMs,
                     {
                       trace,
-                      onActiveTab: (tabId) => {
-                        agentActiveTabId = tabId;
-                      },
                       signal: context.signal,
                       leaseSignal,
                       screenshot: request.screenshot,
@@ -1892,16 +1888,9 @@ export function createBrowserHostEntry(
               if (lease.signal.aborted) {
                 leaseRevokedAfterCompletion = true;
               }
-              if (agentActiveTabId === undefined)
-                agentActiveTabId = await browserRuntime
-                  .activeTabId?.(target)
-                  .catch(() => undefined);
-              await reconcileRuntimeTabs(
-                dataDir,
-                target,
-                agentActiveTabId,
-                trace,
-              );
+              // The agent worked in its own background tab: add any tabs it
+              // opened to the strip, but keep the owner's selected tab.
+              await reconcileRuntimeTabs(dataDir, target, undefined, trace);
               response = {
                 ok: true as const,
                 result: browserResult,

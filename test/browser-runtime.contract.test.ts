@@ -1269,7 +1269,7 @@ describe("Browser Instance runtime", () => {
     }
   });
 
-  it("makes an explicitly targeted agent tab the shared active tab", async () => {
+  it("drives an explicitly targeted agent tab without bringing it to the front", async () => {
     const fixture = await runtimeFixture();
     try {
       await fixture.runtime.execute(
@@ -1285,8 +1285,8 @@ describe("Browser Instance runtime", () => {
       expect(fixture.processFixture.executions[0]?.code).toContain(
         'browser.getPage("tab-agent")',
       );
-      expect(fixture.processFixture.executions[0]?.code).toContain(
-        "await page.bringToFront()",
+      expect(fixture.processFixture.executions[0]?.code).not.toContain(
+        "bringToFront",
       );
       expect(fixture.processFixture.executions.at(-1)?.code).toContain(
         "browser.getPage(tabId)",
