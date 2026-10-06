@@ -3428,17 +3428,37 @@ export const browserScriptParametersSchema = z
   })
   .strict();
 
-/** One short Browser Command, as an agent or the CLI sends it. */
-export const browserCommandParametersSchema = z
+/** One chrome-devtools-axi command line, as an agent or the CLI sends it. */
+export const browserAxiParametersSchema = z
   .object({
-    command: z.string().trim().min(1).max(8_000),
+    args: z.array(z.string().max(32_000)).min(0).max(200),
     profileId: z.string().min(1).optional(),
   })
   .strict();
 
-export type BrowserCommandParameters = z.infer<
-  typeof browserCommandParametersSchema
->;
+export type BrowserAxiParameters = z.infer<typeof browserAxiParametersSchema>;
+
+export const browserAxiRequestSchema = browserAxiParametersSchema
+  .extend({
+    hostId: z.string().min(1),
+    projectId: z.string().min(1),
+    threadId: z.string().min(1),
+    profileId: z.string().min(1),
+    /** The caller's working directory, where axi resolves relative paths. */
+    cwd: z.string().min(1).optional(),
+  })
+  .strict();
+
+export const browserAxiResponseSchema = z
+  .object({
+    exitCode: z.number().int(),
+    stdout: z.string(),
+    stderr: z.string(),
+  })
+  .strict();
+
+export type BrowserAxiRequest = z.infer<typeof browserAxiRequestSchema>;
+export type BrowserAxiResponse = z.infer<typeof browserAxiResponseSchema>;
 
 export const browserScriptRequestSchema = browserScriptParametersSchema
   .extend({

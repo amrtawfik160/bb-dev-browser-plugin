@@ -42,14 +42,9 @@ Each agent session works in its own tab and its own lane.
   activated. Out-of-scope owner tabs are therefore unreadable without parking,
   so the Origin Scope guard applies only to the session's own pages and owner
   tabs are never parked, cleared, or held to an agent's scope.
-- **Short commands.** `browser_command` (and `bb plugin run browser do`) runs
-  one axi-style command per call: open, snapshot, click/fill/hover/select by
-  ref, type, press, scroll, back, wait, eval, screenshot. Responses carry the
-  page, a compact accessibility snapshot with generation-stamped refs, and
-  next steps; a ref from an older snapshot fails with `STALE_REF`. Commands
-  compile to ordinary Browser Scripts, so grants, Origin Scope, lanes, and
-  Activity Records are unchanged. `browser_script` remains for multi-step
-  Playwright logic.
+- **axi.** Agents drive their session with chrome-devtools-axi itself
+  through the session's proxy ([ADR 0022](0022-drive-the-browser-with-chrome-devtools-axi.md)).
+  `browser_script` remains for multi-step Playwright logic.
 
 ## Consequences
 

@@ -348,8 +348,6 @@ type HeldBrowserInstance = {
   lastActivityAt: number;
   idleTimer?: ReturnType<typeof setTimeout>;
   cleanup?: Promise<void>;
-  /** One Session CDP Proxy per agent lane, closed with the instance. */
-  sessionProxies?: Map<string, Promise<SessionCdpProxy>>;
 };
 
 type BrowserCrashHistory = {
@@ -1523,10 +1521,7 @@ export function createBrowserInstanceRuntime(
 
   async function cleanupHeld(held: HeldBrowserInstance) {
     held.cleanup ??= (async () => {
-      const proxies = [...(held.sessionProxies?.values() ?? [])];
-      held.sessionProxies?.clear();
       const cleanup = await Promise.allSettled([
-        ...proxies.map(async (proxy) => (await proxy).close()),
         unlink(held.manifestPath).catch((error: unknown) => {
           if (
             error instanceof Error &&
@@ -1715,23 +1710,39 @@ export function createBrowserInstanceRuntime(
   }
 
   /**
-   * The endpoint an agent session's helper connects through: its lane's
-   * Session CDP Proxy, started on first use. An explicitly named tab is
-   * granted to the session for this and later calls in the lane.
+   * One Session CDP Proxy per agent session (profile + lane). Its address is
+   * stable for the life of the runtime: each new connection wakes the browser
+   * and reaches whichever instance is running, so an agent's tools keep one
+   * endpoint across sleep and restarts. Commands keep the instance awake.
    */
-  async function sessionEndpoint(
-    held: HeldBrowserInstance,
+  const sessionProxies = new Map<string, Promise<SessionCdpProxy>>();
+
+  async function sessionProxy(
+    target: BrowserInstanceTarget,
     lane: string,
     tabId?: string,
   ): Promise<SessionCdpProxy> {
-    held.sessionProxies ??= new Map();
-    let proxy = held.sessionProxies.get(lane);
+    const key = runtimeKey(target);
+    const proxyKey = `${key}\0${lane}`;
+    let proxy = sessionProxies.get(proxyKey);
     if (proxy === undefined) {
       proxy = startSessionCdpProxy({
-        upstreamEndpoint: held.publicState.automationEndpoint,
+        upstreamEndpoint: async () => {
+          const held = await heldInstance(target);
+          noteActivity(key, held);
+          return held.publicState.automationEndpoint;
+        },
+        onActivity: () => {
+          void starts
+            .get(key)
+            ?.then((held) => noteActivity(key, held))
+            .catch(() => undefined);
+        },
+        // The browser's own profile storage never reaches a page or download.
+        deniedPathPrefixes: [options.rootDirectory],
       });
-      held.sessionProxies.set(lane, proxy);
-      proxy.catch(() => held.sessionProxies?.delete(lane));
+      sessionProxies.set(proxyKey, proxy);
+      proxy.catch(() => sessionProxies.delete(proxyKey));
     }
     const ready = await proxy;
     if (tabId !== undefined) ready.grantTarget(tabId);
@@ -2008,12 +2019,12 @@ export function createBrowserInstanceRuntime(
           // the helper and the Origin Scope guard see only its own tabs, so
           // the owner's tabs are never read, parked, or held to its scope.
           const agentLane = target.agentLane;
-          const endpointFor =
+          const laneEndpoint =
             agentLane === undefined
               ? undefined
-              : async (instance: HeldBrowserInstance) =>
-                  (await sessionEndpoint(instance, agentLane, target.tabId))
-                    .endpoint;
+              : (await sessionProxy(target, agentLane, target.tabId)).endpoint;
+          const endpointFor =
+            laneEndpoint === undefined ? undefined : async () => laneEndpoint;
           const request = executionRequest(
             held,
             target.profileId,
@@ -2029,7 +2040,7 @@ export function createBrowserInstanceRuntime(
               ? request
               : {
                   ...request,
-                  endpoint: await endpointFor(held),
+                  endpoint: laneEndpoint!,
                   browserName: laneBrowserName(target.profileId, agentLane!),
                 },
             operationOptions.trace,
@@ -2358,8 +2369,21 @@ export function createBrowserInstanceRuntime(
       const closed = Number.parseInt(String(raw).trim(), 10);
       return Number.isSafeInteger(closed) && closed >= 0 ? closed : 0;
     },
+    /**
+     * The stable DevTools address of one agent session. Tools such as
+     * chrome-devtools-axi connect here and see only the session's own tabs.
+     */
+    async agentSessionEndpoint(target: BrowserInstanceTarget, lane: string) {
+      assertHostConnected(target.hostId);
+      return (await sessionProxy(target, lane)).endpoint;
+    },
     async dispose() {
       disposed = true;
+      const proxies = [...sessionProxies.values()];
+      sessionProxies.clear();
+      await Promise.allSettled(
+        proxies.map(async (proxy) => (await proxy).close()),
+      );
       await capacityChanges;
       const instances = await Promise.allSettled(starts.values());
       await Promise.all(

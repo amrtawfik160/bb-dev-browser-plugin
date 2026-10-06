@@ -29,6 +29,8 @@ import {
   browserProfileGrantSchema,
   browserProfileGrantsSchema,
   browserScriptParametersSchema,
+  type BrowserAxiParameters,
+  type BrowserAxiResponse,
   CLEAR_ACTIVITY_CONFIRMATION,
   RESET_PROFILE_CONFIRMATION,
   browserProfileUnavailableStatus,
@@ -2617,6 +2619,69 @@ export function createBrowserService(
     });
   }
 
+  /**
+   * Run one chrome-devtools-axi command for the calling thread. The agent
+   * gets axi's exact behaviour; the plugin checks the profile grant the way
+   * it does for scripts, then the host runs axi against the thread's own
+   * Session CDP Proxy.
+   */
+  async function browserAxi(
+    parameters: BrowserAxiParameters,
+    context: PluginAgentToolContext & { cwd?: string },
+  ): Promise<BrowserAxiResponse> {
+    const scriptParameters = browserScriptParametersSchema.parse({
+      purpose: "Use the browser",
+      code: "return null;",
+      ...(parameters.profileId === undefined
+        ? {}
+        : { profileId: parameters.profileId }),
+    });
+    const target = await resolveAgentScriptTarget(scriptParameters, context);
+    const refusal = (error: unknown) => ({
+      exitCode: 1,
+      stdout: "",
+      stderr: `error: ${JSON.stringify(error)}\n`,
+    });
+    if (target.hostId === null) {
+      return refusal(
+        setupRequiredStatus({ hostId: null, profileId: target.profileId }),
+      );
+    }
+    const authorization = await authorizeAgentScript({
+      parameters: scriptParameters,
+      context,
+      hostId: target.hostId,
+      profileId: target.profileId,
+      activity: {
+        eventId: newActivityEventId("agent"),
+        occurredAt: new Date().toISOString(),
+        projectId: context.projectId,
+        hostId: target.hostId,
+        profileId: target.profileId,
+        destinationOrigin: null,
+      },
+    });
+    if ("ok" in authorization) {
+      return refusal(
+        authorization.ok
+          ? "Browser access is unavailable."
+          : authorization.error,
+      );
+    }
+    return host.call(
+      "browserAxi",
+      {
+        hostId: target.hostId,
+        projectId: context.projectId,
+        threadId: context.threadId,
+        profileId: target.profileId,
+        args: parameters.args,
+        ...(context.cwd === undefined ? {} : { cwd: context.cwd }),
+      },
+      { hostId: target.hostId, signal: context.signal },
+    );
+  }
+
   async function navigate(
     request: BrowserPanelNavigationInput,
     signal?: AbortSignal,
@@ -3049,6 +3114,7 @@ export function createBrowserService(
   }
 
   return {
+    browserAxi,
     browserScript,
     sessions,
     selectSession,

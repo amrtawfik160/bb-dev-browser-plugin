@@ -157,7 +157,19 @@ site fights automation.
 
 ### Agent
 
-Use `browser_script` or `bb plugin run browser script`; any web origin works by default.
+Agents drive their own tabs with [chrome-devtools-axi](https://github.com/kunchenguid/chrome-devtools-axi),
+unchanged (ADR 0022):
+
+```bash
+bb plugin run browser axi open https://example.com
+bb plugin run browser axi click @g1:3
+bb plugin run browser axi --help
+```
+
+It behaves exactly like `chrome-devtools-axi <command>` in your shell, against
+this thread's own tabs; the `browser_axi` tool is the same for shell-less
+agents. `browser_script` / `bb plugin run browser script` remain for opt-in
+multi-step Playwright logic.
 `page` is this thread's named tab from its first script call on every profile.
 Saving or sharing the profile preserves that binding. Whatever you `return` is the result. Pass an exact origin
 every time.
@@ -257,7 +269,9 @@ Agents may drive any web origin by default. Each automation act still runs
 under a Profile Grant bound to the BB project, recorded automatically on first
 use and revocable in Browser Settings.
 
-Automation goes through bounded `browser_script` calls with typed results.
+Agent browsing goes through chrome-devtools-axi on each thread's Session CDP
+Proxy, which exposes only that thread's tabs; Playwright scripts are bounded
+`browser_script` calls with typed results.
 
 The browser runs as `bb-browser` and never gets the repository. Workspace
 files go through Transfer Staging and are deleted after use.

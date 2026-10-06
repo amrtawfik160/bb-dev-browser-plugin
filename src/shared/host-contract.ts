@@ -20,6 +20,8 @@ import {
   browserSetupResponseSchema,
   browserScriptResponseSchema,
   browserScriptRequestSchema,
+  browserAxiRequestSchema,
+  browserAxiResponseSchema,
   browserNavigationRequestSchema,
   browserHistoryRequestSchema,
   browserNavigationResponseSchema,
@@ -137,6 +139,10 @@ export const browserHostContract = defineRpcContract({
   purge: {
     input: browserPurgeRequestSchema,
     output: browserPurgeResponseSchema,
+  },
+  browserAxi: {
+    input: browserAxiRequestSchema,
+    output: browserAxiResponseSchema,
   },
   browserScript: {
     input: browserScriptRequestSchema,

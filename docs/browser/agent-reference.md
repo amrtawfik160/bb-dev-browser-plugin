@@ -37,8 +37,8 @@ or sharing its profile preserves the binding. A closed or unrestored named
 tab is recreated at `destinationOrigin`. `return` values become the tool result. There is no
 `document` global. Your session connects through its own Session CDP Proxy:
 `browser.listPages()` and `browser.getPage()` reach only your tabs and the
-popups they open, never the owner's or another thread's. For single actions,
-prefer `browser_command` (open, snapshot, click @ref, fill, press…).
+popups they open, never the owner's or another thread's. For browsing, use
+chrome-devtools-axi: `bb plugin run browser axi <command>` (ADR 0022).
 
 The host applies `BrowserContext.setDefaultTimeout` and
 `BrowserContext.setDefaultNavigationTimeout` to the shared context, reserving

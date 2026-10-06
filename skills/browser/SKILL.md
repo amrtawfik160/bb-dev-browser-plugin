@@ -1,6 +1,6 @@
 ---
 name: browser
-description: Drive a real Chromium on this host — open pages, click, type, read, and screenshot — with short commands through the browser_command tool (open, snapshot, click @ref, fill, press…), Playwright code through browser_script, or the bb plugin run browser CLI. Use for web automation, testing a running app, checking a deployed page, or any task that needs a real browser.
+description: Control a real Chrome on this host with chrome-devtools-axi - navigate, snapshot, click, fill forms, run JavaScript, inspect console and network, take screenshots, audit performance - through `bb plugin run browser axi <command>` (or the browser_axi tool). Use whenever a task needs a real browser: opening or testing a web page, clicking through a flow, extracting page content, or debugging a website.
 ---
 
 # Browser
@@ -28,9 +28,9 @@ Before asking the owner to log in, use `browser_sessions`:
    prior activity; it does not prove authentication.
 2. Prefer the selected matching profile. If account choice is ambiguous, ask
    which profile to use. Select with `{action: "select", profileId: "…"}`.
-   Selection affects this thread only; subsequent `browser_script` calls use
+   Selection affects this thread only; subsequent `bb plugin run browser axi` calls use
    it without `profileId`.
-3. Open the requested site with `browser_script` and verify an authenticated
+3. Open the requested site with `bb plugin run browser axi open <url>` and verify an authenticated
    page. Report `{action: "report", origin: "https://…", status: "signed-in"}`
    after verification, or `status: "signed-out"` if authentication expired.
 4. Request a Sign-in Handoff only when no suitable profile is authenticated.
@@ -57,45 +57,38 @@ do not close another agent's tabs or stop its profile. Keep only needed tabs:
 the 12-tab retention cap closes the oldest inactive pages. Sleeping preserves
 site storage and tab locations, but transient form state can be lost.
 
-## Start here: browser commands
+## Start here: chrome-devtools-axi
 
-Use `browser_command` for almost everything. Send one short command; get back
-the page, a compact snapshot whose interactive elements carry refs, and the
-next commands you could run:
+This browser is driven with [chrome-devtools-axi](https://github.com/kunchenguid/chrome-devtools-axi),
+unchanged. Run it through BB so it reaches this thread's own tabs:
 
 ```text
-open https://example.com
-→ page: {title: "Example Domain", url: "https://example.com/", refs: 1}
-  snapshot:
-  heading "Example Domain" [level=1]
-  paragraph: This domain is for use in illustrative examples…
-  uid=g1:e6 link "Learn more"
-  help[2]:
-    Run `click @g1:e6` to click the "Learn more" link
-click @g1:e6
+bb plugin run browser axi <command> [flags]
 ```
 
-| Command                                    | What it does                                          |
-| ------------------------------------------ | ----------------------------------------------------- |
-| `open <url>`                               | Go to a URL in your tab and snapshot it               |
-| `snapshot`                                 | Read the current page and get fresh refs              |
-| `click @ref` / `hover @ref`                | Act on an element from the latest snapshot            |
-| `fill @ref <text>` / `select @ref <value>` | Fill a field or choose an option                      |
-| `type <text>` / `press <key>`              | Type at the focus or press a key (`Enter`, `Tab`…)    |
-| `scroll up\|down\|top\|bottom`, `back`     | Move around                                           |
-| `wait <ms>` / `wait <text>`                | Wait for time or for text to appear                   |
-| `eval <js>`                                | Evaluate an expression or function; returns its value |
-| `screenshot`                               | Snapshot plus an image of your tab                    |
+That is exactly `chrome-devtools-axi <command> [flags]`: same commands, flags,
+output, refs, and hints, and relative output paths (screenshots, traces, heap
+snapshots, network bodies) resolve in your working directory. Without a shell,
+call the `browser_axi` tool with `args` (use absolute paths for files).
 
-Refs look like `@g3:e5`: pass them back exactly as printed. They go stale after
-every command, and a stale ref fails with `STALE_REF` instead of clicking the
-wrong thing — run `snapshot` and retry. Check a state change with the snapshot
-that comes back (or `eval`) before reporting success. From a shell:
-`bb plugin run browser do click @g3:e5`.
+Do not follow command or flag lists from this file - they go stale. Get the
+current source of truth from the CLI:
 
-## Playwright scripts
+- `bb plugin run browser axi --help` for commands, flags, and environment
+- `bb plugin run browser axi <command> --help` for per-command usage
+- Follow axi's own next-step hints after each command; they are already
+  written as `bb plugin run browser axi …`
 
-Use `browser_script` for multi-step logic, with the exact HTTP(S) origin you need. Any web origin
+Your session sees only its own tabs. The owner keeps browsing their tabs and
+other threads keep theirs; nobody interrupts anyone, and the owner can watch
+your tabs in the Browser Panel. Only web pages open (`http`, `https`, `data`,
+`about:blank`); local files and `chrome://` pages do not.
+
+## Playwright scripts (opt-in)
+
+`browser_script` is off by default; axi's `eval` covers most needs. When a
+project enables it, use it for multi-step Playwright logic with the exact
+HTTP(S) origin you need. Any web origin
 works by default: your project's first call records a whole-web grant the
 owner can see in Browser Settings. `origin_denied` means the owner withdrew
 that access for your project (surface the attached Grant Request and pause
@@ -213,7 +206,7 @@ I need you to sign in to GitHub so I can continue.
 - Make the card the last thing in your reply and end your turn. Starting a long
   wait after it collapses the turn and buries the card.
 - The owner can click Done on the card to send a reply and let you continue.
-  When the owner replies, check with `browser_script`. If sign-in is still
+  When the owner replies, check with `bb plugin run browser axi snapshot`. If sign-in is still
   pending, embed the card again as the last thing in that reply.
 - Never ask for a password or code in chat, and never type the owner's
   credentials yourself.

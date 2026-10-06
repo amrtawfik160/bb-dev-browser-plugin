@@ -143,6 +143,12 @@ import {
   type HostDownloadFilesystem,
 } from "./host-downloads.js";
 import { createNodeHostDownloadsFilesystem } from "./host-downloads-filesystem.js";
+import {
+  axiSessionName,
+  resolveAxiRuntime,
+  runAxiCommand,
+  type AxiRuntimePaths,
+} from "./axi-runner.js";
 
 export type HostSetupBoundary = HostReadinessBoundary;
 type HostBoundary = HostReadinessBoundary | HostAdministrationBoundary;
@@ -157,8 +163,10 @@ type ProfileRecoverySource =
   BrowserProfileRecovery | ((dataDir: string) => BrowserProfileRecovery);
 type BrowserRuntimeHost = Omit<
   BrowserInstanceRuntime,
-  "activeTabId" | "checkRendererProcessLimit"
+  "activeTabId" | "checkRendererProcessLimit" | "agentSessionEndpoint"
 > & {
+  /** Optional for small injected host test doubles. */
+  agentSessionEndpoint?: BrowserInstanceRuntime["agentSessionEndpoint"];
   /** Optional for small injected host test doubles. */
   activeTabId?: (
     target: Pick<BrowserRuntimeTarget, "hostId" | "profileId">,
@@ -2203,6 +2211,65 @@ export function createBrowserHostEntry(
           .catch(() => undefined);
         return response;
       },
+      /**
+       * Run one chrome-devtools-axi command for an agent session. axi
+       * connects through the session's Session CDP Proxy, so it sees and
+       * drives only that thread's tabs, beside the owner and other threads.
+       */
+      browserAxi: async (request, context) => {
+        retainWorker(context);
+        const dataDir = context.experimental_paths.dataDir;
+        const target = { hostId: request.hostId, profileId: request.profileId };
+        const failure = (message: string) => ({
+          exitCode: 1,
+          stdout: "",
+          stderr: `error: ${JSON.stringify(message)}\n`,
+        });
+        try {
+          safeLogin(dataDir).assertAgentAllowed(target);
+        } catch (error) {
+          if (error instanceof SafeLoginAgentDeniedError) {
+            return failure(
+              "The owner is signing in with Safe Login. Wait for them to finish, then retry.",
+            );
+          }
+          throw error;
+        }
+        const readiness = await administration(dataDir).inspect(target);
+        if (readiness.state !== "healthy") return failure(readiness.message);
+        const inventory = await profiles(dataDir).listProfiles(request.hostId);
+        const profile = inventory.profiles.find(
+          (candidate) =>
+            candidate.profileId === request.profileId &&
+            candidate.state === "active",
+        );
+        if (profile === undefined) {
+          return failure("The requested Browser Profile is unavailable.");
+        }
+        const browserRuntime = runtime(dataDir);
+        if (browserRuntime?.agentSessionEndpoint === undefined) {
+          return failure("The Workspace Browser runtime is unavailable.");
+        }
+        const lane = `thread:${scopedProfileId({
+          projectId: request.projectId,
+          threadId: request.threadId,
+        })}`;
+        const endpoint = await browserRuntime.agentSessionEndpoint(
+          { ...target, locale: profile.locale, timezone: profile.timezone },
+          lane,
+        );
+        const result = await runAxiCommand(axiRuntime(dataDir), {
+          args: request.args,
+          endpoint,
+          session: axiSessionName(lane),
+          ...(request.cwd === undefined ? {} : { cwd: request.cwd }),
+          homeDirectory: join(dataDir, "axi"),
+          signal: context.signal,
+        });
+        // Show tabs the command opened or closed in every Browser Panel.
+        await reconcileRuntimeTabs(dataDir, target);
+        return result;
+      },
       sleepProfile: async (request, context) => {
         retainWorker(context);
         return sleepProfile(context.experimental_paths.dataDir, request);
@@ -2525,6 +2592,24 @@ export function createBrowserHostEntry(
       }
     },
   });
+}
+
+const axiRuntimes = new Map<string, AxiRuntimePaths>();
+
+/** The pinned chrome-devtools-axi install, found where the helper is found. */
+function axiRuntime(dataDir: string): AxiRuntimePaths {
+  let paths = axiRuntimes.get(dataDir);
+  if (paths === undefined) {
+    const daemonRoot = daemonRootFromHostDataDir(dataDir);
+    const pluginSource = readDaemonPluginSourcePath(daemonRoot, "browser");
+    paths = resolveAxiRuntime([
+      ...(pluginSource === null ? [] : [pluginSource]),
+      dataDir,
+      daemonRoot,
+    ]);
+    axiRuntimes.set(dataDir, paths);
+  }
+  return paths;
 }
 
 function productionDevBrowserRuntime(dataDir: string) {

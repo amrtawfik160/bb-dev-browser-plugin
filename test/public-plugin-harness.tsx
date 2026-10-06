@@ -300,6 +300,7 @@ export function createTabInventoryRuntime(): BrowserInstanceRuntime & {
     get pinnedPanelIds() {
       return [...pinnedPanelIds];
     },
+    agentSessionEndpoint: async () => "http://127.0.0.1:9333",
     start: async (target) => instance(target),
     stop: async () => undefined,
     execute: async () => "",

@@ -28,22 +28,10 @@ import {
   resolveBrowserAddress,
 } from "../browser/browser-navigation.js";
 import {
-  BrowserCommandError,
-  browserCommandScript,
-  commandOrigin,
-  commandPurpose,
-  commandRef,
-  formatBrowserCommandResult,
-  parseBrowserCommand,
-  parseBrowserCommandOutput,
-  type BrowserCommand as AgentBrowserCommand,
-} from "./browser-commands.js";
-import {
   BROWSER_SCRIPT_MAX_TIMEOUT_MS,
   BROWSER_SCRIPT_MIN_TIMEOUT_MS,
-  browserCommandParametersSchema,
+  browserAxiParametersSchema,
   browserScriptParametersSchema,
-  type BrowserCommandParameters,
   browserSessionsParametersSchema,
   browserScriptResultSchema,
   type BrowserActivityRecord,
@@ -787,7 +775,7 @@ function browserScriptJson(browserResult: unknown) {
  */
 async function agentCliIdentity(
   bb: BbPluginApi,
-  command: "open" | "script" | "sessions",
+  command: "open" | "script" | "sessions" | "axi",
   context: PluginCliContext,
 ): Promise<{ projectId: string; threadId: string }> {
   if (context.threadId === undefined) {
@@ -852,41 +840,31 @@ async function runBrowserScriptCli(
   };
 }
 
-async function runBrowserCommandCli(
+/**
+ * `bb plugin run browser axi <command…>` runs chrome-devtools-axi for this
+ * thread, in the caller's directory, exactly as `chrome-devtools-axi
+ * <command…>` would run in a shell, against the thread's own browser tabs.
+ */
+async function runAxiCli(
   bb: BbPluginApi,
   browser: BrowserService,
   argv: string[],
   context: PluginCliContext,
 ) {
-  const words = [...argv];
-  let profileId: string | undefined;
-  const profileIndex = words.indexOf("--profile");
-  if (profileIndex >= 0) {
-    profileId = words[profileIndex + 1];
-    words.splice(profileIndex, 2);
-  }
-  if (words.length === 0) {
-    return {
-      exitCode: 1,
-      stderr:
-        "browser do needs a command, such as `snapshot` or `open https://example.com`.",
-    };
-  }
-  const identity = await agentCliIdentity(bb, "script", context);
-  const result = await runBrowserCommand(
-    browser,
-    browserCommandParametersSchema.parse({
-      command: words.join(" "),
-      ...(profileId === undefined ? {} : { profileId }),
-    }),
-    { ...identity, signal: context.signal ?? new AbortController().signal },
+  const identity = await agentCliIdentity(bb, "axi", context);
+  const result = await browser.browserAxi(
+    browserAxiParametersSchema.parse({ args: argv }),
+    {
+      ...identity,
+      signal: context.signal ?? new AbortController().signal,
+      ...(context.cwd === undefined ? {} : { cwd: context.cwd }),
+    },
   );
-  const text = result.content
-    .flatMap((item) => (item.type === "text" ? [item.text] : []))
-    .join("\n");
-  return "isError" in result && result.isError
-    ? { exitCode: 1, stderr: text }
-    : { exitCode: 0, stdout: text };
+  return {
+    exitCode: result.exitCode,
+    ...(result.stdout.length === 0 ? {} : { stdout: result.stdout }),
+    ...(result.stderr.length === 0 ? {} : { stderr: result.stderr }),
+  };
 }
 
 async function runOpenCli(
@@ -1478,8 +1456,8 @@ async function runCli(
   if (isGrantCliCommand(argv[0])) {
     return failClosedGrantCliCommand();
   }
-  if (argv[0] === "do") {
-    return await runBrowserCommandCli(bb, browser, argv.slice(1), context);
+  if (argv[0] === "axi") {
+    return await runAxiCli(bb, browser, argv.slice(1), context);
   }
   const parsed = parseCliArguments(argv);
   if ("error" in parsed) return { exitCode: 1, stderr: parsed.error };
@@ -2072,114 +2050,6 @@ async function runBrowserScript(
   return response.ok ? toolSuccess(response.result) : toolFailure(response);
 }
 
-/**
- * Per agent session state for Browser Commands: the snapshot generation that
- * stamps refs, and the last page origin so a follow-up command is checked
- * against the site it acts on.
- */
-type BrowserCommandSession = { generation: number; origin?: string };
-const browserCommandSessions = new Map<string, BrowserCommandSession>();
-const MAX_BROWSER_COMMAND_SESSIONS = 512;
-
-function browserCommandSession(key: string): BrowserCommandSession {
-  let session = browserCommandSessions.get(key);
-  if (session === undefined) {
-    if (browserCommandSessions.size >= MAX_BROWSER_COMMAND_SESSIONS) {
-      const oldest = browserCommandSessions.keys().next().value;
-      if (oldest !== undefined) browserCommandSessions.delete(oldest);
-    }
-    session = { generation: 0 };
-    browserCommandSessions.set(key, session);
-  }
-  return session;
-}
-
-function browserCommandFailure(code: string, message: string) {
-  return {
-    content: [
-      {
-        type: "text" as const,
-        text: `error: {code: ${JSON.stringify(code)}, message: ${JSON.stringify(message)}}`,
-      },
-    ],
-    isError: true,
-  };
-}
-
-export async function runBrowserCommand(
-  browser: BrowserService,
-  parameters: BrowserCommandParameters,
-  context: { projectId: string; threadId: string; signal: AbortSignal },
-) {
-  let command: AgentBrowserCommand;
-  try {
-    command = parseBrowserCommand(parameters.command);
-  } catch (error) {
-    if (error instanceof BrowserCommandError)
-      return browserCommandFailure(error.code, error.message);
-    throw error;
-  }
-  const session = browserCommandSession(
-    `${context.threadId}\0${parameters.profileId ?? ""}`,
-  );
-  const ref = commandRef(command);
-  if (ref !== undefined && ref.generation !== session.generation) {
-    return browserCommandFailure(
-      "STALE_REF",
-      `@g${ref.generation}:${ref.ref} is from an older snapshot. Run \`snapshot\` and use a ref from the newest output.`,
-    );
-  }
-  const scriptParameters = browserScriptParametersSchema.parse({
-    purpose: commandPurpose(command),
-    code: browserCommandScript(command),
-    ...((commandOrigin(command) ?? session.origin) === undefined
-      ? {}
-      : { destinationOrigin: commandOrigin(command) ?? session.origin }),
-    ...(parameters.profileId === undefined
-      ? {}
-      : { profileId: parameters.profileId }),
-    screenshot: command.name === "screenshot",
-  });
-  const response: BrowserScriptResponse = await browser.browserScript(
-    scriptParameters,
-    context,
-  );
-  if (!response.ok) return toolFailure(response);
-  const parsed = browserScriptResultSchema.safeParse(response.result);
-  const output = parsed.success
-    ? parsed.data.output
-    : browserScriptText(response.result);
-  const payload = parseBrowserCommandOutput(output);
-  if (payload === undefined) {
-    return browserCommandFailure(
-      "command_failed",
-      "The page did not report back. Run `snapshot` to check its state.",
-    );
-  }
-  try {
-    const origin = new URL(payload.url).origin;
-    if (origin.startsWith("http")) session.origin = origin;
-  } catch {
-    // about:blank and other non-web pages keep the last web origin.
-  }
-  if (payload.snapshot !== undefined) session.generation += 1;
-  return {
-    content: [
-      {
-        type: "text" as const,
-        text: formatBrowserCommandResult(command, payload, session.generation),
-      },
-      ...(parsed.success
-        ? parsed.data.screenshots.map((screenshot) => ({
-            type: "image" as const,
-            data: screenshot.data,
-            mimeType: screenshot.mimeType,
-          }))
-        : []),
-    ],
-  };
-}
-
 function serializeSessions(result: unknown, pretty = false) {
   const serialized = JSON.stringify(result, null, pretty ? 2 : undefined);
   if (Buffer.byteLength(serialized, "utf8") > 256 * 1024) {
@@ -2320,10 +2190,11 @@ function registerCli(bb: BbPluginApi, browser: BrowserService) {
           "bb plugin run browser diagnostics [--profile <id>] [--host <id>] [--json]",
       },
       {
-        name: "do",
-        summary: "Drive this thread's own browser tab with one short command",
+        name: "axi",
+        summary:
+          "Run chrome-devtools-axi against this thread's own browser tabs",
         usage:
-          "bb plugin run browser do <open <url> | snapshot | click @ref | fill @ref <text> | type <text> | press <key> | hover @ref | select @ref <value> | scroll <dir> | back | wait <ms|text> | eval <js> | screenshot> [--profile <id>]",
+          "bb plugin run browser axi <chrome-devtools-axi command and flags>  (run `bb plugin run browser axi --help`)",
       },
       {
         name: "script",
@@ -2468,7 +2339,7 @@ function registerAgentTool(bb: BbPluginApi, browser: BrowserService) {
     description:
       "Run Playwright code in the host-local Workspace Browser. Pass destinationOrigin as an exact origin such as https://example.com. The script gets `page` for this thread's named tab, or an explicit tabId; returned values become the tool result.",
     instructions:
-      "Provide a purpose, an exact destinationOrigin, and QuickJS Playwright code. Before asking the owner to sign in, use browser_sessions to find and select an existing signed-in profile. Calls without profileId use this thread's selected profile, falling back to its private default; explicit profile selections share cookies. Every profile gives each thread a stable named tab from its first script call unless tabId is supplied. `page` is that tab. `return` values become the result. Verify authentication on the requested site, then report signed-in or signed-out through browser_sessions; dated confirmations can expire. If several profiles match, preserve the selected profile or ask which account to use. Your tab works in the background beside the owner's tabs and other threads' tabs; only this thread's calls wait in order, for up to 30 seconds before browser_busy (that call has not run). Let the active operation finish before retrying once. The CLI uses the same lane. Prefer browser_command for single actions. At most three Browser Instances run on a host; awake-limit means capacity is in use, so wait without stopping another profile. Report typed failures without retrying setup. " +
+      "Provide a purpose, an exact destinationOrigin, and QuickJS Playwright code. Before asking the owner to sign in, use browser_sessions to find and select an existing signed-in profile. Calls without profileId use this thread's selected profile, falling back to its private default; explicit profile selections share cookies. Every profile gives each thread a stable named tab from its first script call unless tabId is supplied. `page` is that tab. `return` values become the result. Verify authentication on the requested site, then report signed-in or signed-out through browser_sessions; dated confirmations can expire. If several profiles match, preserve the selected profile or ask which account to use. Your tab works in the background beside the owner's tabs and other threads' tabs; only this thread's calls wait in order, for up to 30 seconds before browser_busy (that call has not run). Let the active operation finish before retrying once. The CLI uses the same lane. Prefer browser_axi (chrome-devtools-axi) for browsing; use this only for multi-step Playwright logic. At most three Browser Instances run on a host; awake-limit means capacity is in use, so wait without stopping another profile. Report typed failures without retrying setup. " +
       'If a person is likely watching, put `::browser-live` on its own line in your reply to show this thread\'s browser inline; skip it for unattended work, use at most one card per reply, and add profile-id="<id>" only when you passed profileId. ' +
       'When a site needs the owner to sign in, never ask for credentials in chat or type theirs: end your reply with `::browser-sign-in{origin="https://example.com"}` on its own line, then end the turn. The owner can click Done on the card to send a reply and let you continue; check the browser when they reply. If sign-in is still pending when you check back, embed the card again.',
     presentation: {
@@ -2483,25 +2354,40 @@ function registerAgentTool(bb: BbPluginApi, browser: BrowserService) {
       runBrowserScript(browser, parameters, context),
   });
   bb.agents.registerTool({
-    name: "browser_command",
+    name: "browser_axi",
     description:
-      "Drive this thread's own browser tab with one short command, like chrome-devtools-axi: open <url>, snapshot, click @ref, fill @ref <text>, type <text>, press <key>, hover @ref, select @ref <value>, scroll <up|down|top|bottom>, back, wait <ms|text>, eval <js>, screenshot. Returns the page, a compact snapshot with refs, and next steps.",
+      'Run chrome-devtools-axi (the agent-ergonomic Chrome DevTools CLI) against this thread\'s own tabs in the host\'s Workspace Browser. Pass the command and flags as args, e.g. ["open", "https://example.com"] or ["click", "@g1:3"].',
     instructions:
-      "Start with `open <url>` or `snapshot`. Act with refs exactly as printed (`click @g3:e5`); refs go stale after every command, so use the newest output. Verify a change with the snapshot that comes back (or `eval`) before reporting success. Your tab is separate from the owner's tabs: the owner keeps browsing and you never interrupt each other. Use browser_script only for multi-step Playwright logic. Sign-in, live-card, and profile rules from browser_script apply.",
+      "Prefer the shell: run `bb plugin run browser axi <command>` exactly as you would run `chrome-devtools-axi <command>`; relative output paths then land in your working directory. Use this tool when you have no shell, with absolute paths for files. Start with `--help` or `open <url>`, follow axi's own next-step hints, and pass refs back exactly as printed. Your tabs are separate from the owner's and other threads': nobody interrupts anyone. " +
+      "If a person is likely watching, put `::browser-live` on its own line in your reply to show this thread's browser inline; skip it for unattended work and use at most one card per reply. " +
+      'When a site needs the owner to sign in, never ask for credentials in chat or type theirs: end your reply with `::browser-sign-in{origin="https://example.com"}` on its own line, then end the turn. The owner can click Done on the card to send a reply and let you continue; check the browser when they reply. If sign-in is still pending when you check back, embed the card again.',
     presentation: {
       label: { pending: "Using the browser", completed: "Used the browser" },
       icon: { glyph: "Globe" },
     },
-    parameters: browserCommandParametersSchema,
-    execute: (parameters, context) =>
-      runBrowserCommand(browser, parameters, context),
+    parameters: browserAxiParametersSchema,
+    execute: async (parameters, context) => {
+      const result = await browser.browserAxi(parameters, context);
+      const text = [result.stdout, result.stderr]
+        .filter((part) => part.length > 0)
+        .join("\n");
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: text.length > 0 ? text : `exit ${result.exitCode}`,
+          },
+        ],
+        ...(result.exitCode === 0 ? {} : { isError: true }),
+      };
+    },
   });
   bb.agents.registerTool({
     name: "browser_sessions",
     description:
-      "Discover saved Browser Profiles and their dated sign-in status on this thread's host. List or search sites, select a profile for this thread, or report authentication after verifying it with browser_script. Does not read or export cookies.",
+      "Discover saved Browser Profiles and their dated sign-in status on this thread's host. List or search sites, select a profile for this thread, or report authentication after verifying it with browser_axi. Does not read or export cookies.",
     instructions:
-      "Before requesting a new login, list sessions (optionally site: 'salesforce'). Follow nextOffset to see more. sites are owner-confirmed or agent-verified timestamps; recentOrigins are only discovery hints. Prefer the selected matching profile. Select one with action: 'select' and profileId, then use browser_script to check the site. Report signed-in only after seeing an authenticated page; report signed-out if expired. If accounts are ambiguous, ask the owner. Profiles stay on their host and archived profiles cannot be selected. Control Lease and Profile Grant rules still apply.",
+      "Before requesting a new login, list sessions (optionally site: 'salesforce'). Follow nextOffset to see more. sites are owner-confirmed or agent-verified timestamps; recentOrigins are only discovery hints. Prefer the selected matching profile. Select one with action: 'select' and profileId, then use `bb plugin run browser axi open <url>` (or browser_axi) to check the site. Report signed-in only after seeing an authenticated page; report signed-out if expired. If accounts are ambiguous, ask the owner. Profiles stay on their host and archived profiles cannot be selected. Control Lease and Profile Grant rules still apply.",
     parameters: browserSessionsParametersSchema,
     execute: async (parameters, context) => {
       try {
@@ -2645,7 +2531,7 @@ export default function plugin(bb: BbPluginApi) {
   registerCli(bb, browser);
   registerAgentTool(bb, browser);
   bb.agents.configure(() => ({
-    tools: ["browser_command", "browser_script", "browser_sessions"],
+    tools: ["browser_axi", "browser_sessions"],
     skills: ["browser"],
   }));
 }

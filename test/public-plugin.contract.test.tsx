@@ -120,6 +120,7 @@ function publicRuntime(
   }),
 ): BrowserInstanceRuntime {
   return {
+    agentSessionEndpoint: async () => "http://127.0.0.1:9333",
     start: async (target) => ({
       state: "running",
       hostId: target.hostId,
@@ -2526,14 +2527,13 @@ describe("Browser public plugin contract", () => {
     }
   });
 
-  it("selects the browser_command and browser_script tools and bundled Browser skill", async () => {
+  it("selects the chrome-devtools-axi tool and bundled Browser skill", async () => {
     const browser = await createPublicPluginHarness();
 
     const capabilities = await browser.resolveAgentCapabilities();
 
     expect(capabilities.tools.map((tool) => tool.name)).toEqual([
-      "browser_script",
-      "browser_command",
+      "browser_axi",
       "browser_sessions",
     ]);
     expect(capabilities.skills).toEqual(["browser"]);

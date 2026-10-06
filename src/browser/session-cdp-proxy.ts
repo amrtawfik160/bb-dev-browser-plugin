@@ -34,11 +34,42 @@ export type SessionCdpProxy = {
 };
 
 export type StartSessionCdpProxyOptions = {
-  /** http://127.0.0.1:<port> of the real browser. */
-  upstreamEndpoint: string;
+  /**
+   * http://127.0.0.1:<port> of the real browser, or a function that wakes the
+   * browser and returns its current endpoint. A function lets one proxy keep
+   * a stable address for a whole agent session across browser restarts.
+   */
+  upstreamEndpoint: string | (() => Promise<string>);
   initialTargetIds?: Iterable<string>;
   host?: string;
+  /** Called (at most once a second) while a client sends commands. */
+  onActivity?: () => void;
+  /**
+   * Host paths a client may never hand to the browser (file uploads, drags,
+   * and download folders), such as the browser's own profile storage.
+   */
+  deniedPathPrefixes?: readonly string[];
 };
+
+/** Schemes an agent session may open: the web, plus blank and inline pages. */
+const NAVIGABLE_SCHEMES = new Set(["http:", "https:", "data:", "blob:"]);
+
+export function navigableUrl(address: string): boolean {
+  if (address === "" || address === "about:blank") return true;
+  try {
+    return NAVIGABLE_SCHEMES.has(new URL(address).protocol);
+  } catch {
+    return false;
+  }
+}
+
+function pathDenied(path: string, prefixes: readonly string[]) {
+  const normalized = path.replace(/\/+$/u, "");
+  return prefixes.some((prefix) => {
+    const root = prefix.replace(/\/+$/u, "");
+    return normalized === root || normalized.startsWith(`${root}/`);
+  });
+}
 
 type CdpParams = Record<string, unknown>;
 
@@ -70,6 +101,8 @@ const UNAVAILABLE_CODE = -32001;
 const SESSION_UNAVAILABLE = "Session is not available in this browser session.";
 const TARGET_UNAVAILABLE = "Target is not available in this browser session.";
 const COMMAND_UNAVAILABLE = "Command is not available in this browser session.";
+const NAVIGATION_UNAVAILABLE =
+  "Only web pages can be opened in this browser session.";
 
 // Screenshots and large evaluate results arrive as single CDP frames.
 // Playwright's own client accepts 256 MiB, so the proxy must not be smaller.
@@ -213,6 +246,23 @@ class SessionOwnership {
    * is pending an unknown page cannot be judged yet and is held instead.
    */
   pendingCreations = 0;
+  onActivity?: () => void;
+  deniedPathPrefixes: readonly string[] = [];
+  private lastActivityAt = 0;
+
+  noteActivity() {
+    const now = Date.now();
+    if (now - this.lastActivityAt < 1_000) return;
+    this.lastActivityAt = now;
+    this.onActivity?.();
+  }
+  /**
+   * Newer Chromium wraps every page in a "tab" target, created just before
+   * the page, while the creating command is still pending. Clients that
+   * attach in tab mode (Puppeteer, and so chrome-devtools-mcp) attach to that
+   * tab, so it must belong to whoever created the page.
+   */
+  private readonly tabsDuringCreation: string[] = [];
   readonly connections = new Set<ProxyConnection>();
 
   owns(targetId: string) {
@@ -238,9 +288,22 @@ class SessionOwnership {
     this.pendingCreations += 1;
   }
 
+  /** Remember an unclaimed tab target announced during a pending creation. */
+  noteTabDuringCreation(info: TargetInfo) {
+    if (info.type !== "tab" || this.pendingCreations === 0) return;
+    if (this.tabsDuringCreation.includes(info.targetId)) return;
+    this.tabsDuringCreation.push(info.targetId);
+  }
+
   creationFinished(targetId: string | undefined) {
-    if (targetId !== undefined) this.pages.add(targetId);
+    if (targetId !== undefined) {
+      this.pages.add(targetId);
+      // Creations answer in order, so the oldest unclaimed tab is this page's.
+      const tab = this.tabsDuringCreation.shift();
+      if (tab !== undefined) this.pages.add(tab);
+    }
     this.pendingCreations = Math.max(0, this.pendingCreations - 1);
+    if (this.pendingCreations === 0) this.tabsDuringCreation.length = 0;
     for (const connection of this.connections) connection.settleHeld();
   }
 }
@@ -391,6 +454,26 @@ class ProxyConnection {
     params: CdpParams | undefined,
     browserLevel: boolean,
   ): string | null {
+    // Only web pages: no file:, chrome:, devtools:, or view-source: documents.
+    if (method === "Page.navigate" || method === "Target.createTarget") {
+      const url = stringParam(params, "url");
+      if (url !== undefined && !navigableUrl(url))
+        return NAVIGATION_UNAVAILABLE;
+    }
+    // Never hand the browser's own storage to a page or a download.
+    const denied = this.ownership.deniedPathPrefixes;
+    if (denied.length > 0) {
+      const files = [
+        ...(Array.isArray(params?.files) ? params.files : []),
+        ...(Array.isArray((params?.data as CdpParams | undefined)?.files)
+          ? ((params!.data as CdpParams).files as unknown[])
+          : []),
+        params?.downloadPath,
+      ].filter((value): value is string => typeof value === "string");
+      if (files.some((path) => pathDenied(path, denied))) {
+        return COMMAND_UNAVAILABLE;
+      }
+    }
     if (
       DENIED_COMMANDS.has(method) ||
       DENIED_DOMAINS.some((domain) => method.startsWith(domain))
@@ -468,6 +551,7 @@ class ProxyConnection {
       return;
     }
     const { id, method, params } = message;
+    this.ownership.noteActivity();
     const sessionId =
       typeof message.sessionId === "string" ? message.sessionId : undefined;
     const browserLevel =
@@ -651,6 +735,7 @@ class ProxyConnection {
           return;
         }
         if (this.ownership.pendingCreations > 0) {
+          this.ownership.noteTabDuringCreation(info);
           this.hold(info.targetId, message, { id: childSession, via });
           return;
         }
@@ -684,6 +769,7 @@ class ProxyConnection {
         if (this.ownership.claims(info)) {
           this.toClient(message);
         } else if (this.ownership.pendingCreations > 0) {
+          this.ownership.noteTabDuringCreation(info);
           this.hold(info.targetId, message);
         }
         return;
@@ -793,19 +879,27 @@ export async function startSessionCdpProxy(
   if (!LOOPBACK_HOSTS.has(host)) {
     throw new Error("The session CDP proxy only binds to loopback.");
   }
-  const upstreamHttp = new URL(options.upstreamEndpoint);
-  const upstreamWsOrigin = `ws://${upstreamHttp.host}`;
+  const resolveUpstream = async () =>
+    new URL(
+      typeof options.upstreamEndpoint === "string"
+        ? options.upstreamEndpoint
+        : await options.upstreamEndpoint(),
+    );
   const ownership = new SessionOwnership();
+  ownership.onActivity = options.onActivity;
+  ownership.deniedPathPrefixes = options.deniedPathPrefixes ?? [];
   for (const targetId of options.initialTargetIds ?? []) {
     ownership.pages.add(targetId);
   }
 
-  const upstreamUrl = (path: string) => new URL(path, upstreamHttp);
   let port = 0;
   const ownSocketUrl = (path: string) => `ws://${host}:${port}${path}`;
 
   const fetchUpstream = async (path: string, method = "GET") => {
-    const response = await fetch(upstreamUrl(path), { method });
+    ownership.noteActivity();
+    const response = await fetch(new URL(path, await resolveUpstream()), {
+      method,
+    });
     return { status: response.status, text: await response.text() };
   };
 
@@ -847,6 +941,10 @@ export async function startSessionCdpProxy(
       return respondJson(response, 200, visible);
     }
     if (path === "/json/new" && (method === "PUT" || method === "GET")) {
+      const requested = decodeURIComponent(url.search.replace(/^\?/u, ""));
+      if (requested.length > 0 && !navigableUrl(requested)) {
+        return notFound(response);
+      }
       // Chromium decides whether GET is still accepted; the proxy forwards
       // the client's method so it never weakens that check.
       ownership.creationStarted();
@@ -910,7 +1008,33 @@ export async function startSessionCdpProxy(
       refuseUpgrade(socket, "404 Not Found");
       return;
     }
-    const upstream = new WebSocket(`${upstreamWsOrigin}${path}`, {
+    void connectUpstream(request, socket, head);
+  });
+
+  /**
+   * Connect to the browser's current endpoint, waking it if it slept. The
+   * client's browser id is ignored: a restarted browser has a new one, and
+   * the session's address must keep working across restarts.
+   */
+  const connectUpstream = async (
+    request: IncomingMessage,
+    socket: Duplex,
+    head: Buffer,
+  ) => {
+    let target: string;
+    try {
+      const version = await fetchUpstream("/json/version");
+      const body = JSON.parse(version.text) as {
+        webSocketDebuggerUrl?: unknown;
+      };
+      if (typeof body.webSocketDebuggerUrl !== "string")
+        throw new Error("no browser");
+      target = body.webSocketDebuggerUrl;
+    } catch {
+      refuseUpgrade(socket, "502 Bad Gateway");
+      return;
+    }
+    const upstream = new WebSocket(target, {
       maxPayload: MAX_PAYLOAD_BYTES,
       perMessageDeflate: false,
     });
@@ -934,7 +1058,7 @@ export async function startSessionCdpProxy(
         new ProxyConnection(ownership, upstream, downstream);
       });
     });
-  });
+  };
 
   port = await listen(server, host);
   let closing: Promise<void> | undefined;
