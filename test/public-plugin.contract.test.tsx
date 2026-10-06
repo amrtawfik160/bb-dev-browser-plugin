@@ -97,7 +97,7 @@ async function grantDefaultProfileOrigin(
     hostId: "host-browser-test",
     profileId: DEFAULT_PROFILE_ID,
     originScope: origin,
-    wholeWeb: false,
+    wholeWeb: origin === "*",
     fileTransfer: false,
     invalidCertificateOrigins: [],
   });
@@ -2521,6 +2521,37 @@ describe("Browser public plugin contract", () => {
             interrupted: true,
           }),
         ]),
+      );
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("runs chrome-devtools-axi for a project with whole-web access", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+      browserRuntime: publicRuntime(async () => "unused"),
+    });
+    try {
+      await grantDefaultProfileOrigin(browser, "*");
+      const reply = await browser.runBrowserAxi(["--version"]);
+      expect(reply.isError ?? false).toBe(false);
+      expect((reply.content[0] as { text: string }).text).toContain("0.1.39");
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("refuses chrome-devtools-axi when a project may use only some sites", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+    });
+    try {
+      await grantDefaultProfileOrigin(browser, "https://example.com");
+      const reply = await browser.runBrowserAxi(["--version"]);
+      expect(reply.isError).toBe(true);
+      expect((reply.content[0] as { text: string }).text).toContain(
+        "needs access to the whole web",
       );
     } finally {
       await browser.dispose();

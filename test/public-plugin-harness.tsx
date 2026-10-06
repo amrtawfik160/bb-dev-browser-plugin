@@ -36,6 +36,7 @@ import {
   browserNavigationResponseSchema,
   browserHostPanelVisibilityRequestSchema,
   browserPanelTransportRequestSchema,
+  browserAxiRequestSchema,
   browserPanelReleaseHostRequestSchema,
   browserPanelControlRequestSchema,
   browserHostReleaseControlRequestSchema,
@@ -743,6 +744,13 @@ export async function createPublicPluginHarness(options?: {
           {
             signal,
           },
+        );
+      }
+      if (method === "browserAxi") {
+        return host.experimental_call(
+          "browserAxi",
+          browserAxiRequestSchema.parse(input),
+          { signal },
         );
       }
       if (method === "panelVisibility") {
@@ -2293,6 +2301,15 @@ export async function createPublicPluginHarness(options?: {
     return { content: [first, ...rest], isError: true };
   }
 
+  async function runBrowserAxi(args: string[]): Promise<PublicToolReply> {
+    const reply = await backend.harness.behavior.callAgentTool(
+      "browser_axi",
+      { args },
+      { threadId: THREAD_ID, projectId: PROJECT_ID },
+    );
+    return reply as PublicToolReply;
+  }
+
   async function runBrowserScriptWithProfile(
     profileId?: string,
     overrides?: {
@@ -2552,6 +2569,7 @@ export async function createPublicPluginHarness(options?: {
     runBrowserTabAction,
     runBrowserScript,
     runBrowserScriptWithProfile,
+    runBrowserAxi,
     runBrowserSessions,
     privilegedExecutor: options?.privilegedExecutor ?? null,
     resolveAgentCapabilities,

@@ -2625,13 +2625,37 @@ export function createBrowserService(
    * it does for scripts, then the host runs axi against the thread's own
    * Session CDP Proxy.
    */
+  /** Sample origin used only to look up whole-web access for an axi command. */
+  const AXI_ACCESS_PROBE_ORIGIN = "https://example.com";
+
+  /** The origin an axi command opens (`open`/`newpage <url>`), else the probe. */
+  function axiCommandOrigin(args: readonly string[]): string {
+    const positional = args.filter((arg) => !arg.startsWith("-"));
+    if (positional[0] === "open" || positional[0] === "newpage") {
+      try {
+        const url = new URL(positional[1] ?? "");
+        if (url.protocol === "http:" || url.protocol === "https:") {
+          return url.origin;
+        }
+      } catch {
+        // Not a URL; fall back to the probe.
+      }
+    }
+    return AXI_ACCESS_PROBE_ORIGIN;
+  }
+
   async function browserAxi(
     parameters: BrowserAxiParameters,
     context: PluginAgentToolContext & { cwd?: string },
   ): Promise<BrowserAxiResponse> {
+    // axi access is all-or-nothing (ADR 0022). The grant check needs one web
+    // origin: the page a command opens, or a sample web origin otherwise.
+    // Either way the project's grant must then cover the whole web.
+    const destinationOrigin = axiCommandOrigin(parameters.args);
     const scriptParameters = browserScriptParametersSchema.parse({
       purpose: "Use the browser",
       code: "return null;",
+      destinationOrigin,
       ...(parameters.profileId === undefined
         ? {}
         : { profileId: parameters.profileId }),
@@ -2658,7 +2682,7 @@ export function createBrowserService(
         projectId: context.projectId,
         hostId: target.hostId,
         profileId: target.profileId,
-        destinationOrigin: null,
+        destinationOrigin,
       },
     });
     if ("ok" in authorization) {
@@ -2667,6 +2691,15 @@ export function createBrowserService(
           ? "Browser access is unavailable."
           : authorization.error,
       );
+    }
+    if (
+      (authorization.temporaryGrant ?? authorization.grant).originScope !== "*"
+    ) {
+      return refusal({
+        code: "origin_denied",
+        message:
+          "This project's browser access is limited to specific sites, and chrome-devtools-axi needs access to the whole web. Ask the owner to allow the whole web for this project in Browser Settings.",
+      });
     }
     return host.call(
       "browserAxi",

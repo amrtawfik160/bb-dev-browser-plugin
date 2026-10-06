@@ -79,6 +79,11 @@ current source of truth from the CLI:
 - Follow axi's own next-step hints after each command; they are already
   written as `bb plugin run browser axi …`
 
+axi needs this project to have access to the whole web, which every project
+gets on its first browser call. If the owner limited the project to specific
+sites, axi stops with `origin_denied`: report it and ask the owner to allow
+the whole web in Browser Settings.
+
 Your session sees only its own tabs. The owner keeps browsing their tabs and
 other threads keep theirs; nobody interrupts anyone, and the owner can watch
 your tabs in the Browser Panel. Only web pages open (`http`, `https`, `data`,
