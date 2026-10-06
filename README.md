@@ -83,8 +83,9 @@ Grant Request. A non-web navigation returns a typed error and does not raise a
 request.
 
 **Origin Scope.** Exact `scheme://host:port`, optional subdomain patterns.
-Tabs outside an agent's scope are parked on `about:blank` during its call and
-restored afterwards. Exact `about:blank` is the safe internal page. Restored
+Each agent session connects through its own Session CDP Proxy and sees only
+its own tabs, so the owner's tabs are never read or touched (ADR 0021). Exact
+`about:blank` is the safe internal page. Restored
 Chrome new-tab / error documents are cleared to `about:blank` before agent
 access.
 

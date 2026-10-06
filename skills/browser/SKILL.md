@@ -75,17 +75,17 @@ open https://example.com
 click @g1:e6
 ```
 
-| Command | What it does |
-| --- | --- |
-| `open <url>` | Go to a URL in your tab and snapshot it |
-| `snapshot` | Read the current page and get fresh refs |
-| `click @ref` / `hover @ref` | Act on an element from the latest snapshot |
-| `fill @ref <text>` / `select @ref <value>` | Fill a field or choose an option |
-| `type <text>` / `press <key>` | Type at the focus or press a key (`Enter`, `Tab`…) |
-| `scroll up\|down\|top\|bottom`, `back` | Move around |
-| `wait <ms>` / `wait <text>` | Wait for time or for text to appear |
-| `eval <js>` | Evaluate an expression or function; returns its value |
-| `screenshot` | Snapshot plus an image of your tab |
+| Command                                    | What it does                                          |
+| ------------------------------------------ | ----------------------------------------------------- |
+| `open <url>`                               | Go to a URL in your tab and snapshot it               |
+| `snapshot`                                 | Read the current page and get fresh refs              |
+| `click @ref` / `hover @ref`                | Act on an element from the latest snapshot            |
+| `fill @ref <text>` / `select @ref <value>` | Fill a field or choose an option                      |
+| `type <text>` / `press <key>`              | Type at the focus or press a key (`Enter`, `Tab`…)    |
+| `scroll up\|down\|top\|bottom`, `back`     | Move around                                           |
+| `wait <ms>` / `wait <text>`                | Wait for time or for text to appear                   |
+| `eval <js>`                                | Evaluate an expression or function; returns its value |
+| `screenshot`                               | Snapshot plus an image of your tab                    |
 
 Refs look like `@g3:e5`: pass them back exactly as printed. They go stale after
 every command, and a stale ref fails with `STALE_REF` instead of clicking the
@@ -147,15 +147,15 @@ workspace access.
 
 - No `document` global — read the DOM with `page.evaluate(() => document.title)`
   or locators.
-- `browser.listPages()` lists tabs; `browser.getPage(id)` binds one. Tab IDs are
+- `browser.listPages()` lists your session's tabs; `browser.getPage(id)` binds
+  one. The owner's and other threads' tabs are not visible to you. Tab IDs are
   runtime-only and change when the browser restarts.
 - Tab state persists between scripts. `page` resumes this thread's named tab
   even after saving or sharing its profile; a fresh tab starts at `destinationOrigin`.
   Navigate when your tab is on another site. Closing a named tab or restarting
   the browser may require navigating back to the task page.
-- Owner tabs outside your grant are parked on `about:blank` while your script
-  runs and come back when it finishes. They are not yours to read; do not
-  report them as failures.
+- Your tab runs in the background (`document.visibilityState` is `hidden`).
+  The owner keeps browsing their own tabs meanwhile and never interrupts you.
 - The host applies Playwright `BrowserContext` action and navigation defaults
   with 25% headroom (capped at 5 seconds) inside the host deadline. The defaults
   cover existing pages and later pages from `browser.getPage` or
@@ -275,11 +275,12 @@ creates a page in the guarded context.
 
 ## Control, profiles, and records
 
-Every script holds one atomic Control Lease per host and profile. Owner
-navigation wins immediately. Competing agents wait in arrival order for up to
-30 seconds before `browser_busy`; cancelled or expired waiting calls never run.
-The wait is separate from the script's execution timeout. Use sequential calls
-when working with one profile. Switching to the CLI uses the same Control Lease.
+Every call holds an atomic Control Lease in your session's own lane. The owner
+and other threads have their own lanes, so nobody waits on or cancels anyone
+else. Your own calls run in arrival order and wait up to 30 seconds before
+`browser_busy`; cancelled or expired waiting calls never run. The wait is
+separate from the script's execution timeout. The CLI uses the same lane.
+Profile stop, Safe Login, and revoked access still stop your calls.
 Your purpose and identity are visible in status,
 diagnostics, and the Browser Panel only while the lease is live.
 

@@ -63,9 +63,9 @@ The plugin must not claim universal login compatibility. Safe Login Mode improve
 
 - All panels receive live state, but only one owner client or agent holds the Control Lease.
 - A second owner client is view-only until it explicitly chooses **Take control**.
-- Owner interaction has priority and may interrupt an agent at any time.
-- Agent scripts receive visible, interruptible, atomic leases no longer than 30 seconds.
-- Agent calls fail immediately while an owner has control. They wait at most five seconds behind another agent before returning a typed `browser_busy` error; commands are never retained for later execution.
+- The owner and each agent session act in separate lanes and never cancel each other; agents work in background tabs and never move the owner's view (ADR 0021).
+- Agent scripts receive visible, atomic leases no longer than 30 seconds in their lane.
+- A second call in the same agent session waits at most 30 seconds before returning a typed `browser_busy` error; commands are never retained for later execution.
 - Agents are denied by default. A persistent Profile Grant authorizes one BB project to use one profile at explicit web origins; unrestricted origins require a separate owner opt-in.
 - Origin Scopes use exact `scheme://host:port` origins and optional explicit subdomain patterns. URL paths do not narrow a grant, each localhost port is separate, and `*` is a distinct whole-web permission.
 - Profile Grants confer full automation within their Origin Scope because arbitrary Playwright scripts cannot be reliably classified as read-only. File transfer remains a separate grant flag.

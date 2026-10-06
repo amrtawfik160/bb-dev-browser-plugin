@@ -126,10 +126,8 @@ Connect session, panel capability redemption) and reconnect behavior.
 - **`bb browser open` or `script` refuses to run from a shell** — both need
   `BB_THREAD_ID`, which every project thread sets. When `BB_PROJECT_ID` is
   absent the project is read from the thread.
-- **Owner tabs went blank** — while an agent runs under an exact-origin grant,
-  tabs outside that origin are parked on `about:blank` and return when the
-  call ends. If one does not come back, its Back button reaches the previous
-  page.
+- **Can't find the agent's work** — agents work in their own background tabs
+  and never switch your view. Select the agent's tab in the strip to watch it.
 - **Disk pressure** — new instances and downloads are refused below 5 GiB host
   free space; low-disk is classified as `repair-required` without deleting
   cookies or site storage.

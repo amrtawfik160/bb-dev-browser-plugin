@@ -71,11 +71,23 @@ The durable site authentication, storage, and open-tab locations restored after 
 _Avoid_: Always-on session, exact process snapshot
 
 **Control Lease**:
-The exclusive, temporary right of either the owner or an agent to send input to a Workspace Browser. The owner has priority, may revoke an agent's lease, and explicitly transfers control between owner clients.
-_Avoid_: Shared cursor, simultaneous control
+The temporary right to drive a Workspace Browser within one lane. The owner has one lane and each agent session has its own, so the owner and agents act at the same time without cancelling each other; calls within one lane run in order. Profile stop, Safe Login, and revoked access end every lane.
+_Avoid_: Exclusive control, owner takeover
+
+**Agent Session**:
+One thread's work on a Browser Profile: its named tab, any popups that tab opens, and its own lane and Session CDP Proxy. An agent session sees and drives only its own tabs and runs in the background beside the owner.
+_Avoid_: Shared cursor, agent takeover
+
+**Session CDP Proxy**:
+The loopback DevTools endpoint an agent session's helper connects through. It exposes only that session's targets, so the owner's and other sessions' tabs are invisible and unreachable to the agent.
+_Avoid_: Raw automation endpoint
+
+**Browser Command**:
+One short agent-ergonomic command (open, snapshot, click @ref, fill, press…) that returns the page, a compact snapshot with generation-stamped refs, and next steps. It compiles to a Browser Script.
+_Avoid_: Macro, script template
 
 **Browser Tab**:
-A page belonging to a Browser Profile's shared tab set and visible from every Browser Panel using that profile. Each profile has one active tab shared across its panels. Automation binds each thread to a named tab from its first script call, while every panel can still see and control those tabs. An explicit tab ID overrides that binding.
+A page belonging to a Browser Profile's shared tab set and visible from every Browser Panel using that profile. Each profile has one active tab shared across its panels, chosen only by the owner. Automation binds each thread to a named tab from its first call; that tab works in the background, and every panel can still select and watch it. An explicit tab ID overrides that binding.
 _Avoid_: Thread tab, panel-local page
 
 **Automation Mode**:

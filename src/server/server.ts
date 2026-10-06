@@ -866,18 +866,27 @@ async function runBrowserCommandCli(
     words.splice(profileIndex, 2);
   }
   if (words.length === 0) {
-    return { exitCode: 1, stderr: "browser do needs a command, such as `snapshot` or `open https://example.com`." };
+    return {
+      exitCode: 1,
+      stderr:
+        "browser do needs a command, such as `snapshot` or `open https://example.com`.",
+    };
   }
   const identity = await agentCliIdentity(bb, "script", context);
   const result = await runBrowserCommand(
     browser,
-    browserCommandParametersSchema.parse({ command: words.join(" "), ...(profileId === undefined ? {} : { profileId }) }),
+    browserCommandParametersSchema.parse({
+      command: words.join(" "),
+      ...(profileId === undefined ? {} : { profileId }),
+    }),
     { ...identity, signal: context.signal ?? new AbortController().signal },
   );
   const text = result.content
     .flatMap((item) => (item.type === "text" ? [item.text] : []))
     .join("\n");
-  return "isError" in result && result.isError ? { exitCode: 1, stderr: text } : { exitCode: 0, stdout: text };
+  return "isError" in result && result.isError
+    ? { exitCode: 1, stderr: text }
+    : { exitCode: 0, stdout: text };
 }
 
 async function runOpenCli(
@@ -2087,7 +2096,12 @@ function browserCommandSession(key: string): BrowserCommandSession {
 
 function browserCommandFailure(code: string, message: string) {
   return {
-    content: [{ type: "text" as const, text: `error: {code: ${JSON.stringify(code)}, message: ${JSON.stringify(message)}}` }],
+    content: [
+      {
+        type: "text" as const,
+        text: `error: {code: ${JSON.stringify(code)}, message: ${JSON.stringify(message)}}`,
+      },
+    ],
     isError: true,
   };
 }
@@ -2101,10 +2115,13 @@ export async function runBrowserCommand(
   try {
     command = parseBrowserCommand(parameters.command);
   } catch (error) {
-    if (error instanceof BrowserCommandError) return browserCommandFailure(error.code, error.message);
+    if (error instanceof BrowserCommandError)
+      return browserCommandFailure(error.code, error.message);
     throw error;
   }
-  const session = browserCommandSession(`${context.threadId}\0${parameters.profileId ?? ""}`);
+  const session = browserCommandSession(
+    `${context.threadId}\0${parameters.profileId ?? ""}`,
+  );
   const ref = commandRef(command);
   if (ref !== undefined && ref.generation !== session.generation) {
     return browserCommandFailure(
@@ -2118,16 +2135,26 @@ export async function runBrowserCommand(
     ...((commandOrigin(command) ?? session.origin) === undefined
       ? {}
       : { destinationOrigin: commandOrigin(command) ?? session.origin }),
-    ...(parameters.profileId === undefined ? {} : { profileId: parameters.profileId }),
+    ...(parameters.profileId === undefined
+      ? {}
+      : { profileId: parameters.profileId }),
     screenshot: command.name === "screenshot",
   });
-  const response: BrowserScriptResponse = await browser.browserScript(scriptParameters, context);
+  const response: BrowserScriptResponse = await browser.browserScript(
+    scriptParameters,
+    context,
+  );
   if (!response.ok) return toolFailure(response);
   const parsed = browserScriptResultSchema.safeParse(response.result);
-  const output = parsed.success ? parsed.data.output : browserScriptText(response.result);
+  const output = parsed.success
+    ? parsed.data.output
+    : browserScriptText(response.result);
   const payload = parseBrowserCommandOutput(output);
   if (payload === undefined) {
-    return browserCommandFailure("command_failed", "The page did not report back. Run `snapshot` to check its state.");
+    return browserCommandFailure(
+      "command_failed",
+      "The page did not report back. Run `snapshot` to check its state.",
+    );
   }
   try {
     const origin = new URL(payload.url).origin;
@@ -2138,7 +2165,10 @@ export async function runBrowserCommand(
   if (payload.snapshot !== undefined) session.generation += 1;
   return {
     content: [
-      { type: "text" as const, text: formatBrowserCommandResult(command, payload, session.generation) },
+      {
+        type: "text" as const,
+        text: formatBrowserCommandResult(command, payload, session.generation),
+      },
       ...(parsed.success
         ? parsed.data.screenshots.map((screenshot) => ({
             type: "image" as const,
@@ -2463,7 +2493,8 @@ function registerAgentTool(bb: BbPluginApi, browser: BrowserService) {
       icon: { glyph: "Globe" },
     },
     parameters: browserCommandParametersSchema,
-    execute: (parameters, context) => runBrowserCommand(browser, parameters, context),
+    execute: (parameters, context) =>
+      runBrowserCommand(browser, parameters, context),
   });
   bb.agents.registerTool({
     name: "browser_sessions",

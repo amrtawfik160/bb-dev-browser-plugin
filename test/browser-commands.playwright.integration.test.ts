@@ -18,7 +18,9 @@ const FIXTURE = `<!doctype html><title>Command fixture</title>
 const SECOND = `<!doctype html><title>Second</title><h1>Second page</h1>`;
 
 async function closeServer(server: Server) {
-  await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+  await new Promise<void>((resolve, reject) =>
+    server.close((error) => (error ? reject(error) : resolve())),
+  );
 }
 
 /** Run one command's Browser Script the way the sandbox would, with `page` bound. */
@@ -26,10 +28,16 @@ async function runCommand(page: Page, line: string, generation: number) {
   const command = parseBrowserCommand(line);
   const sandboxPage = Object.assign(Object.create(page) as Page, {
     snapshotForAI: (options: { track?: string }) =>
-      (page as unknown as { _snapshotForAI(o: unknown): Promise<{ full: string }> })._snapshotForAI(options),
+      (
+        page as unknown as {
+          _snapshotForAI(o: unknown): Promise<{ full: string }>;
+        }
+      )._snapshotForAI(options),
   });
   const body = browserCommandScript(command);
-  const run = new Function("page", `return (async () => {\n${body}\n})();`) as (page: Page) => Promise<string>;
+  const run = new Function("page", `return (async () => {\n${body}\n})();`) as (
+    page: Page,
+  ) => Promise<string>;
   const output = await run(sandboxPage);
   const payload = parseBrowserCommandOutput(output);
   expect(payload, line).toBeDefined();
@@ -47,9 +55,12 @@ describe("Browser Commands against real Chromium", () => {
       response.setHeader("content-type", "text/html");
       response.end(request.url === "/second" ? SECOND : FIXTURE);
     });
-    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
     const address = server.address();
-    if (address === null || typeof address === "string") throw new Error("no port");
+    if (address === null || typeof address === "string")
+      throw new Error("no port");
     const origin = `http://127.0.0.1:${address.port}`;
     const browser = await chromium.launch({ headless: true });
     try {
@@ -65,7 +76,11 @@ describe("Browser Commands against real Chromium", () => {
       const clicked = await runCommand(page, `click @${go}`, 3);
       expect(clicked).toContain("Searched: blue shoes");
 
-      const value = await runCommand(page, "eval document.getElementById('out').textContent", 3);
+      const value = await runCommand(
+        page,
+        "eval document.getElementById('out').textContent",
+        3,
+      );
       expect(value).toContain('result: "Searched: blue shoes"');
 
       const next = refFor(clicked, 'link "Next page"');

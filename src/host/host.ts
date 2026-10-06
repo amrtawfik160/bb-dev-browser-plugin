@@ -1815,17 +1815,17 @@ export function createBrowserHostEntry(
             return response;
           }
           const browserRuntime = runtime(dataDir);
+          // Each agent session works in its own lane: one thread's tab, or the
+          // one tab it named. Other agents and the owner keep going.
+          const agentLane =
+            request.tabId === undefined
+              ? `thread:${scopedProfileId({
+                  projectId: request.projectId,
+                  threadId: request.threadId,
+                })}`
+              : `tab:${request.tabId}`;
           if (browserRuntime !== undefined) {
             try {
-              // Each agent session works in its own lane: one thread's tab,
-              // or the one tab it named. Other agents and the owner keep going.
-              const agentLane =
-                request.tabId === undefined
-                  ? `thread:${scopedProfileId({
-                      projectId: request.projectId,
-                      threadId: request.threadId,
-                    })}`
-                  : `tab:${request.tabId}`;
               lease = await trace.measure("lease-wait", () =>
                 controlLeases.acquireAgent(
                   leaseKey,
@@ -1858,6 +1858,7 @@ export function createBrowserHostEntry(
                       profileId: request.profileId,
                       projectId: request.projectId,
                       threadPageName: `agent-${threadDefaultProfileId}`,
+                      agentLane,
                       initialOrigin: request.destinationOrigin,
                       ...(request.tabId === undefined
                         ? {}

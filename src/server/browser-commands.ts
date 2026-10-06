@@ -81,7 +81,12 @@ const INTERACTIVE_ROLES = new Set([
   "treeitem",
 ]);
 
-const FILLABLE_ROLES = new Set(["textbox", "searchbox", "combobox", "spinbutton"]);
+const FILLABLE_ROLES = new Set([
+  "textbox",
+  "searchbox",
+  "combobox",
+  "spinbutton",
+]);
 
 const RESULT_MARKER = "__bbBrowserCommand:";
 
@@ -119,13 +124,19 @@ export function tokenizeCommand(input: string): string[] {
     started = true;
   }
   if (quote !== null) {
-    throw new BrowserCommandError("invalid_command", "A quoted value is missing its closing quote.");
+    throw new BrowserCommandError(
+      "invalid_command",
+      "A quoted value is missing its closing quote.",
+    );
   }
   if (started) tokens.push(current);
   return tokens;
 }
 
-function parseRef(word: string | undefined, command: string): BrowserCommandRef {
+function parseRef(
+  word: string | undefined,
+  command: string,
+): BrowserCommandRef {
   const match = word === undefined ? null : /^@g(\d+):(e\d+)$/.exec(word);
   if (match === null) {
     throw new BrowserCommandError(
@@ -139,7 +150,10 @@ function parseRef(word: string | undefined, command: string): BrowserCommandRef 
 function rest(tokens: string[], from: number, what: string, command: string) {
   const value = tokens.slice(from).join(" ");
   if (value.length === 0) {
-    throw new BrowserCommandError("invalid_command", `${command} needs ${what}.`);
+    throw new BrowserCommandError(
+      "invalid_command",
+      `${command} needs ${what}.`,
+    );
   }
   return value;
 }
@@ -154,7 +168,10 @@ export function parseBrowserCommand(input: string): BrowserCommand {
   if (name === "eval") {
     const expression = trimmed.slice(4).trim();
     if (expression.length === 0) {
-      throw new BrowserCommandError("invalid_command", "eval needs a JavaScript expression or function.");
+      throw new BrowserCommandError(
+        "invalid_command",
+        "eval needs a JavaScript expression or function.",
+      );
     }
     return { name: "eval", expression };
   }
@@ -163,7 +180,10 @@ export function parseBrowserCommand(input: string): BrowserCommand {
     case "open": {
       const url = rest(tokens, 1, "an http(s) URL", "open");
       if (!/^https?:\/\//i.test(url)) {
-        throw new BrowserCommandError("invalid_command", "open needs an http(s) URL, such as https://example.com.");
+        throw new BrowserCommandError(
+          "invalid_command",
+          "open needs an http(s) URL, such as https://example.com.",
+        );
       }
       return { name: "open", url };
     }
@@ -184,11 +204,22 @@ export function parseBrowserCommand(input: string): BrowserCommand {
     case "type":
       return { name: "type", text: rest(tokens, 1, "text to type", "type") };
     case "press":
-      return { name: "press", key: rest(tokens, 1, "a key, such as Enter", "press") };
+      return {
+        name: "press",
+        key: rest(tokens, 1, "a key, such as Enter", "press"),
+      };
     case "scroll": {
       const direction = tokens[1]?.toLowerCase();
-      if (direction !== "up" && direction !== "down" && direction !== "top" && direction !== "bottom") {
-        throw new BrowserCommandError("invalid_command", "scroll needs up, down, top, or bottom.");
+      if (
+        direction !== "up" &&
+        direction !== "down" &&
+        direction !== "top" &&
+        direction !== "bottom"
+      ) {
+        throw new BrowserCommandError(
+          "invalid_command",
+          "scroll needs up, down, top, or bottom.",
+        );
       }
       return { name: "scroll", direction };
     }
@@ -208,7 +239,9 @@ export function parseBrowserCommand(input: string): BrowserCommand {
 }
 
 /** Commands whose ref must come from the session's latest snapshot. */
-export function commandRef(command: BrowserCommand): BrowserCommandRef | undefined {
+export function commandRef(
+  command: BrowserCommand,
+): BrowserCommandRef | undefined {
   return "target" in command ? command.target : undefined;
 }
 
@@ -250,7 +283,10 @@ export function commandOrigin(command: BrowserCommand): string | undefined {
   try {
     return new URL(command.url).origin;
   } catch {
-    throw new BrowserCommandError("invalid_command", "open needs a valid http(s) URL.");
+    throw new BrowserCommandError(
+      "invalid_command",
+      "open needs a valid http(s) URL.",
+    );
   }
 }
 
@@ -308,9 +344,11 @@ export function browserCommandScript(command: BrowserCommand): string {
       snapshot = false;
       const source = command.expression;
       // Plain expressions become a function, as in chrome-devtools-axi.
-      const body = /^(async\s+)?(\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>/.test(source) || /^(async\s+)?function\b/.test(source)
-        ? source
-        : `() => (${source})`;
+      const body =
+        /^(async\s+)?(\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>/.test(source) ||
+        /^(async\s+)?function\b/.test(source)
+          ? source
+          : `() => (${source})`;
       action = `const __bbValue = await page.evaluate(${body});\nconst __bbEval = __bbValue === undefined ? "undefined" : JSON.stringify(__bbValue);`;
       break;
     }
@@ -329,11 +367,15 @@ export type BrowserCommandPayload = {
   value?: string;
 };
 
-export function parseBrowserCommandOutput(output: string): BrowserCommandPayload | undefined {
+export function parseBrowserCommandOutput(
+  output: string,
+): BrowserCommandPayload | undefined {
   const index = output.lastIndexOf(RESULT_MARKER);
   if (index < 0) return undefined;
   try {
-    const parsed = JSON.parse(output.slice(index + RESULT_MARKER.length).trim()) as BrowserCommandPayload;
+    const parsed = JSON.parse(
+      output.slice(index + RESULT_MARKER.length).trim(),
+    ) as BrowserCommandPayload;
     return typeof parsed.url === "string" ? parsed : undefined;
   } catch {
     return undefined;
@@ -377,14 +419,20 @@ export function compactSnapshot(
   }
   const shown = lines.slice(0, MAX_SNAPSHOT_LINES);
   if (lines.length > shown.length) {
-    shown.push(`… ${lines.length - shown.length} more lines. Scroll, or use eval to read specific content.`);
+    shown.push(
+      `… ${lines.length - shown.length} more lines. Scroll, or use eval to read specific content.`,
+    );
   }
   return { text: shown.join("\n"), elements };
 }
 
 function hintFor(element: SnapshotElement): string {
-  const label = element.name.length > 0 ? ` the "${element.name.slice(0, 60)}" ${element.role}` : ` the ${element.role}`;
-  if (FILLABLE_ROLES.has(element.role)) return `Run \`fill @${element.uid} <text>\` to fill${label}`;
+  const label =
+    element.name.length > 0
+      ? ` the "${element.name.slice(0, 60)}" ${element.role}`
+      : ` the ${element.role}`;
+  if (FILLABLE_ROLES.has(element.role))
+    return `Run \`fill @${element.uid} <text>\` to fill${label}`;
   return `Run \`click @${element.uid}\` to click${label}`;
 }
 
@@ -400,19 +448,25 @@ export function formatBrowserCommandResult(
 ): string {
   const out: string[] = [];
   if (payload.snapshot === undefined) {
-    out.push(`page: {title: ${quoted(payload.title)}, url: ${quoted(payload.url)}}`);
+    out.push(
+      `page: {title: ${quoted(payload.title)}, url: ${quoted(payload.url)}}`,
+    );
     out.push(`result: ${payload.value ?? "undefined"}`);
     out.push("help[1]:", "  Run `snapshot` to see the page and its refs");
     return out.join("\n");
   }
   const { text, elements } = compactSnapshot(payload.snapshot, generation);
-  out.push(`page: {title: ${quoted(payload.title)}, url: ${quoted(payload.url)}, refs: ${elements.length}}`);
+  out.push(
+    `page: {title: ${quoted(payload.title)}, url: ${quoted(payload.url)}, refs: ${elements.length}}`,
+  );
   out.push("snapshot:", text);
   const hints = elements.slice(0, MAX_HINTS).map(hintFor);
   if (command.name === "fill" || command.name === "type") {
     hints.unshift("Run `press Enter` to submit");
   }
-  hints.push("Refs change after every command; pass them back exactly as printed");
+  hints.push(
+    "Refs change after every command; pass them back exactly as printed",
+  );
   out.push(`help[${hints.length}]:`, ...hints.map((hint) => `  ${hint}`));
   return out.join("\n");
 }

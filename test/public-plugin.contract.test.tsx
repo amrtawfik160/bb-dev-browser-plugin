@@ -3139,7 +3139,9 @@ describe("Browser public plugin contract", () => {
 
       // The owner browses while the agent works in its own tab.
       await expect(
-        browser.runBrowserNavigation("https://example.com/owner-keeps-browsing"),
+        browser.runBrowserNavigation(
+          "https://example.com/owner-keeps-browsing",
+        ),
       ).resolves.toMatchObject({ tabId: "public-tab" });
       expect(
         await browser.runBrowserStatus({

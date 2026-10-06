@@ -106,12 +106,13 @@ See [safe-login.md](safe-login.md) for the full workflow.
 
 ## Human and agent control
 
-- All panels receive live state, but only one owner client or agent holds the
-  **Control Lease**. Owner interaction has priority and may interrupt an agent at
-  any time. (ADR 0005)
-- Agent scripts receive visible, interruptible, atomic leases of at most 30
-  seconds. Agent calls fail immediately while an owner has control and wait at
-  most 30 seconds behind other agents before returning `browser_busy`. Waiting
+- All panels receive live state. The owner and each agent session hold
+  separate **Control Lease** lanes, so they act at the same time without
+  cancelling each other. Each agent session works in its own background tab
+  through its own Session CDP Proxy and never moves the owner's view. (ADR 0021)
+- Agent scripts receive visible, atomic leases of at most 30 seconds in their
+  lane. A second call in the same session waits at most 30 seconds before
+  returning `browser_busy`. Waiting
   calls run in arrival order and are removed on cancellation or owner takeover.
 - A persistent **Profile Grant** authorizes one BB project to use one profile
   within an Origin Scope (ADR 0004). A project's first agent operation on a

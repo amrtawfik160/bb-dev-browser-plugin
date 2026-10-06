@@ -36,12 +36,20 @@ describe("Browser Control Lease", () => {
     const manager = createControlLeaseManager();
     const key = "host-a\0profile-a";
     try {
-      const agent = await manager.acquireAgent(key, "Inspect the page", undefined, "thread:a");
+      const agent = await manager.acquireAgent(
+        key,
+        "Inspect the page",
+        undefined,
+        "thread:a",
+      );
       const owner = await manager.acquireOwner(key);
       expect(agent.signal.aborted).toBe(false);
       expect(owner.signal.aborted).toBe(false);
       // The panel still reports the working agent while the owner browses.
-      expect(manager.state(key)).toEqual({ actor: "agent", purpose: "Inspect the page" });
+      expect(manager.state(key)).toEqual({
+        actor: "agent",
+        purpose: "Inspect the page",
+      });
       owner.release();
       agent.release();
       expect(manager.state(key)).toBeUndefined();
@@ -54,15 +62,27 @@ describe("Browser Control Lease", () => {
     const manager = createControlLeaseManager();
     const key = "host-a\0profile-a";
     try {
-      const a = await manager.acquireAgent(key, "Thread A", undefined, "thread:a");
-      const b = await manager.acquireAgent(key, "Thread B", undefined, "thread:b");
+      const a = await manager.acquireAgent(
+        key,
+        "Thread A",
+        undefined,
+        "thread:a",
+      );
+      const b = await manager.acquireAgent(
+        key,
+        "Thread B",
+        undefined,
+        "thread:b",
+      );
       expect(a.signal.aborted).toBe(false);
       expect(b.signal.aborted).toBe(false);
       let secondA = false;
-      const nextA = manager.acquireAgent(key, "Thread A again", undefined, "thread:a").then((lease) => {
-        secondA = true;
-        return lease;
-      });
+      const nextA = manager
+        .acquireAgent(key, "Thread A again", undefined, "thread:a")
+        .then((lease) => {
+          secondA = true;
+          return lease;
+        });
       await Promise.resolve();
       expect(secondA).toBe(false);
       a.release();
@@ -78,12 +98,22 @@ describe("Browser Control Lease", () => {
     const manager = createControlLeaseManager();
     const key = "host-a\0profile-a";
     try {
-      const a = await manager.acquireAgent(key, "Thread A", undefined, "thread:a");
+      const a = await manager.acquireAgent(
+        key,
+        "Thread A",
+        undefined,
+        "thread:a",
+      );
       const owner = await manager.acquireOwner(key);
       manager.revokeAgents(key);
       expect(a.signal.aborted).toBe(true);
       expect(owner.signal.aborted).toBe(false);
-      const b = await manager.acquireAgent(key, "Thread B", undefined, "thread:b");
+      const b = await manager.acquireAgent(
+        key,
+        "Thread B",
+        undefined,
+        "thread:b",
+      );
       manager.revoke(key);
       expect(b.signal.aborted).toBe(true);
       expect(owner.signal.aborted).toBe(true);
@@ -220,5 +250,4 @@ describe("Browser Control Lease", () => {
       vi.useRealTimers();
     }
   });
-
 });

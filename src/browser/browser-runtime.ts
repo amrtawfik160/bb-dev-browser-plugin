@@ -58,6 +58,10 @@ import {
   type BrowserScriptResult,
   type BrowserScriptRuntimeError,
 } from "../shared/contracts.js";
+import {
+  startSessionCdpProxy,
+  type SessionCdpProxy,
+} from "./session-cdp-proxy.js";
 
 export type BrowserExecutable = {
   kind: "chrome-stable" | "playwright-chromium";
@@ -73,6 +77,11 @@ export type BrowserInstanceTarget = {
 
 export type BrowserRuntimeTarget = BrowserInstanceTarget & {
   projectId: string;
+  /**
+   * The agent session's lane. An agent script connects through that lane's
+   * Session CDP Proxy, so it sees and drives only its own tabs.
+   */
+  agentLane?: string;
   tabId?: string;
   threadPageName?: string;
   initialOrigin?: string;
@@ -339,6 +348,8 @@ type HeldBrowserInstance = {
   lastActivityAt: number;
   idleTimer?: ReturnType<typeof setTimeout>;
   cleanup?: Promise<void>;
+  /** One Session CDP Proxy per agent lane, closed with the instance. */
+  sessionProxies?: Map<string, Promise<SessionCdpProxy>>;
 };
 
 type BrowserCrashHistory = {
@@ -870,6 +881,14 @@ function heldBrowserInstance(input: {
     activeLeases: 0,
     lastActivityAt: Date.now(),
   };
+}
+
+/**
+ * The helper keeps one browser connection per name. Each agent lane gets its
+ * own name so its connection, named pages, and proxy stay separate.
+ */
+function laneBrowserName(profileId: string, lane: string) {
+  return `bb-${profileId}-${createHash("sha256").update(lane).digest("hex").slice(0, 12)}`;
 }
 
 function executionRequest(
@@ -1504,7 +1523,10 @@ export function createBrowserInstanceRuntime(
 
   async function cleanupHeld(held: HeldBrowserInstance) {
     held.cleanup ??= (async () => {
+      const proxies = [...(held.sessionProxies?.values() ?? [])];
+      held.sessionProxies?.clear();
       const cleanup = await Promise.allSettled([
+        ...proxies.map(async (proxy) => (await proxy).close()),
         unlink(held.manifestPath).catch((error: unknown) => {
           if (
             error instanceof Error &&
@@ -1692,10 +1714,35 @@ export function createBrowserInstanceRuntime(
     }
   }
 
+  /**
+   * The endpoint an agent session's helper connects through: its lane's
+   * Session CDP Proxy, started on first use. An explicitly named tab is
+   * granted to the session for this and later calls in the lane.
+   */
+  async function sessionEndpoint(
+    held: HeldBrowserInstance,
+    lane: string,
+    tabId?: string,
+  ): Promise<SessionCdpProxy> {
+    held.sessionProxies ??= new Map();
+    let proxy = held.sessionProxies.get(lane);
+    if (proxy === undefined) {
+      proxy = startSessionCdpProxy({
+        upstreamEndpoint: held.publicState.automationEndpoint,
+      });
+      held.sessionProxies.set(lane, proxy);
+      proxy.catch(() => held.sessionProxies?.delete(lane));
+    }
+    const ready = await proxy;
+    if (tabId !== undefined) ready.grantTarget(tabId);
+    return ready;
+  }
+
   async function executeAgainstLiveBrowser(
     held: HeldBrowserInstance,
     request: BrowserExecutionRequest,
     trace?: BrowserOperationTrace,
+    endpointFor?: (held: HeldBrowserInstance) => Promise<string>,
   ): Promise<{ result: unknown; held: HeldBrowserInstance }> {
     try {
       return {
@@ -1714,7 +1761,12 @@ export function createBrowserInstanceRuntime(
       return {
         result: await options.launchBoundary.execute({
           ...request,
-          endpoint: replacement.publicState.automationEndpoint,
+          // An agent session reconnects through the replacement's own proxy,
+          // never the unfiltered endpoint.
+          endpoint:
+            endpointFor === undefined
+              ? replacement.publicState.automationEndpoint
+              : await endpointFor(replacement),
           runtimeDirectory: replacement.runtimeDirectory,
         }),
         held: replacement,
@@ -1952,18 +2004,36 @@ export function createBrowserInstanceRuntime(
             "renderer-check",
             () => enforceRendererProcessLimit(key, held),
           );
+          // An agent session connects through its lane's Session CDP Proxy:
+          // the helper and the Origin Scope guard see only its own tabs, so
+          // the owner's tabs are never read, parked, or held to its scope.
+          const agentLane = target.agentLane;
+          const endpointFor =
+            agentLane === undefined
+              ? undefined
+              : async (instance: HeldBrowserInstance) =>
+                  (await sessionEndpoint(instance, agentLane, target.tabId))
+                    .endpoint;
+          const request = executionRequest(
+            held,
+            target.profileId,
+            executionCode,
+            timeoutMs,
+            operationSignal.signal,
+            screenshot,
+            originPolicy,
+          );
           const executed = await executeAgainstLiveBrowser(
             held,
-            executionRequest(
-              held,
-              target.profileId,
-              executionCode,
-              timeoutMs,
-              operationSignal.signal,
-              screenshot,
-              originPolicy,
-            ),
+            endpointFor === undefined
+              ? request
+              : {
+                  ...request,
+                  endpoint: await endpointFor(held),
+                  browserName: laneBrowserName(target.profileId, agentLane!),
+                },
             operationOptions.trace,
+            endpointFor,
           );
           held = executed.held;
           await measureBrowserStage(

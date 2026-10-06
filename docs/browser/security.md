@@ -102,12 +102,16 @@ produces a typed `origin_denied` result and a non-blocking Grant Request. A
 denied non-web navigation produces the same typed error with a null origin and
 no Grant Request.
 
-Enforcement is host-owned and layered. Before the QuickJS helper starts, the
-host connects independently to the profile's Playwright context, installs the
-web grant-matching route, attaches a CDP guard to each page, and parks any
-existing out-of-scope web or non-web document on exact `about:blank` for the
-length of the call. Parked owner tabs return to their previous document when
-the call ends; a tab that cannot be parked is closed instead. Chromium runs
+Enforcement is host-owned and layered. Each agent session reaches Chromium
+only through its own loopback Session CDP Proxy (ADR 0021), which exposes the
+session's own targets (pages it created, their popups and frames, and an
+explicitly named tab) and refuses to list, attach to, activate, or close any
+other target. Before the QuickJS helper starts, the host connects to the
+profile through that same proxy, installs the web grant-matching route,
+attaches a CDP guard to each of the session's pages, and parks any of the
+session's own out-of-scope documents on exact `about:blank` for the length of
+the call. The owner's and other sessions' tabs are invisible to both the
+helper and the guard, so they are never read, parked, or limited. Chromium runs
 with back/forward cache disabled, so returning to a parked document is always
 a network navigation the route sees. Restored Chrome new-tab / error documents
 are cleared to `about:blank` before agent access because they can expose
@@ -140,10 +144,10 @@ BrowserContext emitted after the initial connection snapshot is registered.
   normally.
 - The first denied navigation is sticky for the operation. Navigating back into
   scope, closing a popup, or throwing a later exception cannot erase it.
-- Denied popup targets are closed when they exist. Pre-existing out-of-scope
-  tabs are parked on `about:blank` while the call runs and restored afterwards,
-  so a later call cannot recover denied page content and the owner keeps the
-  tab. A popup opener remains available when Chromium rejects the popup before
+- Denied popup targets are closed when they exist. The session's own
+  pre-existing out-of-scope tabs are parked on `about:blank` while the call
+  runs and restored afterwards, so a later call cannot recover denied page
+  content. Owner tabs are outside the session and never parked. A popup opener remains available when Chromium rejects the popup before
   a target page exists.
 - Every new sandbox page uses the one routed context, so `browser.newPage()`
   cannot create an unenforced context.
@@ -155,13 +159,15 @@ origins use normal certificate validation; unrelated origins receive no bypass.
 
 ### Control Leases
 
-Input is serialized through a **Control Lease** (ADR 0005). Owner interaction
-has priority and may interrupt an agent at any time. An agent script receives a
-visible, interruptible atomic lease of **at most 30 seconds**. Agent calls fail
-immediately while an owner has control and wait at most **30 seconds**
-(`CONTROL_LEASE_AGENT_WAIT_MS`) behind another agent before returning a typed
-`browser_busy` error. Cancelled, expired, and owner-interrupted waiting calls
-are discarded without execution. On disconnect, the same
+Control is held per lane (ADR 0021, superseding ADR 0005's single lease). The
+owner has one lane and each agent session has its own, so owner actions and
+agents run at the same time without cancelling each other. An agent script
+receives a visible atomic lease of **at most 30 seconds** in its lane, and a
+second call in the same lane waits at most **30 seconds**
+(`CONTROL_LEASE_AGENT_WAIT_MS`) before returning a typed `browser_busy` error.
+Profile stop, sleep, Safe Login, grant revocation, and host disconnect end
+every lane. Cancelled and expired waiting calls are discarded without
+execution. On disconnect, the same
 panel has **10 seconds** (`PANEL_RECLAIM_WINDOW_MS`) to reclaim its lease before
 release.
 
