@@ -1,3 +1,5 @@
+import { execFileSync } from "node:child_process";
+import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   AXI_PACKAGE_VERSION,
@@ -20,6 +22,23 @@ describe("chrome-devtools-axi launcher", () => {
     );
     expect(AXI_PACKAGE_VERSION).toBe("0.1.39");
     expect(DEVTOOLS_MCP_PACKAGE_VERSION).toBe("1.10.1");
+  });
+
+  it("ships every bundled axi file in the repository, not just on disk", () => {
+    // A checkout is all a host gets, so an ignored bundle file would leave
+    // axi missing on every host but the one that built it.
+    const paths = resolveAxiRuntime();
+    for (const file of [
+      paths.axiBin,
+      join(dirname(paths.axiBin), "chrome-devtools-axi-bridge.js"),
+      paths.mcpBin,
+    ]) {
+      expect(() =>
+        execFileSync("git", ["ls-files", "--error-unmatch", file], {
+          stdio: "pipe",
+        }),
+      ).not.toThrow();
+    }
   });
 
   it("names one stable axi session per agent session", () => {

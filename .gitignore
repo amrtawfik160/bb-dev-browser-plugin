@@ -10,3 +10,4 @@ coverage/
 
 # The bundled chrome-devtools-axi and chrome-devtools-mcp ship with the plugin.
 !/vendor/node_modules/
+!/vendor/node_modules/**/dist/
