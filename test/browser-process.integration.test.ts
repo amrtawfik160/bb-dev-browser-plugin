@@ -494,6 +494,92 @@ process.stdin.on("end", () => console.log(JSON.stringify({
   );
 
   it.runIf(integrationEnabled)(
+    "stops every agent lane's helper when its Browser Instance stops",
+    async () => {
+      const rootDirectory = await mkdtemp(join(tmpdir(), "browser-lanes-"));
+      const fixtureExecutable = join(rootDirectory, "chrome");
+      const helperExecutable = join(rootDirectory, "dev-browser-fixture.mjs");
+      const stopLog = join(rootDirectory, "stopped.log");
+      const passwdPath = join(rootDirectory, "passwd");
+      const userId = process.getuid?.() === 0 ? 65534 : process.getuid!();
+      const groupId = process.getgid?.() === 0 ? 65534 : process.getgid!();
+      await chmod(rootDirectory, 0o755);
+      await writeFile(fixtureExecutable, browserFixtureSource);
+      await chmod(fixtureExecutable, 0o755);
+      await writeFile(
+        helperExecutable,
+        `#!/usr/bin/env node
+import { appendFile, mkdir, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+
+const daemonDirectory = join(process.env.HOME, ".dev-browser");
+if (process.argv[2] === "stop") {
+  await appendFile(${JSON.stringify(stopLog)}, process.env.HOME + "\\n");
+  await rm(join(daemonDirectory, "daemon.sock"), { force: true });
+} else {
+  await mkdir(daemonDirectory, { recursive: true });
+  await writeFile(join(daemonDirectory, "daemon.sock"), "");
+  process.stdin.resume();
+  process.stdin.on("end", () => console.log("ran"));
+}
+`,
+      );
+      await chmod(helperExecutable, 0o755);
+      await writeFile(stopLog, "");
+      await chmod(stopLog, 0o666);
+      await writeFile(
+        passwdPath,
+        `bb-browser:x:${userId}:${groupId}::${rootDirectory}:/usr/sbin/nologin\n`,
+      );
+      const profileDirectory = join(rootDirectory, "profile");
+      const runtimeDirectory = join(rootDirectory, "runtime");
+      const boundary = createProductionBrowserProcessBoundary({
+        devBrowserExecutable: helperExecutable,
+        passwdPath,
+      });
+      const running = await boundary.launch({
+        kind: "playwright-chromium",
+        executablePath: fixtureExecutable,
+        browserName: "bb-lanes",
+        profileDirectory,
+        runtimeDirectory,
+        locale: "en-GB",
+        timezone: "Europe/London",
+        chromeArguments: [
+          `--user-data-dir=${profileDirectory}`,
+          "--remote-debugging-address=127.0.0.1",
+          "--remote-debugging-port=0",
+        ],
+      });
+      try {
+        for (const browserName of ["bb-lanes-agent-a", "bb-lanes-agent-b"]) {
+          await boundary.execute({
+            endpoint: running.automationEndpoint,
+            browserName,
+            code: "console.log('lane')",
+            timeoutMs: 5_000,
+            runtimeDirectory,
+          });
+        }
+      } finally {
+        await running.stop();
+      }
+      try {
+        const stopped = (await readFile(stopLog, "utf8"))
+          .split("\n")
+          .filter(Boolean)
+          .sort();
+        expect(stopped).toEqual([
+          join(runtimeDirectory, "bb-lanes-agent-a"),
+          join(runtimeDirectory, "bb-lanes-agent-b"),
+        ]);
+      } finally {
+        await rm(rootDirectory, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.runIf(integrationEnabled)(
     "returns explicitly requested native screenshots and removes the temporary file",
     async () => {
       const rootDirectory = await mkdtemp(
