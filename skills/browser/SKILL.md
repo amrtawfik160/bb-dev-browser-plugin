@@ -41,8 +41,19 @@ Profiles are host-local. Discovery and selection grant no extra browser
 permissions; the selected profile's Profile Grants remain enforced. Archived
 profiles can be listed with `includeArchived: true` but cannot be selected.
 
-Shell equivalents use the current BB thread. Use `bb plugin run browser`
-to target this plugin even when BB reserves the `bb browser` command:
+`bb browser` is BB core's browser control. It does not drive this plugin.
+Agents use `bb plugin run browser ...`, including `bb plugin run browser axi`.
+`--help` is allowed. Run `bb plugin run browser axi --help` for the command
+list, and `bb plugin run browser <command> --help` for one command.
+
+`--timeout` is capped at 30 seconds (30000 ms). A larger value is rejected.
+Use 1000–30000. Split longer work across calls. The tab keeps its state.
+
+Do not install this plugin from a crew's branch copy. `bb plugin install`
+from a worktree replaces the live plugin for every thread. Reinstall the
+main checkout of this plugin before you call the work done.
+
+Shell equivalents use the current BB thread:
 
 ```text
 bb plugin run browser sessions list --site salesforce --json
@@ -220,16 +231,17 @@ I need you to sign in to GitHub so I can continue.
 
 ## Failures and what to do
 
-| Code                | Meaning                                         | Do                                                                                                                     |
-| ------------------- | ----------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| `origin_denied`     | Owner withdrew access, or navigation is non-web | Surface any Grant Request; retry web origins only after approval                                                       |
-| `browser_busy`      | Owner control or a 30-second agent wait expired | This call did not run; let the active operation finish, then retry once                                                |
-| `browser_timeout`   | Script hit its deadline                         | Split the work or wait on a condition instead of a timer                                                               |
-| `awake-limit`       | All three running instances are in use          | Wait for capacity; do not stop another profile or close its tabs                                                       |
-| `script_failed`     | Playwright or syntax error                      | Read the call log at the end of the message — it names the reason. A `Syntax check:` line names the script line to fix |
-| `tab_invalid`       | Tab belongs to a previous runtime               | `browser.listPages()` again                                                                                            |
-| `setup_required`    | Host is not provisioned                         | Report it. Do not retry, install packages, or find another browser                                                     |
-| `safe_login_denied` | Owner-only Safe Login is active                 | Wait for the owner; you cannot see or drive the browser                                                                |
+| Code                   | Meaning                                                              | Do                                                                                                                     |
+| ---------------------- | -------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `origin_denied`        | Owner withdrew access, or navigation is non-web                      | Surface any Grant Request; retry web origins only after approval                                                       |
+| `browser_busy`         | Owner control, a 30-second wait, or a DevTools connect timeout       | This call did not run. Retry once after the browser is free                                                            |
+| `guard_install_failed` | The origin guard could not be installed because the browser was busy | Retry once. The message is `browser busy, retry`                                                                       |
+| `browser_timeout`      | Script hit its deadline                                              | Split the work or wait on a condition instead of a timer                                                               |
+| `awake-limit`          | All three running instances are in use                               | Wait for capacity; do not stop another profile or close its tabs                                                       |
+| `script_failed`        | Playwright or syntax error                                           | Read the call log at the end of the message — it names the reason. A `Syntax check:` line names the script line to fix |
+| `tab_invalid`          | Tab belongs to a previous runtime                                    | `browser.listPages()` again                                                                                            |
+| `setup_required`       | Host is not provisioned                                              | Report it. Do not retry, install packages, or find another browser                                                     |
+| `safe_login_denied`    | Owner-only Safe Login is active                                      | Wait for the owner; you cannot see or drive the browser                                                                |
 
 `bb plugin run browser status` reports host readiness and live control state; `bb plugin run browser
 diagnostics` adds repair detail.

@@ -1,4 +1,7 @@
 import { experimental_defineHostEntry } from "@get-bb/plugin-sdk/host";
+import { installWorkerRejectionGuard } from "./worker-guard.js";
+
+installWorkerRejectionGuard(process);
 import { withPromptCancellation } from "./prompt-cancellation.js";
 import {
   cgroupMemoryKills,
@@ -122,6 +125,7 @@ import {
   type BrowserInstanceRuntime,
   type BrowserRuntimeTarget,
 } from "../browser/browser-runtime.js";
+import { BrowserOriginGuardInstallError } from "../browser/origin-scope.js";
 import { createProductionBrowserProcessBoundary } from "../browser/browser-process.js";
 import {
   daemonRootFromHostDataDir,
@@ -376,6 +380,7 @@ const scriptRuntimeErrorLabels: Record<
   string
 > = {
   browser_busy: "Browser busy",
+  guard_install_failed: "Browser busy",
   "awake-limit": "Browser capacity in use",
   browser_timeout: "Browser script timed out",
   result_too_large: "Browser result too large",
@@ -429,6 +434,44 @@ export function boundScriptFailureMessage(
   ].join(SCRIPT_FAILURE_ELISION);
 }
 
+const CDP_CONNECT_BUSY_MESSAGE =
+  "Browser is busy and the DevTools connection timed out. Retry this call.";
+
+function walkErrors(error: unknown, visit: (error: Error) => boolean) {
+  const seen = new Set<unknown>();
+  const pending = [error];
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (current === undefined || seen.has(current)) continue;
+    seen.add(current);
+    if (!(current instanceof Error)) continue;
+    if (visit(current)) return true;
+    if (current.cause !== undefined) pending.push(current.cause);
+    if (current instanceof AggregateError) pending.push(...current.errors);
+  }
+  return false;
+}
+
+function isGuardInstallFailure(error: unknown) {
+  return walkErrors(
+    error,
+    (current) =>
+      current instanceof BrowserOriginGuardInstallError ||
+      (current.name === "BrowserOriginGuardInstallError" &&
+        "code" in current &&
+        current.code === "guard_install_failed"),
+  );
+}
+
+function isCdpConnectTimeout(error: unknown) {
+  return walkErrors(
+    error,
+    (current) =>
+      /connectOverCDP/u.test(current.message) &&
+      /Timeout \d+ms exceeded/u.test(current.message),
+  );
+}
+
 function scriptRuntimeFailure(
   request: BrowserScriptRequest,
   error: unknown,
@@ -436,16 +479,24 @@ function scriptRuntimeFailure(
   traceId?: string,
   memoryNotice?: string,
 ): BrowserScriptResponse {
-  const code =
-    lease?.signal.aborted === true
-      ? "lease_revoked"
-      : error instanceof ControlLeaseError
-        ? error.code
-        : scriptRuntimeErrorCode(error);
-  const failure =
-    error instanceof Error && error.message.length > 0
-      ? error.message
-      : "The Browser script failed.";
+  const guardInstallFailed = isGuardInstallFailure(error);
+  const cdpConnectBusy = !guardInstallFailed && isCdpConnectTimeout(error);
+  const code = guardInstallFailed
+    ? "guard_install_failed"
+    : cdpConnectBusy
+      ? "browser_busy"
+      : lease?.signal.aborted === true
+        ? "lease_revoked"
+        : error instanceof ControlLeaseError
+          ? error.code
+          : scriptRuntimeErrorCode(error);
+  const failure = guardInstallFailed
+    ? "browser busy, retry"
+    : cdpConnectBusy
+      ? CDP_CONNECT_BUSY_MESSAGE
+      : error instanceof Error && error.message.length > 0
+        ? error.message
+        : "The Browser script failed.";
   const message =
     memoryNotice === undefined ? failure : `${memoryNotice}\n${failure}`;
   const traceSuffix = traceId === undefined ? "" : `\nTrace: ${traceId}`;

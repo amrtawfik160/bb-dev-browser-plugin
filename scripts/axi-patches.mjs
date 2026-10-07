@@ -6,6 +6,9 @@
 // "No page is currently selected" and every retry opens another tab.
 // chrome-devtools-mcp selects the page `new_page` created and marks it
 // `[selected]` in the same listing, so that mark identifies the page.
+//
+// `snapshot` with no selected page used to fail even when one tab was open.
+// That command now selects the only open page before it reads the tree.
 
 const PATCHES = [
   {
@@ -55,6 +58,20 @@ const PATCHES = [
     return selectedId;
   if (incomplete)
     return null;`,
+  },
+  {
+    anchor: `async function handleSnapshot(full) {
+  const snapshot = await stampFresh();
+  return formatPageOutput(snapshot, "snapshot", void 0, full);
+}`,
+    replacement: `async function handleSnapshot(full) {
+  if (getSelectedPageId() === null) {
+    const listed = parsePagesList(await callTool("list_pages"));
+    if (listed.length === 1) setSelectedPageId(listed[0].id);
+  }
+  const snapshot = await stampFresh();
+  return formatPageOutput(snapshot, "snapshot", void 0, full);
+}`,
   },
 ];
 

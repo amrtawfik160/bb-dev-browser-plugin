@@ -2,9 +2,8 @@ import { EventEmitter } from "node:events";
 import { expect, it } from "vitest";
 
 it("logs a dialog rejection and does not exit the worker", async () => {
-  const { installWorkerRejectionGuard } = await import(
-    "../src/host/worker-guard.js"
-  );
+  const { installWorkerRejectionGuard } =
+    await import("../src/host/worker-guard.js");
   const logs: string[] = [];
   const exits: number[] = [];
   const emitter = new EventEmitter();

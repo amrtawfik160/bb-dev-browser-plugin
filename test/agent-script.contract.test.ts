@@ -781,11 +781,13 @@ it("settles a confirm dialog when dismiss rejects with no dialog showing", async
     unhandled.push(reason);
   };
   process.on("unhandledRejection", onUnhandled);
-  const dialogListeners: Array<(dialog: {
-    type: () => string;
-    accept: () => Promise<void>;
-    dismiss: () => Promise<void>;
-  }) => void> = [];
+  const dialogListeners: Array<
+    (dialog: {
+      type: () => string;
+      accept: () => Promise<void>;
+      dismiss: () => Promise<void>;
+    }) => void
+  > = [];
   const context = {
     setDefaultNavigationTimeout: () => undefined,
     setDefaultTimeout: () => undefined,

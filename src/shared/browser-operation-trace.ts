@@ -35,6 +35,7 @@ export const browserOperationTraceSchema = z
     errorCode: z
       .enum([
         "browser_busy",
+        "guard_install_failed",
         "awake-limit",
         "browser_timeout",
         "result_too_large",

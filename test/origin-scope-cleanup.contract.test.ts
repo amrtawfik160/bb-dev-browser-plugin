@@ -276,7 +276,9 @@ describe("Origin Scope cleanup", () => {
 
   it("reports a failed page-guard install as browser busy, not a non-web denial", async () => {
     const boundary = createHostBoundary({
-      enable: new Error("Session closed. Most likely the page has been closed."),
+      enable: new Error(
+        "Session closed. Most likely the page has been closed.",
+      ),
     });
 
     await expect(

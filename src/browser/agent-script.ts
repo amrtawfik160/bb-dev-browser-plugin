@@ -64,6 +64,21 @@ const SANDBOX_CONTEXT_CLOSE_GUARD = `function __bbGuardSandboxContextClose(conte
     value: true,
   });
 }
+const __bbDialogArmedPages = new WeakSet();
+function __bbArmPageDialog(candidate) {
+  if (candidate == null || (typeof candidate !== "object" && typeof candidate !== "function")) return;
+  if (typeof candidate.on !== "function") return;
+  if (__bbDialogArmedPages.has(candidate)) return;
+  __bbDialogArmedPages.add(candidate);
+  candidate.on("dialog", (dialog) => {
+    Promise.resolve()
+      .then(() => {
+        const kind = typeof dialog.type === "function" ? dialog.type() : "";
+        return kind === "alert" ? dialog.accept() : dialog.dismiss();
+      })
+      .catch(() => {});
+  });
+}
 `;
 
 /**
@@ -317,11 +332,13 @@ const __bbConfigureAgentContext = (context) => {
 };
 for (const __bbEntry of ${pageListVariable}) {
   const __bbExistingPage = await browser.getPage(__bbEntry.id);
+  __bbArmPageDialog(__bbExistingPage);
   const __bbExistingContext = __bbExistingPage.context();
   __bbConfigureAgentContext(__bbExistingContext);
   await __bbInstallAgentBrowserBoundary(__bbExistingPage);
 }
 __bbConfigureAgentContext(page.context());
+__bbArmPageDialog(page);
 await __bbInstallAgentBrowserBoundary(page);
 `;
 }
@@ -407,6 +424,7 @@ let __bbVisibleEntry;
 let __bbVisiblePage;
 for (const __bbEntry of __bbPages) {
   const __bbCandidate = await browser.getPage(__bbEntry.id);
+  __bbArmPageDialog(__bbCandidate);
   __bbGuardSandboxContextClose(__bbCandidate.context());
   if (await __bbIsVisible(__bbCandidate)) {
     __bbVisibleEntry = __bbEntry;
@@ -421,7 +439,10 @@ if (__bbPreferred !== null) {
     for (const __bbEntry of __bbPages) {
       if (__bbEntryOrigin(__bbEntry) === __bbPreferred) {
         page = await browser.getPage(__bbEntry.id);
-        if (page != null) __bbGuardSandboxContextClose(page.context());
+        if (page != null) {
+          __bbArmPageDialog(page);
+          __bbGuardSandboxContextClose(page.context());
+        }
         break;
       }
     }
@@ -430,11 +451,17 @@ if (__bbPreferred !== null) {
 if (page === undefined) page = __bbVisiblePage;
 if (page === undefined && __bbPages.length > 0) {
   page = await browser.getPage(__bbPages[0].id);
-  if (page != null) __bbGuardSandboxContextClose(page.context());
+  if (page != null) {
+    __bbArmPageDialog(page);
+    __bbGuardSandboxContextClose(page.context());
+  }
 }
 if (page === undefined) {
   page = await browser.getPage(${JSON.stringify(newTabId())});
-  if (page != null) __bbGuardSandboxContextClose(page.context());
+  if (page != null) {
+    __bbArmPageDialog(page);
+    __bbGuardSandboxContextClose(page.context());
+  }
 }
 if (page === undefined) throw new Error(${JSON.stringify(ACTIVE_TAB_UNAVAILABLE_MESSAGE)});
 ${cutAgentBrowserRoots("__bbPages", enforceNonWebNavigation, operationTimeoutMs)}`;

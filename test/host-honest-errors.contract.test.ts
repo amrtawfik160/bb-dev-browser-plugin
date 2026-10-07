@@ -3,7 +3,10 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, it } from "vitest";
-import { DEFAULT_PROFILE_ID, type BrowserStatus } from "../src/shared/contracts.js";
+import {
+  DEFAULT_PROFILE_ID,
+  type BrowserStatus,
+} from "../src/shared/contracts.js";
 import { createBrowserHostEntry } from "../src/host/host.js";
 import { createFileBrowserProfileStore } from "../src/host/profile-storage.js";
 
