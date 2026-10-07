@@ -30,7 +30,7 @@ function healthyStatus(target: {
   };
 }
 
-function unusedRuntimeMethod() {
+function unusedRuntimeMethod(): never {
   throw new Error("not used");
 }
 
@@ -125,6 +125,12 @@ it("answers a cancelled browser script before BB would kill the host worker", as
     releaseStuckStage();
     await operation.catch(() => undefined);
     await host.experimental_dispose();
-    await rm(rootDirectory, { recursive: true, force: true });
+    // The released script still writes its Activity Record behind the answer.
+    await rm(rootDirectory, {
+      recursive: true,
+      force: true,
+      maxRetries: 10,
+      retryDelay: 50,
+    });
   }
 }, 15_000);

@@ -1,4 +1,5 @@
 import { experimental_defineHostEntry } from "@get-bb/plugin-sdk/host";
+import { withPromptCancellation } from "./prompt-cancellation.js";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -1693,7 +1694,7 @@ export function createBrowserHostEntry(
   }
   return experimental_defineHostEntry({
     contract: browserHostContract,
-    handlers: {
+    handlers: withPromptCancellation(browserHostContract, {
       hostConnection: (request, context) => {
         retainWorker(context);
         return reconcileHostConnection(
@@ -2573,7 +2574,7 @@ export function createBrowserHostEntry(
         }
         return manager.purge(request);
       },
-    },
+    }),
     dispose: async () => {
       try {
         controlLeases.dispose();

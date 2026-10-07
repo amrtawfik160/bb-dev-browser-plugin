@@ -25,6 +25,31 @@ export const BROWSER_SCRIPT_MAX_SCREENSHOTS = 3;
 export const BROWSER_SCRIPT_MAX_SCREENSHOT_BYTES = 1 * 1024 * 1024;
 export const BROWSER_SCRIPT_MAX_SCREENSHOT_BASE64_LENGTH =
   4 * Math.ceil(BROWSER_SCRIPT_MAX_SCREENSHOT_BYTES / 3);
+/** Longest one axi command may run; axi's own bridge timeout is 30 seconds. */
+export const AXI_COMMAND_TIMEOUT_MS = 180_000;
+
+/**
+ * BB cancels a host call at its deadline, 30 seconds unless the caller names
+ * one, and kills the plugin's whole host worker if the call is still running
+ * five seconds later. That orphans every Browser Instance and helper, so the
+ * long agent calls get deadlines above everything they can wait on: an agent
+ * lease (as long as the longest script), a browser start, and the run itself,
+ * repeated once when the first browser stopped answering. A memory-starved
+ * host starts Chrome in tens of seconds, hence the start allowance.
+ */
+const BROWSER_START_ALLOWANCE_MS = 60_000;
+const HOST_CALL_OVERHEAD_MS = 30_000;
+
+export function browserScriptHostCallTimeoutMs(scriptTimeoutMs: number) {
+  return (
+    BROWSER_SCRIPT_MAX_TIMEOUT_MS +
+    2 * (BROWSER_START_ALLOWANCE_MS + scriptTimeoutMs) +
+    HOST_CALL_OVERHEAD_MS
+  );
+}
+
+export const BROWSER_AXI_HOST_CALL_TIMEOUT_MS =
+  BROWSER_START_ALLOWANCE_MS + AXI_COMMAND_TIMEOUT_MS + HOST_CALL_OVERHEAD_MS;
 
 /**
  * Panel Capability transport constants (design §Transport). The capability is
