@@ -78,6 +78,20 @@ type PageRegistration = {
 
 const ORIGIN_SCOPE_ROUTE_PATTERN = "**/*";
 
+export const GUARD_INSTALL_FAILED_MESSAGE = "browser busy, retry";
+
+export class BrowserOriginGuardInstallError extends Error {
+  readonly code = "guard_install_failed" as const;
+
+  constructor(cause?: unknown) {
+    super(
+      GUARD_INSTALL_FAILED_MESSAGE,
+      cause === undefined ? undefined : { cause },
+    );
+    this.name = "BrowserOriginGuardInstallError";
+  }
+}
+
 export class BrowserOriginScopeDeniedError extends Error {
   constructor(
     public readonly origin: string | null,
@@ -113,6 +127,16 @@ function cleanupFailure(message: string, failures: readonly unknown[]) {
 }
 
 function preservePrimaryFailure(primary: unknown, cleanup: Error) {
+  if (primary instanceof BrowserOriginGuardInstallError) {
+    const cause =
+      primary.cause === undefined
+        ? cleanup
+        : new AggregateError(
+            [primary.cause, cleanup],
+            "Origin Scope setup and cleanup failed.",
+          );
+    return new BrowserOriginGuardInstallError(cause);
+  }
   if (primary instanceof BrowserOriginScopeDeniedError) {
     const cause =
       primary.cause === undefined
@@ -531,7 +555,7 @@ export async function installHostOriginScopeGuard(
     if (candidate instanceof BrowserOriginScopeDeniedError) {
       recordDenial(candidate);
     } else {
-      recordDenial(new BrowserOriginScopeDeniedError(null));
+      recordInstallationFailure(candidate);
     }
   };
   const recordInstallationFailure = (error: unknown) => {
@@ -544,7 +568,6 @@ export async function installHostOriginScopeGuard(
       () => pendingPageInstallations.delete(installation),
       (error: unknown) => {
         pendingPageInstallations.delete(installation);
-        denial ??= new BrowserOriginScopeDeniedError(null);
         recordInstallationFailure(error);
       },
     );
@@ -618,7 +641,6 @@ export async function installHostOriginScopeGuard(
     return installation.then(
       () => pendingContextInstallations.delete(installation),
       (error: unknown) => {
-        denial ??= new BrowserOriginScopeDeniedError(null);
         pendingContextInstallations.delete(installation);
         recordInstallationFailure(error);
       },
@@ -699,22 +721,27 @@ export async function installHostOriginScopeGuard(
       throw denial;
     }
     if (backgroundFailures.length > 0) {
-      throw cleanupFailure(
-        "Origin Scope installation failed.",
-        backgroundFailures,
+      throw new BrowserOriginGuardInstallError(
+        cleanupFailure("Origin Scope installation failed.", backgroundFailures),
       );
     }
   } catch (error) {
     const cleanupFailures = await disposeResources();
     if (denial !== null && error !== denial) cleanupFailures.push(error);
+    const primary =
+      denial ??
+      (error instanceof BrowserOriginGuardInstallError
+        ? error
+        : error instanceof BrowserOriginScopeDeniedError
+          ? error
+          : new BrowserOriginGuardInstallError(error));
     if (cleanupFailures.length > 0) {
-      const primary = denial ?? error;
       throw preservePrimaryFailure(
         primary,
         cleanupFailure("Origin Scope cleanup failed.", cleanupFailures),
       );
     }
-    throw denial ?? error;
+    throw primary;
   }
   return {
     deniedError: () => denial,

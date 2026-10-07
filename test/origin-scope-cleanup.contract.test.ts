@@ -8,6 +8,7 @@ import {
 import { installPageNavigationGuard } from "../src/browser/origin-scope-cdp.js";
 
 type CleanupFailure = {
+  enable?: Error;
   close?: Error;
   stopLoading?: Error;
   pageClose?: Error;
@@ -54,7 +55,10 @@ class FakeCdpSession {
   ) {}
 
   async send(method: string) {
-    if (method === "Page.enable") return;
+    if (method === "Page.enable") {
+      if (this.failure.enable !== undefined) throw this.failure.enable;
+      return;
+    }
     if (method === "Page.close") {
       if (this.failure.close !== undefined) throw this.failure.close;
       this.page.closed = true;
@@ -268,5 +272,25 @@ describe("Origin Scope cleanup", () => {
     });
     expect(boundary.close).toHaveBeenCalledTimes(1);
     expect(boundary.page.isClosed()).toBe(true);
+  });
+
+  it("reports a failed page-guard install as browser busy, not a non-web denial", async () => {
+    const boundary = createHostBoundary({
+      enable: new Error(
+        "Session closed. Most likely the page has been closed.",
+      ),
+    });
+
+    await expect(
+      installHostOriginScopeGuard(
+        "http://browser.test",
+        policy,
+        async () => boundary.browser,
+      ),
+    ).rejects.toMatchObject({
+      name: "BrowserOriginGuardInstallError",
+      code: "guard_install_failed",
+      message: "browser busy, retry",
+    });
   });
 });

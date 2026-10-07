@@ -3540,6 +3540,7 @@ export const browserScriptRuntimeErrorSchema = z
     state: z.literal("runtime-error"),
     code: z.enum([
       "browser_busy",
+      "guard_install_failed",
       "awake-limit",
       "browser_timeout",
       "result_too_large",
