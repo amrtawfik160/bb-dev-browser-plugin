@@ -1,5 +1,6 @@
 import type {
   BbPluginApi,
+  ExperimentalHostCallOptions,
   PluginAgentToolContext,
   PluginCliContext,
 } from "@get-bb/plugin-sdk";
@@ -22,6 +23,8 @@ import {
 } from "../access/authorization.js";
 import type { GrantRequestEvent } from "../access/grant-requests.js";
 import {
+  BROWSER_AXI_HOST_CALL_TIMEOUT_MS,
+  browserScriptHostCallTimeoutMs,
   browserGrantRequestDecisionRequestSchema,
   browserGrantRequestDecisionResponseSchema,
   browserGrantRequestQuerySchema,
@@ -260,6 +263,20 @@ function agentBrowserScriptRequest(
       ? {}
       : { invalidCertificateOrigins: [...invalidCertificateOrigins] }),
   };
+}
+
+/**
+ * BB honors a per-call deadline that the pinned SDK's types do not list yet.
+ */
+function withHostCallDeadline(
+  options: ExperimentalHostCallOptions,
+  timeoutMs: number,
+): ExperimentalHostCallOptions {
+  const withDeadline: ExperimentalHostCallOptions & { timeoutMs: number } = {
+    ...options,
+    timeoutMs,
+  };
+  return withDeadline;
 }
 
 const profilePreferenceRowSchema = z
@@ -1209,7 +1226,10 @@ export function createBrowserService(
                 originScope,
                 activeInvalidCertificateOrigins,
               ),
-              { hostId: call.hostId, signal: linked.signal },
+              withHostCallDeadline(
+                { hostId: call.hostId, signal: linked.signal },
+                browserScriptHostCallTimeoutMs(call.parameters.timeoutMs),
+              ),
             );
             return enrichRealBrowserDenial(
               call,
@@ -2749,7 +2769,10 @@ export function createBrowserService(
         args: parameters.args,
         ...(context.cwd === undefined ? {} : { cwd: context.cwd }),
       },
-      { hostId: target.hostId, signal: context.signal },
+      withHostCallDeadline(
+        { hostId: target.hostId, signal: context.signal },
+        BROWSER_AXI_HOST_CALL_TIMEOUT_MS,
+      ),
     );
   }
 

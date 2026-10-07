@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { AXI_COMMAND_TIMEOUT_MS } from "../shared/contracts.js";
 
 /**
  * Agents drive the Workspace Browser with chrome-devtools-axi itself, so every
@@ -18,8 +19,6 @@ export const DEVTOOLS_MCP_PACKAGE_VERSION = "1.10.1";
 /** How agents run axi in BB; axi's own follow-up hints are rewritten to it. */
 export const AXI_LAUNCHER = "bb plugin run browser axi";
 
-/** Longest one axi command may run; axi's own bridge timeout is 30 seconds. */
-export const AXI_COMMAND_TIMEOUT_MS = 180_000;
 /** Output kept per stream; axi truncates snapshots near 16k characters. */
 const MAX_OUTPUT_BYTES = 512 * 1024;
 

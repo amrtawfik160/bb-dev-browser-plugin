@@ -1148,7 +1148,25 @@ type ProductionProcessContext = {
   options: BrowserProcessBoundaryOptions;
   passwdPath: string;
   setprivExecutable: string;
+  /**
+   * Helper names that ran against each runtime directory. Every agent lane
+   * has its own helper daemon attached to the instance, and the daemon never
+   * exits on its own, so each one stops with the instance.
+   */
+  helperNames: Map<string, Set<string>>;
 };
+
+function rememberHelper(
+  context: ProductionProcessContext,
+  request: Pick<BrowserExecutionRequest, "runtimeDirectory" | "browserName">,
+) {
+  let names = context.helperNames.get(request.runtimeDirectory);
+  if (names === undefined) {
+    names = new Set();
+    context.helperNames.set(request.runtimeDirectory, names);
+  }
+  names.add(request.browserName);
+}
 
 async function removeDevToolsPortFile(profileDirectory: string) {
   try {
@@ -1255,6 +1273,25 @@ async function stopAttachedHelper(
   }
 }
 
+async function stopAttachedHelpers(
+  context: ProductionProcessContext,
+  request: BrowserLaunchRequest,
+  identity: ReturnType<typeof browserUserIdentity>,
+) {
+  const names = new Set([
+    request.browserName,
+    ...(context.helperNames.get(request.runtimeDirectory) ?? []),
+  ]);
+  context.helperNames.delete(request.runtimeDirectory);
+  const outcomes = await Promise.allSettled(
+    [...names].map((browserName) =>
+      stopAttachedHelper(context, { ...request, browserName }, identity),
+    ),
+  );
+  const failure = outcomes.find((outcome) => outcome.status === "rejected");
+  if (failure !== undefined) throw failure.reason;
+}
+
 async function stopBrowserProcess(
   context: ProductionProcessContext,
   request: BrowserLaunchRequest,
@@ -1262,7 +1299,7 @@ async function stopBrowserProcess(
   browserProcess: ChildProcessWithoutNullStreams,
 ) {
   try {
-    await stopAttachedHelper(context, request, identity);
+    await stopAttachedHelpers(context, request, identity);
   } finally {
     await attemptBrowserClose(request.profileDirectory);
     await stopProcess(browserProcess);
@@ -1434,6 +1471,7 @@ async function prepareHelperRuntime(
     request.browserName,
   );
   const identity = browserUserIdentity(context.passwdPath);
+  rememberHelper(context, request);
   await ownedDirectory(helperHome, identity);
   const executable = await stagedDevBrowserExecutable(
     context.options,
@@ -1810,7 +1848,12 @@ export function createProductionBrowserProcessBoundary(
 ): BrowserLaunchBoundary {
   const passwdPath = options.passwdPath ?? "/etc/passwd";
   const setprivExecutable = options.setprivExecutable ?? "/usr/bin/setpriv";
-  const context = { options, passwdPath, setprivExecutable };
+  const context: ProductionProcessContext = {
+    options,
+    passwdPath,
+    setprivExecutable,
+    helperNames: new Map(),
+  };
   return {
     runAsUser: "bb-browser",
     get effectiveUserId() {

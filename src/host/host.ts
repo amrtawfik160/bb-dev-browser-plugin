@@ -1,4 +1,10 @@
 import { experimental_defineHostEntry } from "@get-bb/plugin-sdk/host";
+import { withPromptCancellation } from "./prompt-cancellation.js";
+import {
+  cgroupMemoryKills,
+  memoryKillNotice,
+  type HostMemoryKills,
+} from "./memory-kills.js";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -428,6 +434,7 @@ function scriptRuntimeFailure(
   error: unknown,
   lease?: ControlLease,
   traceId?: string,
+  memoryNotice?: string,
 ): BrowserScriptResponse {
   const code =
     lease?.signal.aborted === true
@@ -435,10 +442,12 @@ function scriptRuntimeFailure(
       : error instanceof ControlLeaseError
         ? error.code
         : scriptRuntimeErrorCode(error);
-  const message =
+  const failure =
     error instanceof Error && error.message.length > 0
       ? error.message
       : "The Browser script failed.";
+  const message =
+    memoryNotice === undefined ? failure : `${memoryNotice}\n${failure}`;
   const traceSuffix = traceId === undefined ? "" : `\nTrace: ${traceId}`;
   const boundedMessage =
     (boundScriptFailureMessage(
@@ -701,6 +710,7 @@ export function createBrowserHostEntry(
   transferStagingSource?: TransferStagingSource,
   hostDownloadsSource?: HostDownloadsSource,
   panelStream?: BrowserHostPanelStreamOptions,
+  memoryKills: HostMemoryKills = cgroupMemoryKills(),
 ) {
   let workerLease: { dispose(): Promise<void> } | undefined;
   const operationTraces = createBrowserOperationTraces();
@@ -1693,7 +1703,7 @@ export function createBrowserHostEntry(
   }
   return experimental_defineHostEntry({
     contract: browserHostContract,
-    handlers: {
+    handlers: withPromptCancellation(browserHostContract, {
       hostConnection: (request, context) => {
         retainWorker(context);
         return reconcileHostConnection(
@@ -1783,6 +1793,7 @@ export function createBrowserHostEntry(
           request.tabId !== undefined,
         );
         const leaseKey = controlLeaseKey(target);
+        const memoryKillsAtStart = await memoryKills.count();
         let lease: ControlLease | undefined;
         let response: BrowserScriptResponse | undefined;
         let leaseRevokedAfterCompletion = false;
@@ -1923,6 +1934,7 @@ export function createBrowserHostEntry(
                 error,
                 lease,
                 trace.traceId,
+                await memoryKillNotice(memoryKills, memoryKillsAtStart),
               );
               return response;
             } finally {
@@ -2258,6 +2270,7 @@ export function createBrowserHostEntry(
           { ...target, locale: profile.locale, timezone: profile.timezone },
           lane,
         );
+        const memoryKillsAtStart = await memoryKills.count();
         const result = await runAxiCommand(axiRuntime(dataDir), {
           args: request.args,
           endpoint,
@@ -2268,7 +2281,13 @@ export function createBrowserHostEntry(
         });
         // Show tabs the command opened or closed in every Browser Panel.
         await reconcileRuntimeTabs(dataDir, target);
-        return result;
+        const memoryNotice =
+          result.exitCode === 0
+            ? undefined
+            : await memoryKillNotice(memoryKills, memoryKillsAtStart);
+        return memoryNotice === undefined
+          ? result
+          : { ...result, stderr: `${result.stderr}note: ${memoryNotice}\n` };
       },
       sleepProfile: async (request, context) => {
         retainWorker(context);
@@ -2573,7 +2592,7 @@ export function createBrowserHostEntry(
         }
         return manager.purge(request);
       },
-    },
+    }),
     dispose: async () => {
       try {
         controlLeases.dispose();
