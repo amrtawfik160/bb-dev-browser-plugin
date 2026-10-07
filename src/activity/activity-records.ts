@@ -18,6 +18,7 @@ import {
 import {
   BROWSER_AUTHORIZATION_MIGRATIONS,
   BROWSER_DEFAULT_ACCESS_MIGRATION,
+  BROWSER_ORIGIN_AUTO_APPROVAL_MIGRATION,
 } from "../access/authorization.js";
 import { GRANT_REQUEST_MIGRATION } from "../access/grant-requests.js";
 
@@ -124,6 +125,7 @@ export const BROWSER_DATABASE_MIGRATIONS = [
   activityGrantMetadataMigration,
   activityGrantRequestMetadataMigration,
   BROWSER_DEFAULT_ACCESS_MIGRATION,
+  BROWSER_ORIGIN_AUTO_APPROVAL_MIGRATION,
 ] as const;
 
 const skippedCompatibilityMigration = "SELECT 1";

@@ -95,8 +95,10 @@ your tabs in the Browser Panel. Only web pages open (`http`, `https`, `data`,
 project enables it, use it for multi-step Playwright logic with the exact
 HTTP(S) origin you need. Any web origin
 works by default: your project's first call records a whole-web grant the
-owner can see in Browser Settings. `origin_denied` means the owner withdrew
-that access for your project (surface the attached Grant Request and pause
+owner can see in Browser Settings, and raw localhost origins are approved
+automatically while the owner's Origin Auto-Approval setting is on.
+`origin_denied` means the owner withdrew that access for your project or
+turned Origin Auto-Approval off (surface the attached Grant Request and pause
 until they decide in authenticated Browser Settings) or the navigation is
 non-web (no Grant Request; do not retry it).
 
@@ -240,7 +242,10 @@ bb plugin run browser request-status --request <id> # inspect one scoped request
 ```
 
 Your project is granted the whole web on first use. An owner can revoke that
-in Browser Settings, after which your calls go through Grant Requests.
+in Browser Settings, after which your calls go through Grant Requests. Raw
+localhost is outside the whole web; while Origin Auto-Approval is on, its
+Grant Request is approved at once and logged. File transfer and
+invalid-certificate access always wait for the owner.
 Grantable scopes are exact origins (`https://example.com`) or explicit
 subdomain patterns (`https://*.example.com`) or `*`. Paths are not grantable.
 The owner manages grants and request decisions in authenticated Browser

@@ -651,8 +651,13 @@ function AgentAccessBlock({ status }: { status: AttachedStatus }) {
         : Promise.resolve<BrowserGrantRequest[]>([]),
     [available, rpc, target.hostId, target.profileId],
   );
+  const loadAutoApproval = useCallback(
+    () => rpc.call("browser_origin_auto_approval", {}),
+    [rpc],
+  );
   const grants = useResource(loadGrants);
   const requests = useResource(loadRequests);
+  const autoApproval = useResource(loadAutoApproval);
   const [pending, setPending] = useState<string | null>(null);
   const [confirmations, setConfirmations] = useState<Record<string, string>>(
     {},
@@ -688,6 +693,19 @@ function AgentAccessBlock({ status }: { status: AttachedStatus }) {
     } finally {
       setPending(null);
     }
+  }
+
+  function setAutoApproval(enabled: boolean) {
+    setPending("auto-approval");
+    setMessage(null);
+    setError(null);
+    void rpc
+      .call("browser_origin_auto_approval_set", { ...target, enabled })
+      .then((response) => autoApproval.setData(response))
+      .catch((requestError: unknown) =>
+        setError(administrationErrorMessage(requestError)),
+      )
+      .finally(() => setPending(null));
   }
 
   function revokeGrant(grant: BrowserProfileGrant) {
@@ -784,6 +802,22 @@ function AgentAccessBlock({ status }: { status: AttachedStatus }) {
       <p className="text-sm text-muted-foreground">
         A project gets the whole web on its first browser call. Revoke that
         grant to make its agents ask you first.
+      </p>
+      <label className="flex items-center gap-2 text-sm">
+        <input
+          type="checkbox"
+          className="h-4 w-4 rounded-sm border-input accent-primary"
+          aria-label="Allow agents to open any website without asking"
+          checked={autoApproval.data?.enabled ?? false}
+          disabled={autoApproval.data === null || pending !== null}
+          onChange={(event) => setAutoApproval(event.target.checked)}
+        />
+        Allow agents to open any website without asking
+      </label>
+      <p className="text-xs text-muted-foreground">
+        Sites outside the whole web, such as localhost, are approved for the
+        agent and logged in Activity. File transfer and invalid certificates
+        still ask. A project whose whole-web grant you revoked still asks.
       </p>
       {!available ? (
         <OfflineNotice what="Grants" />

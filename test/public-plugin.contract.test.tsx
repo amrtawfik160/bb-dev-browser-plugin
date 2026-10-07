@@ -2054,6 +2054,75 @@ describe("Browser public plugin contract", () => {
     }
   });
 
+  it("auto-approves a raw localhost origin with an audit trail until the owner turns Origin Auto-Approval off", async () => {
+    const browser = await createPublicPluginHarness({
+      snapshot: preparedSnapshot,
+      browserScriptResponse: { ok: true, result: { title: "done" } },
+    });
+    try {
+      await browser.createBrowserProfile({
+        hostId: "host-browser-test",
+        name: "Auto-approval target",
+      });
+      expect(await browser.rpc.browser_origin_auto_approval({})).toEqual({
+        enabled: true,
+      });
+      const allowed = await browser.runBrowserScriptWithProfile(undefined, {
+        destinationOrigin: "http://localhost:5199",
+      });
+      expect(allowed.isError).toBe(false);
+      const [request] = await browser.listBrowserGrantRequests();
+      expect(request).toMatchObject({
+        origin: "http://localhost:5199",
+        status: "approved",
+        decision: "persist",
+      });
+      expect(
+        (await browser.runBrowserActivityRecords()).filter(
+          (record) =>
+            "requestId" in record && record.requestId === request!.requestId,
+        ),
+      ).toEqual([
+        expect.objectContaining({
+          actor: "agent",
+          action: "grant-request-created",
+          outcome: "pending",
+        }),
+        expect.objectContaining({
+          actor: "system",
+          action: "grant-request-approved",
+          grantScope: "http://localhost:5199",
+          outcome: "auto-approved",
+        }),
+      ]);
+
+      expect(
+        await browser.rpc.browser_origin_auto_approval_set({
+          hostId: "host-browser-test",
+          profileId: DEFAULT_PROFILE_ID,
+          enabled: false,
+        }),
+      ).toEqual({ enabled: false });
+      const denied = await browser.runBrowserScriptWithProfile(undefined, {
+        destinationOrigin: "http://localhost:5200",
+      });
+      expect(denied.isError).toBe(true);
+      expect(
+        await browser.listBrowserGrantRequests({ status: "pending" }),
+      ).toEqual([expect.objectContaining({ origin: "http://localhost:5200" })]);
+      // The grant approved while the setting was on keeps working.
+      expect(
+        (
+          await browser.runBrowserScriptWithProfile(undefined, {
+            destinationOrigin: "http://localhost:5199",
+          })
+        ).isError,
+      ).toBe(false);
+    } finally {
+      await browser.dispose();
+    }
+  });
+
   it("keeps whole-web, file-transfer, and invalid-certificate elevations independent", async () => {
     const browser = await createPublicPluginHarness({
       snapshot: preparedSnapshot,
@@ -2086,6 +2155,11 @@ describe("Browser public plugin contract", () => {
       { destinationOrigin: "https://not-listed.other.test" },
     );
     expect(wholeWebAllowed.isError).toBe(false);
+    await browser.rpc.browser_origin_auto_approval_set({
+      hostId: "host-browser-test",
+      profileId: DEFAULT_PROFILE_ID,
+      enabled: false,
+    });
     const wholeWebLocalhostDenied = await browser.runBrowserScriptWithProfile(
       undefined,
       { destinationOrigin: "http://localhost:3000" },
@@ -2309,6 +2383,11 @@ describe("Browser public plugin contract", () => {
         })
       ).isError,
     ).toBe(false);
+    await browser.rpc.browser_origin_auto_approval_set({
+      hostId: "host-browser-test",
+      profileId: DEFAULT_PROFILE_ID,
+      enabled: false,
+    });
     expect(
       (
         await browser.runBrowserScriptWithProfile(undefined, {
