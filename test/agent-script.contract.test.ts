@@ -774,3 +774,73 @@ describe("shared browser context close", () => {
     expect(sibling._browser).toBeNull();
   });
 });
+
+it("settles a confirm dialog when dismiss rejects with no dialog showing", async () => {
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => {
+    unhandled.push(reason);
+  };
+  process.on("unhandledRejection", onUnhandled);
+  const dialogListeners: Array<(dialog: {
+    type: () => string;
+    accept: () => Promise<void>;
+    dismiss: () => Promise<void>;
+  }) => void> = [];
+  const context = {
+    setDefaultNavigationTimeout: () => undefined,
+    setDefaultTimeout: () => undefined,
+  };
+  const page = {
+    id: "confirm-page",
+    url: "https://app.example.test/confirm",
+    context: () => context,
+    evaluate: async (expression: string) => {
+      if (expression.includes("confirm(")) return true;
+      return "visible";
+    },
+    on: (
+      event: string,
+      listener: (dialog: {
+        type: () => string;
+        accept: () => Promise<void>;
+        dismiss: () => Promise<void>;
+      }) => void,
+    ) => {
+      if (event === "dialog") dialogListeners.push(listener);
+    },
+  };
+  const html = `<button id="confirm">confirm</button><script>document.getElementById("confirm").onclick = () => confirm("leave this page?");</script>`;
+  const fakeBrowser = createPinnedBrowserApi<typeof page>({
+    listPages: async () => [{ id: page.id, url: page.url }],
+    getPage: async () => page,
+    newPage: async () => page,
+    closePage: async () => undefined,
+  });
+  const logs: string[] = [];
+  try {
+    const prepared = prepareAgentExecution({
+      code: `await page.evaluate(${JSON.stringify(`confirm("leave this page?")`)}); return ${JSON.stringify(html)};`,
+    });
+    const run = new Function(
+      "browser",
+      "console",
+      `return (async () => {\n${prepared}\n})();`,
+    ) as (
+      browser: typeof fakeBrowser,
+      console: { log: (value: unknown) => void },
+    ) => Promise<void>;
+    await run(fakeBrowser, { log: (value) => logs.push(String(value)) });
+    expect(dialogListeners).toHaveLength(1);
+    const dismissed = Promise.reject(new Error("No dialog is showing"));
+    dialogListeners[0]?.({
+      type: () => "confirm",
+      accept: () => dismissed,
+      dismiss: () => dismissed,
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(unhandled).toEqual([]);
+    expect(logs).toEqual([html]);
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
+});
