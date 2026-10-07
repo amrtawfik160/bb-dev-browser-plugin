@@ -120,6 +120,7 @@ export type GrantRequestEventCause =
   | "agent-requested"
   | "agent-consumed"
   | "owner-decision"
+  | "owner-auto-approval"
   | "request-expired"
   | "owner-revoked"
   | "persistent-grant-revoked"
@@ -610,6 +611,10 @@ export type GrantRequestStore = {
   decideRequest(
     input: BrowserGrantRequestDecisionRequest,
   ): BrowserGrantRequestDecisionResponse;
+  autoApprove(
+    input: GrantRequestAuthorizationInput,
+    now: Date,
+  ): BrowserProfileGrant | null;
   revokeRequest(requestId: string): BrowserGrantRequestDecisionResponse;
   revokeProject(projectId: string): BrowserGrantRequest[];
   revokeProfile(target: {
@@ -826,6 +831,74 @@ export function createGrantRequestStore(
     emitRequestEvents(events, options.onEvent);
   }
 
+  function persistApproval({
+    current,
+    persistenceConfirmation,
+    nowIso,
+    events,
+    cause,
+  }: {
+    current: EventRow;
+    persistenceConfirmation: string | undefined;
+    nowIso: string;
+    events: GrantRequestEvent[];
+    cause?: "owner-auto-approval";
+  }) {
+    if (options.createPersistentGrant === undefined) {
+      throw new Error("Persistent Browser Grant storage is unavailable.");
+    }
+    const grant = options.createPersistentGrant(
+      persistentGrantInput(current, persistenceConfirmation, nowIso),
+    );
+    appendEvent(
+      database,
+      { ...current, decision: "persist", grant_id: grant.grantId },
+      "approved",
+      nowIso,
+    );
+    collectRequestEvent({
+      events,
+      database,
+      requestId: current.request_id,
+      eventType: "approved",
+      occurredAt: nowIso,
+      ...(cause === undefined ? {} : { actor: "system" as const, cause }),
+    });
+    return grant;
+  }
+
+  /**
+   * Origin Auto-Approval: records the Grant Request an agent would have
+   * raised and approves it at once as a persistent exact-origin grant, so the
+   * request history and the activity log keep the same audit trail an owner
+   * decision leaves. Elevated requests are never auto-approved.
+   */
+  function autoApprove(input: GrantRequestAuthorizationInput, now: Date) {
+    const normalized = normalizedInput(input);
+    if (
+      normalized === null ||
+      normalized.fileTransfer ||
+      normalized.invalidCertificate
+    ) {
+      return null;
+    }
+    const events: GrantRequestEvent[] = [];
+    const grant = database.transaction(() => {
+      const nowIso = now.toISOString();
+      const request = createRequest(normalized, now, events)!;
+      const current = eventRowsForRequest(database, request.requestId).at(-1)!;
+      return persistApproval({
+        current,
+        persistenceConfirmation: undefined,
+        nowIso,
+        events,
+        cause: "owner-auto-approval",
+      });
+    })();
+    emitRequestEvents(events, options.onEvent);
+    return grant;
+  }
+
   function decideRequest(input: BrowserGrantRequestDecisionRequest) {
     const normalizedRequestId = browserGrantRequestIdSchema.parse(
       input.requestId,
@@ -875,32 +948,11 @@ export function createGrantRequestStore(
         );
       }
       if (decision.decision === "persist") {
-        if (options.createPersistentGrant === undefined) {
-          throw new Error("Persistent Browser Grant storage is unavailable.");
-        }
-        const grant = options.createPersistentGrant(
-          persistentGrantInput(
-            current,
-            decision.persistenceConfirmation,
-            nowIso,
-          ),
-        );
-        appendEvent(
-          database,
-          {
-            ...current,
-            decision: "persist",
-            grant_id: grant.grantId,
-          },
-          "approved",
+        const grant = persistApproval({
+          current,
+          persistenceConfirmation: decision.persistenceConfirmation,
           nowIso,
-        );
-        collectRequestEvent({
           events,
-          database,
-          requestId: normalizedRequestId,
-          eventType: "approved",
-          occurredAt: nowIso,
         });
         return response(
           "persisted",
@@ -1063,6 +1115,7 @@ export function createGrantRequestStore(
     expireTemporaryGrant,
     revokeLinkedGrant,
     decideRequest,
+    autoApprove,
     revokeRequest,
     revokeProject: (projectId) =>
       revokeMatching(

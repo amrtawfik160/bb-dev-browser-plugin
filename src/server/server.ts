@@ -2484,6 +2484,10 @@ export default function plugin(bb: BbPluginApi) {
       browser.decideGrantRequest(ownerAuthority, input),
     browser_grant_request_revoke: (input) =>
       browser.revokeGrantRequest(ownerAuthority, input.requestId),
+    browser_origin_auto_approval: () =>
+      browser.originAutoApproval(ownerAuthority),
+    browser_origin_auto_approval_set: (input) =>
+      browser.setOriginAutoApproval(ownerAuthority, input),
     browser_profile_create: (input) => browser.createProfile(input),
     browser_profile_rename: (input) => browser.renameProfile(input),
     browser_profile_select: (input) => browser.selectProfile(input),

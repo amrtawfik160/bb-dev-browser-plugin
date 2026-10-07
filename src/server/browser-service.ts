@@ -15,6 +15,7 @@ import {
 import {
   createProfileGrantStore,
   elevationIsActive,
+  isRawLocalhostHostname,
   scopeMatchesOrigin,
   type BrowserAuthorizationDecision,
   type BrowserAuthorizationSuccess,
@@ -77,6 +78,7 @@ import {
   type BrowserActivityGrantMetadata,
   type BrowserGrantRequest,
   type BrowserGrantRequestDecisionRequest,
+  type BrowserOriginAutoApprovalUpdate,
   type BrowserGrantRequestDecisionResponse,
   type BrowserGrantRequestQuery,
   type BrowserProfileGrant,
@@ -174,6 +176,7 @@ const GRANT_REQUEST_ACTIVITY_ACTIONS = {
 function grantRequestActivityOutcome(event: GrantRequestEvent) {
   if (event.eventType === "requested") return "pending";
   if (event.eventType !== "approved") return event.eventType;
+  if (event.cause === "owner-auto-approval") return "auto-approved";
   if (event.request.decision === "retry") return "retry-approved";
   if (event.request.decision === "one-hour") return "one-hour-approved";
   return "persisted";
@@ -1980,6 +1983,28 @@ export function createBrowserService(
     );
   }
 
+  async function originAutoApproval(authority: unknown) {
+    requireOwnerSettingsAuthority(authority);
+    return { enabled: grantStore.originAutoApproval() };
+  }
+
+  async function setOriginAutoApproval(
+    authority: unknown,
+    request: BrowserOriginAutoApprovalUpdate,
+  ) {
+    requireOwnerSettingsAuthority(authority);
+    return recordActivity({
+      target: { hostId: request.hostId, profileId: request.profileId },
+      kind: "grant",
+      action: "origin-auto-approval",
+      operation: () =>
+        withGrantStateSerialization(() => ({
+          enabled: grantStore.setOriginAutoApproval(request.enabled),
+        })),
+      outcome: (response) => (response.enabled ? "enabled" : "disabled"),
+    });
+  }
+
   async function revokeGrantRequest(
     authority: unknown,
     requestId: string,
@@ -2671,20 +2696,33 @@ export function createBrowserService(
         setupRequiredStatus({ hostId: null, profileId: target.profileId }),
       );
     }
-    const authorization = await authorizeAgentScript({
-      parameters: scriptParameters,
-      context,
-      hostId: target.hostId,
-      profileId: target.profileId,
-      activity: {
-        eventId: newActivityEventId("agent"),
-        occurredAt: new Date().toISOString(),
-        projectId: context.projectId,
-        hostId: target.hostId,
+    const hostId = target.hostId;
+    const authorizeOrigin = (origin: string) =>
+      authorizeAgentScript({
+        parameters: { ...scriptParameters, destinationOrigin: origin },
+        context,
+        hostId,
         profileId: target.profileId,
-        destinationOrigin,
-      },
-    });
+        activity: {
+          eventId: newActivityEventId("agent"),
+          occurredAt: new Date().toISOString(),
+          projectId: context.projectId,
+          hostId,
+          profileId: target.profileId,
+          destinationOrigin: origin,
+        },
+      });
+    let authorization = await authorizeOrigin(destinationOrigin);
+    // Raw localhost sits outside whole-web scope (ADR 0013), so its own grant
+    // is exact. axi still needs the whole web, checked with the probe origin.
+    if (
+      !("ok" in authorization) &&
+      (authorization.temporaryGrant ?? authorization.grant).originScope !==
+        "*" &&
+      isRawLocalhostHostname(new URL(destinationOrigin).hostname)
+    ) {
+      authorization = await authorizeOrigin(AXI_ACCESS_PROBE_ORIGIN);
+    }
     if ("ok" in authorization) {
       return refusal(
         authorization.ok
@@ -3175,6 +3213,8 @@ export function createBrowserService(
     inspectAgentGrantRequest,
     decideGrantRequest,
     revokeGrantRequest,
+    originAutoApproval,
+    setOriginAutoApproval,
     activityRecords,
     clearActivityRecords,
     createProfile,

@@ -109,6 +109,18 @@ CREATE TABLE browser_default_access_withdrawals (
 );
 `;
 
+/**
+ * The owner's Origin Auto-Approval setting. No row means the setting was never
+ * changed, which reads as on: agents open any website without asking.
+ */
+export const BROWSER_ORIGIN_AUTO_APPROVAL_MIGRATION = `
+CREATE TABLE browser_origin_auto_approval (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+  updated_at TEXT NOT NULL
+);
+`;
+
 export type { BrowserAuthorizationRequest } from "../shared/contracts.js";
 
 export type BrowserAuthorizationFailure = {
@@ -199,6 +211,8 @@ type GrantStore = {
     input: BrowserGrantRequestDecisionRequest,
   ): BrowserGrantRequestDecisionResponse;
   revokeRequest(requestId: string): BrowserGrantRequestDecisionResponse;
+  originAutoApproval(): boolean;
+  setOriginAutoApproval(enabled: boolean): boolean;
   revokeProject(projectId: string): BrowserProfileGrant[];
   projectDeleted(projectId: string): BrowserProfileGrant[];
   projectGeneration(projectId: string): number;
@@ -973,8 +987,8 @@ function storedGrantRevokedAt(database: Database.Database, grantId: string) {
  * visible and revocable in Browser Settings like any other; revoking it
  * withdraws Default Access for that project and profile, and granting the
  * whole web again restores it. Raw localhost stays outside whole-web scope
- * (ADR 0013) and keeps the request flow, elevations stay separate opt-ins, and
- * a project deletion tombstone still blocks new grants.
+ * (ADR 0013) and goes through Origin Auto-Approval, elevations stay separate
+ * opt-ins, and a project deletion tombstone still blocks new grants.
  */
 type StoredAuthorizationContext = {
   database: Database.Database;
@@ -1016,6 +1030,61 @@ function defaultAccessGrant(
   );
 }
 
+function originAutoApprovalEnabled(database: Database.Database) {
+  return (
+    database
+      .prepare(
+        "SELECT 1 FROM browser_origin_auto_approval WHERE id = 1 AND enabled = 0",
+      )
+      .get() === undefined
+  );
+}
+
+function setOriginAutoApproval(
+  database: Database.Database,
+  enabled: boolean,
+  updatedAt: string,
+) {
+  database
+    .prepare(
+      `INSERT INTO browser_origin_auto_approval (id, enabled, updated_at)
+       VALUES (1, ?, ?)
+       ON CONFLICT (id) DO UPDATE SET enabled = excluded.enabled,
+                                      updated_at = excluded.updated_at`,
+    )
+    .run(enabled ? 1 : 0, updatedAt);
+}
+
+/**
+ * Origin Auto-Approval: with the owner's setting on, an origin no grant covers
+ * (raw localhost, ADR 0013) gets an auto-approved, audited exact-origin grant
+ * instead of a pending Grant Request. It does not override the owner's
+ * per-project withdrawal of Default Access, an expired time-limited whole-web
+ * grant, a deleted project, or elevations.
+ */
+function originAutoApprovalGrant(
+  context: StoredAuthorizationContext,
+  grants: readonly BrowserProfileGrant[],
+  request: BrowserAuthorizationRequest,
+  now: Date,
+): BrowserProfileGrant | null {
+  if (!originAutoApprovalEnabled(context.database)) return null;
+  if (defaultAccessWithdrawn(context.database, request)) return null;
+  if (
+    grants.some(
+      (grant) =>
+        grant.originScope === "*" &&
+        !elevationIsActive(grant.wholeWebExpiresAt, now),
+    )
+  ) {
+    return null;
+  }
+  if (storedProject(context.database, request.projectId)?.deleted_at != null) {
+    return null;
+  }
+  return context.grantRequests.autoApprove(request, now);
+}
+
 function authorizeStoredRequest(
   context: StoredAuthorizationContext,
   request: BrowserAuthorizationRequest,
@@ -1032,6 +1101,20 @@ function authorizeStoredRequest(
   const defaultGrant = defaultAccessGrant(context, grants, request, now);
   if (defaultGrant !== null) {
     decision = authorizeAgainstGrants([...grants, defaultGrant], request, now);
+    if (decision.allowed) return decision;
+  }
+  const autoApprovedGrant = originAutoApprovalGrant(
+    context,
+    grants,
+    request,
+    now,
+  );
+  if (autoApprovedGrant !== null) {
+    decision = authorizeAgainstGrants(
+      [...grants, autoApprovedGrant],
+      request,
+      now,
+    );
     if (decision.allowed) return decision;
   }
   const requestDecision: GrantRequestAuthorizationDecision =
@@ -1200,6 +1283,11 @@ export function createProfileGrantStore(
       grantRequests.expireTemporaryGrant(grantId, expirationTime),
     decideRequest: (input) => grantRequests.decideRequest(input),
     revokeRequest: (requestId) => grantRequests.revokeRequest(requestId),
+    originAutoApproval: () => originAutoApprovalEnabled(database),
+    setOriginAutoApproval: (enabled) => {
+      setOriginAutoApproval(database, enabled, clock().toISOString());
+      return enabled;
+    },
     revokeProject: (projectId) =>
       (() => {
         const grants = revokeMatchingGrants(database, clock, { projectId });

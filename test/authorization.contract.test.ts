@@ -7,6 +7,7 @@ import {
 } from "../src/access/authorization.js";
 import { createBrowserService } from "../src/server/browser-service.js";
 import { BROWSER_DATABASE_MIGRATIONS } from "../src/activity/activity-records.js";
+import type { GrantRequestEvent } from "../src/access/grant-requests.js";
 import {
   browserProfileGrantCreateRequestSchema,
   browserOriginScopeSchema,
@@ -270,10 +271,12 @@ describe("Browser Profile Grant public authorization contract", () => {
     }
   });
 
-  it("keeps raw localhost outside whole-web grants until explicitly approved", async () => {
+  it("keeps raw localhost outside whole-web grants until explicitly approved when Origin Auto-Approval is off", async () => {
     const { backend, store } = createStore();
 
     try {
+      expect(store.setOriginAutoApproval(false)).toBe(false);
+      expect(store.originAutoApproval()).toBe(false);
       store.create(
         grant({
           grantId: "grant-whole-web",
@@ -317,6 +320,92 @@ describe("Browser Profile Grant public authorization contract", () => {
           origin: "http://localhost:3000/",
         }),
       ).toMatchObject({ allowed: true });
+    } finally {
+      await backend.harness.lifecycle.dispose();
+    }
+  });
+
+  it("auto-approves raw localhost as an audited exact-origin grant while Origin Auto-Approval is on", async () => {
+    const backend = createFakePluginHost({
+      pluginId: "authorization-auto-approval-contract",
+    });
+    const database = backend.bb.storage.database();
+    backend.bb.storage.migrate(database, [...BROWSER_DATABASE_MIGRATIONS]);
+    const events: GrantRequestEvent[] = [];
+    const store = createProfileGrantStore(database, {
+      clock: () => NOW,
+      onGrantRequestEvent: (event) => events.push(event),
+    });
+
+    try {
+      expect(store.originAutoApproval()).toBe(true);
+      store.create(
+        grant({ grantId: "grant-whole-web", originScope: "*", wholeWeb: true }),
+      );
+      const decision = store.authorize(bindingA("http://localhost:5199/"));
+      expect(decision).toMatchObject({
+        allowed: true,
+        grant: { originScope: "http://localhost:5199", wholeWeb: false },
+        grantRequest: null,
+      });
+      expect(
+        events.map(({ eventType, actor, cause, grantId }) => ({
+          eventType,
+          actor,
+          cause,
+          grantId,
+        })),
+      ).toEqual([
+        {
+          eventType: "requested",
+          actor: "agent",
+          cause: "agent-requested",
+          grantId: null,
+        },
+        {
+          eventType: "approved",
+          actor: "system",
+          cause: "owner-auto-approval",
+          grantId: decision.allowed ? decision.grant.grantId : "",
+        },
+      ]);
+      expect(store.listRequests()).toMatchObject([
+        { origin: "http://localhost:5199", status: "approved" },
+      ]);
+
+      // The next call reuses the grant instead of approving again.
+      expect(store.authorize(bindingA("http://localhost:5199"))).toMatchObject({
+        allowed: true,
+      });
+      expect(store.listRequests()).toHaveLength(1);
+
+      // Elevations still need the owner.
+      expect(
+        store.authorize({
+          ...bindingA("http://localhost:5199"),
+          fileTransfer: true,
+        }),
+      ).toMatchObject({
+        allowed: false,
+        grantRequest: { status: "pending" },
+      });
+    } finally {
+      await backend.harness.lifecycle.dispose();
+    }
+  });
+
+  it("leaves a project whose whole-web grant the owner revoked on the request flow while Origin Auto-Approval is on", async () => {
+    const { backend, store } = createStore();
+
+    try {
+      const first = store.authorize(bindingA("https://app.example.test"));
+      if (!first.allowed) throw new Error("expected Default Access");
+      store.revoke(first.grant.grantId);
+      expect(store.authorize(bindingA("http://localhost:5199"))).toMatchObject({
+        allowed: false,
+        code: "origin_denied",
+        grantRequest: { origin: "http://localhost:5199", status: "pending" },
+      });
     } finally {
       await backend.harness.lifecycle.dispose();
     }

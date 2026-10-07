@@ -1207,6 +1207,19 @@ export const browserHostTargetSchema = z
   })
   .strict();
 
+export const browserOriginAutoApprovalSchema = z
+  .object({ enabled: z.boolean() })
+  .strict();
+
+/** The host and profile only attribute the owner's change in activity. */
+export const browserOriginAutoApprovalUpdateSchema = browserHostTargetSchema
+  .extend({ enabled: z.boolean() })
+  .strict();
+
+export type BrowserOriginAutoApprovalUpdate = z.output<
+  typeof browserOriginAutoApprovalUpdateSchema
+>;
+
 export const browserHostConnectionRequestSchema = z
   .object({
     hostId: z.string().min(1),
@@ -3290,6 +3303,14 @@ export const rpcContract = defineRpcContract({
   browser_grant_request_revoke: {
     input: browserGrantRequestRevokeRequestSchema,
     output: browserGrantRequestDecisionResponseSchema,
+  },
+  browser_origin_auto_approval: {
+    input: z.object({}).strict(),
+    output: browserOriginAutoApprovalSchema,
+  },
+  browser_origin_auto_approval_set: {
+    input: browserOriginAutoApprovalUpdateSchema,
+    output: browserOriginAutoApprovalSchema,
   },
   browser_profile_create: {
     input: browserProfileCreateRequestSchema,

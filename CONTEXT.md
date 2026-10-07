@@ -50,6 +50,10 @@ _Avoid_: Auto-approval, implicit permission
 A non-blocking request for an owner to expand one project's Profile Grant for a specific profile, origin, and elevated permission set after an agent operation is denied.
 _Avoid_: Approval prompt, automatic permission
 
+**Origin Auto-Approval**:
+An owner setting, on unless the owner turns it off in Browser Settings, that approves an agent's Grant Request for an origin outside its grants (such as raw localhost) at once as a persistent exact-origin Profile Grant, recorded as a system approval in the request history and Activity. It never approves file transfer or invalid-certificate access, and it does not apply to a project whose Default Access the owner withdrew.
+_Avoid_: Default Access, request bypass
+
 **Browser Result**:
 Text, structured data, or an explicitly requested screenshot returned from browser automation as ordinary BB thread tool output. It is not an Activity Record and the browser plugin keeps no additional copy.
 _Avoid_: Audit log, automatic screenshot

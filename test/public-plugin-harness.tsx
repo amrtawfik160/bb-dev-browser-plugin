@@ -1387,6 +1387,20 @@ export async function createPublicPluginHarness(options?: {
       ) as Promise<
         ReturnType<typeof browserGrantRequestDecisionResponseSchema.parse>
       >,
+    browser_origin_auto_approval: (input: Record<string, never>) =>
+      backend.harness.behavior.callRpc(
+        "browser_origin_auto_approval",
+        input,
+      ) as Promise<{ enabled: boolean }>,
+    browser_origin_auto_approval_set: (input: {
+      hostId: string;
+      profileId: string;
+      enabled: boolean;
+    }) =>
+      backend.harness.behavior.callRpc(
+        "browser_origin_auto_approval_set",
+        input,
+      ) as Promise<{ enabled: boolean }>,
     browser_profile_create: (input: {
       hostId: string;
       name: string;
