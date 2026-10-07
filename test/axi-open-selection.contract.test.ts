@@ -54,27 +54,25 @@ async function fakeBridge(calls: ToolCall[]) {
 }
 
 function runAxi(axiBin: string, home: string, args: string[]) {
-  return new Promise<{ exitCode: number | null; output: string }>(
-    (resolve) => {
-      const child = spawn(process.execPath, [axiBin, ...args], {
-        env: {
-          PATH: process.env.PATH ?? "/usr/bin:/bin",
-          HOME: home,
-          CHROME_DEVTOOLS_AXI_SESSION: SESSION,
-          NO_COLOR: "1",
-        },
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-      let output = "";
-      child.stdout.on("data", (chunk: Buffer) => {
-        output += chunk.toString();
-      });
-      child.stderr.on("data", (chunk: Buffer) => {
-        output += chunk.toString();
-      });
-      child.on("close", (exitCode) => resolve({ exitCode, output }));
-    },
-  );
+  return new Promise<{ exitCode: number | null; output: string }>((resolve) => {
+    const child = spawn(process.execPath, [axiBin, ...args], {
+      env: {
+        PATH: process.env.PATH ?? "/usr/bin:/bin",
+        HOME: home,
+        CHROME_DEVTOOLS_AXI_SESSION: SESSION,
+        NO_COLOR: "1",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let output = "";
+    child.stdout.on("data", (chunk: Buffer) => {
+      output += chunk.toString();
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      output += chunk.toString();
+    });
+    child.on("close", (exitCode) => resolve({ exitCode, output }));
+  });
 }
 
 it("selects the page axi open created when its address redirected", async () => {
