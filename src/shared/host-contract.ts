@@ -10,6 +10,8 @@ import {
   browserHostTargetSchema,
   browserHostConnectionRequestSchema,
   browserHostConnectionResponseSchema,
+  browserServerFactsRequestSchema,
+  browserServerFactsResponseSchema,
   browserLifecycleRequestSchema,
   browserLifecycleResponseSchema,
   browserPurgePlanSchema,
@@ -107,6 +109,10 @@ export const browserHostContract = defineRpcContract({
   hostConnection: {
     input: browserHostConnectionRequestSchema,
     output: browserHostConnectionResponseSchema,
+  },
+  serverFacts: {
+    input: browserServerFactsRequestSchema,
+    output: browserServerFactsResponseSchema,
   },
   status: {
     input: browserHostTargetSchema,

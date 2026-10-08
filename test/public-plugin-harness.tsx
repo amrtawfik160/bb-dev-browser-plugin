@@ -722,7 +722,9 @@ export async function createPublicPluginHarness(options?: {
       },
     },
     experimental_callHostRpc: async ({ method, input, signal }) => {
-      hostRpcCalls.push(method);
+      // The server-facts refresh rides ahead of host calls; it is not one of
+      // the Browser commands these tests count.
+      if (method !== "serverFacts") hostRpcCalls.push(method);
       const failure = hostRpcFailures.get(method);
       if (failure !== undefined) throw new Error(failure);
       if (method === "browserScript") options?.browserScriptStarted?.();

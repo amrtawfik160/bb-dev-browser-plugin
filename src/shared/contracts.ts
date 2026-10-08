@@ -1256,6 +1256,28 @@ export const browserHostConnectionRequestSchema = z
 export const browserHostConnectionResponseSchema =
   browserHostConnectionRequestSchema.extend({ applied: z.boolean() }).strict();
 
+/**
+ * What the server half tells a host that the host cannot learn on its own
+ * without opening the server's database.
+ */
+export const browserServerFactsSchema = z
+  .object({
+    /** Whether this BB is paired with BB Connect. */
+    connectEnrolled: z.boolean(),
+    /** Where the Browser plugin is installed, when the server knows. */
+    pluginSourcePath: z.string().min(1).nullable(),
+  })
+  .strict();
+export type BrowserServerFacts = z.infer<typeof browserServerFactsSchema>;
+
+export const browserServerFactsRequestSchema = browserServerFactsSchema
+  .extend({ hostId: z.string().min(1) })
+  .strict();
+
+export const browserServerFactsResponseSchema = z
+  .object({ stored: z.literal(true) })
+  .strict();
+
 export const browserActivityEventIdSchema = z
   .string()
   .regex(/^[A-Za-z0-9][A-Za-z0-9:_-]{0,127}$/u);
