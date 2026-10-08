@@ -133,6 +133,7 @@ import {
   type BrowserDownloadPurgeOutcome,
 } from "../shared/contracts.js";
 import { createActivitySync } from "../activity/activity-sync.js";
+import { createServerFactsSync } from "./server-facts.js";
 import { browserHostContract } from "../shared/host-contract.js";
 import { createPanelLifecycleDispatch } from "./panel-dispatch.js";
 import { BROWSER_SETTINGS_PROJECT_ID } from "../shared/panel-owner-session.js";
@@ -556,7 +557,23 @@ export function createBrowserService(
   const inactiveProfileKeys = new Set<string>();
   const hostConnectionGenerations = new Map<string, number>();
   let grantStateQueue: Promise<void> = Promise.resolve();
-  const host = bb.hosts.experimental_client({ contract: browserHostContract });
+  const hostClient = bb.hosts.experimental_client({
+    contract: browserHostContract,
+  });
+  const serverFacts = createServerFactsSync(bb, (hostId, facts) =>
+    hostClient.call("serverFacts", { hostId, ...facts }, { hostId }),
+  );
+  // Every host call first makes sure the host holds fresh server facts.
+  const host: typeof hostClient = {
+    call: (async (method, input, options) => {
+      await serverFacts.ensure(options.hostId);
+      return hostClient.call(method, input, options);
+    }) as typeof hostClient.call,
+    experimental_onWorkerExit: (handler) =>
+      hostClient.experimental_onWorkerExit(handler),
+    experimental_onSignal: (signal, handler) =>
+      hostClient.experimental_onSignal(signal, handler),
+  };
   const activitySync = createActivitySync({
     host,
     hosts: bb.sdk.hosts,

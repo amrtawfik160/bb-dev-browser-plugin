@@ -129,8 +129,9 @@ import { BrowserOriginGuardInstallError } from "../browser/origin-scope.js";
 import { createProductionBrowserProcessBoundary } from "../browser/browser-process.js";
 import {
   daemonRootFromHostDataDir,
-  readDaemonPluginSourcePath,
-} from "./daemon-data.js";
+  readServerFacts,
+  writeServerFacts,
+} from "./server-facts.js";
 import { requireDevBrowserRuntime } from "../browser/dev-browser-runtime.js";
 import { PINNED_BROWSER_RUNTIME } from "../shared/dependency-inventory.js";
 import {
@@ -1762,6 +1763,13 @@ export function createBrowserHostEntry(
           context.experimental_paths.dataDir,
         );
       },
+      serverFacts: async (request, context) => {
+        await writeServerFacts(context.experimental_paths.dataDir, {
+          connectEnrolled: request.connectEnrolled,
+          pluginSourcePath: request.pluginSourcePath,
+        });
+        return { stored: true as const };
+      },
       status: async (target, context) => {
         retainWorker(context);
         const dataDir = context.experimental_paths.dataDir;
@@ -2671,7 +2679,7 @@ function axiRuntime(dataDir: string): AxiRuntimePaths {
   let paths = axiRuntimes.get(dataDir);
   if (paths === undefined) {
     const daemonRoot = daemonRootFromHostDataDir(dataDir);
-    const pluginSource = readDaemonPluginSourcePath(daemonRoot, "browser");
+    const pluginSource = readServerFacts(dataDir).pluginSourcePath;
     paths = resolveAxiRuntime([
       ...(pluginSource === null ? [] : [pluginSource]),
       dataDir,
@@ -2684,7 +2692,7 @@ function axiRuntime(dataDir: string): AxiRuntimePaths {
 
 function productionDevBrowserRuntime(dataDir: string) {
   const daemonRoot = daemonRootFromHostDataDir(dataDir);
-  const pluginSource = readDaemonPluginSourcePath(daemonRoot, "browser");
+  const pluginSource = readServerFacts(dataDir).pluginSourcePath;
   const extraSearchRoots = [
     dataDir,
     daemonRoot,

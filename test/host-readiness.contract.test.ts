@@ -131,6 +131,12 @@ function createRealProbeHost(
         createDefaultHostSnapshotReader(fixture.dataDir, fixture.paths),
       ),
     ),
+    {
+      experimental_paths: {
+        dataDir: fixture.dataDir,
+        tempDir: join(fixture.root, "worker-temp"),
+      },
+    },
   );
 }
 
@@ -246,7 +252,31 @@ describe("Workspace Browser host readiness contract", () => {
     }
   });
 
-  it("treats a Connect plugin pairing in bb.db as BB Connect enrollment", async () => {
+  it("treats the Connect pairing the server reported as BB Connect enrollment", async () => {
+    const fixture = await createRealProbeFixture();
+    await writeFile(fixture.daemonConfig, JSON.stringify({}));
+    const host = createRealProbeHost(fixture);
+
+    try {
+      await expect(
+        host.experimental_call("serverFacts", {
+          hostId: target.hostId,
+          connectEnrolled: true,
+          pluginSourcePath: null,
+        }),
+      ).resolves.toEqual({ stored: true });
+      const status = await host.experimental_call("status", target);
+
+      expect(
+        status.capabilities.find((item) => item.id === "bb-connect"),
+      ).toMatchObject({ status: "ready" });
+    } finally {
+      await host.experimental_dispose();
+      await fixture.cleanup();
+    }
+  });
+
+  it("ignores a Connect pairing that only the server database holds", async () => {
     const fixture = await createRealProbeFixture();
     await writeFile(fixture.daemonConfig, JSON.stringify({}));
     const { DatabaseSync } = await import("node:sqlite");
@@ -270,7 +300,7 @@ describe("Workspace Browser host readiness contract", () => {
 
       expect(
         status.capabilities.find((item) => item.id === "bb-connect"),
-      ).toMatchObject({ status: "ready" });
+      ).toMatchObject({ status: "missing" });
     } finally {
       await host.experimental_dispose();
       await fixture.cleanup();

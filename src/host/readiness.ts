@@ -8,10 +8,7 @@ import {
   inspectFallbackBrowser,
   fallbackBrowserPaths,
 } from "./browser-fallback.js";
-import {
-  daemonRootFromHostDataDir,
-  readDaemonConnectPairing,
-} from "./daemon-data.js";
+import { readServerFacts } from "./server-facts.js";
 import {
   BROWSER_STORAGE_ROOT,
   browserHostStorageSegment,
@@ -640,9 +637,7 @@ async function connectEnrollment(dataDir: string) {
   ) {
     return { enrolled: true };
   }
-  return {
-    enrolled: readDaemonConnectPairing(daemonRootFromHostDataDir(dataDir)),
-  };
+  return { enrolled: readServerFacts(dataDir).connectEnrolled };
 }
 
 export function createDefaultHostSnapshotReader(
