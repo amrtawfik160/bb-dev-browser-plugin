@@ -1459,6 +1459,9 @@ async function runCli(
   if (argv[0] === "axi") {
     return await runAxiCli(bb, browser, argv.slice(1), context);
   }
+  if (argv[0] === "sweep-thread-profiles") {
+    return await runThreadProfileSweepCli(browser, argv.slice(1));
+  }
   const parsed = parseCliArguments(argv);
   if ("error" in parsed) return { exitCode: 1, stderr: parsed.error };
   const { command, json, profileId, hostId, requestId } = parsed.arguments;
@@ -1486,6 +1489,44 @@ async function runCli(
     if (error instanceof Error) return { exitCode: 1, stderr: error.message };
     throw error;
   }
+}
+
+const SWEEP_CLI_USAGE =
+  "Usage: bb plugin run browser sweep-thread-profiles [--apply] [--json]";
+
+/**
+ * Report, and with --apply archive, the default profiles of threads archived
+ * past the grace. Archived Profiles stay recoverable until they expire.
+ */
+async function runThreadProfileSweepCli(
+  browser: BrowserService,
+  argv: readonly string[],
+) {
+  const unknown = argv.find((arg) => arg !== "--apply" && arg !== "--json");
+  if (unknown !== undefined) {
+    return {
+      exitCode: 1,
+      stderr: `Unknown option: ${unknown}.\n${SWEEP_CLI_USAGE}`,
+    };
+  }
+  const result = await browser.sweepArchivedThreadProfiles(
+    argv.includes("--apply"),
+  );
+  if (argv.includes("--json")) {
+    return { exitCode: 0, stdout: JSON.stringify(result) };
+  }
+  const lines = [
+    `rule: ${result.rule}`,
+    `${result.applied ? "archived" : "would archive"}: ${result.applied ? result.released : result.profiles.length} profile(s)`,
+    ...result.profiles.map(
+      (profile) =>
+        `  ${profile.hostId} ${profile.profileId} thread ${profile.threadId} archived ${profile.threadArchivedAt}`,
+    ),
+  ];
+  if (!result.applied && result.profiles.length > 0) {
+    lines.push("Run again with --apply to archive them.");
+  }
+  return { exitCode: 0, stdout: `${lines.join("\n")}\n` };
 }
 
 const TRANSFER_CLI_USAGE = [
@@ -2182,6 +2223,12 @@ function registerCli(bb: BbPluginApi, browser: BrowserService) {
         summary: "Report Browser host readiness",
         usage:
           "bb plugin run browser status [--profile <id>] [--host <id>] [--json]",
+      },
+      {
+        name: "sweep-thread-profiles",
+        summary:
+          "Report, or archive with --apply, profiles of threads archived over 7 days ago",
+        usage: SWEEP_CLI_USAGE.replace("Usage: ", ""),
       },
       {
         name: "diagnostics",

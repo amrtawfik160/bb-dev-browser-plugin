@@ -539,6 +539,29 @@ export function panelIdentity(input: BrowserStatusInput): BrowserIdentity {
     : { projectId: input.projectId ?? undefined, hostId: input.hostId };
 }
 
+/**
+ * An archived thread's default profile only sleeps, so unarchiving soon after
+ * finds its browser as it was. Past this grace the profile becomes an
+ * Archived Profile, recoverable until it expires.
+ */
+const ARCHIVED_THREAD_PROFILE_GRACE_MS = 7 * 24 * 60 * 60 * 1_000;
+/**
+ * The periodic release only takes threads archived within this window after
+ * the grace. Older ones go through `sweep-thread-profiles --apply`, so a
+ * backlog is never released without a dry run first.
+ */
+const ARCHIVED_THREAD_PROFILE_WINDOW_MS = 7 * 24 * 60 * 60 * 1_000;
+const ARCHIVED_THREAD_PROFILE_SWEEP_INTERVAL_MS = 6 * 60 * 60 * 1_000;
+const THREAD_LIST_PAGE = 500;
+
+export type ArchivedThreadProfile = {
+  hostId: string;
+  profileId: string;
+  projectId: string;
+  threadId: string;
+  threadArchivedAt: string;
+};
+
 export function createBrowserService(
   bb: BbPluginApi,
   suppliedOwnerAuthority?: unknown,
@@ -935,6 +958,155 @@ export function createBrowserService(
   }
 
   /**
+   * Active, unsaved default profiles of threads archived longer than the
+   * grace, on connected hosts. Profiles selected outside their thread are
+   * left out, as thread lifecycle never releases them.
+   */
+  async function archivedThreadProfiles(
+    olderThanMs: number,
+    newerThanMs = Number.POSITIVE_INFINITY,
+  ): Promise<ArchivedThreadProfile[]> {
+    const now = Date.now();
+    const threads = new Map<
+      string,
+      { projectId: string; threadId: string; archivedAt: number }
+    >();
+    for (let offset = 0; ; offset += THREAD_LIST_PAGE) {
+      const page = await bb.sdk.threads.list({
+        archived: true,
+        includeHidden: true,
+        limit: THREAD_LIST_PAGE,
+        offset,
+      });
+      for (const thread of page) {
+        if (thread.archivedAt === null || thread.projectId === "") continue;
+        const age = now - thread.archivedAt;
+        if (age < olderThanMs || age >= newerThanMs) continue;
+        const scope = { projectId: thread.projectId, threadId: thread.id };
+        threads.set(scopedProfileId(scope), {
+          ...scope,
+          archivedAt: thread.archivedAt,
+        });
+      }
+      if (page.length < THREAD_LIST_PAGE) break;
+    }
+    if (threads.size === 0) return [];
+    const hosts = await bb.sdk.hosts.list();
+    const found: ArchivedThreadProfile[] = [];
+    for (const { id: hostId } of hosts.filter(
+      ({ status }) => status === "connected",
+    )) {
+      const inventory = await host.call("listProfiles", { hostId }, { hostId });
+      for (const profile of inventory.profiles) {
+        const thread = threads.get(profile.profileId);
+        if (thread === undefined) continue;
+        if (profile.state !== "active" || profile.reusable === true) continue;
+        const preferenceKey = `scope:${profileScopeKey(thread)}`;
+        if (
+          profileSelectedOutsideScope(
+            { hostId, profileId: profile.profileId },
+            preferenceKey,
+          )
+        ) {
+          continue;
+        }
+        found.push({
+          hostId,
+          profileId: profile.profileId,
+          projectId: thread.projectId,
+          threadId: thread.threadId,
+          threadArchivedAt: new Date(thread.archivedAt).toISOString(),
+        });
+      }
+    }
+    return found;
+  }
+
+  /** Release profiles one at a time so a large sweep never floods a host. */
+  async function releaseArchivedThreadProfiles(
+    profiles: readonly ArchivedThreadProfile[],
+  ) {
+    let released = 0;
+    const inventories = new Map<string, BrowserProfileInventory>();
+    for (const profile of profiles) {
+      try {
+        let inventory = inventories.get(profile.hostId);
+        if (inventory === undefined) {
+          inventory = await host.call(
+            "listProfiles",
+            { hostId: profile.hostId },
+            { hostId: profile.hostId },
+          );
+          inventories.set(profile.hostId, inventory);
+        }
+        await releaseThreadProfileOnHost(
+          { hostId: profile.hostId, profileId: profile.profileId },
+          profile.projectId,
+          `scope:${profileScopeKey(profile)}`,
+          "archive",
+          inventory,
+        );
+        released += 1;
+      } catch (error) {
+        bb.log.warn(
+          `Browser could not release an archived thread's profile: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+    return released;
+  }
+
+  /**
+   * The owner-run sweep. Without apply it only reports what the rule selects.
+   */
+  async function sweepArchivedThreadProfiles(apply: boolean) {
+    const profiles = await archivedThreadProfiles(
+      ARCHIVED_THREAD_PROFILE_GRACE_MS,
+    );
+    const released = apply ? await releaseArchivedThreadProfiles(profiles) : 0;
+    return {
+      rule: `default profile of a thread archived over ${ARCHIVED_THREAD_PROFILE_GRACE_MS / 86_400_000} days ago; active; not saved; not selected outside its thread`,
+      applied: apply,
+      released,
+      profiles,
+    };
+  }
+
+  function scheduleArchivedThreadProfileRelease() {
+    let running = false;
+    const run = async () => {
+      if (running) return;
+      running = true;
+      try {
+        await releaseArchivedThreadProfiles(
+          await archivedThreadProfiles(
+            ARCHIVED_THREAD_PROFILE_GRACE_MS,
+            ARCHIVED_THREAD_PROFILE_GRACE_MS +
+              ARCHIVED_THREAD_PROFILE_WINDOW_MS,
+          ),
+        );
+      } catch (error) {
+        bb.log.warn(
+          `Browser could not check archived threads' profiles: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      } finally {
+        running = false;
+      }
+    };
+    const first = setTimeout(() => void run(), 60_000);
+    const timer = setInterval(
+      () => void run(),
+      ARCHIVED_THREAD_PROFILE_SWEEP_INTERVAL_MS,
+    );
+    first.unref?.();
+    timer.unref?.();
+    bb.onDispose(() => {
+      clearTimeout(first);
+      clearInterval(timer);
+    });
+  }
+
+  /**
    * An archived thread's default profile sleeps so unarchiving wakes it with
    * its sessions intact; a deleted thread's default profile becomes a
    * recoverable Archived Profile. Only the profile derived from the thread
@@ -970,9 +1142,9 @@ export function createBrowserService(
             thread.projectId,
             preferenceKey,
             release,
-          ).catch(() => {
+          ).catch((error: unknown) => {
             bb.log.warn(
-              "Browser could not release an ended thread's browser on a workspace host.",
+              `Browser could not release an ended thread's browser on a workspace host: ${error instanceof Error ? error.message : String(error)}`,
             );
           }),
         ),
@@ -984,12 +1156,15 @@ export function createBrowserService(
     projectId: string,
     preferenceKey: string,
     release: "sleep" | "archive",
+    listed?: BrowserProfileInventory,
   ) {
-    const inventory = await host.call(
-      "listProfiles",
-      { hostId: target.hostId },
-      { hostId: target.hostId },
-    );
+    const inventory =
+      listed ??
+      (await host.call(
+        "listProfiles",
+        { hostId: target.hostId },
+        { hostId: target.hostId },
+      ));
     const profile = inventory.profiles.find(
       ({ profileId }) => profileId === target.profileId,
     );
@@ -2914,6 +3089,7 @@ export function createBrowserService(
   subscribeToHostConnections();
   subscribeToProjectDeletion();
   subscribeToThreadLifecycle();
+  scheduleArchivedThreadProfileRelease();
 
   /**
    * Stage an explicitly selected workspace or displaying-client file through
@@ -3298,6 +3474,7 @@ export function createBrowserService(
     downloadExportClient,
     downloadExportWorkspace,
     downloadPurge,
+    sweepArchivedThreadProfiles,
   };
 }
 
