@@ -169,6 +169,63 @@ describe("host-local Browser Profile storage", () => {
     }
   });
 
+  it("skips a profile whose directory is removed while profiles are listed", async () => {
+    const rootDirectory = await mkdtemp(join(tmpdir(), "bb-browser-profile-"));
+    let removeDuringList: string | undefined;
+    const store = createFileBrowserProfileStore({
+      rootDirectory,
+      installationId: "installation-test",
+      idFactory: () => "vanishing",
+      ownership: {
+        ensureOwned: async () => undefined,
+        verifyOwned: async (path) => {
+          if (path === removeDuringList) {
+            removeDuringList = undefined;
+            await rm(path, { recursive: true, force: true });
+          }
+        },
+      },
+    });
+
+    try {
+      await store.initialize("host-a");
+      const vanishing = await store.createProfile({
+        hostId: "host-a",
+        name: "Temporary profile",
+      });
+      const vanishingPaths = profileStoragePaths({
+        rootDirectory,
+        installationId: "installation-test",
+        hostId: "host-a",
+        profileId: vanishing.profileId,
+      });
+      removeDuringList = vanishingPaths.profileDirectory;
+
+      const inventory = await store.listProfiles("host-a");
+      expect(inventory.profiles.map((profile) => profile.profileId)).toEqual([
+        DEFAULT_PROFILE_ID,
+      ]);
+
+      const kept = await store.createProfile({
+        hostId: "host-a",
+        name: "Profile without manifest",
+      });
+      await rm(
+        profileStoragePaths({
+          rootDirectory,
+          installationId: "installation-test",
+          hostId: "host-a",
+          profileId: kept.profileId,
+        }).manifestPath,
+      );
+      await expect(store.listProfiles("host-a")).rejects.toMatchObject({
+        code: "profile-manifest-corrupt",
+      });
+    } finally {
+      await rm(rootDirectory, { recursive: true, force: true });
+    }
+  });
+
   it("creates profile storage with the configured browser-user ownership", async () => {
     const rootDirectory = await mkdtemp(join(tmpdir(), "bb-browser-profile-"));
     try {
