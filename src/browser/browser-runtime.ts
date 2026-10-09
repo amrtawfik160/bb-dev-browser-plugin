@@ -113,6 +113,8 @@ export type BrowserProcessIdentity = {
 export type BrowserExecutionRequest = {
   endpoint: string;
   browserName: string;
+  /** The Browser Instance's own helper name when an agent lane runs this. */
+  instanceBrowserName?: string;
   code: string;
   timeoutMs: number;
   runtimeDirectory: string;
@@ -2042,6 +2044,7 @@ export function createBrowserInstanceRuntime(
                   ...request,
                   endpoint: laneEndpoint!,
                   browserName: laneBrowserName(target.profileId, agentLane!),
+                  instanceBrowserName: request.browserName,
                 },
             operationOptions.trace,
             endpointFor,

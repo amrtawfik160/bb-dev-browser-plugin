@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { constants, readFileSync } from "node:fs";
 import {
   access,
+  appendFile,
   chmod,
   chown,
   cp,
@@ -1148,24 +1149,57 @@ type ProductionProcessContext = {
   options: BrowserProcessBoundaryOptions;
   passwdPath: string;
   setprivExecutable: string;
-  /**
-   * Helper names that ran against each runtime directory. Every agent lane
-   * has its own helper daemon attached to the instance, and the daemon never
-   * exits on its own, so each one stops with the instance.
-   */
+  /** Helper names this worker already wrote to each helper list. */
   helperNames: Map<string, Set<string>>;
 };
 
-function rememberHelper(
+/**
+ * Every agent lane has its own helper daemon attached to the instance, and
+ * the daemon never exits on its own, so each one stops with the instance. The
+ * list lives on disk because a restarted worker must still find them.
+ */
+function helperListPath(runtimeDirectory: string, instanceBrowserName: string) {
+  return join(runtimeDirectory, `${instanceBrowserName}.helpers`);
+}
+
+async function rememberHelper(
   context: ProductionProcessContext,
-  request: Pick<BrowserExecutionRequest, "runtimeDirectory" | "browserName">,
+  request: BrowserExecutionRequest,
 ) {
-  let names = context.helperNames.get(request.runtimeDirectory);
+  const path = helperListPath(
+    request.runtimeDirectory,
+    request.instanceBrowserName ?? request.browserName,
+  );
+  let names = context.helperNames.get(path);
   if (names === undefined) {
     names = new Set();
-    context.helperNames.set(request.runtimeDirectory, names);
+    context.helperNames.set(path, names);
   }
+  if (names.has(request.browserName)) return;
+  await appendFile(path, `${request.browserName}\n`, { mode: 0o600 });
   names.add(request.browserName);
+}
+
+async function recordedHelperNames(path: string, instanceBrowserName: string) {
+  let text: string;
+  try {
+    text = await readFile(path, "utf8");
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      return [];
+    }
+    throw error;
+  }
+  // The runtime directory belongs to the browser user, so only names of this
+  // instance's own helpers are trusted.
+  return text
+    .split("\n")
+    .filter(
+      (name) =>
+        /^[A-Za-z0-9_-]+$/u.test(name) &&
+        (name === instanceBrowserName ||
+          name.startsWith(`${instanceBrowserName}-`)),
+    );
 }
 
 async function removeDevToolsPortFile(profileDirectory: string) {
@@ -1278,11 +1312,13 @@ async function stopAttachedHelpers(
   request: BrowserLaunchRequest,
   identity: ReturnType<typeof browserUserIdentity>,
 ) {
+  const path = helperListPath(request.runtimeDirectory, request.browserName);
   const names = new Set([
     request.browserName,
-    ...(context.helperNames.get(request.runtimeDirectory) ?? []),
+    ...(context.helperNames.get(path) ?? []),
+    ...(await recordedHelperNames(path, request.browserName)),
   ]);
-  context.helperNames.delete(request.runtimeDirectory);
+  context.helperNames.delete(path);
   const outcomes = await Promise.allSettled(
     [...names].map((browserName) =>
       stopAttachedHelper(context, { ...request, browserName }, identity),
@@ -1290,6 +1326,21 @@ async function stopAttachedHelpers(
   );
   const failure = outcomes.find((outcome) => outcome.status === "rejected");
   if (failure !== undefined) throw failure.reason;
+  await unlink(path).catch((error: unknown) => {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      return;
+    }
+    throw error;
+  });
+}
+
+/** Helpers of a browser that is already gone; a failure keeps the list. */
+function stopOrphanedHelpers(
+  context: ProductionProcessContext,
+  request: BrowserLaunchRequest,
+  identity: ReturnType<typeof browserUserIdentity>,
+) {
+  return stopAttachedHelpers(context, request, identity).catch(() => undefined);
 }
 
 async function stopBrowserProcess(
@@ -1314,6 +1365,7 @@ async function launchProductionBrowser(
   const identity = browserUserIdentity(context.passwdPath);
   await ownedDirectory(request.profileDirectory, identity);
   await ownedDirectory(request.runtimeDirectory, identity);
+  await stopOrphanedHelpers(context, request, identity);
   await removeDevToolsPortFile(request.profileDirectory);
   const executablePath = request.executablePath;
   const browserProcess = ownedProcess(
@@ -1360,7 +1412,7 @@ async function launchProductionBrowser(
     exited: Promise.race([
       waitForExit(browserProcess),
       rendererMonitor.failure,
-    ]),
+    ]).finally(() => stopOrphanedHelpers(context, request, identity)),
     stop: async () => {
       rendererMonitor.dispose();
       await stopBrowserProcess(context, request, identity, browserProcess);
@@ -1376,7 +1428,7 @@ async function stopRecoveredBrowser(input: {
   pid: number;
 }) {
   try {
-    await stopAttachedHelper(input.context, input.request, input.identity);
+    await stopAttachedHelpers(input.context, input.request, input.identity);
   } finally {
     await requestBrowserClose(input.automationEndpoint).then(
       () => undefined,
@@ -1448,7 +1500,7 @@ async function recoverProductionBrowser(
     exited: Promise.race([
       waitForProcessExit(expectedIdentity.pid),
       rendererMonitor.failure,
-    ]),
+    ]).finally(() => stopOrphanedHelpers(context, request, identity)),
     stop: async () => {
       rendererMonitor.dispose();
       await stopRecoveredBrowser({
@@ -1471,7 +1523,6 @@ async function prepareHelperRuntime(
     request.browserName,
   );
   const identity = browserUserIdentity(context.passwdPath);
-  rememberHelper(context, request);
   await ownedDirectory(helperHome, identity);
   const executable = await stagedDevBrowserExecutable(
     context.options,
@@ -1502,6 +1553,7 @@ async function prepareHelperRuntime(
     }
   }
   if (clientPatched) await recycleHelperDaemon(helperHome);
+  await rememberHelper(context, request);
   return { executable, helperHome, identity };
 }
 
