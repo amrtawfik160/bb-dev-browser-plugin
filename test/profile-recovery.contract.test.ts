@@ -6,6 +6,7 @@ import {
   readdir,
   rm,
   stat,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -547,6 +548,138 @@ describe("Browser Profile recovery", () => {
       await expect(readFile(secondArchivePath)).resolves.toEqual(
         await readFile(firstArchivePath),
       );
+    } finally {
+      await rm(rootDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("skips stale Chrome singleton links in a backup but still refuses other links", async () => {
+    const rootDirectory = await mkdtemp(join(tmpdir(), "bb-browser-recovery-"));
+    const archivePath = join(rootDirectory, "profile.bb-backup");
+    try {
+      const store = createFileBrowserProfileStore({
+        rootDirectory,
+        installationId: "installation-test",
+      });
+      await store.initialize("host-a");
+      const targetPaths = profileStoragePaths({
+        rootDirectory,
+        installationId: "installation-test",
+        hostId: "host-a",
+        profileId: DEFAULT_PROFILE_ID,
+      });
+      await writeFile(join(targetPaths.browserDataPath, "Cookies"), "stable", {
+        mode: 0o600,
+      });
+      await symlink(
+        "host-12345",
+        join(targetPaths.browserDataPath, "SingletonLock"),
+      );
+      await symlink(
+        "/tmp/.org.chromium.Chromium.dead/SingletonSocket",
+        join(targetPaths.browserDataPath, "SingletonSocket"),
+      );
+      await symlink(
+        "1234567890",
+        join(targetPaths.browserDataPath, "SingletonCookie"),
+      );
+      const recovery = createFileBrowserProfileRecovery({
+        rootDirectory,
+        installationId: "installation-test",
+        state: {
+          isProfileStopped: async () => true,
+          isDevBrowserProfileStopped: async () => true,
+        },
+      });
+
+      await expect(
+        recovery.backupProfile({
+          hostId: "host-a",
+          profileId: DEFAULT_PROFILE_ID,
+          archivePath,
+        }),
+      ).resolves.toMatchObject({ outcome: "backed-up" });
+      const archiveText = (await readFile(archivePath)).toString("latin1");
+      expect(archiveText).toContain("chrome-data/Cookies");
+      expect(archiveText).not.toContain("Singleton");
+
+      await symlink(
+        "Cookies",
+        join(targetPaths.browserDataPath, "Cookies-link"),
+      );
+      await expect(
+        recovery.backupProfile({
+          hostId: "host-a",
+          profileId: DEFAULT_PROFILE_ID,
+          archivePath: join(rootDirectory, "second.bb-backup"),
+        }),
+      ).rejects.toMatchObject({
+        code: "recovery-archive-invalid",
+        message: "Browser Profile contains an unsupported symbolic link.",
+      });
+    } finally {
+      await rm(rootDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("skips stale Chrome singleton links when importing a dev-browser profile", async () => {
+    const rootDirectory = await mkdtemp(join(tmpdir(), "bb-browser-recovery-"));
+    const sourcePath = join(rootDirectory, "dev-browser-default");
+    try {
+      await mkdir(sourcePath, { recursive: true, mode: 0o700 });
+      await writeFile(join(sourcePath, "Cookies"), "source-session", {
+        mode: 0o600,
+      });
+      await symlink("host-12345", join(sourcePath, "SingletonLock"));
+      await symlink("dead-socket", join(sourcePath, "SingletonSocket"));
+      await symlink("1234567890", join(sourcePath, "SingletonCookie"));
+      const store = createFileBrowserProfileStore({
+        rootDirectory,
+        installationId: "installation-test",
+      });
+      await store.initialize("host-a");
+      const recovery = createFileBrowserProfileRecovery({
+        rootDirectory,
+        installationId: "installation-test",
+        idFactory: () => "imported",
+        state: {
+          isProfileStopped: async () => true,
+          isDevBrowserProfileStopped: async () => true,
+        },
+      });
+
+      await expect(
+        recovery.importDevBrowserProfile({
+          hostId: "host-a",
+          name: "Imported dev-browser",
+          sourcePath,
+        }),
+      ).resolves.toMatchObject({ outcome: "imported" });
+      const importedEntries = await readdir(
+        profileStoragePaths({
+          rootDirectory,
+          installationId: "installation-test",
+          hostId: "host-a",
+          profileId: "profile-imported",
+        }).browserDataPath,
+      );
+      expect(importedEntries).toContain("Cookies");
+      expect(
+        importedEntries.filter((name) => name.startsWith("Singleton")),
+      ).toEqual([]);
+
+      await symlink("Cookies", join(sourcePath, "Cookies-link"));
+      await expect(
+        recovery.importDevBrowserProfile({
+          hostId: "host-a",
+          name: "Second dev-browser copy",
+          sourcePath,
+        }),
+      ).rejects.toMatchObject({
+        code: "recovery-archive-invalid",
+        message:
+          "The dev-browser profile source contains an unsupported symbolic link.",
+      });
     } finally {
       await rm(rootDirectory, { recursive: true, force: true });
     }
