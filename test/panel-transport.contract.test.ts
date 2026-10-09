@@ -1,11 +1,12 @@
 import { randomUUID } from "node:crypto";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { WebSocket } from "ws";
 import {
   BROWSER_DOWNLOAD_MAX_FILE_BYTES,
   BROWSER_DOWNLOAD_MAX_PROFILE_BYTES,
   BROWSER_DOWNLOAD_TTL_MS,
   PANEL_GATEWAY_INPUT_MAX_PER_SECOND,
+  PANEL_GATEWAY_MESSAGE_MAX_BYTES,
   PANEL_MAX_FRAMES_PER_SECOND,
   PANEL_MAX_VIEWPORT_HEIGHT,
   PANEL_MAX_VIEWPORT_WIDTH,
@@ -335,6 +336,78 @@ describe("Panel transport server contract", () => {
       expect(source.inputs).toEqual([{ kind: "click" }]);
       socket.close();
     } finally {
+      await transport.stop();
+    }
+  });
+
+  it("drops frames while the viewer socket has more than two frames queued and resumes once it drains", async () => {
+    const clock = { now: () => 1_000_000 };
+    const capabilities = createPanelCapabilityStore({ clock });
+    const gateway = createPanelGateway({
+      capabilities,
+      hostId,
+      profileId,
+      clock,
+    });
+    const stream = createAutomationStreamAdapter({ clock, capabilities });
+    let emit: ((frame: ScreencastFrame) => void) | undefined;
+    const source: ScreencastSource = {
+      start(onFrame, signal) {
+        emit = onFrame;
+        return new Promise<void>((resolve) =>
+          signal.addEventListener("abort", () => resolve(), { once: true }),
+        );
+      },
+      input() {},
+      async stop() {},
+    };
+    const frame = (sequence: number): ScreencastFrame => ({
+      sequence,
+      mimeType: "image/jpeg",
+      data: Buffer.from(`frame-${sequence}`),
+    });
+    // A slow viewer: the host socket reports a backlog above two frames.
+    let queued = PANEL_GATEWAY_MESSAGE_MAX_BYTES * 2 + 1;
+    const buffered = vi
+      .spyOn(WebSocket.prototype, "bufferedAmount", "get")
+      .mockImplementation(() => queued);
+    const transport = createPanelTransportServer({
+      gateway,
+      stream,
+      source,
+      clock,
+    });
+    const port = await transport.start();
+    try {
+      const socket = await connect(port);
+      const issued = capabilities.issue({
+        ownerSessionId,
+        panelId,
+        hostId,
+        profileId,
+      });
+      const sequences: number[] = [];
+      socket.on("message", (raw) => {
+        const message = decode<{ type: string; sequence?: number }>(
+          raw.toString(),
+        );
+        if (message.type === "frame") sequences.push(message.sequence ?? -1);
+      });
+      const inbox = collectMessages(socket);
+      send(socket, redeemMessage(issued));
+      await inbox.waitFor(
+        (raw) => decode<{ type: string }>(raw).type === "ready",
+      );
+      await waitFor(() => emit !== undefined);
+      for (let sequence = 1; sequence <= 50; sequence += 1)
+        emit?.(frame(sequence));
+      queued = 0;
+      emit?.(frame(51));
+      await waitFor(() => sequences.includes(51));
+      expect(sequences).toEqual([51]);
+      socket.close();
+    } finally {
+      buffered.mockRestore();
       await transport.stop();
     }
   });
