@@ -493,22 +493,20 @@ process.stdin.on("end", () => console.log(JSON.stringify({
     },
   );
 
-  it.runIf(integrationEnabled)(
-    "stops every agent lane's helper when its Browser Instance stops",
-    async () => {
-      const rootDirectory = await mkdtemp(join(tmpdir(), "browser-lanes-"));
-      const fixtureExecutable = join(rootDirectory, "chrome");
-      const helperExecutable = join(rootDirectory, "dev-browser-fixture.mjs");
-      const stopLog = join(rootDirectory, "stopped.log");
-      const passwdPath = join(rootDirectory, "passwd");
-      const userId = process.getuid?.() === 0 ? 65534 : process.getuid!();
-      const groupId = process.getgid?.() === 0 ? 65534 : process.getgid!();
-      await chmod(rootDirectory, 0o755);
-      await writeFile(fixtureExecutable, browserFixtureSource);
-      await chmod(fixtureExecutable, 0o755);
-      await writeFile(
-        helperExecutable,
-        `#!/usr/bin/env node
+  async function laneHelperFixture() {
+    const rootDirectory = await mkdtemp(join(tmpdir(), "browser-lanes-"));
+    const fixtureExecutable = join(rootDirectory, "chrome");
+    const helperExecutable = join(rootDirectory, "dev-browser-fixture.mjs");
+    const stopLog = join(rootDirectory, "stopped.log");
+    const passwdPath = join(rootDirectory, "passwd");
+    const userId = process.getuid?.() === 0 ? 65534 : process.getuid!();
+    const groupId = process.getgid?.() === 0 ? 65534 : process.getgid!();
+    await chmod(rootDirectory, 0o755);
+    await writeFile(fixtureExecutable, browserFixtureSource);
+    await chmod(fixtureExecutable, 0o755);
+    await writeFile(
+      helperExecutable,
+      `#!/usr/bin/env node
 import { appendFile, mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -523,58 +521,151 @@ if (process.argv[2] === "stop") {
   process.stdin.on("end", () => console.log("ran"));
 }
 `,
-      );
-      await chmod(helperExecutable, 0o755);
-      await writeFile(stopLog, "");
-      await chmod(stopLog, 0o666);
-      await writeFile(
-        passwdPath,
-        `bb-browser:x:${userId}:${groupId}::${rootDirectory}:/usr/sbin/nologin\n`,
-      );
-      const profileDirectory = join(rootDirectory, "profile");
-      const runtimeDirectory = join(rootDirectory, "runtime");
-      const boundary = createProductionBrowserProcessBoundary({
+    );
+    await chmod(helperExecutable, 0o755);
+    await writeFile(stopLog, "");
+    await chmod(stopLog, 0o666);
+    await writeFile(
+      passwdPath,
+      `bb-browser:x:${userId}:${groupId}::${rootDirectory}:/usr/sbin/nologin\n`,
+    );
+    const profileDirectory = join(rootDirectory, "profile");
+    const runtimeDirectory = join(rootDirectory, "runtime");
+    // A new boundary has no memory of the helpers an earlier one ran, like a
+    // host worker after a plugin reload or server restart.
+    const startWorker = () =>
+      createProductionBrowserProcessBoundary({
         devBrowserExecutable: helperExecutable,
         passwdPath,
       });
-      const running = await boundary.launch({
-        kind: "playwright-chromium",
-        executablePath: fixtureExecutable,
-        browserName: "bb-lanes",
-        profileDirectory,
-        runtimeDirectory,
-        locale: "en-GB",
-        timezone: "Europe/London",
-        chromeArguments: [
-          `--user-data-dir=${profileDirectory}`,
-          "--remote-debugging-address=127.0.0.1",
-          "--remote-debugging-port=0",
-        ],
-      });
-      try {
-        for (const browserName of ["bb-lanes-agent-a", "bb-lanes-agent-b"]) {
+    const launchRequest = {
+      kind: "playwright-chromium" as const,
+      executablePath: fixtureExecutable,
+      browserName: "bb-lanes",
+      profileDirectory,
+      runtimeDirectory,
+      locale: "en-GB",
+      timezone: "Europe/London",
+      chromeArguments: [
+        `--user-data-dir=${profileDirectory}`,
+        "--remote-debugging-address=127.0.0.1",
+        "--remote-debugging-port=0",
+      ],
+    };
+    return {
+      startWorker,
+      launchRequest,
+      runLanes: async (
+        boundary: ReturnType<typeof startWorker>,
+        endpoint: string,
+      ) => {
+        for (const lane of ["agent-a", "agent-b"]) {
           await boundary.execute({
-            endpoint: running.automationEndpoint,
-            browserName,
+            endpoint,
+            browserName: `bb-lanes-${lane}`,
+            instanceBrowserName: "bb-lanes",
             code: "console.log('lane')",
             timeoutMs: 5_000,
             runtimeDirectory,
           });
         }
-      } finally {
-        await running.stop();
-      }
+      },
+      stoppedHelpers: async () =>
+        (await readFile(stopLog, "utf8")).split("\n").filter(Boolean).sort(),
+      laneHomes: [
+        join(runtimeDirectory, "bb-lanes-agent-a"),
+        join(runtimeDirectory, "bb-lanes-agent-b"),
+      ],
+      dispose: () => rm(rootDirectory, { recursive: true, force: true }),
+    };
+  }
+
+  it.runIf(integrationEnabled)(
+    "stops every agent lane's helper when its Browser Instance stops",
+    async () => {
+      const fixture = await laneHelperFixture();
       try {
-        const stopped = (await readFile(stopLog, "utf8"))
-          .split("\n")
-          .filter(Boolean)
-          .sort();
-        expect(stopped).toEqual([
-          join(runtimeDirectory, "bb-lanes-agent-a"),
-          join(runtimeDirectory, "bb-lanes-agent-b"),
-        ]);
+        const boundary = fixture.startWorker();
+        const running = await boundary.launch(fixture.launchRequest);
+        try {
+          await fixture.runLanes(boundary, running.automationEndpoint);
+        } finally {
+          await running.stop();
+        }
+        expect(await fixture.stoppedHelpers()).toEqual(fixture.laneHomes);
       } finally {
-        await rm(rootDirectory, { recursive: true, force: true });
+        await fixture.dispose();
+      }
+    },
+  );
+
+  it.runIf(integrationEnabled)(
+    "stops every agent lane's helper when a restarted worker stops the recovered instance",
+    async () => {
+      const fixture = await laneHelperFixture();
+      try {
+        const before = fixture.startWorker();
+        const running = await before.launch(fixture.launchRequest);
+        let recovered: Awaited<ReturnType<typeof before.recover>> = null;
+        try {
+          await fixture.runLanes(before, running.automationEndpoint);
+          const after = fixture.startWorker();
+          recovered = await after.recover(
+            fixture.launchRequest,
+            await after.processIdentity(running.pid),
+            running.automationEndpoint,
+          );
+          expect(recovered).not.toBeNull();
+          await recovered!.stop();
+        } finally {
+          if (recovered === null) await running.stop();
+        }
+        expect(await fixture.stoppedHelpers()).toEqual(fixture.laneHomes);
+      } finally {
+        await fixture.dispose();
+      }
+    },
+  );
+
+  it.runIf(integrationEnabled)(
+    "stops every agent lane's helper when its browser exits on its own",
+    async () => {
+      const fixture = await laneHelperFixture();
+      try {
+        const boundary = fixture.startWorker();
+        const running = await boundary.launch(fixture.launchRequest);
+        try {
+          await fixture.runLanes(boundary, running.automationEndpoint);
+          process.kill(running.pid, "SIGKILL");
+          await running.exited.catch(() => undefined);
+          expect(await fixture.stoppedHelpers()).toEqual(fixture.laneHomes);
+        } finally {
+          await running.stop();
+        }
+      } finally {
+        await fixture.dispose();
+      }
+    },
+  );
+
+  it.runIf(integrationEnabled)(
+    "stops lane helpers left by an earlier worker before launching the profile again",
+    async () => {
+      const fixture = await laneHelperFixture();
+      try {
+        await fixture.runLanes(
+          fixture.startWorker(),
+          "ws://127.0.0.1:9/devtools/browser/gone",
+        );
+        const boundary = fixture.startWorker();
+        const running = await boundary.launch(fixture.launchRequest);
+        try {
+          expect(await fixture.stoppedHelpers()).toEqual(fixture.laneHomes);
+        } finally {
+          await running.stop();
+        }
+      } finally {
+        await fixture.dispose();
       }
     },
   );
