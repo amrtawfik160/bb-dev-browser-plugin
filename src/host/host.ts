@@ -2200,13 +2200,23 @@ export function createBrowserHostEntry(
         const store = profiles(context.experimental_paths.dataDir);
         const inventory = await store.listProfiles(target.hostId);
         if (inventory.profiles.length === 0) return inventory;
-        await store.reconcileProfileLifecycle(target.hostId);
-        const expired = await store.expireArchivedProfiles(target.hostId);
+        const lifecycleChanged = await store.reconcileProfileLifecycle(
+          target.hostId,
+        );
+        // Every server profile lookup lands here. Pass the listing on so the
+        // store skips another full pass when nothing has expired.
+        const expired = await store.expireArchivedProfiles(
+          target.hostId,
+          lifecycleChanged ? undefined : inventory,
+        );
         await recordExpiredProfiles(
           outbox(context.experimental_paths.dataDir),
           target.hostId,
           expired.deletedProfileIds,
         );
+        if (!lifecycleChanged && expired.deletedProfileIds.length === 0) {
+          return inventory;
+        }
         return store.listProfiles(target.hostId);
       },
       createProfile: async (request, context) => {
