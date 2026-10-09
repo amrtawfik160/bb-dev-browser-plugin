@@ -1,5 +1,5 @@
 import { experimental_createHostEntryHarness } from "@get-bb/plugin-sdk/testing/host";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -153,5 +153,71 @@ describe("Host Downloads host boundary (issue #20)", () => {
     });
     expect(after.downloads).toEqual([]);
     expect(manager.size()).toBe(0);
+  });
+
+  it("refuses a workspace export through a symlink that leaves the workspace, on a real filesystem", async () => {
+    const rootDirectory = await mkdtemp(join(tmpdir(), "host-downloads-"));
+    const profiles = createFileBrowserProfileStore({
+      rootDirectory,
+      installationId: "installation-downloads",
+    });
+    await profiles.initialize(HOST_ID);
+    const manager = createHostDownloadsManager({
+      filesystem: createNodeHostDownloadsFilesystem(),
+      quarantineRoot: resolveHostDownloadsRoot(rootDirectory)!,
+    });
+    const payload = new TextEncoder().encode("website-chosen-bytes");
+    const start = await manager.startDownload({
+      downloadId: "planted",
+      profileId: DEFAULT_PROFILE_ID,
+      suggestedName: "payload.txt",
+      contentType: "text/plain",
+      totalBytes: payload.byteLength,
+    });
+    expect(start.outcome).toBe("quarantined");
+    await manager.appendChunk({
+      hostId: HOST_ID,
+      downloadId: "planted",
+      data: Buffer.from(payload).toString("base64"),
+      chunkBytes: payload.byteLength,
+    });
+    await manager.completeDownload({ hostId: HOST_ID, downloadId: "planted" });
+
+    const workspace = await mkdtemp(join(tmpdir(), "host-downloads-ws-"));
+    const outside = await mkdtemp(join(tmpdir(), "host-downloads-outside-"));
+    // A cloned repo may contain a directory symlink and a dangling file
+    // symlink that both point outside the workspace.
+    await symlink(outside, join(workspace, "evil"));
+    await symlink(join(outside, "dangling.txt"), join(workspace, "link.txt"));
+    const exportTo = (relativePath: string) =>
+      manager.exportToWorkspace(
+        {
+          hostId: HOST_ID,
+          downloadId: "planted",
+          environmentRoot: workspace,
+          relativePath,
+        },
+        { actor: "owner", leaseActive: false },
+        workspace,
+      );
+
+    for (const relativePath of [
+      "evil/payload.txt",
+      "evil/nested/payload.txt",
+    ]) {
+      const refused = await exportTo(relativePath);
+      expect(refused.outcome, relativePath).toBe("rejected");
+      if (refused.outcome === "rejected") {
+        expect(refused.reason, relativePath).toBe("outside-environment");
+      }
+    }
+    expect((await exportTo("link.txt")).outcome).toBe("rejected");
+    expect(await readdir(outside)).toEqual([]);
+
+    const exported = await exportTo("a/b/payload.txt");
+    expect(exported.outcome).toBe("exported");
+    expect(
+      new Uint8Array(await readFile(join(workspace, "a/b/payload.txt"))),
+    ).toEqual(payload);
   });
 });

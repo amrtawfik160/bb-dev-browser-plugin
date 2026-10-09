@@ -47,7 +47,12 @@ import { createLowDiskGuard } from "./quarantine-guards.js";
 export interface HostDownloadFilesystem {
   realpath(path: string): Promise<string>;
   stat(path: string): Promise<TransferStagingStat>;
-  copyFile(source: string, destination: string): Promise<void>;
+  /** `exclusive` fails when the destination exists, including as a symlink. */
+  copyFile(
+    source: string,
+    destination: string,
+    options?: { exclusive?: boolean },
+  ): Promise<void>;
   writeFile(path: string, data: Uint8Array, mode: number): Promise<void>;
   appendFile(path: string, data: Uint8Array): Promise<void>;
   readFile(path: string): Promise<Uint8Array>;
@@ -768,6 +773,21 @@ export function createHostDownloadsManager(options: HostDownloadsOptions) {
    * Control Lease (the file-transfer grant is enforced by browser-service).
    * The quarantine file remains for later expiry.
    */
+  async function existingAncestorInside(
+    path: string,
+    root: string,
+  ): Promise<boolean> {
+    let current = path;
+    while (isInsideEnvironment(current, root)) {
+      try {
+        return isInsideEnvironment(await filesystem.realpath(current), root);
+      } catch {
+        current = current.slice(0, current.lastIndexOf("/"));
+      }
+    }
+    return false;
+  }
+
   async function exportToWorkspace(
     input: BrowserDownloadExportWorkspaceInput,
     authorization: HostDownloadExportAuthorization,
@@ -826,6 +846,18 @@ export function createHostDownloadsManager(options: HostDownloadsOptions) {
       );
     }
     const parentDir = resolvedTarget.slice(0, resolvedTarget.lastIndexOf("/"));
+    // The lexical check above does not see a symlinked directory inside the
+    // environment. Resolve the nearest existing ancestor before creating any
+    // directory, and the parent again before copying, so neither mkdir nor
+    // the copy can be redirected out of the environment.
+    const outside = rejection(
+      input.downloadId,
+      "outside-environment",
+      "The export target resolves outside the environment.",
+    );
+    if (!(await existingAncestorInside(parentDir, resolvedRoot))) {
+      return outside;
+    }
     if (parentDir !== "" && parentDir !== resolvedRoot) {
       try {
         await filesystem.mkdir(parentDir, BROWSER_DOWNLOAD_DIR_MODE);
@@ -834,7 +866,17 @@ export function createHostDownloadsManager(options: HostDownloadsOptions) {
       }
     }
     try {
-      await filesystem.copyFile(record.quarantinePath, resolvedTarget);
+      const realParent = await filesystem.realpath(parentDir);
+      if (!isInsideEnvironment(realParent, resolvedRoot)) return outside;
+    } catch {
+      return outside;
+    }
+    try {
+      // A new target is created exclusively so a dangling symlink at the
+      // target path is refused instead of followed.
+      await filesystem.copyFile(record.quarantinePath, resolvedTarget, {
+        exclusive: !exists,
+      });
       await filesystem.chmod(resolvedTarget, BROWSER_DOWNLOAD_FILE_MODE);
     } catch {
       return rejection(
