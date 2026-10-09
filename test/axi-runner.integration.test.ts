@@ -112,5 +112,68 @@ describe.skipIf(!real)(
         );
       }
     }, 180_000);
+
+    it("ends an idle axi bridge on its own", async () => {
+      const userDataDir = await mkdtemp(join(tmpdir(), "bb-axi-browser-"));
+      const home = await mkdtemp(join(tmpdir(), "bb-axi-home-"));
+      const context = await chromium.launchPersistentContext(userDataDir, {
+        headless: true,
+        args: ["--remote-debugging-port=0"],
+      });
+      const devToolsPort = (
+        await readFile(join(userDataDir, "DevToolsActivePort"), "utf8")
+      ).split("\n")[0]!;
+      const proxy = await startSessionCdpProxy({
+        upstreamEndpoint: async () =>
+          (
+            (await (
+              await fetch(`http://127.0.0.1:${devToolsPort}/json/version`)
+            ).json()) as { webSocketDebuggerUrl: string }
+          ).webSocketDebuggerUrl,
+      });
+      const session = axiSessionName(`thread:${home}`);
+      try {
+        const opened = await runAxiCommand(resolveAxiRuntime(), {
+          args: ["open", "about:blank"],
+          endpoint: proxy.endpoint,
+          session,
+          homeDirectory: home,
+          bridgeIdleTimeoutMs: 2_000,
+        });
+        expect(opened.exitCode, opened.stderr).toBe(0);
+        const pidFile = join(
+          home,
+          ".chrome-devtools-axi",
+          "sessions",
+          session,
+          "bridge.pid",
+        );
+        const { pid } = JSON.parse(await readFile(pidFile, "utf8")) as {
+          pid: number;
+        };
+        const alive = () => {
+          try {
+            process.kill(pid, 0);
+            return true;
+          } catch {
+            return false;
+          }
+        };
+        expect(alive()).toBe(true);
+        const deadline = Date.now() + 30_000;
+        while (alive() && Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 250));
+        }
+        expect(alive(), "bridge still running after its idle time").toBe(false);
+      } finally {
+        await proxy.close();
+        await context.close();
+        await Promise.all(
+          [userDataDir, home].map((dir) =>
+            rm(dir, { recursive: true, force: true }),
+          ),
+        );
+      }
+    }, 120_000);
   },
 );

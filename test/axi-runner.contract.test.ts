@@ -1,4 +1,6 @@
 import { execFileSync } from "node:child_process";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
@@ -8,6 +10,7 @@ import {
   refusedAxiCommand,
   resolveAxiRuntime,
   rewriteAxiHints,
+  runAxiCommand,
 } from "../src/host/axi-runner.js";
 import {
   navigableUrl,
@@ -57,6 +60,29 @@ describe("chrome-devtools-axi launcher", () => {
     expect(axiSessionName("thread:a")).toBe(axiSessionName("thread:a"));
     expect(axiSessionName("thread:a")).not.toBe(axiSessionName("thread:b"));
     expect(axiSessionName("thread:a")).toMatch(/^bb-[0-9a-f]{16}$/u);
+  });
+
+  it("starts every axi bridge with a bounded idle time", async () => {
+    const home = await mkdtemp(join(tmpdir(), "bb-axi-env-"));
+    const axiBin = join(home, "fake-axi.mjs");
+    await writeFile(
+      axiBin,
+      "process.stdout.write(String(process.env.CHROME_DEVTOOLS_AXI_IDLE_TIMEOUT_MS));",
+    );
+    try {
+      const result = await runAxiCommand(
+        { axiBin, mcpBin: join(home, "unused-mcp.js") },
+        {
+          args: ["pages"],
+          endpoint: "http://127.0.0.1:9/",
+          session: axiSessionName("thread:a"),
+          homeDirectory: home,
+        },
+      );
+      expect(result).toMatchObject({ exitCode: 0, stdout: "300000" });
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
   });
 
   it("keeps axi's next-step hints runnable in BB", () => {
