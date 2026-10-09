@@ -1,3 +1,4 @@
+import { constants } from "node:fs";
 import {
   appendFile,
   chmod,
@@ -40,8 +41,12 @@ export function createNodeHostDownloadsFilesystem(): HostDownloadFilesystem {
   return {
     realpath: (path) => realpath(path),
     stat: toStat,
-    copyFile: (source, destination) =>
-      copyFile(source, destination).then(() => undefined),
+    copyFile: (source, destination, options) =>
+      copyFile(
+        source,
+        destination,
+        options?.exclusive === true ? constants.COPYFILE_EXCL : 0,
+      ).then(() => undefined),
     writeFile: (path, data, mode) =>
       writeFile(path, data, { mode, flag: "wx" }).then(() => undefined),
     appendFile: (path, data) =>
