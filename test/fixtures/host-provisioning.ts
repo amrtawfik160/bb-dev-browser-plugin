@@ -39,6 +39,7 @@ import {
   type BrowserHostTarget,
 } from "../../src/shared/contracts.js";
 import { profileStoragePaths } from "../../src/host/profile-storage.js";
+import { realBrowserTestHostId } from "./real-browser-host.js";
 import {
   createDefaultHostSnapshotReader,
   createHostReadinessBoundary,
@@ -279,8 +280,7 @@ function readWorkerEnv(): {
 } | null {
   const dataDir = requiredEnvironment("BB_BROWSER_HOST_DATA_DIR");
   if (dataDir === undefined) return null;
-  const hostId =
-    requiredEnvironment("BB_BROWSER_REAL_HOST_ID") ?? "ci-browser-host";
+  const hostId = realBrowserTestHostId();
   const profileId =
     requiredEnvironment("BB_BROWSER_REAL_PROFILE_ID") ?? "ci-auth-fixture";
   const projectId =

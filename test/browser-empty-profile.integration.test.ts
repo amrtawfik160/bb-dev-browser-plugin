@@ -9,6 +9,7 @@ import {
   provisionedBrowserStorageRoot,
 } from "../src/host/readiness.js";
 import { profileStoragePaths } from "../src/host/profile-storage.js";
+import { realBrowserTestHostId } from "./fixtures/real-browser-host.js";
 
 it.runIf(process.env.BB_BROWSER_REAL_INTEGRATION === "1")(
   "owner navigation and reload recover after the last real Browser Tab closes",
@@ -31,7 +32,7 @@ it.runIf(process.env.BB_BROWSER_REAL_INTEGRATION === "1")(
       }),
     };
     const target = {
-      hostId: process.env.BB_BROWSER_REAL_HOST_ID ?? "ci-browser-host",
+      hostId: realBrowserTestHostId(),
       profileId: `empty-tab-${randomUUID()}`,
       projectId: "empty-tab-recovery",
       locale: "en-US",

@@ -13,6 +13,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { X509Certificate, generateKeyPairSync, createSign } from "node:crypto";
 import { expect, it } from "vitest";
+import { realBrowserTestHostId } from "./fixtures/real-browser-host.js";
 import { projectLoopbackAlias } from "../src/access/authorization.js";
 import { profileStoragePaths } from "../src/host/profile-storage.js";
 import {
@@ -139,7 +140,7 @@ it.runIf(integrationEnabled)(
     const rootDirectory = provisionedBrowserStorageRoot(
       process.env.BB_BROWSER_REAL_ROOT,
     );
-    const hostId = process.env.BB_BROWSER_REAL_HOST_ID ?? "ci-browser-host";
+    const hostId = realBrowserTestHostId();
     const profileId =
       process.env.BB_BROWSER_REAL_PROFILE_ID ?? "ci-origin-scope-fixture";
     const projectId =
