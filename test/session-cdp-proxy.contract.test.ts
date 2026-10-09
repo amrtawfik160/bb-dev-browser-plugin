@@ -1,4 +1,14 @@
+import {
+  mkdir,
+  mkdtemp,
+  realpath,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { createServer, type Server } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { WebSocket, WebSocketServer } from "ws";
 import {
@@ -588,5 +598,68 @@ describe("session CDP proxy", () => {
     );
     await fake.close();
     await closed;
+  });
+
+  it("denies browser storage paths however they are spelled", async () => {
+    const base = await realpath(await mkdtemp(join(tmpdir(), "cdp-deny-")));
+    const elsewhere = await realpath(
+      await mkdtemp(join(tmpdir(), "cdp-elsewhere-")),
+    );
+    try {
+      const storage = join(base, "storage");
+      await mkdir(join(storage, "profiles/personal"), { recursive: true });
+      await writeFile(join(storage, "profiles/personal/Cookies"), "secret");
+      await mkdir(join(base, "x"));
+      await symlink(storage, join(elsewhere, "link"));
+      await writeFile(join(elsewhere, "ok.txt"), "fine");
+
+      fake = await startFakeBrowser();
+      proxy = await startSessionCdpProxy({
+        upstreamEndpoint: fake.endpoint,
+        initialTargetIds: [AGENT],
+        deniedPathPrefixes: [storage],
+      });
+      const client = await connectClient(proxy);
+      const parent = base.slice(0, base.lastIndexOf("/"));
+      const leaf = base.slice(base.lastIndexOf("/") + 1);
+      const cookies = "storage/profiles/personal/Cookies";
+      const bypasses = [
+        join(storage, "profiles/personal/Cookies"),
+        `${parent}//${leaf}/${cookies}`,
+        `${base}/./${cookies}`,
+        `${base}/x/../${cookies}`,
+        `/proc/self/root${base}/${cookies}`,
+        join(elsewhere, "link/profiles/personal/Cookies"),
+        join(elsewhere, "link/profiles/new-download-folder"),
+      ];
+      for (const path of bypasses) {
+        for (const [method, params] of [
+          ["DOM.setFileInputFiles", { files: [path], backendNodeId: 1 }],
+          [
+            "Input.dispatchDragEvent",
+            { type: "drop", x: 1, y: 1, data: { items: [], files: [path] } },
+          ],
+          [
+            "Browser.setDownloadBehavior",
+            { behavior: "allow", downloadPath: path },
+          ],
+        ] as const) {
+          expect((await client.send(method, params)).error?.code, path).toBe(
+            -32001,
+          );
+        }
+      }
+      expect(upstreamMethods(fake)).toEqual([]);
+
+      const allowed = await client.send("DOM.setFileInputFiles", {
+        files: [join(elsewhere, "ok.txt")],
+        backendNodeId: 1,
+      });
+      expect(allowed.error).toBeUndefined();
+      expect(upstreamMethods(fake)).toEqual(["DOM.setFileInputFiles"]);
+    } finally {
+      await rm(base, { recursive: true, force: true });
+      await rm(elsewhere, { recursive: true, force: true });
+    }
   });
 });
