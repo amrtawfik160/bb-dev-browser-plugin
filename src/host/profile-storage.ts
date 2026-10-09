@@ -122,8 +122,12 @@ export interface BrowserProfileStore {
   deleteProfile(
     request: BrowserProfileDeleteRequest,
   ): Promise<BrowserProfileLifecycleResponse>;
-  expireArchivedProfiles(hostId: string): Promise<BrowserProfileExpiryResponse>;
-  reconcileProfileLifecycle(hostId: string): Promise<void>;
+  expireArchivedProfiles(
+    hostId: string,
+    current?: BrowserProfileInventory,
+  ): Promise<BrowserProfileExpiryResponse>;
+  /** Finish interrupted lifecycle work; true when any was found. */
+  reconcileProfileLifecycle(hostId: string): Promise<boolean>;
 }
 
 export interface FileBrowserProfileStoreOptions {
@@ -1632,7 +1636,8 @@ export function createFileBrowserProfileStore(
       hostId,
       DEFAULT_PROFILE_ID,
     );
-    if (!(await pathExists(paths.lifecycleDirectory))) return;
+    if (!(await pathExists(paths.lifecycleDirectory))) return false;
+    let found = false;
     const entries = await readdir(paths.lifecycleDirectory, {
       withFileTypes: true,
     });
@@ -1643,6 +1648,7 @@ export function createFileBrowserProfileStore(
       const journalPath = join(paths.lifecycleDirectory, entry.name);
       const journal = await readLifecycleJournal(journalPath);
       if (journal === null || journal.hostId !== hostId) continue;
+      found = true;
       const journalPaths = profilePaths(
         options.rootDirectory,
         options.installationId,
@@ -1656,6 +1662,7 @@ export function createFileBrowserProfileStore(
         await rm(journalPath, { force: true });
       }
     }
+    return found;
   }
 
   function recoverableLifecycleJournalError(
@@ -1787,13 +1794,23 @@ export function createFileBrowserProfileStore(
     });
   }
 
-  async function expireArchivedProfiles(hostId: string) {
+  function expiredProfiles(inventory: BrowserProfileInventory) {
+    return inventory.profiles.filter(
+      (profile) =>
+        profile.state === "archived" && clock() > new Date(profile.expiresAt),
+    );
+  }
+
+  async function expireArchivedProfiles(
+    hostId: string,
+    current?: BrowserProfileInventory,
+  ) {
+    if (current !== undefined && expiredProfiles(current).length === 0) {
+      return { deletedProfileIds: [] };
+    }
     return withMutationLock(options, hostId, ownership, async () => {
       const inventory = await reconcileBeforeLifecycle(hostId);
-      const expired = inventory.profiles.filter(
-        (profile) =>
-          profile.state === "archived" && clock() > new Date(profile.expiresAt),
-      );
+      const expired = expiredProfiles(inventory);
       for (const profile of expired) {
         await beginLifecycle("delete", {
           hostId,
@@ -1805,7 +1822,7 @@ export function createFileBrowserProfileStore(
   }
 
   async function reconcileProfileLifecycle(hostId: string) {
-    await withMutationLock(options, hostId, ownership, () =>
+    return withMutationLock(options, hostId, ownership, () =>
       reconcileProfileLifecycleUnlocked(hostId),
     );
   }

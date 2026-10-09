@@ -130,4 +130,54 @@ describe("Browser Profile host boundary", () => {
       await rm(rootDirectory, { recursive: true, force: true });
     }
   });
+
+  it("lists profiles once per call and still expires archived profiles", async () => {
+    const rootDirectory = await mkdtemp(join(tmpdir(), "bb-browser-host-"));
+    const hostId = "host-a";
+    let now = new Date("2026-08-27T00:00:00.000Z");
+    const store = createFileBrowserProfileStore({
+      rootDirectory,
+      installationId: "installation-test",
+      clock: () => now,
+      lifecycle: { stopProfile: async () => undefined },
+    });
+    let listings = 0;
+    const countingStore = {
+      ...store,
+      listProfiles: (id: string) => {
+        listings += 1;
+        return store.listProfiles(id);
+      },
+    };
+    const readiness = {
+      inspect: () =>
+        setupRequiredStatus({ hostId, profileId: DEFAULT_PROFILE_ID }),
+      diagnostics: () => {
+        throw new Error("not used");
+      },
+    };
+    const host = experimental_createHostEntryHarness(
+      createBrowserHostEntry(readiness, countingStore),
+    );
+
+    try {
+      await store.initialize(hostId);
+      const old = await store.createProfile({ hostId, name: "Old" });
+      await store.archiveProfile({ hostId, profileId: old.profileId });
+      now = new Date("2026-10-27T00:00:00.000Z");
+
+      const first = await host.experimental_call("listProfiles", { hostId });
+      expect(first.profiles.map((profile) => profile.profileId)).toEqual([
+        DEFAULT_PROFILE_ID,
+      ]);
+
+      listings = 0;
+      await host.experimental_call("listProfiles", { hostId });
+      await host.experimental_call("listProfiles", { hostId });
+      expect(listings).toBe(2);
+    } finally {
+      await host.experimental_dispose();
+      await rm(rootDirectory, { recursive: true, force: true });
+    }
+  });
 });
