@@ -412,6 +412,8 @@ export async function createPublicPluginHarness(options?: {
   profileStore?: BrowserProfileStore;
   /** Existing contract fixtures explicitly share Personal; isolation tests use fresh defaults. */
   sharedProfile?: boolean;
+  /** Threads `bb.sdk.threads.list({ archived: true })` returns. */
+  archivedThreads?: { id: string; projectId: string; archivedAt: number }[];
   profileRecovery?: BrowserProfileRecovery;
   deferProjectLookup?: boolean;
   deferProfileInventory?: boolean;
@@ -683,6 +685,12 @@ export async function createPublicPluginHarness(options?: {
       },
       threads: {
         send: async () => ({ ok: true, delivery: "sent" }),
+        list: async (args?: { limit?: number; offset?: number }) => {
+          const offset = args?.offset ?? 0;
+          return (options?.archivedThreads ?? [])
+            .slice(offset, offset + (args?.limit ?? 50))
+            .map((thread) => makeThreadResponse(thread));
+        },
         get: async ({ threadId }) => {
           threadLookups.push(threadId);
           if (!KNOWN_HARNESS_THREAD_IDS.has(threadId)) {

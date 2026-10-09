@@ -20,7 +20,10 @@ const secondThreadProfileId = scopedProfileId({
   threadId: "thread-second",
 });
 
-async function threadHarness(sharedProfile = false) {
+async function threadHarness(
+  sharedProfile = false,
+  archivedThreads?: { id: string; projectId: string; archivedAt: number }[],
+) {
   const runtime = createTabInventoryRuntime();
   const stopped: string[] = [];
   const executed: string[] = [];
@@ -35,6 +38,7 @@ async function threadHarness(sharedProfile = false) {
     status: healthyBrowserStatus,
     browserRuntime: runtime,
     sharedProfile,
+    archivedThreads,
   });
   async function useBrowser(threadId = THREAD_ID) {
     const result = await browser.runBrowserScriptWithProfile(undefined, {
@@ -67,6 +71,53 @@ async function threadHarness(sharedProfile = false) {
 }
 
 describe("thread lifecycle releases thread browsers", () => {
+  it("sweeps profiles of threads archived past the grace only with --apply", async () => {
+    const day = 24 * 60 * 60 * 1_000;
+    const { browser, useBrowser, profileState } = await threadHarness(false, [
+      {
+        id: THREAD_ID,
+        projectId: PROJECT_ID,
+        archivedAt: Date.now() - 30 * day,
+      },
+      {
+        id: "thread-second",
+        projectId: PROJECT_ID,
+        archivedAt: Date.now() - 1 * day,
+      },
+    ]);
+    try {
+      await useBrowser();
+      await useBrowser("thread-second");
+
+      const dryRun = await browser.runBrowserCli([
+        "sweep-thread-profiles",
+        "--json",
+      ]);
+      expect(dryRun.exitCode).toBe(0);
+      expect(JSON.parse(dryRun.stdout!)).toMatchObject({
+        applied: false,
+        released: 0,
+        profiles: [{ profileId: threadProfileId, threadId: THREAD_ID }],
+      });
+      expect(await profileState(threadProfileId)).toBe("active");
+
+      const applied = await browser.runBrowserCli([
+        "sweep-thread-profiles",
+        "--apply",
+        "--json",
+      ]);
+      expect(JSON.parse(applied.stdout!)).toMatchObject({
+        applied: true,
+        released: 1,
+      });
+      expect(await profileState(threadProfileId)).toBe("archived");
+      expect(await profileState(secondThreadProfileId)).toBe("active");
+      expect(await profileState(DEFAULT_PROFILE_ID)).toBe("active");
+    } finally {
+      await browser.dispose();
+    }
+  });
+
   it("sleeps only the archived thread's default profile and wakes it again", async () => {
     const { browser, stopped, executed, useBrowser, profileState } =
       await threadHarness();
