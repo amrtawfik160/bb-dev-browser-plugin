@@ -32,6 +32,26 @@ const PROFILE_ARCHIVE_VERSION = 1;
 const ARCHIVE_FILE_MODE = 0o600;
 const PROFILE_DIRECTORY_MODE = 0o700;
 const COPY_BUFFER_BYTES = 64 * 1024;
+// Chrome leaves these per-process runtime links behind after an unclean exit.
+// They are never profile data, so backup and import skip them.
+const CHROME_SINGLETON_LINK_NAMES = new Set([
+  "SingletonLock",
+  "SingletonSocket",
+  "SingletonCookie",
+]);
+
+function isChromeSingletonLink(
+  directory: string,
+  browserDataDirectory: string,
+  name: string,
+  metadata: Awaited<ReturnType<typeof lstat>>,
+) {
+  return (
+    metadata.isSymbolicLink() &&
+    directory === browserDataDirectory &&
+    CHROME_SINGLETON_LINK_NAMES.has(name)
+  );
+}
 const MINIMUM_RECOVERY_FREE_BYTES = 5 * 1024 ** 3;
 
 const archiveHeaderSchema = z
@@ -615,6 +635,7 @@ async function readProfileManifest(
 async function listArchiveFiles(
   profileDirectory: string,
   currentPath: string,
+  browserDataPath: string,
   ownership: ProfileStorageOwnershipBoundary,
 ): Promise<ArchiveFile[]> {
   const entries = await readdir(currentPath, { withFileTypes: true });
@@ -631,6 +652,11 @@ async function listArchiveFiles(
       );
     }
     const metadata = await lstat(absolutePath);
+    if (
+      isChromeSingletonLink(currentPath, browserDataPath, entry.name, metadata)
+    ) {
+      continue;
+    }
     if (metadata.isSymbolicLink()) {
       throw new BrowserProfileRecoveryError(
         "recovery-archive-invalid",
@@ -652,7 +678,12 @@ async function listArchiveFiles(
         absolutePath,
       });
       archiveFiles.push(
-        ...(await listArchiveFiles(profileDirectory, absolutePath, ownership)),
+        ...(await listArchiveFiles(
+          profileDirectory,
+          absolutePath,
+          browserDataPath,
+          ownership,
+        )),
       );
     } else if (metadata.isFile()) {
       archiveFiles.push({
@@ -904,6 +935,7 @@ async function copyDirectoryTree(
   targetDirectory: string,
   ownership: ProfileStorageOwnershipBoundary,
   copy: ProfileRecoveryCopyBoundary,
+  browserDataDirectory = sourceDirectory,
 ): Promise<number> {
   const sourceMetadata = await lstat(sourceDirectory);
   if (!sourceMetadata.isDirectory() || sourceMetadata.isSymbolicLink()) {
@@ -926,6 +958,16 @@ async function copyDirectoryTree(
     const sourcePath = join(sourceDirectory, sourceEntry.name);
     const targetPath = join(targetDirectory, sourceEntry.name);
     const sourceEntryMetadata = await lstat(sourcePath);
+    if (
+      isChromeSingletonLink(
+        sourceDirectory,
+        browserDataDirectory,
+        sourceEntry.name,
+        sourceEntryMetadata,
+      )
+    ) {
+      continue;
+    }
     if (sourceEntryMetadata.isSymbolicLink()) {
       throw new BrowserProfileRecoveryError(
         "recovery-archive-invalid",
@@ -938,6 +980,7 @@ async function copyDirectoryTree(
         targetPath,
         ownership,
         copy,
+        browserDataDirectory,
       );
       continue;
     }
@@ -955,12 +998,25 @@ async function copyDirectoryTree(
   return copiedBytes;
 }
 
-async function directoryByteSize(sourceDirectory: string): Promise<number> {
+async function directoryByteSize(
+  sourceDirectory: string,
+  browserDataDirectory = sourceDirectory,
+): Promise<number> {
   const sourceEntries = await readdir(sourceDirectory, { withFileTypes: true });
   let totalBytes = 0;
   for (const sourceEntry of sourceEntries) {
     const sourcePath = join(sourceDirectory, sourceEntry.name);
     const sourceMetadata = await lstat(sourcePath);
+    if (
+      isChromeSingletonLink(
+        sourceDirectory,
+        browserDataDirectory,
+        sourceEntry.name,
+        sourceMetadata,
+      )
+    ) {
+      continue;
+    }
     if (sourceMetadata.isSymbolicLink()) {
       throw new BrowserProfileRecoveryError(
         "recovery-archive-invalid",
@@ -968,7 +1024,7 @@ async function directoryByteSize(sourceDirectory: string): Promise<number> {
       );
     }
     if (sourceMetadata.isDirectory()) {
-      totalBytes += await directoryByteSize(sourcePath);
+      totalBytes += await directoryByteSize(sourcePath, browserDataDirectory);
     } else if (sourceMetadata.isFile()) {
       totalBytes += sourceMetadata.size;
     } else {
@@ -1587,6 +1643,7 @@ export function createFileBrowserProfileRecovery(
           const archiveFiles = await listArchiveFiles(
             paths.profileDirectory,
             paths.profileDirectory,
+            paths.browserDataPath,
             ownership,
           );
           const header: ArchiveHeader = {
