@@ -9,6 +9,11 @@
 //
 // `snapshot` with no selected page used to fail even when one tab was open.
 // That command now selects the only open page before it reads the tree.
+//
+// The bridge starts chrome-devtools-mcp with the MCP SDK's default
+// environment, which drops CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS, so
+// chrome-devtools-mcp sent usage statistics to Google. The bridge now passes
+// the opt-out as `--no-usage-statistics` instead.
 
 const PATCHES = [
   {
@@ -75,9 +80,35 @@ const PATCHES = [
   },
 ];
 
+const BRIDGE_PATCHES = [
+  {
+    anchor: `      args.push(\`--chrome-arg=\${arg}\`);
+    }
+  }
+  return args;
+}`,
+    replacement: `      args.push(\`--chrome-arg=\${arg}\`);
+    }
+  }
+  if (process.env.CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS) {
+    args.push("--no-usage-statistics");
+  }
+  return args;
+}`,
+  },
+];
+
 export function patchAxiCli(source) {
+  return applyPatches(source, PATCHES);
+}
+
+export function patchAxiBridge(source) {
+  return applyPatches(source, BRIDGE_PATCHES);
+}
+
+function applyPatches(source, patches) {
   let patched = source;
-  for (const { anchor, replacement } of PATCHES) {
+  for (const { anchor, replacement } of patches) {
     const occurrences = patched.split(anchor).length - 1;
     if (occurrences !== 1) {
       throw new Error(

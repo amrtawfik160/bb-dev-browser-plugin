@@ -7,7 +7,7 @@
 // bundled into two files (its CLI and its bridge), and chrome-devtools-mcp,
 // which has no runtime dependencies, is copied as published.
 //
-// The CLI bundle then gets the fixes in axi-patches.mjs.
+// The CLI and bridge bundles then get the fixes in axi-patches.mjs.
 //
 // Usage: node scripts/vendor-axi.mjs   (then commit vendor/)
 import { execFileSync } from "node:child_process";
@@ -23,7 +23,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
-import { patchAxiCli } from "./axi-patches.mjs";
+import { patchAxiBridge, patchAxiCli } from "./axi-patches.mjs";
 
 const AXI_VERSION = "0.1.39";
 const MCP_VERSION = "1.10.1";
@@ -78,6 +78,13 @@ try {
   });
   const axiCli = join(axiTarget, "dist", "bin", "chrome-devtools-axi.js");
   writeFileSync(axiCli, patchAxiCli(readFileSync(axiCli, "utf8")));
+  const axiBridge = join(
+    axiTarget,
+    "dist",
+    "bin",
+    "chrome-devtools-axi-bridge.js",
+  );
+  writeFileSync(axiBridge, patchAxiBridge(readFileSync(axiBridge, "utf8")));
   const axiPackage = JSON.parse(
     readFileSync(join(axiSource, "package.json"), "utf8"),
   );
