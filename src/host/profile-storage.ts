@@ -1357,17 +1357,25 @@ export function createFileBrowserProfileStore(
               `Browser Profile directory is invalid: ${entry.name}`,
             );
           }
-          const { manifest } = await readVerifiedManifest(
-            profilePaths(
-              options.rootDirectory,
-              options.installationId,
-              hostId,
-              parsedProfileId.data,
-            ),
-            hostId,
+          const paths = profilePaths(
+            options.rootDirectory,
             options.installationId,
-            ownership,
+            hostId,
+            parsedProfileId.data,
           );
+          let manifest: BrowserProfileManifest;
+          try {
+            ({ manifest } = await readVerifiedManifest(
+              paths,
+              hostId,
+              options.installationId,
+              ownership,
+            ));
+          } catch (error) {
+            // A profile deleted after readdir is gone, not corrupt.
+            if (!(await pathExists(paths.profileDirectory))) return null;
+            throw error;
+          }
           if (manifest.profileId !== parsedProfileId.data) {
             throw new BrowserProfileError(
               "profile-manifest-corrupt",
@@ -1381,7 +1389,7 @@ export function createFileBrowserProfileStore(
       hostId,
       installationId: options.installationId,
       selectedProfileId,
-      profiles,
+      profiles: profiles.filter((profile) => profile !== null),
     };
   }
 
