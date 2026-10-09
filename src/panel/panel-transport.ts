@@ -504,6 +504,9 @@ export function createPanelTransportServer(
 
   function deliverFrame(socket: WebSocket, frame: ScreencastFrame) {
     if (disposed || socket.readyState !== socket.OPEN || !authorized) return;
+    // Skip frames while a slow viewer still has more than two frames queued,
+    // so host memory stays bounded; the next frame after it drains is current.
+    if (socket.bufferedAmount > gateway.messageMaxBytes * 2) return;
     const now = clock.now();
     // Validate the frame metadata through the gateway so the bandwidth cap and
     // stale-frame policy apply before pixels are delivered.
