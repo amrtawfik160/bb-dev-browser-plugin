@@ -508,6 +508,40 @@ describe("Browser Instance runtime", () => {
     }
   });
 
+  it("reads tabs of an evicted profile without waking it", async () => {
+    const fixture = await runtimeFixture();
+    const target = (profileId: string) => ({ ...fixture.target, profileId });
+    try {
+      for (const profileId of [
+        "profile-a",
+        "profile-b",
+        "profile-c",
+        "profile-d",
+      ]) {
+        await fixture.runtime.start(target(profileId));
+      }
+      expect(fixture.processFixture.launches).toHaveLength(4);
+
+      await expect(
+        fixture.runtime.listPages(target("profile-a")),
+      ).rejects.toMatchObject({ code: "browser-unavailable" });
+      await expect(
+        fixture.runtime.activeTabId(target("profile-a")),
+      ).rejects.toMatchObject({ code: "browser-unavailable" });
+      await expect(
+        fixture.runtime.closePages(target("profile-a"), ["tab-1"]),
+      ).resolves.toBe(0);
+      await fixture.runtime.checkRendererProcessLimit(target("profile-a"));
+
+      expect(fixture.processFixture.launches).toHaveLength(4);
+      expect(await fixture.runtime.status(target("profile-a"))).toMatchObject({
+        state: "sleeping",
+      });
+    } finally {
+      await fixture.dispose();
+    }
+  });
+
   it("issue #12 refuses a fourth wake when panels pin every awake profile", async () => {
     const fixture = await runtimeFixture();
     const target = (profileId: string) => ({ ...fixture.target, profileId });

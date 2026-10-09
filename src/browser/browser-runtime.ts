@@ -1621,6 +1621,26 @@ export function createBrowserInstanceRuntime(
     return serializedCapacityStart(target, key);
   }
 
+  /**
+   * The running (or waking) instance, never a new launch. Tab reads follow
+   * every command; waking an instance evicted meanwhile would evict another
+   * at the awake limit, and so on, relaunching Chromium per command.
+   */
+  async function awakeInstance(
+    target: Pick<BrowserRuntimeTarget, "hostId" | "profileId">,
+  ) {
+    const key = runtimeKey(target);
+    await retirements.get(key);
+    const start = starts.get(key);
+    if (start === undefined) {
+      throw new BrowserInstanceError(
+        "browser-unavailable",
+        "This Browser Instance is asleep; reading its tabs does not wake it.",
+      );
+    }
+    return start;
+  }
+
   function assertNoCleanupFailure(key: string) {
     const cleanupFailure = cleanupFailures.get(key);
     if (cleanupFailure === undefined) return;
@@ -1924,12 +1944,7 @@ export function createBrowserInstanceRuntime(
       target: Pick<BrowserRuntimeTarget, "hostId" | "profileId">,
     ) {
       const key = runtimeKey(target);
-      let held = await heldInstance({
-        hostId: target.hostId,
-        profileId: target.profileId,
-        locale: "en-US",
-        timezone: "UTC",
-      });
+      let held = await awakeInstance(target);
       noteActivity(key, held);
       await enforceRendererProcessLimit(key, held);
       const active = await readActiveTabId(
@@ -1948,12 +1963,9 @@ export function createBrowserInstanceRuntime(
       target: Pick<BrowserRuntimeTarget, "hostId" | "profileId">,
     ) {
       const key = runtimeKey(target);
-      const held = await heldInstance({
-        hostId: target.hostId,
-        profileId: target.profileId,
-        locale: "en-US",
-        timezone: "UTC",
-      });
+      const held = await awakeInstance(target).catch(() => undefined);
+      // A sleeping instance has no renderers to count.
+      if (held === undefined) return;
       await enforceRendererProcessLimit(key, held);
     },
     async execute(
@@ -2209,15 +2221,7 @@ export function createBrowserInstanceRuntime(
     async listPages(
       target: Pick<BrowserRuntimeTarget, "hostId" | "profileId">,
     ): Promise<RuntimeBrowserPage[]> {
-      // listPages runs after an operation that already started the instance, so
-      // heldInstance returns the running start without relaunching; the locale
-      // and timezone are only used for a fresh launch, which does not happen here.
-      let held = await heldInstance({
-        hostId: target.hostId,
-        profileId: target.profileId,
-        locale: "en-US",
-        timezone: "UTC",
-      });
+      let held = await awakeInstance(target);
       const key = runtimeKey(target);
       noteActivity(key, held);
       await enforceRendererProcessLimit(key, held);
@@ -2345,12 +2349,9 @@ export function createBrowserInstanceRuntime(
       tabIds: readonly string[],
     ): Promise<number> {
       if (tabIds.length === 0) return 0;
-      let held = await heldInstance({
-        hostId: target.hostId,
-        profileId: target.profileId,
-        locale: "en-US",
-        timezone: "UTC",
-      });
+      // A sleeping instance has no pages left to close.
+      let held = await awakeInstance(target).catch(() => undefined);
+      if (held === undefined) return 0;
       const key = runtimeKey(target);
       noteActivity(key, held);
       await enforceRendererProcessLimit(key, held);
