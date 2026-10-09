@@ -1,9 +1,11 @@
+import { realpathSync } from "node:fs";
 import {
   createServer,
   type IncomingMessage,
   type Server,
   type ServerResponse,
 } from "node:http";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import type { Duplex } from "node:stream";
 import { WebSocket, WebSocketServer, type RawData } from "ws";
 
@@ -75,11 +77,43 @@ export function upstreamHttpOrigin(endpoint: string): URL {
   return new URL(url.origin);
 }
 
+/**
+ * The real location of a path as Chrome would open it: `.`, `..`, repeated
+ * slashes, and symlinks resolved. A path that does not exist yet (a download
+ * folder) resolves through its nearest existing parent. Null when it cannot
+ * be resolved, which callers treat as denied.
+ */
+function realLocation(path: string): string | null {
+  let current = resolve(path);
+  const missing: string[] = [];
+  for (;;) {
+    try {
+      return join(realpathSync(current), ...missing.reverse());
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return null;
+      const parent = dirname(current);
+      if (parent === current) return null;
+      missing.push(basename(current));
+      current = parent;
+    }
+  }
+}
+
+function under(path: string, root: string) {
+  return path === root || path.startsWith(root === "/" ? "/" : `${root}/`);
+}
+
+// Synchronous so commands still reach Chromium in the order they were sent.
 function pathDenied(path: string, prefixes: readonly string[]) {
-  const normalized = path.replace(/\/+$/u, "");
+  // Chrome resolves relative paths against its own working directory.
+  if (!isAbsolute(path)) return true;
+  const real = realLocation(path);
+  if (real === null) return true;
+  // /proc links reach any file Chrome can open, whatever they look like.
+  if (under(resolve(path), "/proc") || under(real, "/proc")) return true;
   return prefixes.some((prefix) => {
-    const root = prefix.replace(/\/+$/u, "");
-    return normalized === root || normalized.startsWith(`${root}/`);
+    const root = resolve(prefix);
+    return under(real, realLocation(root) ?? root) || under(real, root);
   });
 }
 
