@@ -151,6 +151,11 @@ bb plugin run browser script --purpose "Read the checkout total" --origin https:
   --code "return await page.locator('.total').innerText()"
 ```
 
+With `--json` it prints one object, so parse it once:
+`{"ok":true,"output":"<printed text>","screenshots":[{"path":"/tmp/bb-browser-script-…/screenshot-1.png","mimeType":"image/png"}]}`.
+A script that returns a non-text value also gets `"result": <value>`. A
+failure prints `{"ok":false,"error":{…}}` and exits 1.
+
 ## What the sandbox gives you
 
 QuickJS with Playwright. No Node, no modules, no `process`, no filesystem, no

@@ -5,7 +5,8 @@ import type {
 } from "@get-bb/plugin-sdk";
 import type { z } from "zod";
 import { randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import {
   createBrowserService,
@@ -63,6 +64,7 @@ const CLI_USAGE = [
   "  open <url> [--profile <id>] [--timeout <ms>] [--screenshot] [--json]",
   "  trust|untrust|grants|grant|revoke|approve|deny: authenticated Browser Settings required",
   "  script --purpose <text> --code <source> --origin <origin> [--profile <id>] [--tab <id>] [--timeout <ms>] [--screenshot] [--file-transfer] [--invalid-certificate] [--json]",
+  '    --json prints one object: {"ok":true,"output":"<printed text>","screenshots":[{"path":"<file>","mimeType":"image/png"}]}',
   "  setup [--profile <id>] [--step <id> --confirm <text>] [--json]",
   "  purge [--profile <id>] [--confirm <text>] [--json]",
   "  disable|uninstall [--profile <id>] --confirm <text> [--json]",
@@ -761,9 +763,44 @@ function browserScriptText(browserResult: unknown) {
   return serialized === undefined ? "" : serialized;
 }
 
-function browserScriptJson(browserResult: unknown) {
-  const serialized = JSON.stringify(browserResult);
-  return serialized === undefined ? "" : serialized;
+const SCREENSHOT_EXTENSIONS = {
+  "image/png": "png",
+  "image/jpeg": "jpg",
+  "image/webp": "webp",
+} as const;
+
+/**
+ * The `script --json` result: one object, so callers parse once. Screenshots
+ * are written to a private temporary folder and reported by path.
+ */
+async function browserScriptJson(browserResult: unknown) {
+  const parsed = browserScriptResultSchema.safeParse(browserResult);
+  const screenshots = parsed.success ? parsed.data.screenshots : [];
+  const directory =
+    screenshots.length === 0
+      ? null
+      : await mkdtemp(join(tmpdir(), "bb-browser-script-"));
+  const returned =
+    parsed.success || typeof browserResult === "string"
+      ? {}
+      : { result: browserResult };
+  return JSON.stringify({
+    ok: true,
+    output: browserScriptText(browserResult),
+    ...returned,
+    screenshots: await Promise.all(
+      screenshots.map(async (screenshot, index) => {
+        const path = join(
+          directory!,
+          `screenshot-${index + 1}.${SCREENSHOT_EXTENSIONS[screenshot.mimeType]}`,
+        );
+        await writeFile(path, Buffer.from(screenshot.data, "base64"), {
+          mode: 0o600,
+        });
+        return { path, mimeType: screenshot.mimeType };
+      }),
+    ),
+  });
 }
 
 /**
@@ -835,7 +872,7 @@ async function runBrowserScriptCli(
     stdout:
       cliArguments.json ||
       browserScriptResultSchema.safeParse(response.result).success
-        ? browserScriptJson(response.result)
+        ? await browserScriptJson(response.result)
         : browserScriptText(response.result),
   };
 }

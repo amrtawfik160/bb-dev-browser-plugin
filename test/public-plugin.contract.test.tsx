@@ -237,7 +237,10 @@ describe("Browser public plugin contract", () => {
           "--json",
         ]);
         expect(cli.exitCode).toBe(0);
-        expect(JSON.parse(cli.stdout)).toEqual({ title: "woke" });
+        expect(JSON.parse(cli.stdout)).toMatchObject({
+          ok: true,
+          result: { title: "woke" },
+        });
       } finally {
         await browser.dispose();
       }
@@ -265,7 +268,10 @@ describe("Browser public plugin contract", () => {
         { projectId: undefined },
       );
       expect(cli.exitCode).toBe(0);
-      expect(JSON.parse(cli.stdout)).toEqual({ title: "threaded" });
+      expect(JSON.parse(cli.stdout)).toMatchObject({
+        ok: true,
+        result: { title: "threaded" },
+      });
 
       const noThread = await browser.runBrowserCli(
         ["open", "https://example.com"],
@@ -2679,7 +2685,11 @@ describe("Browser public plugin contract", () => {
         "--json",
       ]);
       expect(cli).toMatchObject({ exitCode: 0 });
-      expect(JSON.parse(cli.stdout)).toBe("hello from Browser");
+      expect(JSON.parse(cli.stdout)).toEqual({
+        ok: true,
+        output: "hello from Browser",
+        screenshots: [],
+      });
     } finally {
       await browser.dispose();
     }
@@ -3048,6 +3058,31 @@ describe("Browser public plugin contract", () => {
       });
       expect(JSON.stringify(browser.persistedActivityRows())).not.toMatch(
         /Capture the fixture|fixture text|png-fixture|console\.log/u,
+      );
+
+      const cli = await browser.runBrowserCli([
+        "script",
+        "--purpose",
+        "Capture the fixture",
+        "--code",
+        "console.log('fixture')",
+        "--origin",
+        "https://example.com",
+        "--screenshot",
+        "--json",
+      ]);
+      const printed = JSON.parse(cli.stdout!) as {
+        ok: boolean;
+        output: string;
+        screenshots: { path: string; mimeType: string }[];
+      };
+      expect(printed).toMatchObject({
+        ok: true,
+        output: "fixture text",
+        screenshots: [{ mimeType: "image/png" }],
+      });
+      expect((await readFile(printed.screenshots[0]!.path)).toString()).toBe(
+        "png",
       );
     } finally {
       await browser.dispose();
