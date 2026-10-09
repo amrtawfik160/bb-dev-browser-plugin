@@ -19,6 +19,13 @@ export const DEVTOOLS_MCP_PACKAGE_VERSION = "1.10.1";
 /** How agents run axi in BB; axi's own follow-up hints are rewritten to it. */
 export const AXI_LAUNCHER = "bb plugin run browser axi";
 
+/**
+ * axi's bridge runs detached and, unless told otherwise, until an explicit
+ * `stop`. Ending sessions never send one, so each bridge exits on its own
+ * after the same idle time a Browser Instance sleeps after.
+ */
+export const AXI_BRIDGE_IDLE_TIMEOUT_MS = 5 * 60 * 1_000;
+
 /** Output kept per stream; axi truncates snapshots near 16k characters. */
 const MAX_OUTPUT_BYTES = 512 * 1024;
 
@@ -134,6 +141,7 @@ export type AxiCommandRequest = {
   homeDirectory: string;
   signal?: AbortSignal;
   timeoutMs?: number;
+  bridgeIdleTimeoutMs?: number;
 };
 
 export type AxiCommandResult = {
@@ -182,6 +190,9 @@ export async function runAxiCommand(
       CHROME_DEVTOOLS_AXI_BROWSER_URL: request.endpoint,
       CHROME_DEVTOOLS_AXI_SESSION: request.session,
       CHROME_DEVTOOLS_AXI_MCP_PATH: paths.mcpBin,
+      CHROME_DEVTOOLS_AXI_IDLE_TIMEOUT_MS: String(
+        request.bridgeIdleTimeoutMs ?? AXI_BRIDGE_IDLE_TIMEOUT_MS,
+      ),
       // Agent browsing is the owner's business: no usage statistics to Google.
       CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS: "1",
       NO_COLOR: "1",
