@@ -2,6 +2,7 @@ import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
 import { describe, expect, it } from "vitest";
 import { startSessionCdpProxy } from "../src/browser/session-cdp-proxy.js";
@@ -166,6 +167,52 @@ describe.skipIf(!real)(
         }
         expect(alive(), "bridge still running after its idle time").toBe(false);
       } finally {
+        await proxy.close();
+        await context.close();
+        await Promise.all(
+          [userDataDir, home].map((dir) =>
+            rm(dir, { recursive: true, force: true }),
+          ),
+        );
+      }
+    }, 120_000);
+
+    it("starts chrome-devtools-mcp with usage statistics turned off", async () => {
+      const userDataDir = await mkdtemp(join(tmpdir(), "bb-axi-browser-"));
+      const home = await mkdtemp(join(tmpdir(), "bb-axi-home-"));
+      const context = await chromium.launchPersistentContext(userDataDir, {
+        headless: true,
+        args: ["--remote-debugging-port=0"],
+      });
+      const devToolsPort = (
+        await readFile(join(userDataDir, "DevToolsActivePort"), "utf8")
+      ).split("\n")[0]!;
+      const proxy = await startSessionCdpProxy({
+        upstreamEndpoint: async () =>
+          (
+            (await (
+              await fetch(`http://127.0.0.1:${devToolsPort}/json/version`)
+            ).json()) as { webSocketDebuggerUrl: string }
+          ).webSocketDebuggerUrl,
+      });
+      const mcpBin = fileURLToPath(
+        new URL("./fixtures/mcp-argv-recorder.mjs", import.meta.url),
+      );
+      const session = axiSessionName(`thread:${home}`);
+      const axi = (...args: string[]) =>
+        runAxiCommand(
+          { ...resolveAxiRuntime(), mcpBin },
+          { args, endpoint: proxy.endpoint, session, homeDirectory: home },
+        );
+      try {
+        const opened = await axi("open", "about:blank");
+        expect(opened.exitCode, opened.stderr).toBe(0);
+        const argv = JSON.parse(
+          await readFile(join(home, "mcp-argv.json"), "utf8"),
+        ) as string[];
+        expect(argv).toContain("--no-usage-statistics");
+      } finally {
+        await axi("stop").catch(() => undefined);
         await proxy.close();
         await context.close();
         await Promise.all(

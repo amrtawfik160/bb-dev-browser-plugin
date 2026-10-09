@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -45,6 +45,35 @@ describe("chrome-devtools-axi launcher", () => {
         }),
       ).not.toThrow();
     }
+  });
+
+  it("tells chrome-devtools-mcp not to send usage statistics", async () => {
+    // The bridge starts chrome-devtools-mcp without our environment, so the
+    // opt-out must reach it as an argument.
+    const bridge = await readFile(
+      join(
+        dirname(resolveAxiRuntime().axiBin),
+        "chrome-devtools-axi-bridge.js",
+      ),
+      "utf8",
+    );
+    const start = bridge.indexOf("var KEYCHAIN_ISOLATION_CHROME_ARGS");
+    const end = bridge.indexOf("var DEFAULT_MCP_PATH_PROBE");
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const buildTransportArgs = new Function(
+      "process",
+      `${bridge.slice(start, end)}\nreturn buildTransportArgs();`,
+    ) as (process: { env: Record<string, string> }) => string[];
+    const endpoint = "ws://127.0.0.1:1/devtools/browser/x";
+    expect(
+      buildTransportArgs({
+        env: {
+          CHROME_DEVTOOLS_AXI_BROWSER_URL: endpoint,
+          CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS: "1",
+        },
+      }),
+    ).toContain("--no-usage-statistics");
   });
 
   it("reads the browser's DevTools over HTTP from the ws:// endpoint Chromium reports", () => {
