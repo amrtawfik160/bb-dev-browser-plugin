@@ -1,4 +1,4 @@
-import { mkdtemp, utimes, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -7,7 +7,7 @@ import {
   OWNER_CLEANUP_IDLE_MS,
   profileKeepReason,
   type ProfileCleanupFacts,
-} from "../src/server/profile-cleanup.js";
+} from "../src/shared/profile-cleanup-rule.js";
 import {
   createFileBrowserProfileStore,
   profileStoragePaths,
@@ -159,8 +159,18 @@ describe("unused worker profile rule", () => {
   });
 });
 
+/** Set every file and folder in a tree to one modification time. */
+async function age(path: string, at: Date) {
+  for (const entry of await readdir(path, { withFileTypes: true })) {
+    const child = join(path, entry.name);
+    if (entry.isDirectory()) await age(child, at);
+    else await utimes(child, at, at);
+  }
+  await utimes(path, at, at);
+}
+
 describe("host profile usage", () => {
-  it("reports the newest browser-data change and the size on disk", async () => {
+  it("reports the newest file change and the size on disk", async () => {
     const rootDirectory = await mkdtemp(join(tmpdir(), "bb-browser-usage-"));
     const store = createFileBrowserProfileStore({
       rootDirectory,
@@ -179,23 +189,21 @@ describe("host profile usage", () => {
       hostId: "host-a",
       profileId: profile.profileId,
     });
-    await writeFile(join(paths.browserDataPath, "Cookies"), "x".repeat(5_000));
+    const cookies = join(paths.browserDataPath, "Cookies");
+    await writeFile(cookies, "x".repeat(5_000));
     const old = new Date(NOW - 5 * DAY);
-    await utimes(paths.profileDirectory, old, old);
-    await utimes(paths.browserDataPath, old, old);
+    await age(paths.profileDirectory, old);
 
-    const [usage] = await store.profileUsage("host-a", [profile.profileId], {
-      measureSize: true,
-    });
+    const [usage] = await store.profileUsage("host-a", [profile.profileId]);
     expect(usage).toMatchObject({ profileId: profile.profileId });
     expect(Date.parse(usage!.lastUsedAt)).toBe(old.getTime());
     expect(usage!.sizeBytes).toBeGreaterThanOrEqual(5_000);
 
-    const [unmeasured] = await store.profileUsage(
-      "host-a",
-      [profile.profileId],
-      { measureSize: false },
-    );
-    expect(unmeasured!.sizeBytes).toBeNull();
+    // Writing inside an existing file leaves its folders' times unchanged.
+    const now = new Date(NOW);
+    await writeFile(cookies, "y");
+    await utimes(cookies, now, now);
+    const [written] = await store.profileUsage("host-a", [profile.profileId]);
+    expect(Date.parse(written!.lastUsedAt)).toBe(now.getTime());
   });
 });

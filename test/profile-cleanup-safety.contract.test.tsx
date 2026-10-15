@@ -62,8 +62,8 @@ async function fixture() {
   await store.initialize(HOST_ID);
   // Runs once, right after the first profile is deleted.
   const deleteProfile = store.deleteProfile.bind(store);
-  store.deleteProfile = async (request) => {
-    const response = await deleteProfile(request);
+  store.deleteProfile = async (request, running) => {
+    const response = await deleteProfile(request, running);
     const hook = onDelete;
     onDelete = null;
     if (response.outcome === "deleted") await hook?.(request.profileId);

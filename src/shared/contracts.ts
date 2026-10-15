@@ -524,6 +524,20 @@ export const browserProfileDeleteRequestSchema = browserProfileTargetSchema
   .extend({
     confirmation: z.string().min(1),
     defaultProfileId: browserProfileIdSchema.optional(),
+    /**
+     * Cleanup's delete: the host deletes only if the profile is still an
+     * unused worker profile, checked under its storage and launch locks.
+     */
+    unused: z
+      .object({
+        idleMs: z.number().int().positive(),
+        /** Some project or thread explicitly selected the profile. */
+        selected: z.boolean(),
+        /** The plugin's newest recorded browser activity for the profile. */
+        lastActivityAt: z.string().datetime().nullable(),
+      })
+      .strict()
+      .optional(),
   })
   .strict();
 
@@ -559,7 +573,7 @@ export const browserProfileLifecycleResponseSchema = z.discriminatedUnion(
       .strict(),
     z
       .object({
-        outcome: z.enum(["deleted", "already-deleted"]),
+        outcome: z.enum(["deleted", "already-deleted", "kept"]),
         profileId: browserProfileIdSchema,
         progress: browserProfileLifecycleProgressSchema,
         message: z.string().min(1),
@@ -578,7 +592,6 @@ const PROFILE_BATCH_LIMIT = 10_000;
 export const browserProfileUsageRequestSchema = browserProfileHostTargetSchema
   .extend({
     profileIds: z.array(browserProfileIdSchema).max(PROFILE_BATCH_LIMIT),
-    measureSize: z.boolean(),
   })
   .strict();
 
@@ -587,7 +600,7 @@ export const browserProfileUsageSchema = z
     profileId: browserProfileIdSchema,
     lastUsedAt: z.string().datetime(),
     running: z.boolean(),
-    sizeBytes: z.number().int().nonnegative().nullable(),
+    sizeBytes: z.number().int().nonnegative(),
   })
   .strict();
 

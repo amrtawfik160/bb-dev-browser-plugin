@@ -148,12 +148,14 @@ import {
   scopedProfileId,
 } from "../shared/profile-scope.js";
 import {
-  AUTOMATIC_CLEANUP_IDLE_MS,
-  OWNER_CLEANUP_IDLE_MS,
   automaticCleanupSetting,
-  profileKeepReason,
   setAutomaticCleanup,
 } from "./profile-cleanup.js";
+import {
+  AUTOMATIC_CLEANUP_IDLE_MS,
+  OWNER_CLEANUP_IDLE_MS,
+  profileKeepReason,
+} from "../shared/profile-cleanup-rule.js";
 import { presentBrowserSessions } from "./browser-sessions.js";
 
 const PROFILE_IMPORT_ACTIVITY_ACTION = ["imp", "ort"].join("");
@@ -1133,14 +1135,27 @@ export function createBrowserService(
     return new Set(rows.map(({ profile_id }) => profile_id));
   }
 
+  /**
+   * The plugin's newest recorded browser activity for a profile. Lifecycle
+   * records, such as cleanup's own, are not use.
+   */
+  function lastRecordedActivity(hostId: string, profileId: string) {
+    const row = database
+      .prepare(
+        `SELECT MAX(occurred_at) AS occurred_at FROM browser_activity_records
+         WHERE host_id = ? AND profile_id = ? AND kind <> 'lifecycle'`,
+      )
+      .get(hostId, profileId) as { occurred_at: string | null };
+    return row.occurred_at;
+  }
+
   async function storedProfileUsage(
     hostId: string,
     profileIds: readonly string[],
-    measureSize: boolean,
   ) {
     const { profiles } = await host.call(
       "profileUsage",
-      { hostId, profileIds: [...profileIds], measureSize },
+      { hostId, profileIds: [...profileIds] },
       withHostCallDeadline({ hostId }, PROFILE_USAGE_DEADLINE_MS),
     );
     return new Map(profiles.map((usage) => [usage.profileId, usage]));
@@ -1157,17 +1172,20 @@ export function createBrowserService(
     const usage = await storedProfileUsage(
       hostId,
       workers.map(({ profileId }) => profileId),
-      false,
     );
     const now = Date.now();
     const profiles = workers.filter((profile) => {
       const stored = usage.get(profile.profileId);
+      const recorded = lastRecordedActivity(hostId, profile.profileId);
       return (
         stored !== undefined &&
         profileKeepReason(
           {
             profile,
-            lastUsedAt: Date.parse(stored.lastUsedAt),
+            lastUsedAt: Math.max(
+              Date.parse(stored.lastUsedAt),
+              recorded === null ? 0 : Date.parse(recorded),
+            ),
             running: stored.running,
             selected: selected.has(profile.profileId),
           },
@@ -1175,7 +1193,7 @@ export function createBrowserService(
         ) === null
       );
     });
-    return { inventory, profiles };
+    return { inventory, profiles, usage };
   }
 
   async function profileCleanupPlan(
@@ -1183,27 +1201,60 @@ export function createBrowserService(
     request: { hostId: string },
   ): Promise<BrowserProfileCleanupPlan> {
     requireOwnerSettingsAuthority(authority);
-    const { profiles } = await unusedWorkerProfiles(
+    const { profiles, usage } = await unusedWorkerProfiles(
       request.hostId,
       OWNER_CLEANUP_IDLE_MS,
     );
     const profileIds = profiles.map(({ profileId }) => profileId);
-    const sizes = await storedProfileUsage(request.hostId, profileIds, true);
     return {
       hostId: request.hostId,
       idleDays: OWNER_CLEANUP_IDLE_MS / 86_400_000,
       automatic: automaticCleanupSetting(database),
       profileIds,
-      sizeBytes: [...sizes.values()].reduce(
-        (total, { sizeBytes }) => total + (sizeBytes ?? 0),
+      sizeBytes: profileIds.reduce(
+        (total, profileId) => total + (usage.get(profileId)?.sizeBytes ?? 0),
         0,
       ),
     };
   }
 
   /**
+   * Delete one listed profile if it is still an unused worker profile. The
+   * check runs in the queue that saves selections, and the host repeats the
+   * rest of it under the locks sign-ins and browser launches take.
+   */
+  function deleteUnusedProfile(
+    request: Omit<BrowserProfileDeleteRequest, "defaultProfileId">,
+    inventory: BrowserProfileInventory,
+    idleMs: number,
+  ) {
+    return withGrantStateSerialization(async () => {
+      const response = await callConnectedProfile("deleteProfile", {
+        ...request,
+        defaultProfileId: deletionFallbackProfileId(request),
+        unused: {
+          idleMs,
+          selected: explicitlySelectedProfileIds(request.hostId).has(
+            request.profileId,
+          ),
+          lastActivityAt: lastRecordedActivity(
+            request.hostId,
+            request.profileId,
+          ),
+        },
+      });
+      if (response.outcome !== "deleted") return response;
+      const target = profileDeletionTarget(request, inventory);
+      markProfileAuthorityInactive(target);
+      revokeProfileAuthority(target, "profile-deleted");
+      replaceProfilePreferences(request, inventory);
+      return response;
+    });
+  }
+
+  /**
    * Permanently delete the listed profiles that still match the rule. Each
-   * is checked again just before deletion, so one used since the owner saw
+   * is checked again right before deletion, so one used since the owner saw
    * the list is skipped.
    */
   async function deleteUnusedWorkerProfiles(
@@ -1219,27 +1270,20 @@ export function createBrowserService(
     const result = { deleted: 0, skipped: 0, failed: 0 };
     for (const profileId of profileIds) {
       const profile = matching.get(profileId);
-      const stored = (await storedProfileUsage(hostId, [profileId], false)).get(
-        profileId,
-      );
-      if (
-        profile === undefined ||
-        stored === undefined ||
-        stored.running ||
-        Date.now() - Date.parse(stored.lastUsedAt) <= idleMs
-      ) {
+      if (profile === undefined) {
         result.skipped += 1;
         continue;
       }
       const request = { hostId, profileId, confirmation: profile.name };
       try {
-        await recordProfileLifecycleActivity(
+        const response = await recordProfileLifecycleActivity(
           request,
           "delete",
-          () => deleteExistingProfile(request, inventory),
+          () => deleteUnusedProfile(request, inventory, idleMs),
           actor === "system" ? { actor } : undefined,
         );
-        result.deleted += 1;
+        if (response.outcome === "deleted") result.deleted += 1;
+        else result.skipped += 1;
       } catch (error) {
         result.failed += 1;
         bb.log.warn(

@@ -1393,6 +1393,31 @@ async function publishRunningBrowser(
   });
 }
 
+/**
+ * Run `operation` holding the lock a Browser Instance launch takes, so no
+ * launch overlaps it. Null, without running it, when a live Browser
+ * Instance holds the lock.
+ */
+export async function withoutBrowserInstance<T>(
+  runtimeManifestPath: string,
+  operation: () => Promise<T>,
+): Promise<T | null> {
+  const lockPath = `${runtimeManifestPath}.instance.lock`;
+  let lock: FileHandle;
+  try {
+    lock = await acquireProfileLock(lockPath);
+  } catch (error) {
+    if (error instanceof BrowserInstanceError && error.code === "profile-in-use")
+      return null;
+    throw error;
+  }
+  try {
+    return await operation();
+  } finally {
+    await releaseProfileLock(lock, lockPath);
+  }
+}
+
 async function cleanupFailedLaunch(
   lock: FileHandle,
   lockPath: string,
