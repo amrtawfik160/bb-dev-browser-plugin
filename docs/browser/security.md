@@ -190,6 +190,18 @@ Records expire after **30 days** or **10,000 entries** per profile. The owner
 can export or clear them. Grant changes, control transfers, mode transitions,
 setup, profile lifecycle, and file exports also produce Activity Records.
 
+**Secret Refs** let a script ask the host to type a stored test credential or
+authenticator code. Only refs in the root-owned, mode-0600 binding file exist.
+The host checks the page's current top-level origin against the ref's exact
+origins before it reads the value. The value never returns to the script and
+is redacted from that run's output and errors. After a fill, the script can
+read the field and send the value anywhere; the origin list controls only where
+the host types it. The real controls are binding only test-account credentials
+and limiting scripts to agents with browser access. The bound env file must be
+a regular, single-name, root-owned `0600` file reached without symlinks inside
+the secrets folder, and a variable marked as a seed in any ref is never typed
+as itself. Details: [secret-refs.md](secret-refs.md).
+
 **Host Downloads** are untrusted quarantine objects, never auto-opened or
 executed, expiring after 7 days. **Transfer Staging** is one-use and removed
 after use, cancellation, failure, expiry, worker restart, or profile lifecycle

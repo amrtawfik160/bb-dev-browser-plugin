@@ -427,7 +427,7 @@ function contextChannel(
   return channel ?? null;
 }
 
-async function connectOriginScopeBrowser(
+export async function connectOriginScopeBrowser(
   endpoint: string,
   timeoutMs: number,
   playwright?: ResolvePlaywrightRuntimeOptions,

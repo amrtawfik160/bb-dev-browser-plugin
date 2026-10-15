@@ -68,6 +68,14 @@ The CLI derives project and host from BB context and does **not** accept
 > option when used with another command; `open` also rejects `--host` (verified
 > in `validateCliCommandOptions`).
 
+## Filling stored credentials
+
+`fillSecret(selector, ref)` and `fillTotp(selector, ref)` are available inside
+scripts. The host types the stored value (or the current authenticator code)
+into an `<input>` on the bound `page` when that page's origin is listed for the
+ref. Refusals name the ref, never the value. Details:
+[secret-refs.md](secret-refs.md).
+
 ## The bundled skill
 
 The bundled skill lives at [`skills/browser/SKILL.md`](../../skills/browser/SKILL.md)

@@ -125,6 +125,8 @@ export type BrowserExecutionRequest = {
     mimeType: "image/png";
   };
   originPolicy?: BrowserOriginScopePolicy;
+  /** Private marker for this run's `fillSecret` and `fillTotp` requests. */
+  secretFillMarker?: string;
 };
 
 export type BrowserOperationOptions = {
@@ -2037,6 +2039,7 @@ export function createBrowserInstanceRuntime(
       // left alone. Only a caller that asks for the agent's tab gets a report.
       const activeTabMarker =
         operationOptions.onActiveTab === undefined ? undefined : randomUUID();
+      const secretFillMarker = randomUUID();
       const executionCode = prepareAgentExecution({
         code,
         tabId: target.tabId,
@@ -2048,6 +2051,7 @@ export function createBrowserInstanceRuntime(
         enforceNonWebNavigation: originPolicy !== undefined,
         activeTabMarker,
         screenshot,
+        secretFillMarker,
       });
       const operationSignal = linkedOperationSignal(operationOptions);
       try {
@@ -2067,15 +2071,18 @@ export function createBrowserInstanceRuntime(
               : (await sessionProxy(target, agentLane, target.tabId)).endpoint;
           const endpointFor =
             laneEndpoint === undefined ? undefined : async () => laneEndpoint;
-          const request = executionRequest(
-            held,
-            target.profileId,
-            executionCode,
-            timeoutMs,
-            operationSignal.signal,
-            screenshot,
-            originPolicy,
-          );
+          const request = {
+            ...executionRequest(
+              held,
+              target.profileId,
+              executionCode,
+              timeoutMs,
+              operationSignal.signal,
+              screenshot,
+              originPolicy,
+            ),
+            secretFillMarker,
+          };
           const executed = await executeAgainstLiveBrowser(
             held,
             endpointFor === undefined

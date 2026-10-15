@@ -172,6 +172,12 @@ workspace access.
   the browser may require navigating back to the task page.
 - Your tab runs in the background (`document.visibilityState` is `hidden`).
   The owner keeps browsing their own tabs meanwhile and never interrupts you.
+- No env or secret files. To sign in with a stored test credential, call
+  `await fillSecret("#password", "<ref>")` or
+  `await fillTotp("#otp", "<ref>")`. The host types the value on the bound
+  `page` only when its origin is listed for that ref; you never receive it,
+  and it is `[redacted]` in output. Do not read the filled field back. Refs are owner-defined; see
+  `docs/browser/secret-refs.md`.
 - The host applies Playwright `BrowserContext` action and navigation defaults
   with 25% headroom (capped at 5 seconds) inside the host deadline. The defaults
   cover existing pages and later pages from `browser.getPage` or

@@ -1006,6 +1006,22 @@ describe("Browser Instance runtime", () => {
     }
   });
 
+  it("gives each agent script its own secret fill channel", async () => {
+    const fixture = await runtimeFixture();
+    try {
+      await fixture.runtime.execute(fixture.target, "return 1", 5_000);
+      await fixture.runtime.execute(fixture.target, "return 2", 5_000);
+      const [first, second] = fixture.processFixture.executions;
+      expect(first?.secretFillMarker).toMatch(/^[0-9a-f-]{36}$/u);
+      expect(second?.secretFillMarker).not.toBe(first?.secretFillMarker);
+      expect(first?.code).toContain("const fillSecret =");
+      expect(first?.code).toContain("const fillTotp =");
+      expect(first?.code).toContain(first!.secretFillMarker!);
+    } finally {
+      await fixture.dispose();
+    }
+  });
+
   it("lets dev-browser attach without transferring Browser Instance lifecycle", async () => {
     const fixture = await runtimeFixture();
     try {
