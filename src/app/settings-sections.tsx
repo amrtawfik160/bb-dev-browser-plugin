@@ -1,4 +1,10 @@
-import { useCallback, useEffect, useState, type FormEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type FormEvent,
+} from "react";
 import type { ComponentProps, ReactNode } from "react";
 import { useRpc } from "@get-bb/plugin-sdk/app";
 import {
@@ -13,6 +19,9 @@ import {
   type BrowserDownloadListResult,
   type BrowserGrantRequest,
   type BrowserProfile,
+  type BrowserProfileCleanupJob,
+  type BrowserProfileCleanupPlan,
+  type BrowserProfileCleanupStatus,
   type BrowserProfileGrant,
   type BrowserProfileInventory,
   type BrowserProfileLifecycleResponse,
@@ -1038,6 +1047,208 @@ function ProfileDangerZone({
   );
 }
 
+function formatGigabytes(bytes: number) {
+  return `${(bytes / 1_000_000_000).toFixed(1)} GB`;
+}
+
+function cleanupJobMessage(
+  job: BrowserProfileCleanupJob,
+  automatic: BrowserProfileCleanupStatus["automatic"],
+) {
+  if (job.state === "running") {
+    const done = job.deleted + job.skipped + job.failed;
+    return `Deleting unused worker profiles: ${done} of ${job.total} done.`;
+  }
+  return (
+    `Deleted ${job.deleted} profile(s).` +
+    (job.skipped > 0
+      ? ` Kept ${job.skipped} that were used since the check.`
+      : "") +
+    (job.failed > 0
+      ? ` ${job.failed} could not be deleted; check again to retry.`
+      : "") +
+    (job.error === null ? "" : ` Stopped early: ${job.error}`) +
+    ` Automatic cleanup is ${automatic === "on" ? "on" : "off"}.`
+  );
+}
+
+/**
+ * The owner's one-step cleanup of worker profiles, the browsers threads get
+ * on first use. Checking lists what the rule takes; one click starts a
+ * background run that deletes them, and the card follows its progress.
+ */
+function UnusedProfileCleanup({
+  hostId,
+  onComplete,
+}: {
+  hostId: string;
+  onComplete: () => void;
+}) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [plan, setPlan] = useState<BrowserProfileCleanupPlan | null>(null);
+  const [automatic, setAutomatic] = useState(true);
+  const [pending, setPending] = useState<string | null>(null);
+  // Undefined until the latest run is loaded.
+  const [status, setStatus] = useState<BrowserProfileCleanupStatus>();
+  const [error, setError] = useState<string | null>(null);
+  const checkbox = "h-4 w-4 rounded-sm border-input accent-primary";
+  const running = status?.job?.state === "running";
+  const busy = pending !== null || running;
+  // The parent passes a new callback each render; polling must not restart.
+  const completed = useRef(onComplete);
+  completed.current = onComplete;
+
+  // Show the latest run when the card opens, and follow one still going.
+  useEffect(() => {
+    if (status !== undefined && !running) return;
+    let active = true;
+    const timer = setTimeout(
+      () =>
+        void rpc
+          .call("browser_profile_cleanup_status", {})
+          .then((next) => {
+            if (!active) return;
+            setStatus(next);
+            if (running && next.job?.state !== "running") completed.current();
+          })
+          .catch((requestError: unknown) => {
+            if (active) setError(administrationErrorMessage(requestError));
+          }),
+      status === undefined ? 0 : 1_000,
+    );
+    return () => {
+      active = false;
+      clearTimeout(timer);
+    };
+  }, [rpc, status, running]);
+
+  function run(action: string, operation: () => Promise<void>) {
+    setPending(action);
+    setError(null);
+    void operation()
+      .catch((requestError: unknown) =>
+        setError(administrationErrorMessage(requestError)),
+      )
+      .finally(() => setPending(null));
+  }
+
+  function check() {
+    run("check", async () => {
+      const next = await rpc.call("browser_profile_cleanup_plan", { hostId });
+      setPlan(next);
+      // On by default; it takes effect once the owner confirms it here.
+      setAutomatic(next.automatic !== "off");
+    });
+  }
+
+  function cleanUp(current: BrowserProfileCleanupPlan) {
+    run("delete", async () => {
+      setStatus(
+        await rpc.call("browser_profile_cleanup", {
+          hostId,
+          profileIds: current.profileIds,
+          automatic,
+        }),
+      );
+      setPlan(null);
+    });
+  }
+
+  function saveAutomatic(enabled: boolean) {
+    setAutomatic(enabled);
+    run("automatic", async () => {
+      const result = await rpc.call("browser_profile_cleanup_automatic_set", {
+        enabled,
+      });
+      setPlan((current) =>
+        current === null
+          ? null
+          : { ...current, automatic: result.enabled ? "on" : "off" },
+      );
+    });
+  }
+
+  return (
+    <Card aria-label={`Clean up unused worker profiles on ${hostId}`}>
+      <Subheading>Clean up unused worker profiles</Subheading>
+      <p className="mt-1 text-sm text-muted-foreground">
+        Worker profiles are the browsers threads get automatically. This
+        permanently deletes the ones untouched for more than 1 day that have no
+        signed-in site, are not selected anywhere, and have no running browser.
+        Renamed and saved profiles are always kept.
+      </p>
+      {plan === null ? (
+        <Button
+          className="mt-3"
+          variant="secondary"
+          size="sm"
+          disabled={busy}
+          onClick={check}
+        >
+          {pending === "check" ? "Checking…" : "Check unused worker profiles"}
+        </Button>
+      ) : (
+        <div className="mt-3 space-y-3">
+          <p className="text-sm">
+            {plan.profileIds.length === 0
+              ? "No unused worker profiles right now."
+              : `${plan.profileIds.length} unused worker profile(s), ${formatGigabytes(plan.sizeBytes)} on disk.`}
+          </p>
+          {plan.profileIds.length === 0 &&
+          plan.automatic === "not-confirmed" ? null : (
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                className={checkbox}
+                aria-label="Delete unused worker profiles automatically"
+                checked={automatic}
+                disabled={busy}
+                onChange={(event) =>
+                  plan.profileIds.length === 0
+                    ? saveAutomatic(event.target.checked)
+                    : setAutomatic(event.target.checked)
+                }
+              />
+              From now on, delete worker profiles automatically after 2 days
+              unused
+            </label>
+          )}
+          <div className="flex flex-wrap gap-2">
+            {plan.profileIds.length === 0 ? null : (
+              <Button
+                variant="destructive"
+                size="sm"
+                disabled={busy}
+                onClick={() => cleanUp(plan)}
+              >
+                {pending === "delete"
+                  ? "Deleting…"
+                  : `Delete ${plan.profileIds.length} profile(s)`}
+              </Button>
+            )}
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={busy}
+              onClick={() => setPlan(null)}
+            >
+              Cancel
+            </Button>
+          </div>
+        </div>
+      )}
+      <AdministrationFeedback
+        message={
+          plan === null && status?.job
+            ? cleanupJobMessage(status.job, status.automatic)
+            : null
+        }
+        error={error}
+      />
+    </Card>
+  );
+}
+
 function ProfileCard({
   profile,
   draft,
@@ -1328,6 +1539,10 @@ function ProfilesBlock({ status }: { status: AttachedStatus }) {
           <p className="font-mono text-xs text-muted-foreground">
             Selected: {inventory.data.selectedProfileId}
           </p>
+          <UnusedProfileCleanup
+            hostId={status.hostId}
+            onComplete={() => void refresh()}
+          />
           {inventory.data.profiles.length === 0 ? (
             <EmptyState title="No named profiles yet.">
               The default profile is used until you create one below.

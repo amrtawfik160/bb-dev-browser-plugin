@@ -524,6 +524,20 @@ export const browserProfileDeleteRequestSchema = browserProfileTargetSchema
   .extend({
     confirmation: z.string().min(1),
     defaultProfileId: browserProfileIdSchema.optional(),
+    /**
+     * Cleanup's delete: the host deletes only if the profile is still an
+     * unused worker profile, checked under its storage and launch locks.
+     */
+    unused: z
+      .object({
+        idleMs: z.number().int().positive(),
+        /** Some project or thread explicitly selected the profile. */
+        selected: z.boolean(),
+        /** The plugin's newest recorded browser activity for the profile. */
+        lastActivityAt: z.string().datetime().nullable(),
+      })
+      .strict()
+      .optional(),
   })
   .strict();
 
@@ -559,7 +573,7 @@ export const browserProfileLifecycleResponseSchema = z.discriminatedUnion(
       .strict(),
     z
       .object({
-        outcome: z.enum(["deleted", "already-deleted"]),
+        outcome: z.enum(["deleted", "already-deleted", "kept"]),
         profileId: browserProfileIdSchema,
         progress: browserProfileLifecycleProgressSchema,
         message: z.string().min(1),
@@ -571,6 +585,92 @@ export const browserProfileLifecycleResponseSchema = z.discriminatedUnion(
 export const browserProfileExpiryResponseSchema = z
   .object({ deletedProfileIds: z.array(browserProfileIdSchema) })
   .strict();
+
+/** Profiles listed per host stay well under this; it only bounds requests. */
+const PROFILE_BATCH_LIMIT = 10_000;
+
+export const browserProfileUsageRequestSchema = browserProfileHostTargetSchema
+  .extend({
+    profileIds: z.array(browserProfileIdSchema).max(PROFILE_BATCH_LIMIT),
+  })
+  .strict();
+
+export const browserProfileUsageSchema = z
+  .object({
+    profileId: browserProfileIdSchema,
+    lastUsedAt: z.string().datetime(),
+    running: z.boolean(),
+    sizeBytes: z.number().int().nonnegative(),
+  })
+  .strict();
+
+export const browserProfileUsageResponseSchema = z
+  .object({ profiles: z.array(browserProfileUsageSchema) })
+  .strict();
+
+export type BrowserProfileUsage = z.infer<typeof browserProfileUsageSchema>;
+
+/** The unused worker profiles the owner's cleanup would delete now. */
+export const browserProfileCleanupPlanSchema = z
+  .object({
+    hostId: z.string().min(1),
+    idleDays: z.number().positive(),
+    /** Not confirmed until the owner first cleans up or sets it. */
+    automatic: z.enum(["not-confirmed", "on", "off"]),
+    profileIds: z.array(browserProfileIdSchema),
+    sizeBytes: z.number().int().nonnegative(),
+  })
+  .strict();
+
+export const browserProfileCleanupRequestSchema = browserProfileHostTargetSchema
+  .extend({
+    profileIds: z.array(browserProfileIdSchema).max(PROFILE_BATCH_LIMIT),
+    automatic: z.boolean(),
+  })
+  .strict();
+
+/** One cleanup run. It runs in the background, one at a time. */
+export const browserProfileCleanupJobSchema = z
+  .object({
+    id: z.string().min(1),
+    hostId: z.string().min(1),
+    state: z.enum(["running", "finished"]),
+    total: z.number().int().nonnegative(),
+    deleted: z.number().int().nonnegative(),
+    /** Kept because they were used or changed since the check. */
+    skipped: z.number().int().nonnegative(),
+    failed: z.number().int().nonnegative(),
+    /** Why the run stopped early, if it did. */
+    error: z.string().nullable(),
+    startedAt: z.string().datetime(),
+    finishedAt: z.string().datetime().nullable(),
+  })
+  .strict();
+
+/** The latest cleanup run since the server started, and the setting. */
+export const browserProfileCleanupStatusSchema = z
+  .object({
+    job: browserProfileCleanupJobSchema.nullable(),
+    automatic: z.enum(["not-confirmed", "on", "off"]),
+  })
+  .strict();
+
+export const browserProfileCleanupAutomaticSchema = z
+  .object({ enabled: z.boolean() })
+  .strict();
+
+export type BrowserProfileCleanupPlan = z.infer<
+  typeof browserProfileCleanupPlanSchema
+>;
+export type BrowserProfileCleanupRequest = z.infer<
+  typeof browserProfileCleanupRequestSchema
+>;
+export type BrowserProfileCleanupJob = z.infer<
+  typeof browserProfileCleanupJobSchema
+>;
+export type BrowserProfileCleanupStatus = z.infer<
+  typeof browserProfileCleanupStatusSchema
+>;
 
 const browserProfileContextSchema = z
   .object({
@@ -3358,6 +3458,22 @@ export const rpcContract = defineRpcContract({
   browser_origin_auto_approval_set: {
     input: browserOriginAutoApprovalUpdateSchema,
     output: browserOriginAutoApprovalSchema,
+  },
+  browser_profile_cleanup_plan: {
+    input: browserProfileHostTargetSchema,
+    output: browserProfileCleanupPlanSchema,
+  },
+  browser_profile_cleanup: {
+    input: browserProfileCleanupRequestSchema,
+    output: browserProfileCleanupStatusSchema,
+  },
+  browser_profile_cleanup_status: {
+    input: z.object({}).strict(),
+    output: browserProfileCleanupStatusSchema,
+  },
+  browser_profile_cleanup_automatic_set: {
+    input: browserProfileCleanupAutomaticSchema,
+    output: browserProfileCleanupAutomaticSchema,
   },
   browser_profile_create: {
     input: browserProfileCreateRequestSchema,

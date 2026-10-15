@@ -982,6 +982,14 @@ export function createBrowserHostEntry(
     await browserRuntime?.stop(target);
     return { outcome: "slept" };
   }
+  /** A Browser Instance is running or starting for the profile. */
+  async function profileRunning(
+    dataDir: string,
+    target: { hostId: string; profileId: string },
+  ) {
+    const state = (await runtime(dataDir)?.status(target))?.state;
+    return state === "running" || state === "waking";
+  }
   function runtime(dataDir: string) {
     if (retainedRuntime !== undefined) return retainedRuntime;
     if (runtimeSource === undefined) return undefined;
@@ -2381,7 +2389,10 @@ export function createBrowserHostEntry(
         retainWorker(context);
         const dataDir = context.experimental_paths.dataDir;
         await requireReadyForProfileMutation(administration(dataDir), request);
-        const response = await profiles(dataDir).deleteProfile(request);
+        const response = await profiles(dataDir).deleteProfile(request, () =>
+          profileRunning(dataDir, request),
+        );
+        if (response.outcome === "kept") return response;
         await transferStaging(dataDir)
           ?.purgeAll()
           .catch(() => undefined);
@@ -2411,6 +2422,26 @@ export function createBrowserHostEntry(
             .catch(() => undefined);
         }
         return expired;
+      },
+      profileUsage: async (request, context) => {
+        retainWorker(context);
+        const dataDir = context.experimental_paths.dataDir;
+        const stored =
+          (await profiles(dataDir).profileUsage?.(
+            request.hostId,
+            request.profileIds,
+          )) ?? [];
+        const usage = [];
+        for (const profile of stored) {
+          usage.push({
+            ...profile,
+            running: await profileRunning(dataDir, {
+              hostId: request.hostId,
+              profileId: profile.profileId,
+            }),
+          });
+        }
+        return { profiles: usage };
       },
       backupProfile: async (request, context) => {
         retainWorker(context);

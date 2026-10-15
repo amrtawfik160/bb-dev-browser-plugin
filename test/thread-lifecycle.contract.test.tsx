@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
-import { describe, expect, it } from "vitest";
+import { fireEvent } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createPublicPluginHarness,
   createTabInventoryRuntime,
@@ -62,6 +63,7 @@ async function threadHarness(
   }
   return {
     browser,
+    runtime,
     stopped,
     executed,
     useBrowser,
@@ -238,6 +240,148 @@ describe("thread lifecycle releases thread browsers", () => {
       expect(JSON.stringify(warnings)).not.toContain(threadProfileId);
       browser.setHostConnection("connected");
       expect(await profileState(threadProfileId)).toBe("active");
+    } finally {
+      await browser.dispose();
+    }
+  });
+});
+
+describe("owner cleanup of unused worker profiles", () => {
+  const day = 24 * 60 * 60 * 1_000;
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  async function cleanupHarness() {
+    const harness = await threadHarness();
+    const running = new Set<string>();
+    harness.runtime.status = async (target) => ({
+      state: running.has(target.profileId) ? "running" : "sleeping",
+      hostId: target.hostId,
+      profileId: target.profileId,
+    });
+    return { ...harness, running };
+  }
+
+  it("shows and deletes only idle, unsigned, unselected, stopped worker profiles", async () => {
+    const { browser, useBrowser, profileState, running } =
+      await cleanupHarness();
+    try {
+      await useBrowser();
+      await useBrowser("thread-second");
+      await useBrowser("thread-signed-in");
+      await useBrowser("thread-selected");
+      const signedInId = scopedProfileId({
+        projectId: PROJECT_ID,
+        threadId: "thread-signed-in",
+      });
+      const selectedId = scopedProfileId({
+        projectId: PROJECT_ID,
+        threadId: "thread-selected",
+      });
+      await browser.runBrowserSessions(
+        {
+          action: "report",
+          origin: "https://mail.example.com",
+          status: "signed-in",
+        },
+        { threadId: "thread-signed-in" },
+      );
+      await browser.selectBrowserProfile(
+        { hostId: HOST_ID, profileId: selectedId },
+        { projectId: "project-a" },
+      );
+      running.add(secondThreadProfileId);
+
+      expect(await browser.browserProfileCleanupPlan()).toMatchObject({
+        automatic: "not-confirmed",
+        profileIds: [],
+      });
+
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(Date.now() + 3 * day);
+
+      const plan = await browser.browserProfileCleanupPlan();
+      expect(plan.profileIds).toEqual([threadProfileId]);
+      expect(plan.sizeBytes).toBeGreaterThan(0);
+
+      const result = await browser.cleanUpBrowserProfiles({
+        profileIds: plan.profileIds,
+        automatic: true,
+      });
+      expect(result).toMatchObject({ deleted: 1, automatic: true });
+      expect(await profileState(threadProfileId)).toBeUndefined();
+      for (const kept of [secondThreadProfileId, signedInId, selectedId]) {
+        expect(await profileState(kept)).toBe("active");
+      }
+      expect(await browser.browserProfileCleanupPlan()).toMatchObject({
+        automatic: "on",
+      });
+      expect(await browser.setAutomaticProfileCleanup(false)).toEqual({
+        enabled: false,
+      });
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("skips a listed profile that was used after the owner saw the list", async () => {
+    const { browser, useBrowser, profileState } = await cleanupHarness();
+    try {
+      await useBrowser();
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(Date.now() + 3 * day);
+      const plan = await browser.browserProfileCleanupPlan();
+      expect(plan.profileIds).toEqual([threadProfileId]);
+      vi.useRealTimers();
+      const result = await browser.cleanUpBrowserProfiles({
+        profileIds: plan.profileIds,
+        automatic: false,
+      });
+      expect(result).toMatchObject({ deleted: 0, automatic: false });
+      expect(await profileState(threadProfileId)).toBe("active");
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("lets the owner check and delete them from Settings in one step", async () => {
+    const { browser, useBrowser, profileState } = await cleanupHarness();
+    try {
+      await useBrowser();
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(Date.now() + 3 * day);
+      const settings = browser.renderSettings();
+      fireEvent.click(
+        await settings.findByRole("button", {
+          name: "Check unused worker profiles",
+        }),
+      );
+      await settings.findByText(/^1 unused worker profile\(s\), \d+\.\d GB/);
+      const automatic = settings.getByRole("checkbox", {
+        name: "Delete unused worker profiles automatically",
+      });
+      expect((automatic as HTMLInputElement).checked).toBe(true);
+      fireEvent.click(
+        settings.getByRole("button", { name: "Delete 1 profile(s)" }),
+      );
+      await settings.findByText(
+        /Deleted 1 profile\(s\)\. Automatic cleanup is on\./,
+        undefined,
+        { timeout: 5_000 },
+      );
+      expect(await profileState(threadProfileId)).toBeUndefined();
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("keeps agents from running the cleanup", async () => {
+    const { browser } = await cleanupHarness();
+    try {
+      const commands = browser.registeredBrowserCliCommands();
+      expect(JSON.stringify(commands)).not.toContain("cleanup");
     } finally {
       await browser.dispose();
     }

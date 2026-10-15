@@ -41,7 +41,12 @@ import {
   type BrowserProfileTarget,
   type BrowserSessionSiteUpdate,
 } from "../shared/contracts.js";
-import { scopedProfileId } from "../shared/profile-scope.js";
+import {
+  scopedProfileId,
+  threadProfileDefaultName,
+} from "../shared/profile-scope.js";
+import { profileKeepReason } from "../shared/profile-cleanup-rule.js";
+import { withoutBrowserInstance } from "../browser/browser-runtime.js";
 
 const PROFILE_DIRECTORY_MODE = 0o700;
 const PROFILE_MANIFEST_MODE = 0o600;
@@ -119,8 +124,13 @@ export interface BrowserProfileStore {
   resetProfile(
     request: BrowserProfileResetRequest,
   ): Promise<BrowserProfileLifecycleResponse>;
+  /**
+   * With `request.unused`, `running` tells whether a Browser Instance is
+   * running or starting for the profile.
+   */
   deleteProfile(
     request: BrowserProfileDeleteRequest,
+    running?: () => Promise<boolean>,
   ): Promise<BrowserProfileLifecycleResponse>;
   expireArchivedProfiles(
     hostId: string,
@@ -128,7 +138,18 @@ export interface BrowserProfileStore {
   ): Promise<BrowserProfileExpiryResponse>;
   /** Finish interrupted lifecycle work; true when any was found. */
   reconcileProfileLifecycle(hostId: string): Promise<boolean>;
+  /** Last file change and size of the listed profiles still on disk. */
+  profileUsage?(
+    hostId: string,
+    profileIds: readonly string[],
+  ): Promise<StoredProfileUsage[]>;
 }
+
+export type StoredProfileUsage = {
+  profileId: string;
+  lastUsedAt: string;
+  sizeBytes: number;
+};
 
 export interface FileBrowserProfileStoreOptions {
   rootDirectory: string;
@@ -813,6 +834,43 @@ async function readManifest(
   return { manifest: validatedManifest, legacy: migrated.legacy };
 }
 
+function missing(error: unknown) {
+  return error instanceof Error && "code" in error && error.code === "ENOENT";
+}
+
+/**
+ * Newest modification time, in ms, and disk space of a tree, without
+ * following symlinks. Null when the tree is gone.
+ */
+async function treeUsage(
+  path: string,
+): Promise<{ newest: number; size: number } | null> {
+  let metadata;
+  try {
+    metadata = await lstat(path);
+  } catch (error) {
+    if (missing(error)) return null;
+    throw error;
+  }
+  const usage = { newest: metadata.mtimeMs, size: metadata.blocks * 512 };
+  if (!metadata.isDirectory()) return usage;
+  let entries: string[];
+  try {
+    entries = await readdir(path);
+  } catch (error) {
+    if (missing(error)) return usage;
+    throw error;
+  }
+  for (const entry of entries) {
+    // Null when removed while measuring.
+    const child = await treeUsage(join(path, entry));
+    if (child === null) continue;
+    usage.newest = Math.max(usage.newest, child.newest);
+    usage.size += child.size;
+  }
+  return usage;
+}
+
 async function profileDirectoryMetadata(path: string) {
   try {
     const metadata = await lstat(path);
@@ -942,12 +1000,13 @@ function lifecycleProfileResponse(
 
 function lifecycleDeleteResponse(
   profileId: string,
-  outcome: "deleted" | "already-deleted" = "already-deleted",
+  outcome: "deleted" | "already-deleted" | "kept" = "already-deleted",
 ): BrowserProfileLifecycleResponse {
-  const message =
-    outcome === "deleted"
-      ? `Browser Profile ${profileId} was permanently deleted.`
-      : `Browser Profile ${profileId} was already permanently deleted.`;
+  const message = {
+    deleted: `Browser Profile ${profileId} was permanently deleted.`,
+    "already-deleted": `Browser Profile ${profileId} was already permanently deleted.`,
+    kept: `Browser Profile ${profileId} was kept because it is in use.`,
+  }[outcome];
   return {
     outcome,
     profileId,
@@ -1780,7 +1839,10 @@ export function createFileBrowserProfileStore(
     });
   }
 
-  async function deleteProfile(request: BrowserProfileDeleteRequest) {
+  async function deleteProfile(
+    request: BrowserProfileDeleteRequest,
+    running: () => Promise<boolean> = async () => false,
+  ) {
     return withMutationLock(options, request.hostId, ownership, async () => {
       const inventory = await reconcileBeforeLifecycle(request.hostId);
       const current = inventory.profiles.find(
@@ -1789,8 +1851,46 @@ export function createFileBrowserProfileStore(
       if (current === undefined)
         return lifecycleDeleteResponse(request.profileId);
       assertDeleteConfirmation(current, request);
-      await beginLifecycle("delete", request);
-      return lifecycleDeleteResponse(request.profileId, "deleted");
+      const { unused } = request;
+      if (unused === undefined) {
+        await beginLifecycle("delete", request);
+        return lifecycleDeleteResponse(request.profileId, "deleted");
+      }
+      // Sign-in updates wait on the storage lock held here, and a launch
+      // waits on the instance lock, so this check holds until the delete.
+      const paths = profilePaths(
+        options.rootDirectory,
+        options.installationId,
+        request.hostId,
+        request.profileId,
+      );
+      const deleted = await withoutBrowserInstance(
+        paths.runtimeManifestPath,
+        async () => {
+          const files = await treeUsage(paths.profileDirectory);
+          const keep = profileKeepReason(
+            {
+              profile: current,
+              lastUsedAt: Math.max(
+                files?.newest ?? 0,
+                unused.lastActivityAt === null
+                  ? 0
+                  : Date.parse(unused.lastActivityAt),
+              ),
+              running: await running(),
+              selected: unused.selected,
+            },
+            { now: clock().getTime(), idleMs: unused.idleMs },
+          );
+          if (keep !== null) return false;
+          await beginLifecycle("delete", request);
+          return true;
+        },
+      );
+      return lifecycleDeleteResponse(
+        request.profileId,
+        deleted === true ? "deleted" : "kept",
+      );
     });
   }
 
@@ -1837,13 +1937,45 @@ export function createFileBrowserProfileStore(
     return createProfile(
       {
         hostId: request.hostId,
-        name: `${request.threadId === undefined ? "Project" : "Thread"} ${profileId.split("-").at(-1)}`,
+        name:
+          request.threadId === undefined
+            ? `Project ${profileId.split("-").at(-1)}`
+            : threadProfileDefaultName(profileId),
       },
       request,
     );
   }
 
+  /**
+   * The browser writes into its files whenever it runs, so the newest file
+   * change is the profile's last use. Profiles no longer on disk are left
+   * out.
+   */
+  async function profileUsage(
+    hostId: string,
+    profileIds: readonly string[],
+  ): Promise<StoredProfileUsage[]> {
+    const usage: StoredProfileUsage[] = [];
+    for (const profileId of profileIds) {
+      const { profileDirectory } = profilePaths(
+        options.rootDirectory,
+        options.installationId,
+        hostId,
+        profileId,
+      );
+      const files = await treeUsage(profileDirectory);
+      if (files === null) continue;
+      usage.push({
+        profileId,
+        lastUsedAt: new Date(files.newest).toISOString(),
+        sizeBytes: files.size,
+      });
+    }
+    return usage;
+  }
+
   return {
+    profileUsage,
     archiveUnsavedProfile,
     recordSessionSite,
     listProfiles,
