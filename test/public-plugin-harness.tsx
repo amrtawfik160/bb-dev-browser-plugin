@@ -24,6 +24,7 @@ import { experimental_createHostEntryHarness } from "@get-bb/plugin-sdk/testing/
 import type {
   BrowserProfileCleanupPlan,
   BrowserProfileCleanupResult,
+  BrowserProfileCleanupStatus,
 } from "../src/shared/contracts.js";
 import {
   browserActivityRecordsSchema,
@@ -1506,6 +1507,11 @@ export async function createPublicPluginHarness(options?: {
         "browser_profile_cleanup",
         input,
       ) as Promise<BrowserProfileCleanupResult>,
+    browser_profile_cleanup_status: () =>
+      backend.harness.behavior.callRpc(
+        "browser_profile_cleanup_status",
+        {},
+      ) as Promise<BrowserProfileCleanupStatus>,
     browser_profile_cleanup_automatic_set: (input: { enabled: boolean }) =>
       backend.harness.behavior.callRpc(
         "browser_profile_cleanup_automatic_set",
@@ -2000,6 +2006,21 @@ export async function createPublicPluginHarness(options?: {
     automatic: boolean;
   }) {
     return rpc.browser_profile_cleanup({ hostId: configuredHostId, ...input });
+  }
+
+  /** Start the background cleanup job; resolves with its status at once. */
+  function startBrowserProfileCleanup(input: {
+    profileIds: string[];
+    automatic: boolean;
+  }) {
+    return rpc.browser_profile_cleanup({
+      hostId: configuredHostId,
+      ...input,
+    }) as unknown as Promise<BrowserProfileCleanupStatus>;
+  }
+
+  function browserProfileCleanupStatus() {
+    return rpc.browser_profile_cleanup_status();
   }
 
   function setAutomaticProfileCleanup(enabled: boolean) {
@@ -2609,6 +2630,8 @@ export async function createPublicPluginHarness(options?: {
     deleteBrowserProfile,
     browserProfileCleanupPlan,
     cleanUpBrowserProfiles,
+    startBrowserProfileCleanup,
+    browserProfileCleanupStatus,
     setAutomaticProfileCleanup,
     backupBrowserProfile,
     restoreBrowserProfile,

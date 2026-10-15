@@ -11,7 +11,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   createFileBrowserProfileStore,
   profileStoragePaths,
@@ -248,6 +248,74 @@ describe("last use of a worker profile", () => {
       );
       const plan = await f.browser.browserProfileCleanupPlan();
       expect(plan.profileIds).not.toContain(worker.profileId);
+    } finally {
+      await f.dispose();
+    }
+  });
+});
+
+describe("cleanup runs in the background", () => {
+  function within<T>(promise: Promise<T>, ms: number) {
+    return Promise.race([
+      promise,
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error(`no answer within ${ms} ms`)), ms),
+      ),
+    ]);
+  }
+
+  it("returns at once, reports progress, and runs one job at a time", async () => {
+    const f = await fixture();
+    let release = () => {};
+    const blocked = new Promise<void>((resolve) => (release = resolve));
+    try {
+      await f.idleWorker("thread-a");
+      await f.idleWorker("thread-b");
+      const plan = await f.browser.browserProfileCleanupPlan();
+      f.afterFirstDelete(() => blocked);
+
+      const started = await within(
+        f.browser.startBrowserProfileCleanup({
+          profileIds: plan.profileIds,
+          automatic: false,
+        }),
+        5_000,
+      );
+      expect(started.job).toMatchObject({ state: "running", total: 2 });
+      const again = await f.browser.startBrowserProfileCleanup({
+        profileIds: plan.profileIds,
+        automatic: false,
+      });
+      expect(again.job?.id).toBe(started.job?.id);
+      expect((await f.browser.browserProfileCleanupStatus()).job).toMatchObject(
+        { id: started.job?.id, state: "running" },
+      );
+
+      release();
+      await vi.waitFor(
+        async () =>
+          expect(
+            (await f.browser.browserProfileCleanupStatus()).job,
+          ).toMatchObject({ state: "finished", deleted: 2, skipped: 0 }),
+        { timeout: 5_000 },
+      );
+    } finally {
+      release();
+      await f.dispose();
+    }
+  }, 15_000);
+
+  it("shows the last result when the owner opens the card again", async () => {
+    const f = await fixture();
+    try {
+      await f.idleWorker("thread-a");
+      const plan = await f.browser.browserProfileCleanupPlan();
+      await f.browser.cleanUpBrowserProfiles({
+        profileIds: plan.profileIds,
+        automatic: false,
+      });
+      const settings = f.browser.renderSettings();
+      await settings.findByText(/Deleted 1 profile\(s\)\./);
     } finally {
       await f.dispose();
     }
