@@ -1,4 +1,13 @@
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  chown,
+  link,
+  mkdir,
+  mkdtemp,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -24,6 +33,12 @@ afterEach(async () => {
 async function writeBindings(document: unknown, mode = 0o600) {
   await writeFile(bindingPath, JSON.stringify(document));
   await chmod(bindingPath, mode);
+}
+
+async function writeEnv(name: string, contents: string, mode = 0o600) {
+  const path = join(secretsDirectory, name);
+  await writeFile(path, contents);
+  await chmod(path, mode);
 }
 
 function load() {
@@ -96,6 +111,14 @@ describe("browser secret ref bindings", () => {
       { file: "app.env", var: "A", origins: ["http://app.example"] },
     ],
     [
+      "a plain http origin that is not loopback",
+      { file: "app.env", var: "A", origins: ["http://dev.example:5001"] },
+    ],
+    [
+      "a plain http loopback origin with a path",
+      { file: "app.env", var: "A", origins: ["http://localhost:5001/"] },
+    ],
+    [
       "an origin with a path",
       { file: "app.env", var: "A", origins: ["https://app.example/login"] },
     ],
@@ -112,16 +135,57 @@ describe("browser secret ref bindings", () => {
     await expect(load()).rejects.toThrow(/browser secret ref file is invalid/u);
   });
 
+  it.each([
+    ["the same ref order", "app-totp", "app-seed-as-value"],
+    ["the reverse ref order", "app-seed-as-value", "app-totp"],
+  ])(
+    "rejects the whole file when a plain ref aliases a seed (%s)",
+    async (_label, first, second) => {
+      const entries = {
+        "app-totp": {
+          file: "app.env",
+          var: "OTP_SEED",
+          origins: ["https://app.example"],
+          totp: true,
+        },
+        "app-seed-as-value": {
+          // The same variable reached through another spelling of the path.
+          file: join(secretsDirectory, "./app.env"),
+          var: "OTP_SEED",
+          origins: ["https://app.example"],
+        },
+      };
+      await writeBindings({
+        refs: { [first]: entries[first], [second]: entries[second] },
+      });
+      await expect(load()).rejects.toThrow(
+        /browser secret ref file is invalid/u,
+      );
+    },
+  );
+
+  it("accepts plain http only for the exact local dev server origin", async () => {
+    await writeBindings({
+      refs: {
+        dev: {
+          file: "app.env",
+          var: "A",
+          origins: ["http://localhost:5001"],
+        },
+      },
+    });
+    expect((await load()).get("dev")?.origins).toEqual([
+      "http://localhost:5001",
+    ]);
+  });
+
   it("refuses a binding file that group or others can read", async () => {
     await writeBindings({ refs: {} }, 0o640);
     await expect(load()).rejects.toThrow(/mode 0600/u);
   });
 
   it("reads one variable and reports a missing one as undefined", async () => {
-    await writeFile(
-      join(secretsDirectory, "app.env"),
-      'export APP_PASSWORD="fixture pass"\nOTHER=1\n',
-    );
+    await writeEnv("app.env", 'export APP_PASSWORD="fixture pass"\nOTHER=1\n');
     const binding = {
       kind: "value" as const,
       ref: "app-password",
@@ -139,6 +203,103 @@ describe("browser secret ref bindings", () => {
         file: join(secretsDirectory, "no.env"),
       }),
     ).resolves.toBeUndefined();
+  });
+});
+
+describe("bound env file checks", () => {
+  let outsideDirectory: string;
+
+  beforeEach(async () => {
+    outsideDirectory = await mkdtemp(join(tmpdir(), "secret-refs-outside-"));
+  });
+
+  afterEach(async () => {
+    await rm(outsideDirectory, { recursive: true, force: true });
+  });
+
+  function binding(file: string) {
+    return {
+      kind: "value" as const,
+      ref: "app-password",
+      file: join(secretsDirectory, file),
+      variable: "PW",
+      origins: ["https://app.example"],
+    };
+  }
+
+  async function writeOutside(name: string) {
+    const path = join(outsideDirectory, name);
+    await writeFile(path, "PW=outside-fixture\n");
+    await chmod(path, 0o600);
+    return path;
+  }
+
+  const refused = /env file for secret ref "app-password" must be/u;
+
+  it("refuses a bound file that is a symlink leaving the secrets folder", async () => {
+    await symlink(
+      await writeOutside("app.env"),
+      join(secretsDirectory, "app.env"),
+    );
+    await expect(readSecretVariable(binding("app.env"))).rejects.toThrow(
+      refused,
+    );
+  });
+
+  it("refuses a bound file that is a symlink to a file inside the folder", async () => {
+    await writeEnv("real.env", "PW=inside-fixture\n");
+    await symlink(
+      join(secretsDirectory, "real.env"),
+      join(secretsDirectory, "app.env"),
+    );
+    await expect(readSecretVariable(binding("app.env"))).rejects.toThrow(
+      refused,
+    );
+  });
+
+  it("refuses a bound file whose folder is a symlink leaving the secrets folder", async () => {
+    await writeOutside("app.env");
+    await symlink(outsideDirectory, join(secretsDirectory, "linked"));
+    await expect(readSecretVariable(binding("linked/app.env"))).rejects.toThrow(
+      refused,
+    );
+  });
+
+  it("refuses a bound file with a second hard link", async () => {
+    await writeEnv("app.env", "PW=inside-fixture\n");
+    await link(
+      join(secretsDirectory, "app.env"),
+      join(secretsDirectory, "alias.env"),
+    );
+    await expect(readSecretVariable(binding("app.env"))).rejects.toThrow(
+      refused,
+    );
+  });
+
+  it("refuses a bound file that group or others can read", async () => {
+    await writeEnv("app.env", "PW=inside-fixture\n", 0o644);
+    await expect(readSecretVariable(binding("app.env"))).rejects.toThrow(
+      refused,
+    );
+  });
+
+  it.runIf(process.getuid?.() === 0)(
+    "refuses a bound file owned by another user",
+    async () => {
+      await writeEnv("app.env", "PW=inside-fixture\n");
+      await chown(join(secretsDirectory, "app.env"), 65534, 65534);
+      await expect(readSecretVariable(binding("app.env"))).rejects.toThrow(
+        refused,
+      );
+    },
+  );
+
+  it("reads a regular file in a real subfolder", async () => {
+    await mkdir(join(secretsDirectory, "sub"));
+    await writeEnv("sub/app.env", "PW=inside-fixture\n");
+    await expect(readSecretVariable(binding("sub/app.env"))).resolves.toBe(
+      "inside-fixture",
+    );
   });
 });
 

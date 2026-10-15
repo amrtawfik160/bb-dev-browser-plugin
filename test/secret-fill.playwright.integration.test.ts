@@ -25,6 +25,12 @@ const PAGES: Record<string, string> = {
     '<!doctype html><script>location.replace("https://other.test/login")</script>',
   "https://other.test/login":
     '<!doctype html><input id="password" type="password">',
+  "http://localhost:5001/login":
+    '<!doctype html><input id="password" type="password">',
+  "http://localhost:5002/login":
+    '<!doctype html><input id="password" type="password">',
+  "http://127.0.0.1:5001/login":
+    '<!doctype html><input id="password" type="password">',
 };
 
 let secretsDirectory: string;
@@ -60,10 +66,12 @@ async function connectWithRetry(target: string) {
 
 beforeAll(async () => {
   secretsDirectory = await mkdtemp(join(tmpdir(), "secret-fill-"));
+  const envPath = join(secretsDirectory, "app.env");
   await writeFile(
-    join(secretsDirectory, "app.env"),
+    envPath,
     `APP_PASSWORD=${PASSWORD}\nAPP_TOTP_SECRET=${SEED}\n`,
   );
+  await chmod(envPath, 0o600);
   const bindingPath = join(secretsDirectory, "browser-secret-refs.json");
   await writeFile(
     bindingPath,
@@ -79,6 +87,11 @@ beforeAll(async () => {
           var: "APP_TOTP_SECRET",
           origins: ["https://allowed.test"],
           totp: true,
+        },
+        "dev-password": {
+          file: "app.env",
+          var: "APP_PASSWORD",
+          origins: ["http://localhost:5001"],
         },
         "app-missing": {
           file: "app.env",
@@ -301,6 +314,35 @@ await fillTotp("#otp", "app-password");`);
     );
     expect(await page.inputValue("#otp")).toBe("");
   }, 30_000);
+});
+
+describe("a plain-http local dev server origin", () => {
+  it("fills on the exact bound origin", async () => {
+    const result = await runScript(`
+await page.goto("http://localhost:5001/login");
+await fillSecret("#password", "dev-password");`);
+    expect(result.error).toBeUndefined();
+    expect(await page.inputValue("#password")).toBe(PASSWORD);
+    expectNoSecret(result.output, result.answers);
+  }, 30_000);
+
+  it.each([
+    ["another port", "http://localhost:5002"],
+    ["another host on the same port", "http://127.0.0.1:5001"],
+  ])(
+    "refuses %s",
+    async (_label, origin) => {
+      const result = await runScript(`
+await page.goto("${origin}/login");
+await fillSecret("#password", "dev-password");`);
+      expect(result.error?.message).toContain(
+        `secret ref "dev-password" may not be filled on ${origin}.`,
+      );
+      expect(await page.inputValue("#password")).toBe("");
+      expectNoSecret(result.error?.message);
+    },
+    30_000,
+  );
 });
 
 describe("secret fill fixture hygiene", () => {

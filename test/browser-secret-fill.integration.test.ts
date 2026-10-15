@@ -24,6 +24,7 @@ it.runIf(process.env.BB_BROWSER_REAL_INTEGRATION === "1")(
     const secretsDirectory = await mkdtemp(join(tmpdir(), "real-secret-fill-"));
     const bindingPath = join(secretsDirectory, "browser-secret-refs.json");
     await writeFile(join(secretsDirectory, "app.env"), `PW=${PASSWORD}\n`);
+    await chmod(join(secretsDirectory, "app.env"), 0o600);
     await writeFile(
       bindingPath,
       JSON.stringify({
