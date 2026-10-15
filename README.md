@@ -285,9 +285,10 @@ Safe Login Mode gives agents no pixels and no DOM.
 
 Activity Records keep metadata only.
 
-Secret Refs let a script fill a stored credential only on the exact origins its
-owner listed. The value is redacted from the run's output and errors, but a
-script can still read the filled input; the origin binding is the real limit.
+Secret Refs let the host type a stored credential only on the exact origins its
+owner listed. The value is redacted from the run's output and errors. After a
+fill, the script can read the field and send the value anywhere, so bind only
+test-account credentials.
 
 No analytics, telemetry, or browser data leave the host. BB Connect is the
 only remote authenticated path.

@@ -176,7 +176,7 @@ workspace access.
   `await fillSecret("#password", "<ref>")` or
   `await fillTotp("#otp", "<ref>")`. The host types the value on the bound
   `page` only when its origin is listed for that ref; you never receive it,
-  and it is `[redacted]` in output. Refs are owner-defined; see
+  and it is `[redacted]` in output. Do not read the filled field back. Refs are owner-defined; see
   `docs/browser/secret-refs.md`.
 - The host applies Playwright `BrowserContext` action and navigation defaults
   with 25% headroom (capped at 5 seconds) inside the host deadline. The defaults
