@@ -23,7 +23,6 @@ import {
 import { experimental_createHostEntryHarness } from "@get-bb/plugin-sdk/testing/host";
 import type {
   BrowserProfileCleanupPlan,
-  BrowserProfileCleanupResult,
   BrowserProfileCleanupStatus,
 } from "../src/shared/contracts.js";
 import {
@@ -1506,7 +1505,7 @@ export async function createPublicPluginHarness(options?: {
       backend.harness.behavior.callRpc(
         "browser_profile_cleanup",
         input,
-      ) as Promise<BrowserProfileCleanupResult>,
+      ) as Promise<BrowserProfileCleanupStatus>,
     browser_profile_cleanup_status: () =>
       backend.harness.behavior.callRpc(
         "browser_profile_cleanup_status",
@@ -2001,11 +2000,17 @@ export async function createPublicPluginHarness(options?: {
     return rpc.browser_profile_cleanup_plan({ hostId });
   }
 
-  function cleanUpBrowserProfiles(input: {
+  /** Run the cleanup job to the end; the job's counts and the setting. */
+  async function cleanUpBrowserProfiles(input: {
     profileIds: string[];
     automatic: boolean;
   }) {
-    return rpc.browser_profile_cleanup({ hostId: configuredHostId, ...input });
+    let status = await startBrowserProfileCleanup(input);
+    while (status.job?.state === "running") {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      status = await browserProfileCleanupStatus();
+    }
+    return { ...status.job!, automatic: status.automatic === "on" };
   }
 
   /** Start the background cleanup job; resolves with its status at once. */
@@ -2013,10 +2018,7 @@ export async function createPublicPluginHarness(options?: {
     profileIds: string[];
     automatic: boolean;
   }) {
-    return rpc.browser_profile_cleanup({
-      hostId: configuredHostId,
-      ...input,
-    }) as unknown as Promise<BrowserProfileCleanupStatus>;
+    return rpc.browser_profile_cleanup({ hostId: configuredHostId, ...input });
   }
 
   function browserProfileCleanupStatus() {

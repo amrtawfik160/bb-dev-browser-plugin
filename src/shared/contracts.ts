@@ -629,12 +629,29 @@ export const browserProfileCleanupRequestSchema = browserProfileHostTargetSchema
   })
   .strict();
 
-export const browserProfileCleanupResultSchema = z
+/** One cleanup run. It runs in the background, one at a time. */
+export const browserProfileCleanupJobSchema = z
   .object({
+    id: z.string().min(1),
+    hostId: z.string().min(1),
+    state: z.enum(["running", "finished"]),
+    total: z.number().int().nonnegative(),
     deleted: z.number().int().nonnegative(),
+    /** Kept because they were used or changed since the check. */
     skipped: z.number().int().nonnegative(),
     failed: z.number().int().nonnegative(),
-    automatic: z.boolean(),
+    /** Why the run stopped early, if it did. */
+    error: z.string().nullable(),
+    startedAt: z.string().datetime(),
+    finishedAt: z.string().datetime().nullable(),
+  })
+  .strict();
+
+/** The latest cleanup run since the server started, and the setting. */
+export const browserProfileCleanupStatusSchema = z
+  .object({
+    job: browserProfileCleanupJobSchema.nullable(),
+    automatic: z.enum(["not-confirmed", "on", "off"]),
   })
   .strict();
 
@@ -648,8 +665,11 @@ export type BrowserProfileCleanupPlan = z.infer<
 export type BrowserProfileCleanupRequest = z.infer<
   typeof browserProfileCleanupRequestSchema
 >;
-export type BrowserProfileCleanupResult = z.infer<
-  typeof browserProfileCleanupResultSchema
+export type BrowserProfileCleanupJob = z.infer<
+  typeof browserProfileCleanupJobSchema
+>;
+export type BrowserProfileCleanupStatus = z.infer<
+  typeof browserProfileCleanupStatusSchema
 >;
 
 const browserProfileContextSchema = z
@@ -3445,7 +3465,11 @@ export const rpcContract = defineRpcContract({
   },
   browser_profile_cleanup: {
     input: browserProfileCleanupRequestSchema,
-    output: browserProfileCleanupResultSchema,
+    output: browserProfileCleanupStatusSchema,
+  },
+  browser_profile_cleanup_status: {
+    input: z.object({}).strict(),
+    output: browserProfileCleanupStatusSchema,
   },
   browser_profile_cleanup_automatic_set: {
     input: browserProfileCleanupAutomaticSchema,

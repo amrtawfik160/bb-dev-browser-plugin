@@ -1407,7 +1407,10 @@ export async function withoutBrowserInstance<T>(
   try {
     lock = await acquireProfileLock(lockPath);
   } catch (error) {
-    if (error instanceof BrowserInstanceError && error.code === "profile-in-use")
+    if (
+      error instanceof BrowserInstanceError &&
+      error.code === "profile-in-use"
+    )
       return null;
     throw error;
   }

@@ -2587,6 +2587,8 @@ export default function plugin(bb: BbPluginApi) {
       browser.profileCleanupPlan(ownerAuthority, input),
     browser_profile_cleanup: (input) =>
       browser.cleanUpProfiles(ownerAuthority, input),
+    browser_profile_cleanup_status: () =>
+      browser.profileCleanupStatus(ownerAuthority),
     browser_profile_cleanup_automatic_set: (input) =>
       browser.setAutomaticProfileCleanup(ownerAuthority, input),
     browser_profile_backup: (input) => browser.backupProfile(input),

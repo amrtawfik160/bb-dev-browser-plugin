@@ -368,6 +368,8 @@ describe("owner cleanup of unused worker profiles", () => {
       );
       await settings.findByText(
         /Deleted 1 profile\(s\)\. Automatic cleanup is on\./,
+        undefined,
+        { timeout: 5_000 },
       );
       expect(await profileState(threadProfileId)).toBeUndefined();
     } finally {

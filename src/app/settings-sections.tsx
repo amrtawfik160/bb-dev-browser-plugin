@@ -1,4 +1,10 @@
-import { useCallback, useEffect, useState, type FormEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type FormEvent,
+} from "react";
 import type { ComponentProps, ReactNode } from "react";
 import { useRpc } from "@get-bb/plugin-sdk/app";
 import {
@@ -13,7 +19,9 @@ import {
   type BrowserDownloadListResult,
   type BrowserGrantRequest,
   type BrowserProfile,
+  type BrowserProfileCleanupJob,
   type BrowserProfileCleanupPlan,
+  type BrowserProfileCleanupStatus,
   type BrowserProfileGrant,
   type BrowserProfileInventory,
   type BrowserProfileLifecycleResponse,
@@ -1043,9 +1051,31 @@ function formatGigabytes(bytes: number) {
   return `${(bytes / 1_000_000_000).toFixed(1)} GB`;
 }
 
+function cleanupJobMessage(
+  job: BrowserProfileCleanupJob,
+  automatic: BrowserProfileCleanupStatus["automatic"],
+) {
+  if (job.state === "running") {
+    const done = job.deleted + job.skipped + job.failed;
+    return `Deleting unused worker profiles: ${done} of ${job.total} done.`;
+  }
+  return (
+    `Deleted ${job.deleted} profile(s).` +
+    (job.skipped > 0
+      ? ` Kept ${job.skipped} that were used since the check.`
+      : "") +
+    (job.failed > 0
+      ? ` ${job.failed} could not be deleted; check again to retry.`
+      : "") +
+    (job.error === null ? "" : ` Stopped early: ${job.error}`) +
+    ` Automatic cleanup is ${automatic === "on" ? "on" : "off"}.`
+  );
+}
+
 /**
  * The owner's one-step cleanup of worker profiles, the browsers threads get
- * on first use. Checking lists what the rule takes; one click deletes them.
+ * on first use. Checking lists what the rule takes; one click starts a
+ * background run that deletes them, and the card follows its progress.
  */
 function UnusedProfileCleanup({
   hostId,
@@ -1058,9 +1088,39 @@ function UnusedProfileCleanup({
   const [plan, setPlan] = useState<BrowserProfileCleanupPlan | null>(null);
   const [automatic, setAutomatic] = useState(true);
   const [pending, setPending] = useState<string | null>(null);
-  const [message, setMessage] = useState<string | null>(null);
+  // Undefined until the latest run is loaded.
+  const [status, setStatus] = useState<BrowserProfileCleanupStatus>();
   const [error, setError] = useState<string | null>(null);
   const checkbox = "h-4 w-4 rounded-sm border-input accent-primary";
+  const running = status?.job?.state === "running";
+  const busy = pending !== null || running;
+  // The parent passes a new callback each render; polling must not restart.
+  const completed = useRef(onComplete);
+  completed.current = onComplete;
+
+  // Show the latest run when the card opens, and follow one still going.
+  useEffect(() => {
+    if (status !== undefined && !running) return;
+    let active = true;
+    const timer = setTimeout(
+      () =>
+        void rpc
+          .call("browser_profile_cleanup_status", {})
+          .then((next) => {
+            if (!active) return;
+            setStatus(next);
+            if (running && next.job?.state !== "running") completed.current();
+          })
+          .catch((requestError: unknown) => {
+            if (active) setError(administrationErrorMessage(requestError));
+          }),
+      status === undefined ? 0 : 1_000,
+    );
+    return () => {
+      active = false;
+      clearTimeout(timer);
+    };
+  }, [rpc, status, running]);
 
   function run(action: string, operation: () => Promise<void>) {
     setPending(action);
@@ -1073,7 +1133,6 @@ function UnusedProfileCleanup({
   }
 
   function check() {
-    setMessage(null);
     run("check", async () => {
       const next = await rpc.call("browser_profile_cleanup_plan", { hostId });
       setPlan(next);
@@ -1084,23 +1143,14 @@ function UnusedProfileCleanup({
 
   function cleanUp(current: BrowserProfileCleanupPlan) {
     run("delete", async () => {
-      const result = await rpc.call("browser_profile_cleanup", {
-        hostId,
-        profileIds: current.profileIds,
-        automatic,
-      });
-      setPlan(null);
-      setMessage(
-        `Deleted ${result.deleted} profile(s).` +
-          (result.skipped > 0
-            ? ` Kept ${result.skipped} that were used since the check.`
-            : "") +
-          (result.failed > 0
-            ? ` ${result.failed} could not be deleted; check again to retry.`
-            : "") +
-          ` Automatic cleanup is ${result.automatic ? "on" : "off"}.`,
+      setStatus(
+        await rpc.call("browser_profile_cleanup", {
+          hostId,
+          profileIds: current.profileIds,
+          automatic,
+        }),
       );
-      onComplete();
+      setPlan(null);
     });
   }
 
@@ -1132,7 +1182,7 @@ function UnusedProfileCleanup({
           className="mt-3"
           variant="secondary"
           size="sm"
-          disabled={pending !== null}
+          disabled={busy}
           onClick={check}
         >
           {pending === "check" ? "Checking…" : "Check unused worker profiles"}
@@ -1152,7 +1202,7 @@ function UnusedProfileCleanup({
                 className={checkbox}
                 aria-label="Delete unused worker profiles automatically"
                 checked={automatic}
-                disabled={pending !== null}
+                disabled={busy}
                 onChange={(event) =>
                   plan.profileIds.length === 0
                     ? saveAutomatic(event.target.checked)
@@ -1168,7 +1218,7 @@ function UnusedProfileCleanup({
               <Button
                 variant="destructive"
                 size="sm"
-                disabled={pending !== null}
+                disabled={busy}
                 onClick={() => cleanUp(plan)}
               >
                 {pending === "delete"
@@ -1179,7 +1229,7 @@ function UnusedProfileCleanup({
             <Button
               variant="secondary"
               size="sm"
-              disabled={pending !== null}
+              disabled={busy}
               onClick={() => setPlan(null)}
             >
               Cancel
@@ -1187,7 +1237,14 @@ function UnusedProfileCleanup({
           </div>
         </div>
       )}
-      <AdministrationFeedback message={message} error={error} />
+      <AdministrationFeedback
+        message={
+          plan === null && status?.job
+            ? cleanupJobMessage(status.job, status.automatic)
+            : null
+        }
+        error={error}
+      />
     </Card>
   );
 }
