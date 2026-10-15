@@ -35,7 +35,11 @@ function workerProfile(overrides: Partial<BrowserProfile> = {}) {
       suppressWelcome: true,
       chromeArguments: ["--no-first-run", "--no-default-browser-check"],
     },
-    storage: { owner: "bb-browser", directoryMode: "0700", manifestMode: "0600" },
+    storage: {
+      owner: "bb-browser",
+      directoryMode: "0700",
+      manifestMode: "0600",
+    },
     state: "active",
     archivedAt: null,
     expiresAt: null,
@@ -114,7 +118,10 @@ describe("unused worker profile rule", () => {
 
   it("keeps a profile used within the idle period", () => {
     expect(
-      profileKeepReason(facts({ lastUsedAt: NOW - 23 * 60 * 60 * 1_000 }), ownerRule),
+      profileKeepReason(
+        facts({ lastUsedAt: NOW - 23 * 60 * 60 * 1_000 }),
+        ownerRule,
+      ),
     ).toBe("recent");
     expect(
       profileKeepReason(facts({ lastUsedAt: NOW - 1.5 * DAY }), {

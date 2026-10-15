@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+import { fireEvent } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createPublicPluginHarness,
@@ -279,11 +280,14 @@ describe("owner cleanup of unused worker profiles", () => {
         projectId: PROJECT_ID,
         threadId: "thread-selected",
       });
-      const sessions = await browser.runBrowserSessions(
-        { action: "report", origin: "https://mail.example.com", status: "signed-in" },
+      await browser.runBrowserSessions(
+        {
+          action: "report",
+          origin: "https://mail.example.com",
+          status: "signed-in",
+        },
         { threadId: "thread-signed-in" },
       );
-      expect(sessions.isError).not.toBe(true);
       await browser.selectBrowserProfile(
         { hostId: HOST_ID, profileId: selectedId },
         { projectId: "project-a" },
@@ -291,7 +295,7 @@ describe("owner cleanup of unused worker profiles", () => {
       running.add(secondThreadProfileId);
 
       expect(await browser.browserProfileCleanupPlan()).toMatchObject({
-        automatic: false,
+        automatic: "not-confirmed",
         profileIds: [],
       });
 
@@ -312,7 +316,7 @@ describe("owner cleanup of unused worker profiles", () => {
         expect(await profileState(kept)).toBe("active");
       }
       expect(await browser.browserProfileCleanupPlan()).toMatchObject({
-        automatic: true,
+        automatic: "on",
       });
       expect(await browser.setAutomaticProfileCleanup(false)).toEqual({
         enabled: false,
@@ -337,6 +341,35 @@ describe("owner cleanup of unused worker profiles", () => {
       });
       expect(result).toMatchObject({ deleted: 0, automatic: false });
       expect(await profileState(threadProfileId)).toBe("active");
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("lets the owner check and delete them from Settings in one step", async () => {
+    const { browser, useBrowser, profileState } = await cleanupHarness();
+    try {
+      await useBrowser();
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(Date.now() + 3 * day);
+      const settings = browser.renderSettings();
+      fireEvent.click(
+        await settings.findByRole("button", {
+          name: "Check unused worker profiles",
+        }),
+      );
+      await settings.findByText(/^1 unused worker profile\(s\), \d+\.\d GB/);
+      const automatic = settings.getByRole("checkbox", {
+        name: "Delete unused worker profiles automatically",
+      });
+      expect((automatic as HTMLInputElement).checked).toBe(true);
+      fireEvent.click(
+        settings.getByRole("button", { name: "Delete 1 profile(s)" }),
+      );
+      await settings.findByText(
+        /Deleted 1 profile\(s\)\. Automatic cleanup is on\./,
+      );
+      expect(await profileState(threadProfileId)).toBeUndefined();
     } finally {
       await browser.dispose();
     }

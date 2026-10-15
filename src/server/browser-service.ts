@@ -82,6 +82,9 @@ import {
   type BrowserGrantRequest,
   type BrowserGrantRequestDecisionRequest,
   type BrowserOriginAutoApprovalUpdate,
+  type BrowserProfileCleanupPlan,
+  type BrowserProfileCleanupRequest,
+  type BrowserProfileCleanupResult,
   type BrowserGrantRequestDecisionResponse,
   type BrowserGrantRequestQuery,
   type BrowserProfileGrant,
@@ -139,7 +142,18 @@ import { createPanelLifecycleDispatch } from "./panel-dispatch.js";
 import { BROWSER_SETTINGS_PROJECT_ID } from "../shared/panel-owner-session.js";
 import { dependencyInventory } from "../shared/dependency-inventory.js";
 import { authorizeFileTransfer } from "../host/transfer-staging.js";
-import { profileScopeKey, scopedProfileId } from "../shared/profile-scope.js";
+import {
+  isThreadProfileId,
+  profileScopeKey,
+  scopedProfileId,
+} from "../shared/profile-scope.js";
+import {
+  AUTOMATIC_CLEANUP_IDLE_MS,
+  OWNER_CLEANUP_IDLE_MS,
+  automaticCleanupSetting,
+  profileKeepReason,
+  setAutomaticCleanup,
+} from "./profile-cleanup.js";
 import { presentBrowserSessions } from "./browser-sessions.js";
 
 const PROFILE_IMPORT_ACTIVITY_ACTION = ["imp", "ort"].join("");
@@ -553,6 +567,9 @@ const ARCHIVED_THREAD_PROFILE_GRACE_MS = 7 * 24 * 60 * 60 * 1_000;
 const ARCHIVED_THREAD_PROFILE_WINDOW_MS = 7 * 24 * 60 * 60 * 1_000;
 const ARCHIVED_THREAD_PROFILE_SWEEP_INTERVAL_MS = 6 * 60 * 60 * 1_000;
 const THREAD_LIST_PAGE = 500;
+const AUTOMATIC_CLEANUP_INTERVAL_MS = 6 * 60 * 60 * 1_000;
+/** Measuring hundreds of profiles walks every file in them. */
+const PROFILE_USAGE_DEADLINE_MS = 10 * 60 * 1_000;
 
 export type ArchivedThreadProfile = {
   hostId: string;
@@ -1098,6 +1115,199 @@ export function createBrowserService(
       () => void run(),
       ARCHIVED_THREAD_PROFILE_SWEEP_INTERVAL_MS,
     );
+    first.unref?.();
+    timer.unref?.();
+    bb.onDispose(() => {
+      clearTimeout(first);
+      clearInterval(timer);
+    });
+  }
+
+  /** Profiles some project or thread explicitly selected on a host. */
+  function explicitlySelectedProfileIds(hostId: string) {
+    const rows = database
+      .prepare(
+        "SELECT DISTINCT profile_id FROM browser_preferences WHERE host_id = ?",
+      )
+      .all(hostId) as { profile_id: string }[];
+    return new Set(rows.map(({ profile_id }) => profile_id));
+  }
+
+  async function storedProfileUsage(
+    hostId: string,
+    profileIds: readonly string[],
+    measureSize: boolean,
+  ) {
+    const { profiles } = await host.call(
+      "profileUsage",
+      { hostId, profileIds: [...profileIds], measureSize },
+      withHostCallDeadline({ hostId }, PROFILE_USAGE_DEADLINE_MS),
+    );
+    return new Map(profiles.map((usage) => [usage.profileId, usage]));
+  }
+
+  /** Worker profiles {@link profileKeepReason} lets cleanup delete now. */
+  async function unusedWorkerProfiles(hostId: string, idleMs: number) {
+    await requireConnectedHost(hostId);
+    const inventory = await host.call("listProfiles", { hostId }, { hostId });
+    const selected = explicitlySelectedProfileIds(hostId);
+    const workers = inventory.profiles.filter(({ profileId }) =>
+      isThreadProfileId(profileId),
+    );
+    const usage = await storedProfileUsage(
+      hostId,
+      workers.map(({ profileId }) => profileId),
+      false,
+    );
+    const now = Date.now();
+    const profiles = workers.filter((profile) => {
+      const stored = usage.get(profile.profileId);
+      return (
+        stored !== undefined &&
+        profileKeepReason(
+          {
+            profile,
+            lastUsedAt: Date.parse(stored.lastUsedAt),
+            running: stored.running,
+            selected: selected.has(profile.profileId),
+          },
+          { now, idleMs },
+        ) === null
+      );
+    });
+    return { inventory, profiles };
+  }
+
+  async function profileCleanupPlan(
+    authority: unknown,
+    request: { hostId: string },
+  ): Promise<BrowserProfileCleanupPlan> {
+    requireOwnerSettingsAuthority(authority);
+    const { profiles } = await unusedWorkerProfiles(
+      request.hostId,
+      OWNER_CLEANUP_IDLE_MS,
+    );
+    const profileIds = profiles.map(({ profileId }) => profileId);
+    const sizes = await storedProfileUsage(request.hostId, profileIds, true);
+    return {
+      hostId: request.hostId,
+      idleDays: OWNER_CLEANUP_IDLE_MS / 86_400_000,
+      automatic: automaticCleanupSetting(database),
+      profileIds,
+      sizeBytes: [...sizes.values()].reduce(
+        (total, { sizeBytes }) => total + (sizeBytes ?? 0),
+        0,
+      ),
+    };
+  }
+
+  /**
+   * Permanently delete the listed profiles that still match the rule. Each
+   * is checked again just before deletion, so one used since the owner saw
+   * the list is skipped.
+   */
+  async function deleteUnusedWorkerProfiles(
+    hostId: string,
+    profileIds: readonly string[],
+    idleMs: number,
+    actor: "owner" | "system",
+  ) {
+    const { inventory, profiles } = await unusedWorkerProfiles(hostId, idleMs);
+    const matching = new Map(
+      profiles.map((profile) => [profile.profileId, profile]),
+    );
+    const result = { deleted: 0, skipped: 0, failed: 0 };
+    for (const profileId of profileIds) {
+      const profile = matching.get(profileId);
+      const stored = (await storedProfileUsage(hostId, [profileId], false)).get(
+        profileId,
+      );
+      if (
+        profile === undefined ||
+        stored === undefined ||
+        stored.running ||
+        Date.now() - Date.parse(stored.lastUsedAt) <= idleMs
+      ) {
+        result.skipped += 1;
+        continue;
+      }
+      const request = { hostId, profileId, confirmation: profile.name };
+      try {
+        await recordProfileLifecycleActivity(
+          request,
+          "delete",
+          () => deleteExistingProfile(request, inventory),
+          actor === "system" ? { actor } : undefined,
+        );
+        result.deleted += 1;
+      } catch (error) {
+        result.failed += 1;
+        bb.log.warn(
+          `Browser could not delete an unused worker profile: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+    return result;
+  }
+
+  async function cleanUpProfiles(
+    authority: unknown,
+    request: BrowserProfileCleanupRequest,
+  ): Promise<BrowserProfileCleanupResult> {
+    requireOwnerSettingsAuthority(authority);
+    const automatic = setAutomaticCleanup(database, request.automatic);
+    const result = await deleteUnusedWorkerProfiles(
+      request.hostId,
+      request.profileIds,
+      OWNER_CLEANUP_IDLE_MS,
+      "owner",
+    );
+    return { ...result, automatic };
+  }
+
+  async function setAutomaticProfileCleanup(
+    authority: unknown,
+    request: { enabled: boolean },
+  ) {
+    requireOwnerSettingsAuthority(authority);
+    return { enabled: setAutomaticCleanup(database, request.enabled) };
+  }
+
+  /**
+   * With the owner's setting on, delete worker profiles that matched the
+   * rule for {@link AUTOMATIC_CLEANUP_IDLE_MS} on every connected host.
+   */
+  function scheduleAutomaticProfileCleanup() {
+    let running = false;
+    const run = async () => {
+      if (running || automaticCleanupSetting(database) !== "on") return;
+      running = true;
+      try {
+        const hosts = await bb.sdk.hosts.list();
+        for (const { id: hostId } of hosts.filter(
+          ({ status }) => status === "connected",
+        )) {
+          const { profiles } = await unusedWorkerProfiles(
+            hostId,
+            AUTOMATIC_CLEANUP_IDLE_MS,
+          );
+          await deleteUnusedWorkerProfiles(
+            hostId,
+            profiles.map(({ profileId }) => profileId),
+            AUTOMATIC_CLEANUP_IDLE_MS,
+            "system",
+          );
+        }
+      } catch (error) {
+        bb.log.warn(
+          `Browser could not clean up unused worker profiles: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      } finally {
+        running = false;
+      }
+    };
+    const first = setTimeout(() => void run(), 60_000);
+    const timer = setInterval(() => void run(), AUTOMATIC_CLEANUP_INTERVAL_MS);
     first.unref?.();
     timer.unref?.();
     bb.onDispose(() => {
@@ -2711,7 +2921,7 @@ export function createBrowserService(
     target: BrowserHostTarget,
     action: string,
     operation: () => Promise<BrowserProfileLifecycleResponse>,
-    attribution?: { actor: "system"; projectId: string },
+    attribution?: { actor: "system"; projectId?: string },
   ) {
     return recordActivity({
       target,
@@ -3090,6 +3300,7 @@ export function createBrowserService(
   subscribeToProjectDeletion();
   subscribeToThreadLifecycle();
   scheduleArchivedThreadProfileRelease();
+  scheduleAutomaticProfileCleanup();
 
   /**
    * Stage an explicitly selected workspace or displaying-client file through
@@ -3475,6 +3686,9 @@ export function createBrowserService(
     downloadExportWorkspace,
     downloadPurge,
     sweepArchivedThreadProfiles,
+    profileCleanupPlan,
+    cleanUpProfiles,
+    setAutomaticProfileCleanup,
   };
 }
 

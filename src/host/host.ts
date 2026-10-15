@@ -2412,6 +2412,30 @@ export function createBrowserHostEntry(
         }
         return expired;
       },
+      profileUsage: async (request, context) => {
+        retainWorker(context);
+        const dataDir = context.experimental_paths.dataDir;
+        const stored =
+          (await profiles(dataDir).profileUsage?.(
+            request.hostId,
+            request.profileIds,
+            { measureSize: request.measureSize },
+          )) ?? [];
+        const browserRuntime = runtime(dataDir);
+        const usage = [];
+        for (const profile of stored) {
+          const lifecycle = await browserRuntime?.status({
+            hostId: request.hostId,
+            profileId: profile.profileId,
+          });
+          usage.push({
+            ...profile,
+            running:
+              lifecycle?.state === "running" || lifecycle?.state === "waking",
+          });
+        }
+        return { profiles: usage };
+      },
       backupProfile: async (request, context) => {
         retainWorker(context);
         const dataDir = context.experimental_paths.dataDir;

@@ -572,6 +572,73 @@ export const browserProfileExpiryResponseSchema = z
   .object({ deletedProfileIds: z.array(browserProfileIdSchema) })
   .strict();
 
+/** Profiles listed per host stay well under this; it only bounds requests. */
+const PROFILE_BATCH_LIMIT = 10_000;
+
+export const browserProfileUsageRequestSchema = browserProfileHostTargetSchema
+  .extend({
+    profileIds: z.array(browserProfileIdSchema).max(PROFILE_BATCH_LIMIT),
+    measureSize: z.boolean(),
+  })
+  .strict();
+
+export const browserProfileUsageSchema = z
+  .object({
+    profileId: browserProfileIdSchema,
+    lastUsedAt: z.string().datetime(),
+    running: z.boolean(),
+    sizeBytes: z.number().int().nonnegative().nullable(),
+  })
+  .strict();
+
+export const browserProfileUsageResponseSchema = z
+  .object({ profiles: z.array(browserProfileUsageSchema) })
+  .strict();
+
+export type BrowserProfileUsage = z.infer<typeof browserProfileUsageSchema>;
+
+/** The unused worker profiles the owner's cleanup would delete now. */
+export const browserProfileCleanupPlanSchema = z
+  .object({
+    hostId: z.string().min(1),
+    idleDays: z.number().positive(),
+    /** Not confirmed until the owner first cleans up or sets it. */
+    automatic: z.enum(["not-confirmed", "on", "off"]),
+    profileIds: z.array(browserProfileIdSchema),
+    sizeBytes: z.number().int().nonnegative(),
+  })
+  .strict();
+
+export const browserProfileCleanupRequestSchema = browserProfileHostTargetSchema
+  .extend({
+    profileIds: z.array(browserProfileIdSchema).max(PROFILE_BATCH_LIMIT),
+    automatic: z.boolean(),
+  })
+  .strict();
+
+export const browserProfileCleanupResultSchema = z
+  .object({
+    deleted: z.number().int().nonnegative(),
+    skipped: z.number().int().nonnegative(),
+    failed: z.number().int().nonnegative(),
+    automatic: z.boolean(),
+  })
+  .strict();
+
+export const browserProfileCleanupAutomaticSchema = z
+  .object({ enabled: z.boolean() })
+  .strict();
+
+export type BrowserProfileCleanupPlan = z.infer<
+  typeof browserProfileCleanupPlanSchema
+>;
+export type BrowserProfileCleanupRequest = z.infer<
+  typeof browserProfileCleanupRequestSchema
+>;
+export type BrowserProfileCleanupResult = z.infer<
+  typeof browserProfileCleanupResultSchema
+>;
+
 const browserProfileContextSchema = z
   .object({
     projectId: z.string().min(1).nullable().optional(),
@@ -3358,6 +3425,18 @@ export const rpcContract = defineRpcContract({
   browser_origin_auto_approval_set: {
     input: browserOriginAutoApprovalUpdateSchema,
     output: browserOriginAutoApprovalSchema,
+  },
+  browser_profile_cleanup_plan: {
+    input: browserProfileHostTargetSchema,
+    output: browserProfileCleanupPlanSchema,
+  },
+  browser_profile_cleanup: {
+    input: browserProfileCleanupRequestSchema,
+    output: browserProfileCleanupResultSchema,
+  },
+  browser_profile_cleanup_automatic_set: {
+    input: browserProfileCleanupAutomaticSchema,
+    output: browserProfileCleanupAutomaticSchema,
   },
   browser_profile_create: {
     input: browserProfileCreateRequestSchema,

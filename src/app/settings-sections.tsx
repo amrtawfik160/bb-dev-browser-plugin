@@ -13,6 +13,7 @@ import {
   type BrowserDownloadListResult,
   type BrowserGrantRequest,
   type BrowserProfile,
+  type BrowserProfileCleanupPlan,
   type BrowserProfileGrant,
   type BrowserProfileInventory,
   type BrowserProfileLifecycleResponse,
@@ -1038,6 +1039,159 @@ function ProfileDangerZone({
   );
 }
 
+function formatGigabytes(bytes: number) {
+  return `${(bytes / 1_000_000_000).toFixed(1)} GB`;
+}
+
+/**
+ * The owner's one-step cleanup of worker profiles, the browsers threads get
+ * on first use. Checking lists what the rule takes; one click deletes them.
+ */
+function UnusedProfileCleanup({
+  hostId,
+  onComplete,
+}: {
+  hostId: string;
+  onComplete: () => void;
+}) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [plan, setPlan] = useState<BrowserProfileCleanupPlan | null>(null);
+  const [automatic, setAutomatic] = useState(true);
+  const [pending, setPending] = useState<string | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const checkbox = "h-4 w-4 rounded-sm border-input accent-primary";
+
+  function run(action: string, operation: () => Promise<void>) {
+    setPending(action);
+    setError(null);
+    void operation()
+      .catch((requestError: unknown) =>
+        setError(administrationErrorMessage(requestError)),
+      )
+      .finally(() => setPending(null));
+  }
+
+  function check() {
+    setMessage(null);
+    run("check", async () => {
+      const next = await rpc.call("browser_profile_cleanup_plan", { hostId });
+      setPlan(next);
+      // On by default; it takes effect once the owner confirms it here.
+      setAutomatic(next.automatic !== "off");
+    });
+  }
+
+  function cleanUp(current: BrowserProfileCleanupPlan) {
+    run("delete", async () => {
+      const result = await rpc.call("browser_profile_cleanup", {
+        hostId,
+        profileIds: current.profileIds,
+        automatic,
+      });
+      setPlan(null);
+      setMessage(
+        `Deleted ${result.deleted} profile(s).` +
+          (result.skipped > 0
+            ? ` Kept ${result.skipped} that were used since the check.`
+            : "") +
+          (result.failed > 0
+            ? ` ${result.failed} could not be deleted; check again to retry.`
+            : "") +
+          ` Automatic cleanup is ${result.automatic ? "on" : "off"}.`,
+      );
+      onComplete();
+    });
+  }
+
+  function saveAutomatic(enabled: boolean) {
+    setAutomatic(enabled);
+    run("automatic", async () => {
+      const result = await rpc.call("browser_profile_cleanup_automatic_set", {
+        enabled,
+      });
+      setPlan((current) =>
+        current === null
+          ? null
+          : { ...current, automatic: result.enabled ? "on" : "off" },
+      );
+    });
+  }
+
+  return (
+    <Card aria-label={`Clean up unused worker profiles on ${hostId}`}>
+      <Subheading>Clean up unused worker profiles</Subheading>
+      <p className="mt-1 text-sm text-muted-foreground">
+        Worker profiles are the browsers threads get automatically. This
+        permanently deletes the ones untouched for more than 1 day that have no
+        signed-in site, are not selected anywhere, and have no running browser.
+        Renamed and saved profiles are always kept.
+      </p>
+      {plan === null ? (
+        <Button
+          className="mt-3"
+          variant="secondary"
+          size="sm"
+          disabled={pending !== null}
+          onClick={check}
+        >
+          {pending === "check" ? "Checking…" : "Check unused worker profiles"}
+        </Button>
+      ) : (
+        <div className="mt-3 space-y-3">
+          <p className="text-sm">
+            {plan.profileIds.length === 0
+              ? "No unused worker profiles right now."
+              : `${plan.profileIds.length} unused worker profile(s), ${formatGigabytes(plan.sizeBytes)} on disk.`}
+          </p>
+          {plan.profileIds.length === 0 &&
+          plan.automatic === "not-confirmed" ? null : (
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                className={checkbox}
+                aria-label="Delete unused worker profiles automatically"
+                checked={automatic}
+                disabled={pending !== null}
+                onChange={(event) =>
+                  plan.profileIds.length === 0
+                    ? saveAutomatic(event.target.checked)
+                    : setAutomatic(event.target.checked)
+                }
+              />
+              From now on, delete worker profiles automatically after 2 days
+              unused
+            </label>
+          )}
+          <div className="flex flex-wrap gap-2">
+            {plan.profileIds.length === 0 ? null : (
+              <Button
+                variant="destructive"
+                size="sm"
+                disabled={pending !== null}
+                onClick={() => cleanUp(plan)}
+              >
+                {pending === "delete"
+                  ? "Deleting…"
+                  : `Delete ${plan.profileIds.length} profile(s)`}
+              </Button>
+            )}
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={pending !== null}
+              onClick={() => setPlan(null)}
+            >
+              Cancel
+            </Button>
+          </div>
+        </div>
+      )}
+      <AdministrationFeedback message={message} error={error} />
+    </Card>
+  );
+}
+
 function ProfileCard({
   profile,
   draft,
@@ -1328,6 +1482,10 @@ function ProfilesBlock({ status }: { status: AttachedStatus }) {
           <p className="font-mono text-xs text-muted-foreground">
             Selected: {inventory.data.selectedProfileId}
           </p>
+          <UnusedProfileCleanup
+            hostId={status.hostId}
+            onComplete={() => void refresh()}
+          />
           {inventory.data.profiles.length === 0 ? (
             <EmptyState title="No named profiles yet.">
               The default profile is used until you create one below.

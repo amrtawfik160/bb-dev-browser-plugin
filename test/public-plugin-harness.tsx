@@ -1010,6 +1010,11 @@ export async function createPublicPluginHarness(options?: {
           { signal },
         );
       }
+      if (method === "profileUsage") {
+        return host.experimental_call(method, input as never, {
+          signal,
+        }) as Promise<unknown>;
+      }
       if (method === "backupProfile") {
         return host.experimental_call(
           "backupProfile",

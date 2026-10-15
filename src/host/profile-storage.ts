@@ -41,7 +41,10 @@ import {
   type BrowserProfileTarget,
   type BrowserSessionSiteUpdate,
 } from "../shared/contracts.js";
-import { scopedProfileId } from "../shared/profile-scope.js";
+import {
+  scopedProfileId,
+  threadProfileDefaultName,
+} from "../shared/profile-scope.js";
 
 const PROFILE_DIRECTORY_MODE = 0o700;
 const PROFILE_MANIFEST_MODE = 0o600;
@@ -128,7 +131,19 @@ export interface BrowserProfileStore {
   ): Promise<BrowserProfileExpiryResponse>;
   /** Finish interrupted lifecycle work; true when any was found. */
   reconcileProfileLifecycle(hostId: string): Promise<boolean>;
+  /** Last use and, when measured, size of the listed profiles still on disk. */
+  profileUsage?(
+    hostId: string,
+    profileIds: readonly string[],
+    options: { measureSize: boolean },
+  ): Promise<StoredProfileUsage[]>;
 }
+
+export type StoredProfileUsage = {
+  profileId: string;
+  lastUsedAt: string;
+  sizeBytes: number | null;
+};
 
 export interface FileBrowserProfileStoreOptions {
   rootDirectory: string;
@@ -811,6 +826,41 @@ async function readManifest(
     ...settings,
   });
   return { manifest: validatedManifest, legacy: migrated.legacy };
+}
+
+async function modifiedAt(path: string): Promise<number | null> {
+  try {
+    return (await lstat(path)).mtimeMs;
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      return null;
+    }
+    throw error;
+  }
+}
+
+/** Disk space a directory tree takes, without following symlinks. */
+async function diskUsage(path: string): Promise<number> {
+  let entries;
+  try {
+    entries = await readdir(path, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+  let total = 0;
+  for (const entry of entries) {
+    const child = join(path, entry.name);
+    if (entry.isDirectory()) {
+      total += await diskUsage(child);
+      continue;
+    }
+    try {
+      total += (await lstat(child)).blocks * 512;
+    } catch {
+      // Removed while measuring.
+    }
+  }
+  return total;
 }
 
 async function profileDirectoryMetadata(path: string) {
@@ -1837,13 +1887,54 @@ export function createFileBrowserProfileStore(
     return createProfile(
       {
         hostId: request.hostId,
-        name: `${request.threadId === undefined ? "Project" : "Thread"} ${profileId.split("-").at(-1)}`,
+        name:
+          request.threadId === undefined
+            ? `Project ${profileId.split("-").at(-1)}`
+            : threadProfileDefaultName(profileId),
       },
       request,
     );
   }
 
+  /**
+   * The browser changes its data folders whenever it runs, so their newest
+   * modification time is the profile's last use. Profiles no longer on disk
+   * are left out.
+   */
+  async function profileUsage(
+    hostId: string,
+    profileIds: readonly string[],
+    { measureSize }: { measureSize: boolean },
+  ): Promise<StoredProfileUsage[]> {
+    const usage: StoredProfileUsage[] = [];
+    for (const profileId of profileIds) {
+      const paths = profilePaths(
+        options.rootDirectory,
+        options.installationId,
+        hostId,
+        profileId,
+      );
+      const times = (
+        await Promise.all(
+          [
+            paths.profileDirectory,
+            paths.browserDataPath,
+            join(paths.browserDataPath, "Default"),
+          ].map(modifiedAt),
+        )
+      ).filter((time) => time !== null);
+      if (times.length === 0) continue;
+      usage.push({
+        profileId,
+        lastUsedAt: new Date(Math.max(...times)).toISOString(),
+        sizeBytes: measureSize ? await diskUsage(paths.profileDirectory) : null,
+      });
+    }
+    return usage;
+  }
+
   return {
+    profileUsage,
     archiveUnsavedProfile,
     recordSessionSite,
     listProfiles,

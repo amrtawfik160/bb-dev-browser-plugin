@@ -12,3 +12,18 @@ export function scopedProfileId(scope: BrowserProfileScope): string {
     .digest("hex");
   return `bb-${scope.threadId === undefined ? "project" : "thread"}-${hash.slice(0, 32)}`;
 }
+
+const THREAD_PROFILE_PREFIX = "bb-thread-";
+
+/** A thread's default profile, created for a worker thread on first use. */
+export function isThreadProfileId(profileId: string): boolean {
+  return profileId.startsWith(THREAD_PROFILE_PREFIX);
+}
+
+/**
+ * The name a thread's default profile is created with. Any other name was
+ * given by the owner.
+ */
+export function threadProfileDefaultName(profileId: string): string {
+  return `Thread ${profileId.slice(THREAD_PROFILE_PREFIX.length)}`;
+}
