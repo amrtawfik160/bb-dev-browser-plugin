@@ -112,7 +112,10 @@ export function createSecretFillSession(options: {
   const pending = new Set<Promise<void>>();
 
   async function resolveValue(binding: SecretRefBinding) {
-    const stored = await readSecretVariable(binding);
+    const stored = await readSecretVariable(
+      binding,
+      options.paths.secretsDirectory,
+    );
     if (stored === undefined) {
       refuse(`the value for secret ref "${binding.ref}" is missing.`);
     }

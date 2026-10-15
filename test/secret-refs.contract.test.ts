@@ -141,7 +141,7 @@ describe("browser secret ref bindings", () => {
   ])(
     "rejects the whole file when a plain ref aliases a seed (%s)",
     async (_label, first, second) => {
-      const entries = {
+      const entries: Record<string, unknown> = {
         "app-totp": {
           file: "app.env",
           var: "OTP_SEED",
@@ -193,15 +193,20 @@ describe("browser secret ref bindings", () => {
       variable: "APP_PASSWORD",
       origins: ["https://app.example"],
     };
-    await expect(readSecretVariable(binding)).resolves.toBe("fixture pass");
+    await expect(readSecretVariable(binding, secretsDirectory)).resolves.toBe(
+      "fixture pass",
+    );
     await expect(
-      readSecretVariable({ ...binding, variable: "ABSENT" }),
+      readSecretVariable({ ...binding, variable: "ABSENT" }, secretsDirectory),
     ).resolves.toBeUndefined();
     await expect(
-      readSecretVariable({
-        ...binding,
-        file: join(secretsDirectory, "no.env"),
-      }),
+      readSecretVariable(
+        {
+          ...binding,
+          file: join(secretsDirectory, "no.env"),
+        },
+        secretsDirectory,
+      ),
     ).resolves.toBeUndefined();
   });
 });
@@ -241,9 +246,9 @@ describe("bound env file checks", () => {
       await writeOutside("app.env"),
       join(secretsDirectory, "app.env"),
     );
-    await expect(readSecretVariable(binding("app.env"))).rejects.toThrow(
-      refused,
-    );
+    await expect(
+      readSecretVariable(binding("app.env"), secretsDirectory),
+    ).rejects.toThrow(refused);
   });
 
   it("refuses a bound file that is a symlink to a file inside the folder", async () => {
@@ -252,17 +257,17 @@ describe("bound env file checks", () => {
       join(secretsDirectory, "real.env"),
       join(secretsDirectory, "app.env"),
     );
-    await expect(readSecretVariable(binding("app.env"))).rejects.toThrow(
-      refused,
-    );
+    await expect(
+      readSecretVariable(binding("app.env"), secretsDirectory),
+    ).rejects.toThrow(refused);
   });
 
   it("refuses a bound file whose folder is a symlink leaving the secrets folder", async () => {
     await writeOutside("app.env");
     await symlink(outsideDirectory, join(secretsDirectory, "linked"));
-    await expect(readSecretVariable(binding("linked/app.env"))).rejects.toThrow(
-      refused,
-    );
+    await expect(
+      readSecretVariable(binding("linked/app.env"), secretsDirectory),
+    ).rejects.toThrow(refused);
   });
 
   it("refuses a bound file with a second hard link", async () => {
@@ -271,16 +276,16 @@ describe("bound env file checks", () => {
       join(secretsDirectory, "app.env"),
       join(secretsDirectory, "alias.env"),
     );
-    await expect(readSecretVariable(binding("app.env"))).rejects.toThrow(
-      refused,
-    );
+    await expect(
+      readSecretVariable(binding("app.env"), secretsDirectory),
+    ).rejects.toThrow(refused);
   });
 
   it("refuses a bound file that group or others can read", async () => {
     await writeEnv("app.env", "PW=inside-fixture\n", 0o644);
-    await expect(readSecretVariable(binding("app.env"))).rejects.toThrow(
-      refused,
-    );
+    await expect(
+      readSecretVariable(binding("app.env"), secretsDirectory),
+    ).rejects.toThrow(refused);
   });
 
   it.runIf(process.getuid?.() === 0)(
@@ -288,18 +293,18 @@ describe("bound env file checks", () => {
     async () => {
       await writeEnv("app.env", "PW=inside-fixture\n");
       await chown(join(secretsDirectory, "app.env"), 65534, 65534);
-      await expect(readSecretVariable(binding("app.env"))).rejects.toThrow(
-        refused,
-      );
+      await expect(
+        readSecretVariable(binding("app.env"), secretsDirectory),
+      ).rejects.toThrow(refused);
     },
   );
 
   it("reads a regular file in a real subfolder", async () => {
     await mkdir(join(secretsDirectory, "sub"));
     await writeEnv("sub/app.env", "PW=inside-fixture\n");
-    await expect(readSecretVariable(binding("sub/app.env"))).resolves.toBe(
-      "inside-fixture",
-    );
+    await expect(
+      readSecretVariable(binding("sub/app.env"), secretsDirectory),
+    ).resolves.toBe("inside-fixture");
   });
 });
 

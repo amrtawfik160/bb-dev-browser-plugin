@@ -1,6 +1,6 @@
 import { createHmac } from "node:crypto";
 import { constants } from "node:fs";
-import { open, readFile } from "node:fs/promises";
+import { open, readlink, realpath } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { z } from "zod";
 
@@ -42,10 +42,16 @@ export type SecretRefBinding =
 export const SECRET_REF_NAME = /^[A-Za-z0-9._-]{1,100}$/u;
 const SEED_VARIABLE = /TOTP_SECRET/u;
 
-const exactHttpsOrigin = z.string().refine((value) => {
+// Plain http only for a local dev server; any process on that port gets it.
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
+
+const exactOrigin = z.string().refine((value) => {
   try {
     const url = new URL(value);
-    return url.protocol === "https:" && url.origin === value;
+    const allowed =
+      url.protocol === "https:" ||
+      (url.protocol === "http:" && LOOPBACK_HOSTS.has(url.hostname));
+    return allowed && url.origin === value;
   } catch {
     return false;
   }
@@ -70,7 +76,7 @@ const bindingFileSchema = z
         .object({
           file: z.string().min(1),
           var: z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/u),
-          origins: z.array(exactHttpsOrigin).min(1),
+          origins: z.array(exactOrigin).min(1),
           totp: totpSchema.optional(),
         })
         .strict(),
@@ -96,6 +102,9 @@ function parseBindings(
   const parsed = bindingFileSchema.safeParse(raw);
   if (!parsed.success) throw new Error(INVALID_FILE);
   const bindings = new Map<string, SecretRefBinding>();
+  // Seed-ness belongs to the variable, not the ref: every ref to a
+  // (file, variable) pair must agree on whether it is a seed.
+  const seedByVariable = new Map<string, boolean>();
   for (const [ref, entry] of Object.entries(parsed.data.refs)) {
     const source = {
       ref,
@@ -103,6 +112,12 @@ function parseBindings(
       variable: entry.var,
       origins: entry.origins,
     };
+    const variableKey = `${source.file}\0${source.variable}`;
+    const isSeed = entry.totp !== undefined;
+    if ((seedByVariable.get(variableKey) ?? isSeed) !== isSeed) {
+      throw new Error(INVALID_FILE);
+    }
+    seedByVariable.set(variableKey, isSeed);
     if (entry.totp === undefined) {
       // An authenticator seed must never be typed as itself.
       if (SEED_VARIABLE.test(entry.var)) throw new Error(INVALID_FILE);
@@ -176,16 +191,67 @@ function unquote(value: string) {
   return trimmed;
 }
 
+/** Where an open descriptor really points, without trusting the path. */
+async function descriptorPath(fd: number, path: string) {
+  try {
+    return await readlink(`/proc/self/fd/${fd}`);
+  } catch {
+    return realpath(path);
+  }
+}
+
+/**
+ * The bound env file's contents, or undefined when it does not exist. The file
+ * must be reached without any symlink, stay inside the secrets folder, have a
+ * single name (so a seed cannot be aliased), and be owner-only mode 0600.
+ */
+async function readEnvFile(
+  binding: SecretRefBinding,
+  secretsDirectory: string,
+): Promise<string | undefined> {
+  const refused = new Error(
+    `the env file for secret ref "${binding.ref}" must be a regular file inside the secrets folder, reached without symlinks, owned by the host user with mode 0600.`,
+  );
+  let handle;
+  try {
+    handle = await open(
+      binding.file,
+      constants.O_RDONLY | constants.O_NOFOLLOW,
+    );
+  } catch (error) {
+    if (isMissing(error)) return undefined;
+    throw refused;
+  }
+  try {
+    const stats = await handle.stat();
+    const expected = join(
+      await realpath(secretsDirectory),
+      relative(resolve(secretsDirectory), binding.file),
+    );
+    if (
+      !stats.isFile() ||
+      stats.nlink !== 1 ||
+      stats.uid !== process.getuid?.() ||
+      (stats.mode & 0o077) !== 0 ||
+      (await descriptorPath(handle.fd, binding.file)) !== expected
+    ) {
+      throw refused;
+    }
+    return await handle.readFile("utf8");
+  } catch {
+    throw refused;
+  } finally {
+    await handle.close();
+  }
+}
+
 /** One variable from the bound env file, or undefined when either is absent. */
 export async function readSecretVariable(
   binding: SecretRefBinding,
+  secretsDirectory: string,
 ): Promise<string | undefined> {
-  let source: string;
-  try {
-    source = await readFile(binding.file, "utf8");
-  } catch {
-    return undefined;
-  }
+  const source = await readEnvFile(binding, secretsDirectory);
+  if (source === undefined) return undefined;
   for (const line of source.split(/\r?\n/u)) {
     const match = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$/u.exec(
       line,
