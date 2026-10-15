@@ -117,8 +117,12 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await sandboxBrowser?.close();
-  chrome?.kill("SIGKILL");
-  await rm(secretsDirectory, { recursive: true, force: true });
+  if (chrome !== undefined && chrome.exitCode === null) {
+    const exited = new Promise((resolve) => chrome.once("exit", resolve));
+    chrome.kill("SIGKILL");
+    await exited;
+  }
+  await rm(secretsDirectory, { recursive: true, force: true, maxRetries: 5 });
 });
 
 /**
