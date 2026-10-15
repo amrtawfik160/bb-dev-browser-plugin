@@ -6,7 +6,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { chromium, type Browser, type Page } from "playwright";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { prepareAgentExecution } from "../src/browser/agent-script.js";
+import {
+  secretFillHelpers,
+  wrapAgentScriptResult,
+} from "../src/browser/agent-script.js";
 import { createSecretFillSession } from "../src/browser/secret-fill.js";
 
 // Fixture values only. No real secret file is ever read by this suite.
@@ -138,32 +141,24 @@ async function runScript(code: string) {
     now: () => 59_000,
   });
   const lines: string[] = [];
-  const browserApi = Object.freeze({
-    getPage: async () => page,
-    newPage: async () => page,
-    listPages: async () => [{ id: "main", url: page.url() }],
-    closePage: async () => undefined,
-  });
-  const prepared = prepareAgentExecution({
-    code,
-    tabId: "main",
-    timeoutMs: 15_000,
-    secretFillMarker: marker,
-  });
+  // The tab-binding preamble hardens Playwright prototypes. In production it
+  // runs in the helper's own process; here it would share this process's
+  // Playwright with the host side, so bind `page` directly instead.
+  const prepared = `${secretFillHelpers(marker)}${wrapAgentScriptResult(code)}`;
   const run = new Function(
-    "browser",
+    "page",
     "console",
     "readFile",
     `return (async () => {\n${prepared}\n})();`,
   ) as (
-    browser: unknown,
+    page: Page,
     console: { log: (value: unknown) => void },
     readFile: (name: string) => Promise<string>,
   ) => Promise<void>;
   let error: Error | undefined;
   try {
     await run(
-      browserApi,
+      page,
       {
         log: (value) => {
           const line = String(value);
@@ -244,7 +239,9 @@ await fillSecret("#password", "app-password");`);
 await page.goto("https://allowed.test/redirect");
 await page.waitForURL("https://other.test/login");
 await fillSecret("#password", "app-password");`);
-    expect(result.error?.message).toMatch(/may not be filled on https:\/\/other\.test/u);
+    expect(result.error?.message).toMatch(
+      /may not be filled on https:\/\/other\.test/u,
+    );
     expect(await page.inputValue("#password")).toBe("");
     expectNoSecret(result.error?.message);
   }, 30_000);
@@ -253,7 +250,9 @@ await fillSecret("#password", "app-password");`);
     const result = await runScript(`
 await page.goto("https://allowed.test/login");
 await fillSecret("#password", "app-missing");`);
-    expect(result.error?.message).toMatch(/value for secret ref "app-missing" is missing/u);
+    expect(result.error?.message).toMatch(
+      /value for secret ref "app-missing" is missing/u,
+    );
     expect(result.error?.message).not.toContain("APP_NOT_SET");
   }, 30_000);
 
@@ -261,7 +260,9 @@ await fillSecret("#password", "app-missing");`);
     const result = await runScript(`
 await page.goto("https://allowed.test/login");
 await fillSecret("#box", "app-password");`);
-    expect(result.error?.message).toMatch(/element for secret ref "app-password" is not an input/u);
+    expect(result.error?.message).toMatch(
+      /element for secret ref "app-password" is not an input/u,
+    );
     expectNoSecret(result.error?.message);
   }, 30_000);
 
@@ -280,7 +281,9 @@ return await page.inputValue("#otp");`);
     const result = await runScript(`
 await page.goto("https://allowed.test/login");
 await fillSecret("#otp", "app-totp");`);
-    expect(result.error?.message).toMatch(/secret ref "app-totp" holds an authenticator seed/u);
+    expect(result.error?.message).toMatch(
+      /secret ref "app-totp" holds an authenticator seed/u,
+    );
     expect(await page.inputValue("#otp")).toBe("");
     expectNoSecret(result.error?.message);
   }, 30_000);
@@ -289,7 +292,9 @@ await fillSecret("#otp", "app-totp");`);
     const result = await runScript(`
 await page.goto("https://allowed.test/login");
 await fillTotp("#otp", "app-password");`);
-    expect(result.error?.message).toMatch(/secret ref "app-password" is not an authenticator seed/u);
+    expect(result.error?.message).toMatch(
+      /secret ref "app-password" is not an authenticator seed/u,
+    );
     expect(await page.inputValue("#otp")).toBe("");
   }, 30_000);
 });

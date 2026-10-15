@@ -3,6 +3,7 @@ import {
   BROWSER_SCRIPT_MIN_TIMEOUT_MS,
 } from "../shared/contracts.js";
 import { newTabId } from "./browser-tabs.js";
+import { SECRET_FILL_ATTRIBUTE } from "./secret-fill.js";
 
 /**
  * Convenience wrapping for agent Playwright scripts.
@@ -543,6 +544,52 @@ if (__bbResult !== undefined) {
 }`;
 }
 
+/**
+ * `fillSecret(selector, ref)` and `fillTotp(selector, ref)` for agent code.
+ * The helper tags the element on the bound `page` with a fresh nonce, prints
+ * one request line carrying the run's private marker, and waits for the
+ * host's answer file. The value is typed by the host and never returned here.
+ * The marker stays out of the page; only the nonce reaches the DOM.
+ */
+export function secretFillHelpers(marker: string): string {
+  return `const __bbSecretFill = (() => {
+  let __bbCount = 0;
+  const __bbRequest = async (kind, selector, ref) => {
+    const helper = kind === "totp" ? "fillTotp" : "fillSecret";
+    if (typeof selector !== "string" || typeof ref !== "string") {
+      throw new Error(helper + "(selector, ref) takes a selector string and a secret ref name.");
+    }
+    __bbCount += 1;
+    const id = __bbCount + "-" + Math.random().toString(36).slice(2, 12);
+    await page.locator(selector).evaluate(
+      (element, args) => element.setAttribute(args[0], args[1]),
+      [${JSON.stringify(SECRET_FILL_ATTRIBUTE)}, id],
+    );
+    console.log(JSON.stringify({ __bbSecretFill: ${JSON.stringify(marker)}, kind, id, ref }));
+    const answerName = "bb-secret-fill-" + id + ".json";
+    for (;;) {
+      let answer;
+      try {
+        answer = await readFile(answerName);
+      } catch {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        continue;
+      }
+      const outcome = JSON.parse(answer);
+      if (outcome.ok !== true) throw new Error(String(outcome.error));
+      return;
+    }
+  };
+  return Object.freeze({
+    secret: (selector, ref) => __bbRequest("secret", selector, ref),
+    totp: (selector, ref) => __bbRequest("totp", selector, ref),
+  });
+})();
+const fillSecret = __bbSecretFill.secret;
+const fillTotp = __bbSecretFill.totp;
+`;
+}
+
 export function prepareAgentExecution(input: {
   code: string;
   tabId?: string;
@@ -552,17 +599,22 @@ export function prepareAgentExecution(input: {
   enforceNonWebNavigation?: boolean;
   activeTabMarker?: string;
   screenshot?: { fileName: string; marker: string };
+  secretFillMarker?: string;
 }): string {
   const operationTimeoutMs = boundedOperationTimeoutMs(
     input.timeoutMs ?? BROWSER_SCRIPT_MAX_TIMEOUT_MS,
   );
-  const pagePreamble = agentPagePreamble(
-    input.tabId,
-    input.preferredOrigin,
-    input.enforceNonWebNavigation ?? false,
-    operationTimeoutMs,
-    input.threadPageName,
-  );
+  const pagePreamble =
+    agentPagePreamble(
+      input.tabId,
+      input.preferredOrigin,
+      input.enforceNonWebNavigation ?? false,
+      operationTimeoutMs,
+      input.threadPageName,
+    ) +
+    (input.secretFillMarker === undefined
+      ? ""
+      : secretFillHelpers(input.secretFillMarker));
   const wrappedUser = wrapAgentScriptResult(
     input.code,
     input.activeTabMarker,

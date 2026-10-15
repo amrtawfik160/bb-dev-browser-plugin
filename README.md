@@ -180,6 +180,11 @@ bb plugin run browser script --purpose "Read the page title" \
   --code "return await page.title()"
 ```
 
+Scripts can type a stored test credential with `fillSecret(selector, ref)` or
+an authenticator code with `fillTotp(selector, ref)`. The host resolves the
+ref, checks the page origin, and types the value; the script never receives
+it. See [secret-refs.md](docs/browser/secret-refs.md).
+
 `origin_denied` means the owner revoked this project's access (a Grant Request
 is attached) or the navigation is non-web (no request). There is no
 `document` global.
@@ -280,6 +285,10 @@ Safe Login Mode gives agents no pixels and no DOM.
 
 Activity Records keep metadata only.
 
+Secret Refs let a script fill a stored credential only on the exact origins its
+owner listed. The value is redacted from the run's output and errors, but a
+script can still read the filled input; the origin binding is the real limit.
+
 No analytics, telemetry, or browser data leave the host. BB Connect is the
 only remote authenticated path.
 
@@ -295,6 +304,7 @@ Threat model: [`docs/browser/security.md`](docs/browser/security.md).
 | [agent-reference.md](docs/browser/agent-reference.md)         | `browser_script`, CLI, typed results |
 | [cli-reference.md](docs/browser/cli-reference.md)             | Complete plugin CLI flags            |
 | [safe-login.md](docs/browser/safe-login.md)                   | Owner-only Safe Login Mode           |
+| [secret-refs.md](docs/browser/secret-refs.md)                 | Filling stored test credentials      |
 | [architecture.md](docs/browser/architecture.md)               | Runtime and ADR index                |
 | [permissions.md](docs/browser/permissions.md)                 | Host, OS-user, and data permissions  |
 | [troubleshooting.md](docs/browser/troubleshooting.md)         | Diagnosing states                    |

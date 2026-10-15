@@ -101,7 +101,11 @@ describe("browser secret ref bindings", () => {
     ],
     [
       "an authenticator seed bound as a plain value",
-      { file: "app.env", var: "APP_TOTP_SECRET", origins: ["https://a.example"] },
+      {
+        file: "app.env",
+        var: "APP_TOTP_SECRET",
+        origins: ["https://a.example"],
+      },
     ],
   ])("rejects the whole file for %s", async (_label, entry) => {
     await writeBindings({ refs: { bad: entry } });
@@ -130,7 +134,10 @@ describe("browser secret ref bindings", () => {
       readSecretVariable({ ...binding, variable: "ABSENT" }),
     ).resolves.toBeUndefined();
     await expect(
-      readSecretVariable({ ...binding, file: join(secretsDirectory, "no.env") }),
+      readSecretVariable({
+        ...binding,
+        file: join(secretsDirectory, "no.env"),
+      }),
     ).resolves.toBeUndefined();
   });
 });
@@ -145,7 +152,11 @@ describe("authenticator codes", () => {
     [2_000_000_000_000, "69279037"],
   ])("matches the RFC 6238 SHA-1 vector at %d ms", (nowMs, code) => {
     expect(
-      totpCode(rfcSeed, { algorithm: "SHA1", digits: 8, periodSeconds: 30 }, nowMs),
+      totpCode(
+        rfcSeed,
+        { algorithm: "SHA1", digits: 8, periodSeconds: 30 },
+        nowMs,
+      ),
     ).toBe(code);
   });
 

@@ -1,5 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { constants, readFileSync } from "node:fs";
 import {
   access,
@@ -8,15 +8,18 @@ import {
   chown,
   cp,
   mkdir,
+  lstat,
   open,
   readFile,
   readdir,
+  rename,
   stat,
   symlink,
   unlink,
 } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import { createConnection } from "node:net";
+import { StringDecoder } from "node:string_decoder";
 import { join, dirname } from "node:path";
 import type {
   BrowserExecutionRequest,
@@ -32,6 +35,7 @@ import {
 } from "./browser-runtime.js";
 import {
   BrowserOriginScopeDeniedError,
+  connectOriginScopeBrowser,
   installHostOriginScopeGuard,
   preferOriginScopeDenial,
   type HostOriginScopeGuard,
@@ -47,6 +51,15 @@ import {
   patchSandboxClientBinary,
   patchSandboxClientFile,
 } from "./sandbox-client-patch.js";
+import {
+  createSecretFillSession,
+  type SecretFillSession,
+} from "./secret-fill.js";
+import {
+  BROWSER_SECRET_REFS_PATH,
+  BROWSER_SECRETS_DIRECTORY,
+  type SecretRefPaths,
+} from "./secret-refs.js";
 
 const DEVTOOLS_PORT_FILE = "DevToolsActivePort";
 const MAX_BROWSER_RESULT_BYTES = BROWSER_SCRIPT_RESULT_LIMIT_BYTES;
@@ -77,6 +90,7 @@ type BrowserProcessBoundaryOptions = {
   playwrightSearchRoots?: readonly string[];
   passwdPath?: string;
   setprivExecutable?: string;
+  secretRefs?: SecretRefPaths;
 };
 
 function originScopePlaywrightOptions(
@@ -1683,6 +1697,7 @@ async function readScreenshotResult(
 }
 
 type CollectHelperResultInput = {
+  secretFill: SecretFillSession | null;
   child: ChildProcessWithoutNullStreams;
   request: BrowserExecutionRequest;
   signal: AbortSignal;
@@ -1692,7 +1707,8 @@ type CollectHelperResultInput = {
 
 async function collectHelperResult(input: CollectHelperResultInput) {
   try {
-    const output = await collectOutput(input.child, input.signal);
+    const rawOutput = await collectOutput(input.child, input.signal);
+    const output = input.secretFill?.finishOutput(rawOutput) ?? rawOutput;
     const denial = preferOriginScopeDenial(input.guard, null);
     if (denial !== null) throw denial;
     if (input.request.screenshot === undefined) return output;
@@ -1771,6 +1787,114 @@ function preserveExecutionFailure(
   );
 }
 
+/**
+ * Feed each complete stdout line to `onLine` while the script runs. The
+ * collector keeps its own copy of the raw bytes.
+ */
+function tapStdoutLines(
+  child: ChildProcessWithoutNullStreams,
+  onLine: (line: string) => void,
+) {
+  const decoder = new StringDecoder("utf8");
+  let buffered = "";
+  child.stdout.on("data", (chunk: Buffer) => {
+    buffered += decoder.write(chunk);
+    let newline = buffered.indexOf("\n");
+    while (newline >= 0) {
+      onLine(buffered.slice(0, newline));
+      buffered = buffered.slice(newline + 1);
+      newline = buffered.indexOf("\n");
+    }
+  });
+}
+
+/**
+ * Answer a secret fill through the helper's temp folder, where the script's
+ * `readFile` looks. The folder belongs to the browser user, so refuse links
+ * and write a fresh file that is renamed into place.
+ */
+async function writeSecretFillAnswer(
+  helperRuntime: Awaited<ReturnType<typeof prepareHelperRuntime>>,
+  fileName: string,
+  contents: string,
+) {
+  const daemonDirectory = join(helperRuntime.helperHome, ".dev-browser");
+  const directory = join(daemonDirectory, "tmp");
+  const { userId, groupId } = helperRuntime.identity;
+  try {
+    await mkdir(directory, { mode: 0o700 });
+    await chown(directory, userId, groupId);
+  } catch (error) {
+    if (!(
+      error instanceof Error &&
+      "code" in error &&
+      error.code === "EEXIST"
+    )) {
+      throw error;
+    }
+  }
+  for (const path of [daemonDirectory, directory]) {
+    const entry = await lstat(path);
+    if (!entry.isDirectory() || entry.uid !== userId) {
+      throw new Error("The browser helper temp folder is not safe to write.");
+    }
+  }
+  const temporary = join(directory, `.${randomUUID()}.tmp`);
+  const handle = await open(
+    temporary,
+    constants.O_WRONLY |
+      constants.O_CREAT |
+      constants.O_EXCL |
+      constants.O_NOFOLLOW,
+    0o600,
+  );
+  try {
+    await handle.writeFile(contents);
+    await handle.chown(userId, groupId);
+  } finally {
+    await handle.close();
+  }
+  const destination = join(directory, fileName);
+  await rename(temporary, destination);
+  return destination;
+}
+
+function startSecretFillSession(
+  context: ProductionProcessContext,
+  request: BrowserExecutionRequest,
+  helperRuntime: Awaited<ReturnType<typeof prepareHelperRuntime>>,
+  child: ChildProcessWithoutNullStreams,
+) {
+  if (request.secretFillMarker === undefined) return null;
+  const answers: string[] = [];
+  const session = createSecretFillSession({
+    marker: request.secretFillMarker,
+    paths: context.options.secretRefs ?? {
+      bindingPath: BROWSER_SECRET_REFS_PATH,
+      secretsDirectory: BROWSER_SECRETS_DIRECTORY,
+    },
+    connect: () =>
+      connectOriginScopeBrowser(
+        request.endpoint,
+        request.timeoutMs,
+        originScopePlaywrightOptions(context.options),
+      ),
+    answer: async (fileName, contents) => {
+      answers.push(
+        await writeSecretFillAnswer(helperRuntime, fileName, contents),
+      );
+    },
+  });
+  tapStdoutLines(child, (line) => session.handleLine(line));
+  return {
+    ...session,
+    async dispose() {
+      await session.dispose();
+      await Promise.allSettled(answers.map((path) => unlink(path)));
+    },
+  };
+}
+
 async function executeBrowserHelper(
   context: ProductionProcessContext,
   request: BrowserExecutionRequest,
@@ -1785,6 +1909,12 @@ async function executeBrowserHelper(
     context,
     request,
     helperRuntime,
+  );
+  const secretFill = startSecretFillSession(
+    context,
+    request,
+    helperRuntime,
+    devBrowserProcess,
   );
   const executionSignal = timedExecutionSignal(
     request.timeoutMs,
@@ -1805,25 +1935,33 @@ async function executeBrowserHelper(
     return await collectHelperResult({
       child: devBrowserProcess,
       request,
+      secretFill,
       signal: executionSignal.signal,
       guard: originGuard,
       ...(screenshotPath === undefined ? {} : { screenshotPath }),
     });
   } catch (error) {
-    executionError = error;
-    throw error;
+    executionError = secretFill?.redactError(error) ?? error;
+    throw executionError;
   } finally {
     const aborted = executionSignal.signal.aborted;
     executionSignal.dispose();
-    await cleanupBrowserHelper(
-      devBrowserProcess,
-      aborted,
-      originGuard,
-      screenshotPath,
-    ).catch((error: unknown) => {
-      if (executionError === undefined) throw error;
-      throw preserveExecutionFailure(executionError, error);
-    });
+    try {
+      await cleanupBrowserHelper(
+        devBrowserProcess,
+        aborted,
+        originGuard,
+        screenshotPath,
+      ).catch((error: unknown) => {
+        const failure =
+          executionError === undefined
+            ? error
+            : preserveExecutionFailure(executionError, error);
+        throw secretFill?.redactError(failure) ?? failure;
+      });
+    } finally {
+      await secretFill?.dispose();
+    }
   }
 }
 
