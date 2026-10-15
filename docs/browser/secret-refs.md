@@ -4,8 +4,10 @@
 > the field and send the value anywhere. The `origins` list controls only
 > where the plugin types it. See [Limits](#limits).
 
-Agent scripts can type a stored test credential into a page without the value
-ever entering the script. Two helpers exist inside `browser_script` /
+Agent scripts can type a stored test credential into a page; the helper
+returns no value, but the script can still read the filled field. Write each
+origin in its canonical form (lowercase scheme and host, explicit port when not
+the default, no trailing slash). Two helpers exist inside `browser_script` /
 `bb plugin run browser script`:
 
 ```js

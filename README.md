@@ -182,8 +182,9 @@ bb plugin run browser script --purpose "Read the page title" \
 
 Scripts can type a stored test credential with `fillSecret(selector, ref)` or
 an authenticator code with `fillTotp(selector, ref)`. The host resolves the
-ref, checks the page origin, and types the value; the script never receives
-it. See [secret-refs.md](docs/browser/secret-refs.md).
+ref, checks the page origin, and types the value; the helper returns no value.
+The script can still read the filled field, so bind only test-account
+credentials. See [secret-refs.md](docs/browser/secret-refs.md).
 
 `origin_denied` means the owner revoked this project's access (a Grant Request
 is attached) or the navigation is non-web (no request). There is no
