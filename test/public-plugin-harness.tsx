@@ -21,6 +21,10 @@ import {
   type RenderedSlot,
 } from "@get-bb/plugin-sdk/testing/app";
 import { experimental_createHostEntryHarness } from "@get-bb/plugin-sdk/testing/host";
+import type {
+  BrowserProfileCleanupPlan,
+  BrowserProfileCleanupResult,
+} from "../src/shared/contracts.js";
 import {
   browserActivityRecordsSchema,
   browserActivityAcknowledgementRequestSchema,
@@ -159,6 +163,8 @@ const KNOWN_HARNESS_THREAD_IDS = new Set([
   THREAD_ID,
   FOREIGN_THREAD_ID,
   "thread-second",
+  "thread-signed-in",
+  "thread-selected",
 ]);
 const KNOWN_HARNESS_PROJECT_IDS = new Set([
   PROJECT_ID,
@@ -1481,6 +1487,25 @@ export async function createPublicPluginHarness(options?: {
       ) as Promise<
         ReturnType<typeof browserProfileLifecycleResponseSchema.parse>
       >,
+    browser_profile_cleanup_plan: (input: { hostId: string }) =>
+      backend.harness.behavior.callRpc(
+        "browser_profile_cleanup_plan",
+        input,
+      ) as Promise<BrowserProfileCleanupPlan>,
+    browser_profile_cleanup: (input: {
+      hostId: string;
+      profileIds: string[];
+      automatic: boolean;
+    }) =>
+      backend.harness.behavior.callRpc(
+        "browser_profile_cleanup",
+        input,
+      ) as Promise<BrowserProfileCleanupResult>,
+    browser_profile_cleanup_automatic_set: (input: { enabled: boolean }) =>
+      backend.harness.behavior.callRpc(
+        "browser_profile_cleanup_automatic_set",
+        input,
+      ) as Promise<{ enabled: boolean }>,
     browser_profile_backup: (input: {
       hostId: string;
       profileId: string;
@@ -1959,6 +1984,21 @@ export async function createPublicPluginHarness(options?: {
     confirmation: string;
   }) {
     return rpc.browser_profile_delete(input);
+  }
+
+  function browserProfileCleanupPlan(hostId = configuredHostId) {
+    return rpc.browser_profile_cleanup_plan({ hostId });
+  }
+
+  function cleanUpBrowserProfiles(input: {
+    profileIds: string[];
+    automatic: boolean;
+  }) {
+    return rpc.browser_profile_cleanup({ hostId: configuredHostId, ...input });
+  }
+
+  function setAutomaticProfileCleanup(enabled: boolean) {
+    return rpc.browser_profile_cleanup_automatic_set({ enabled });
   }
 
   function backupBrowserProfile(input: {
@@ -2562,6 +2602,9 @@ export async function createPublicPluginHarness(options?: {
     restoreArchivedBrowserProfile,
     resetBrowserProfile,
     deleteBrowserProfile,
+    browserProfileCleanupPlan,
+    cleanUpBrowserProfiles,
+    setAutomaticProfileCleanup,
     backupBrowserProfile,
     restoreBrowserProfile,
     importBrowserProfile,

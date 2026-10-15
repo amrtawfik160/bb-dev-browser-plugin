@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createPublicPluginHarness,
   createTabInventoryRuntime,
@@ -62,6 +62,7 @@ async function threadHarness(
   }
   return {
     browser,
+    runtime,
     stopped,
     executed,
     useBrowser,
@@ -238,6 +239,114 @@ describe("thread lifecycle releases thread browsers", () => {
       expect(JSON.stringify(warnings)).not.toContain(threadProfileId);
       browser.setHostConnection("connected");
       expect(await profileState(threadProfileId)).toBe("active");
+    } finally {
+      await browser.dispose();
+    }
+  });
+});
+
+describe("owner cleanup of unused worker profiles", () => {
+  const day = 24 * 60 * 60 * 1_000;
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  async function cleanupHarness() {
+    const harness = await threadHarness();
+    const running = new Set<string>();
+    harness.runtime.status = async (target) => ({
+      state: running.has(target.profileId) ? "running" : "sleeping",
+      hostId: target.hostId,
+      profileId: target.profileId,
+    });
+    return { ...harness, running };
+  }
+
+  it("shows and deletes only idle, unsigned, unselected, stopped worker profiles", async () => {
+    const { browser, useBrowser, profileState, running } =
+      await cleanupHarness();
+    try {
+      await useBrowser();
+      await useBrowser("thread-second");
+      await useBrowser("thread-signed-in");
+      await useBrowser("thread-selected");
+      const signedInId = scopedProfileId({
+        projectId: PROJECT_ID,
+        threadId: "thread-signed-in",
+      });
+      const selectedId = scopedProfileId({
+        projectId: PROJECT_ID,
+        threadId: "thread-selected",
+      });
+      const sessions = await browser.runBrowserSessions(
+        { action: "report", origin: "https://mail.example.com", status: "signed-in" },
+        { threadId: "thread-signed-in" },
+      );
+      expect(sessions.isError).not.toBe(true);
+      await browser.selectBrowserProfile(
+        { hostId: HOST_ID, profileId: selectedId },
+        { projectId: "project-a" },
+      );
+      running.add(secondThreadProfileId);
+
+      expect(await browser.browserProfileCleanupPlan()).toMatchObject({
+        automatic: false,
+        profileIds: [],
+      });
+
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(Date.now() + 3 * day);
+
+      const plan = await browser.browserProfileCleanupPlan();
+      expect(plan.profileIds).toEqual([threadProfileId]);
+      expect(plan.sizeBytes).toBeGreaterThan(0);
+
+      const result = await browser.cleanUpBrowserProfiles({
+        profileIds: plan.profileIds,
+        automatic: true,
+      });
+      expect(result).toMatchObject({ deleted: 1, automatic: true });
+      expect(await profileState(threadProfileId)).toBeUndefined();
+      for (const kept of [secondThreadProfileId, signedInId, selectedId]) {
+        expect(await profileState(kept)).toBe("active");
+      }
+      expect(await browser.browserProfileCleanupPlan()).toMatchObject({
+        automatic: true,
+      });
+      expect(await browser.setAutomaticProfileCleanup(false)).toEqual({
+        enabled: false,
+      });
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("skips a listed profile that was used after the owner saw the list", async () => {
+    const { browser, useBrowser, profileState } = await cleanupHarness();
+    try {
+      await useBrowser();
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(Date.now() + 3 * day);
+      const plan = await browser.browserProfileCleanupPlan();
+      expect(plan.profileIds).toEqual([threadProfileId]);
+      vi.useRealTimers();
+      const result = await browser.cleanUpBrowserProfiles({
+        profileIds: plan.profileIds,
+        automatic: false,
+      });
+      expect(result).toMatchObject({ deleted: 0, automatic: false });
+      expect(await profileState(threadProfileId)).toBe("active");
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("keeps agents from running the cleanup", async () => {
+    const { browser } = await cleanupHarness();
+    try {
+      const commands = browser.registeredBrowserCliCommands();
+      expect(JSON.stringify(commands)).not.toContain("cleanup");
     } finally {
       await browser.dispose();
     }
