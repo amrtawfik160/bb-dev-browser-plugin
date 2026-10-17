@@ -36,7 +36,8 @@ function expiredLifecycleProfileIds(events: readonly BrowserActivityEvent[]) {
         .filter(
           (event) =>
             event.kind === "lifecycle" &&
-            event.action === "archive-expired" &&
+            (event.action === "archive-expired" ||
+              event.action === "storage-limit") &&
             event.outcome === "deleted",
         )
         .map(({ profileId }) => profileId),

@@ -1,6 +1,7 @@
 import { mkdtemp, readdir, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 import {
   AUTOMATIC_CLEANUP_IDLE_MS,
@@ -12,7 +13,18 @@ import {
   createFileBrowserProfileStore,
   profileStoragePaths,
 } from "../src/host/profile-storage.js";
-import type { BrowserProfile } from "../src/shared/contracts.js";
+import {
+  DEFAULT_PROFILE_STORAGE_LIMIT_BYTES,
+  type BrowserProfile,
+} from "../src/shared/contracts.js";
+import {
+  automaticCleanupSetting,
+  BROWSER_PROFILE_CLEANUP_MIGRATION,
+  BROWSER_PROFILE_STORAGE_LIMIT_MIGRATION,
+  profileStorageLimitBytes,
+  setAutomaticCleanup,
+  setProfileStorageLimitBytes,
+} from "../src/server/profile-cleanup.js";
 import { scopedProfileId } from "../src/shared/profile-scope.js";
 
 const DAY = 24 * 60 * 60 * 1_000;
@@ -205,5 +217,33 @@ describe("host profile usage", () => {
     await utimes(cookies, now, now);
     const [written] = await store.profileUsage("host-a", [profile.profileId]);
     expect(Date.parse(written!.lastUsedAt)).toBe(now.getTime());
+  });
+});
+
+describe("owner storage settings", () => {
+  function settingsDatabase() {
+    const database = new Database(":memory:");
+    database.exec(BROWSER_PROFILE_CLEANUP_MIGRATION);
+    database.exec(BROWSER_PROFILE_STORAGE_LIMIT_MIGRATION);
+    return database;
+  }
+
+  it("turns automatic cleanup on until the owner turns it off", () => {
+    const database = settingsDatabase();
+    expect(automaticCleanupSetting(database)).toBe("on");
+    setAutomaticCleanup(database, false);
+    expect(automaticCleanupSetting(database)).toBe("off");
+    setAutomaticCleanup(database, true);
+    expect(automaticCleanupSetting(database)).toBe("on");
+  });
+
+  it("limits all profiles to 10 GB until the owner changes it", () => {
+    const database = settingsDatabase();
+    expect(DEFAULT_PROFILE_STORAGE_LIMIT_BYTES).toBe(10_000_000_000);
+    expect(profileStorageLimitBytes(database)).toBe(
+      DEFAULT_PROFILE_STORAGE_LIMIT_BYTES,
+    );
+    setProfileStorageLimitBytes(database, 4_000_000_000);
+    expect(profileStorageLimitBytes(database)).toBe(4_000_000_000);
   });
 });

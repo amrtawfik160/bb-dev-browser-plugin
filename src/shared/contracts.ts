@@ -15,6 +15,11 @@ export const CLEAR_ACTIVITY_CONFIRMATION = "Clear Browser activity records";
 export const RESET_PROFILE_CONFIRMATION =
   "Lose saved sessions and reset this Browser Profile";
 export const PROFILE_ARCHIVE_RETENTION_DAYS = 30;
+const GIGABYTE = 1_000_000_000;
+/** One storage limit covers every Browser Profile on a host (ADR 0024). */
+export const DEFAULT_PROFILE_STORAGE_LIMIT_BYTES = 10 * GIGABYTE;
+export const MIN_PROFILE_STORAGE_LIMIT_BYTES = 1 * GIGABYTE;
+export const MAX_PROFILE_STORAGE_LIMIT_BYTES = 10_000 * GIGABYTE;
 export const ACTIVITY_RECORD_LIMIT = 10_000;
 export const ACTIVITY_RETENTION_DAYS = 30;
 export const ACTIVITY_OUTBOX_BATCH_LIMIT = 100;
@@ -586,6 +591,39 @@ export const browserProfileExpiryResponseSchema = z
   .object({ deletedProfileIds: z.array(browserProfileIdSchema) })
   .strict();
 
+const browserProfileStorageLimitBytesSchema = z
+  .number()
+  .int()
+  .min(MIN_PROFILE_STORAGE_LIMIT_BYTES)
+  .max(MAX_PROFILE_STORAGE_LIMIT_BYTES);
+
+export const browserProfileStorageLimitSchema = z
+  .object({ limitBytes: browserProfileStorageLimitBytesSchema })
+  .strict();
+
+export const browserProfileStorageMaintenanceRequestSchema =
+  browserProfileHostTargetSchema
+    .extend({ limitBytes: browserProfileStorageLimitBytesSchema })
+    .strict();
+
+/** What one scheduled storage pass on a host removed. */
+export const browserProfileStorageMaintenanceResponseSchema = z
+  .object({
+    expiredProfileIds: z.array(browserProfileIdSchema),
+    /** Profiles whose Rebuildable Data was removed to meet the limit. */
+    rebuildableDataProfileIds: z.array(browserProfileIdSchema),
+    /** Archived Profiles permanently deleted to meet the limit. */
+    deletedProfileIds: z.array(browserProfileIdSchema),
+    removedRunDirectories: z.number().int().nonnegative(),
+    usedBytes: z.number().int().nonnegative(),
+    limitBytes: browserProfileStorageLimitBytesSchema,
+  })
+  .strict();
+
+export type BrowserProfileStorageMaintenanceResponse = z.infer<
+  typeof browserProfileStorageMaintenanceResponseSchema
+>;
+
 /** Profiles listed per host stay well under this; it only bounds requests. */
 const PROFILE_BATCH_LIMIT = 10_000;
 
@@ -615,8 +653,8 @@ export const browserProfileCleanupPlanSchema = z
   .object({
     hostId: z.string().min(1),
     idleDays: z.number().positive(),
-    /** Not confirmed until the owner first cleans up or sets it. */
-    automatic: z.enum(["not-confirmed", "on", "off"]),
+    /** On unless the owner turned it off. */
+    automatic: z.enum(["on", "off"]),
     profileIds: z.array(browserProfileIdSchema),
     sizeBytes: z.number().int().nonnegative(),
   })
@@ -651,7 +689,7 @@ export const browserProfileCleanupJobSchema = z
 export const browserProfileCleanupStatusSchema = z
   .object({
     job: browserProfileCleanupJobSchema.nullable(),
-    automatic: z.enum(["not-confirmed", "on", "off"]),
+    automatic: z.enum(["on", "off"]),
   })
   .strict();
 
@@ -3474,6 +3512,14 @@ export const rpcContract = defineRpcContract({
   browser_profile_cleanup_automatic_set: {
     input: browserProfileCleanupAutomaticSchema,
     output: browserProfileCleanupAutomaticSchema,
+  },
+  browser_profile_storage_limit: {
+    input: z.object({}).strict(),
+    output: browserProfileStorageLimitSchema,
+  },
+  browser_profile_storage_limit_set: {
+    input: browserProfileStorageLimitSchema,
+    output: browserProfileStorageLimitSchema,
   },
   browser_profile_create: {
     input: browserProfileCreateRequestSchema,

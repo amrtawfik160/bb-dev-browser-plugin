@@ -644,6 +644,45 @@ async function recordExpiredProfiles(
 }
 
 /**
+ * System Activity Records for meeting the host storage limit (ADR 0024):
+ * which profiles lost Rebuildable Data and which Archived Profiles were
+ * permanently deleted.
+ */
+async function recordStorageLimitCleanup(
+  outbox: ActivityOutbox,
+  hostId: string,
+  result: { rebuildableDataProfileIds: string[]; deletedProfileIds: string[] },
+) {
+  const records = [
+    ...result.rebuildableDataProfileIds.map((profileId) => ({
+      profileId,
+      outcome: "rebuildable-data-removed",
+    })),
+    ...result.deletedProfileIds.map((profileId) => ({
+      profileId,
+      outcome: "deleted",
+    })),
+  ];
+  for (const { profileId, outcome } of records) {
+    await outbox.enqueue({
+      eventId: `host-lifecycle-${randomUUID()}`,
+      actor: "system",
+      projectId: null,
+      hostId,
+      profileId,
+      destinationOrigin: null,
+      occurredAt: new Date().toISOString(),
+      kind: "lifecycle",
+      action: "storage-limit",
+      outcome,
+      interrupted: false,
+      interruptionReason: null,
+      durationMs: null,
+    });
+  }
+}
+
+/**
  * Activity Record for a Host Download export (issue #20). Metadata-only: it
  * captures the actor, authorization context, host/profile, destination, and
  * outcome, never file contents, full URLs, page data, or clipboard data. The
@@ -2422,6 +2461,47 @@ export function createBrowserHostEntry(
             .catch(() => undefined);
         }
         return expired;
+      },
+      maintainProfileStorage: async (request, context) => {
+        retainWorker(context);
+        const dataDir = context.experimental_paths.dataDir;
+        const store = profiles(dataDir);
+        const expired = await store.expireArchivedProfiles(request.hostId);
+        await recordExpiredProfiles(
+          outbox(dataDir),
+          request.hostId,
+          expired.deletedProfileIds,
+        );
+        const removedRunDirectories =
+          (await store.removeStaleLaunchFolders?.()) ?? 0;
+        const limit = (await store.enforceStorageLimit?.(
+          request.hostId,
+          request.limitBytes,
+          (profileId) =>
+            profileRunning(dataDir, { hostId: request.hostId, profileId }),
+        )) ?? {
+          usedBytes: 0,
+          rebuildableDataProfileIds: [],
+          deletedProfileIds: [],
+        };
+        await recordStorageLimitCleanup(outbox(dataDir), request.hostId, limit);
+        // Permanently deleted profiles lose their downloads too (issue #20).
+        for (const profileId of [
+          ...expired.deletedProfileIds,
+          ...limit.deletedProfileIds,
+        ]) {
+          await hostDownloads(dataDir)
+            ?.purge({ hostId: request.hostId, profileId })
+            .catch(() => undefined);
+        }
+        return {
+          expiredProfileIds: expired.deletedProfileIds,
+          rebuildableDataProfileIds: limit.rebuildableDataProfileIds,
+          deletedProfileIds: limit.deletedProfileIds,
+          removedRunDirectories,
+          usedBytes: limit.usedBytes,
+          limitBytes: request.limitBytes,
+        };
       },
       profileUsage: async (request, context) => {
         retainWorker(context);

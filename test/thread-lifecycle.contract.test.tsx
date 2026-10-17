@@ -1,4 +1,7 @@
 // @vitest-environment jsdom
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fireEvent } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -8,6 +11,10 @@ import {
 } from "./public-plugin-harness.js";
 import { DEFAULT_PROFILE_ID } from "../src/shared/contracts.js";
 import { scopedProfileId } from "../src/shared/profile-scope.js";
+import {
+  createFileBrowserProfileStore,
+  profileStoragePaths,
+} from "../src/host/profile-storage.js";
 
 const HOST_ID = "host-browser-test";
 const PROJECT_ID = "project-browser-test";
@@ -294,8 +301,9 @@ describe("owner cleanup of unused worker profiles", () => {
       );
       running.add(secondThreadProfileId);
 
+      // On unless the owner turns it off.
       expect(await browser.browserProfileCleanupPlan()).toMatchObject({
-        automatic: "not-confirmed",
+        automatic: "on",
         profileIds: [],
       });
 
@@ -382,6 +390,202 @@ describe("owner cleanup of unused worker profiles", () => {
     try {
       const commands = browser.registeredBrowserCliCommands();
       expect(JSON.stringify(commands)).not.toContain("cleanup");
+    } finally {
+      await browser.dispose();
+    }
+  });
+});
+
+describe("scheduled profile storage maintenance", () => {
+  const day = 24 * 60 * 60 * 1_000;
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("releases a backlog of long-archived threads without the owner-run sweep", async () => {
+    vi.useFakeTimers({
+      toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"],
+    });
+    const { browser, useBrowser, profileState } = await threadHarness(false, [
+      {
+        id: THREAD_ID,
+        projectId: PROJECT_ID,
+        archivedAt: Date.now() - 60 * day,
+      },
+      {
+        id: "thread-second",
+        projectId: PROJECT_ID,
+        archivedAt: Date.now() - 1 * day,
+      },
+    ]);
+    try {
+      await useBrowser();
+      await useBrowser("thread-second");
+
+      await vi.advanceTimersByTimeAsync(60_000);
+      await vi.waitFor(async () =>
+        expect(await profileState(threadProfileId)).toBe("archived"),
+      );
+      expect(await profileState(secondThreadProfileId)).toBe("active");
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("expires archives and enforces the storage limit on the schedule", async () => {
+    vi.useFakeTimers({
+      toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"],
+    });
+    const { browser } = await threadHarness();
+    try {
+      await vi.advanceTimersByTimeAsync(60_000);
+      await vi.waitFor(() =>
+        expect(browser.hostRpcCalls).toContain("maintainProfileStorage"),
+      );
+      const calls = browser.hostRpcCalls.filter(
+        (method) => method === "maintainProfileStorage",
+      ).length;
+      await vi.advanceTimersByTimeAsync(6 * 60 * 60 * 1_000);
+      await vi.waitFor(() =>
+        expect(
+          browser.hostRpcCalls.filter(
+            (method) => method === "maintainProfileStorage",
+          ).length,
+        ).toBeGreaterThan(calls),
+      );
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("records the system cleanup that meets the limit", async () => {
+    vi.useFakeTimers({
+      toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"],
+    });
+    const rootDirectory = await mkdtemp(join(tmpdir(), "bb-browser-limit-"));
+    const fileStore = createFileBrowserProfileStore({
+      rootDirectory,
+      installationId: "installation-public-test",
+      lifecycle: { stopProfile: async () => undefined },
+    });
+    // Profiles here are tiny; a limit nothing can meet exercises both steps.
+    const profileStore = {
+      ...fileStore,
+      enforceStorageLimit: (
+        hostId: string,
+        _limitBytes: number,
+        running?: (profileId: string) => Promise<boolean>,
+      ) => fileStore.enforceStorageLimit(hostId, 1, running),
+    };
+    await profileStore.initialize(HOST_ID);
+    const runtime = createTabInventoryRuntime();
+    runtime.status = async (target) => ({
+      state: "sleeping",
+      hostId: target.hostId,
+      profileId: target.profileId,
+    });
+    const browser = await createPublicPluginHarness({
+      status: healthyBrowserStatus,
+      browserRuntime: runtime,
+      profileStore,
+    });
+    try {
+      const archived = await browser.createBrowserProfile({
+        hostId: HOST_ID,
+        name: "Old archive",
+      });
+      const active = await browser.createBrowserProfile({
+        hostId: HOST_ID,
+        name: "Active",
+      });
+      const paths = (profileId: string) =>
+        profileStoragePaths({
+          rootDirectory,
+          installationId: "installation-public-test",
+          hostId: HOST_ID,
+          profileId,
+        });
+      await mkdir(join(paths(active.profileId).browserDataPath, "Default"), {
+        recursive: true,
+      });
+      await writeFile(
+        join(paths(active.profileId).browserDataPath, "Default", "Cookies"),
+        "signed-in",
+      );
+      await mkdir(join(paths(active.profileId).browserDataPath, "ShaderCache"));
+      await profileStore.archiveProfile({
+        hostId: HOST_ID,
+        profileId: archived.profileId,
+      });
+
+      await vi.advanceTimersByTimeAsync(60_000);
+      await vi.waitFor(async () => {
+        const inventory = await browser.runBrowserProfiles(HOST_ID);
+        expect(
+          inventory.profiles.map(({ profileId }) => profileId),
+        ).not.toContain(archived.profileId);
+      });
+      await vi.waitFor(async () =>
+        expect(
+          (await browser.runBrowserActivityRecords(archived.profileId)).map(
+            ({ action, outcome, actor }) => [action, outcome, actor],
+          ),
+        ).toContainEqual(["storage-limit", "deleted", "system"]),
+      );
+      expect(
+        (await browser.runBrowserActivityRecords(active.profileId)).map(
+          ({ action, outcome }) => [action, outcome],
+        ),
+      ).toContainEqual(["storage-limit", "rebuildable-data-removed"]);
+      await expect(
+        readFile(
+          join(paths(active.profileId).browserDataPath, "Default", "Cookies"),
+          "utf8",
+        ),
+      ).resolves.toBe("signed-in");
+    } finally {
+      await browser.dispose();
+      await rm(rootDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps one owner storage limit, 10 GB unless changed", async () => {
+    const { browser } = await threadHarness();
+    try {
+      expect(await browser.rpc.browser_profile_storage_limit()).toEqual({
+        limitBytes: 10_000_000_000,
+      });
+      expect(
+        await browser.rpc.browser_profile_storage_limit_set({
+          limitBytes: 25_000_000_000,
+        }),
+      ).toEqual({ limitBytes: 25_000_000_000 });
+      expect(await browser.rpc.browser_profile_storage_limit()).toEqual({
+        limitBytes: 25_000_000_000,
+      });
+      await expect(
+        browser.rpc.browser_profile_storage_limit_set({ limitBytes: 1 }),
+      ).rejects.toThrow();
+    } finally {
+      await browser.dispose();
+    }
+  });
+
+  it("lets the owner change the limit in Settings", async () => {
+    const { browser } = await threadHarness();
+    try {
+      const settings = browser.renderSettings();
+      const input = (await settings.findByRole("textbox", {
+        name: "Profile storage limit in GB",
+      })) as HTMLInputElement;
+      await vi.waitFor(() => expect(input.value).toBe("10"));
+      fireEvent.change(input, { target: { value: "20" } });
+      fireEvent.click(settings.getByRole("button", { name: "Save limit" }));
+      await settings.findByText("Storage limit is 20.0 GB.");
+      expect(await browser.rpc.browser_profile_storage_limit()).toEqual({
+        limitBytes: 20_000_000_000,
+      });
     } finally {
       await browser.dispose();
     }

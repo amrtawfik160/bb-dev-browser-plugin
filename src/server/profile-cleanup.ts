@@ -1,8 +1,9 @@
 import type Database from "better-sqlite3";
+import { DEFAULT_PROFILE_STORAGE_LIMIT_BYTES } from "../shared/contracts.js";
 
 /**
  * The owner's automatic cleanup setting. No row means the owner has not
- * confirmed it yet, which reads as off.
+ * chosen, which reads as on; only an explicit off turns it off.
  */
 export const BROWSER_PROFILE_CLEANUP_MIGRATION = `
 CREATE TABLE browser_profile_cleanup (
@@ -12,7 +13,19 @@ CREATE TABLE browser_profile_cleanup (
 );
 `;
 
-export type AutomaticCleanupSetting = "not-confirmed" | "on" | "off";
+/**
+ * The owner's storage limit for all profiles on a host. No row means the
+ * default, {@link DEFAULT_PROFILE_STORAGE_LIMIT_BYTES}.
+ */
+export const BROWSER_PROFILE_STORAGE_LIMIT_MIGRATION = `
+CREATE TABLE browser_profile_storage_limit (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  limit_bytes INTEGER NOT NULL CHECK (limit_bytes > 0),
+  updated_at TEXT NOT NULL
+);
+`;
+
+export type AutomaticCleanupSetting = "on" | "off";
 
 export function automaticCleanupSetting(
   database: Database.Database,
@@ -20,8 +33,7 @@ export function automaticCleanupSetting(
   const row = database
     .prepare("SELECT automatic FROM browser_profile_cleanup WHERE id = 1")
     .get() as { automatic: number } | undefined;
-  if (row === undefined) return "not-confirmed";
-  return row.automatic === 1 ? "on" : "off";
+  return row?.automatic === 0 ? "off" : "on";
 }
 
 export function setAutomaticCleanup(
@@ -37,4 +49,28 @@ export function setAutomaticCleanup(
     )
     .run(enabled ? 1 : 0, new Date().toISOString());
   return enabled;
+}
+
+export function profileStorageLimitBytes(database: Database.Database) {
+  const row = database
+    .prepare(
+      "SELECT limit_bytes FROM browser_profile_storage_limit WHERE id = 1",
+    )
+    .get() as { limit_bytes: number } | undefined;
+  return row?.limit_bytes ?? DEFAULT_PROFILE_STORAGE_LIMIT_BYTES;
+}
+
+export function setProfileStorageLimitBytes(
+  database: Database.Database,
+  limitBytes: number,
+) {
+  database
+    .prepare(
+      `INSERT INTO browser_profile_storage_limit (id, limit_bytes, updated_at)
+       VALUES (1, ?, ?)
+       ON CONFLICT (id) DO UPDATE SET limit_bytes = excluded.limit_bytes,
+                                      updated_at = excluded.updated_at`,
+    )
+    .run(limitBytes, new Date().toISOString());
+  return limitBytes;
 }

@@ -10,6 +10,8 @@ import { useRpc } from "@get-bb/plugin-sdk/app";
 import {
   CLEAR_ACTIVITY_CONFIRMATION,
   DEFAULT_PROFILE_ID,
+  MAX_PROFILE_STORAGE_LIMIT_BYTES,
+  MIN_PROFILE_STORAGE_LIMIT_BYTES,
   PERSIST_BROWSER_ELEVATED_ACCESS_CONFIRMATION,
   RESET_PROFILE_CONFIRMATION,
   STOP_BROWSER_CONFIRMATION,
@@ -1047,8 +1049,10 @@ function ProfileDangerZone({
   );
 }
 
+const GIGABYTE_BYTES = 1_000_000_000;
+
 function formatGigabytes(bytes: number) {
-  return `${(bytes / 1_000_000_000).toFixed(1)} GB`;
+  return `${(bytes / GIGABYTE_BYTES).toFixed(1)} GB`;
 }
 
 function cleanupJobMessage(
@@ -1069,6 +1073,94 @@ function cleanupJobMessage(
       : "") +
     (job.error === null ? "" : ` Stopped early: ${job.error}`) +
     ` Automatic cleanup is ${automatic === "on" ? "on" : "off"}.`
+  );
+}
+
+/**
+ * The one storage limit for all profiles on a host (ADR 0024). Over it,
+ * scheduled cleanup removes Rebuildable Data, then old Archived Profiles.
+ */
+function ProfileStorageLimit() {
+  const rpc = useRpc<typeof rpcContract>();
+  const load = useCallback(
+    () => rpc.call("browser_profile_storage_limit", {}),
+    [rpc],
+  );
+  const limit = useResource(load);
+  const [draft, setDraft] = useState<string | null>(null);
+  const [pending, setPending] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const current =
+    limit.data === null ? "" : String(limit.data.limitBytes / GIGABYTE_BYTES);
+  const value = draft ?? current;
+
+  function save() {
+    const gigabytes = Number(value);
+    const minimum = MIN_PROFILE_STORAGE_LIMIT_BYTES / GIGABYTE_BYTES;
+    const maximum = MAX_PROFILE_STORAGE_LIMIT_BYTES / GIGABYTE_BYTES;
+    setMessage(null);
+    setError(null);
+    if (
+      !Number.isInteger(gigabytes) ||
+      gigabytes < minimum ||
+      gigabytes > maximum
+    ) {
+      setError(`Enter a whole number of GB from ${minimum} to ${maximum}.`);
+      return;
+    }
+    setPending(true);
+    void rpc
+      .call("browser_profile_storage_limit_set", {
+        limitBytes: gigabytes * GIGABYTE_BYTES,
+      })
+      .then((response) => {
+        limit.setData(response);
+        setDraft(null);
+        setMessage(`Storage limit is ${formatGigabytes(response.limitBytes)}.`);
+      })
+      .catch((requestError: unknown) =>
+        setError(administrationErrorMessage(requestError)),
+      )
+      .finally(() => setPending(false));
+  }
+
+  return (
+    <Card aria-label="Profile storage limit">
+      <Subheading>Storage limit</Subheading>
+      <p className="mt-1 text-sm text-muted-foreground">
+        All profiles on this host share one limit. Over it, cleanup first
+        removes caches and downloaded browser components from the least recently
+        used profiles, then permanently deletes the oldest archived profiles.
+        Saved and signed-in profiles keep their sign-ins and are never deleted
+        to meet the limit.
+      </p>
+      {limit.error !== null ? (
+        <ErrorState message={limit.error} onRetry={() => void limit.reload()} />
+      ) : (
+        <div className="mt-3 flex flex-wrap items-end gap-2">
+          <Field label="Limit in GB">
+            <input
+              aria-label="Profile storage limit in GB"
+              className={inputClassName}
+              inputMode="numeric"
+              value={value}
+              disabled={limit.data === null || pending}
+              onChange={(event) => setDraft(event.target.value)}
+            />
+          </Field>
+          <Button
+            variant="secondary"
+            size="sm"
+            disabled={limit.data === null || pending || value === current}
+            onClick={save}
+          >
+            {pending ? "Saving…" : "Save limit"}
+          </Button>
+        </div>
+      )}
+      <AdministrationFeedback message={message} error={error} />
+    </Card>
   );
 }
 
@@ -1136,8 +1228,8 @@ function UnusedProfileCleanup({
     run("check", async () => {
       const next = await rpc.call("browser_profile_cleanup_plan", { hostId });
       setPlan(next);
-      // On by default; it takes effect once the owner confirms it here.
-      setAutomatic(next.automatic !== "off");
+      // On unless the owner turned it off.
+      setAutomatic(next.automatic === "on");
     });
   }
 
@@ -1194,25 +1286,22 @@ function UnusedProfileCleanup({
               ? "No unused worker profiles right now."
               : `${plan.profileIds.length} unused worker profile(s), ${formatGigabytes(plan.sizeBytes)} on disk.`}
           </p>
-          {plan.profileIds.length === 0 &&
-          plan.automatic === "not-confirmed" ? null : (
-            <label className="flex items-center gap-2 text-sm">
-              <input
-                type="checkbox"
-                className={checkbox}
-                aria-label="Delete unused worker profiles automatically"
-                checked={automatic}
-                disabled={busy}
-                onChange={(event) =>
-                  plan.profileIds.length === 0
-                    ? saveAutomatic(event.target.checked)
-                    : setAutomatic(event.target.checked)
-                }
-              />
-              From now on, delete worker profiles automatically after 2 days
-              unused
-            </label>
-          )}
+          <label className="flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              className={checkbox}
+              aria-label="Delete unused worker profiles automatically"
+              checked={automatic}
+              disabled={busy}
+              onChange={(event) =>
+                plan.profileIds.length === 0
+                  ? saveAutomatic(event.target.checked)
+                  : setAutomatic(event.target.checked)
+              }
+            />
+            From now on, delete worker profiles automatically after 2 days
+            unused
+          </label>
           <div className="flex flex-wrap gap-2">
             {plan.profileIds.length === 0 ? null : (
               <Button
@@ -1539,6 +1628,7 @@ function ProfilesBlock({ status }: { status: AttachedStatus }) {
           <p className="font-mono text-xs text-muted-foreground">
             Selected: {inventory.data.selectedProfileId}
           </p>
+          <ProfileStorageLimit />
           <UnusedProfileCleanup
             hostId={status.hostId}
             onComplete={() => void refresh()}

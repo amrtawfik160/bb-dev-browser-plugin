@@ -21,7 +21,10 @@ import {
   BROWSER_ORIGIN_AUTO_APPROVAL_MIGRATION,
 } from "../access/authorization.js";
 import { GRANT_REQUEST_MIGRATION } from "../access/grant-requests.js";
-import { BROWSER_PROFILE_CLEANUP_MIGRATION } from "../server/profile-cleanup.js";
+import {
+  BROWSER_PROFILE_CLEANUP_MIGRATION,
+  BROWSER_PROFILE_STORAGE_LIMIT_MIGRATION,
+} from "../server/profile-cleanup.js";
 
 export { browserActivityEventFromOutboxItem as activityEventFromOutboxItem } from "../shared/contracts.js";
 
@@ -128,6 +131,7 @@ export const BROWSER_DATABASE_MIGRATIONS = [
   BROWSER_DEFAULT_ACCESS_MIGRATION,
   BROWSER_ORIGIN_AUTO_APPROVAL_MIGRATION,
   BROWSER_PROFILE_CLEANUP_MIGRATION,
+  BROWSER_PROFILE_STORAGE_LIMIT_MIGRATION,
 ] as const;
 
 const skippedCompatibilityMigration = "SELECT 1";
