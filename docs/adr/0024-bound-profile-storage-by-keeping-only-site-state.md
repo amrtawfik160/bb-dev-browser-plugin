@@ -6,4 +6,6 @@ Profile storage is now bounded by treating that recreatable part as Rebuildable 
 
 All profiles on a host share one storage limit, 10 GB by default and changeable in Browser Settings. Over the limit, cleanup first removes Rebuildable Data from the least recently used profiles, then permanently deletes Archived Profiles, oldest first; it never deletes a saved or signed-in profile to meet the limit. Expiry runs on a schedule instead of only when profiles are listed, profiles of threads archived before ADR 0018 are swept automatically once, and automatic cleanup of unused worker profiles is on unless the owner turns it off.
 
+Turning component downloads off also stops certificate revocation lists, the certificate transparency list, lookalike-site warnings, the subresource filter, and Widevine. Keeping them updating measured 67 MB more per fresh profile on Chrome 154, mostly a text-to-speech engine and the component download cache that no switch removes, so we accepted that loss and kept only Safe Browsing.
+
 We rejected sharing one copy of Chrome's components across profiles, because Chrome has no supported way to do it, and a per-profile limit, because the cost comes from hundreds of ordinary profiles rather than a few large ones.
