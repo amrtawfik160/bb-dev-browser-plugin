@@ -412,12 +412,36 @@ function PanelStreamSurface({
     }
 
     let newestFrame = 0;
-    function drawFrame(frame: { mimeType: string; data: string }) {
+    /**
+     * Tell the host this connection is done with a frame, drawn or skipped,
+     * so it sends the next one. It sends no more than two ahead of these.
+     */
+    function acknowledgeFrame(frameSocket: WebSocket, sequence: number) {
+      if (disposed || frameSocket.readyState !== WebSocket.OPEN) return;
+      const encoded = encodePanelProtocolMessage({
+        protocolVersion: PANEL_PROTOCOL_VERSION,
+        type: "ack",
+        sequence,
+      });
+      if (encoded.outcome === "encoded") frameSocket.send(encoded.raw);
+    }
+
+    function drawFrame(
+      frameSocket: WebSocket,
+      frame: { sequence: number; mimeType: string; data: string },
+    ) {
       const canvas = canvasRef.current;
-      if (canvas === null) return;
+      if (canvas === null) {
+        acknowledgeFrame(frameSocket, frame.sequence);
+        return;
+      }
       const image = new Image();
       const order = ++newestFrame;
+      image.addEventListener("error", () =>
+        acknowledgeFrame(frameSocket, frame.sequence),
+      );
       image.addEventListener("load", () => {
+        acknowledgeFrame(frameSocket, frame.sequence);
         if (disposed || order !== newestFrame) return;
         // Keep the encoded frame's pixels. Drawing into the logical viewport
         // first discarded the extra density before CSS displayed the canvas.
@@ -499,7 +523,8 @@ function PanelStreamSurface({
           return;
         }
         if (message.type === "frame") {
-          drawFrame({
+          drawFrame(nextSocket, {
+            sequence: message.sequence,
             mimeType: message.mimeType,
             data: message.data,
           });

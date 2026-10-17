@@ -70,6 +70,11 @@ export const PANEL_MAX_VIEWPORT_WIDTH = 1920;
 export const PANEL_MAX_VIEWPORT_HEIGHT = 1080;
 export const PANEL_MIN_FRAMES_PER_SECOND = 5;
 export const PANEL_MAX_FRAMES_PER_SECOND = 15;
+/**
+ * Frames the host sends to one panel before it acknowledges displaying them.
+ * A slow link then lowers the frame rate instead of building a backlog.
+ */
+export const PANEL_MAX_UNACKNOWLEDGED_FRAMES = 2;
 export const PANEL_GATEWAY_BIND_HOST = "127.0.0.1";
 export const PANEL_PROTOCOL_VERSION = 1 as const;
 export const PANEL_GATEWAY_MESSAGE_MAX_BYTES = 2 * 1024 * 1024;

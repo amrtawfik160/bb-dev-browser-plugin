@@ -360,7 +360,7 @@ describe("issue #24 AC5 current-host performance thresholds", () => {
         cleanupNeeded = true;
         await cleanupFixtureProfiles(context);
 
-        // The "panel-transport" worker reports the real CDP stream's congestion
+        // The "panel-transport" worker reports the real CDP stream's target
         // FPS and the loopback gateway bind host. This test asserts the stream
         // policy bounds are in force — the reclaim window and reconnect backoff
         // that back the input-to-frame latency policy — plus the interaction

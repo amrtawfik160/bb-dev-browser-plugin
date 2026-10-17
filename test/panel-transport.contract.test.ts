@@ -412,6 +412,88 @@ describe("Panel transport server contract", () => {
     }
   });
 
+  it("sends a frame only while two await acknowledgement and sends the newest when room frees", async () => {
+    const clock = { now: () => 1_000_000 };
+    const capabilities = createPanelCapabilityStore({ clock });
+    const gateway = createPanelGateway({
+      capabilities,
+      hostId,
+      profileId,
+      clock,
+    });
+    const stream = createAutomationStreamAdapter({ clock, capabilities });
+    let emit: ((frame: ScreencastFrame) => void) | undefined;
+    const source: ScreencastSource = {
+      start(onFrame, signal) {
+        emit = onFrame;
+        return new Promise<void>((resolve) =>
+          signal.addEventListener("abort", () => resolve(), { once: true }),
+        );
+      },
+      input() {},
+      async stop() {},
+    };
+    const frame = (sequence: number): ScreencastFrame => ({
+      sequence,
+      mimeType: "image/jpeg",
+      data: Buffer.from(`frame-${sequence}`),
+    });
+    const transport = createPanelTransportServer({
+      gateway,
+      stream,
+      source,
+      clock,
+    });
+    const port = await transport.start();
+    try {
+      const socket = await connect(port);
+      const sequences: number[] = [];
+      socket.on("message", (raw) => {
+        const message = decode<{ type: string; sequence?: number }>(
+          raw.toString(),
+        );
+        if (message.type === "frame") sequences.push(message.sequence ?? -1);
+      });
+      const inbox = collectMessages(socket);
+      send(
+        socket,
+        redeemMessage(
+          capabilities.issue({ ownerSessionId, panelId, hostId, profileId }),
+        ),
+      );
+      await inbox.waitFor(
+        (raw) => decode<{ type: string }>(raw).type === "ready",
+      );
+      await waitFor(() => emit !== undefined);
+      for (let sequence = 1; sequence <= 10; sequence += 1)
+        emit?.(frame(sequence));
+      await waitFor(() => sequences.length === 2);
+      await waitForSettled(() => sequences.length === 2);
+      expect(sequences).toEqual([1, 2]);
+
+      // Acknowledging the first frame frees room for the newest frame, not
+      // for the backlog behind it.
+      send(socket, { type: "ack", sequence: 1 });
+      await waitFor(() => sequences.length === 3);
+      expect(sequences).toEqual([1, 2, 10]);
+
+      // A cumulative acknowledgement covers 2 and 10, releasing the frame
+      // held meanwhile; with room left, the next frame goes out at once.
+      emit?.(frame(11));
+      await waitForSettled(() => sequences.length === 3);
+      send(socket, { type: "ack", sequence: 10 });
+      await waitFor(() => sequences.length === 4);
+      emit?.(frame(12));
+      await waitFor(() => sequences.length === 5);
+      await waitForSettled(() => sequences.length === 5);
+      expect(sequences).toEqual([1, 2, 10, 11, 12]);
+      expect(socket.readyState).toBe(WebSocket.OPEN);
+      socket.close();
+    } finally {
+      await transport.stop();
+    }
+  });
+
   it("rejects input after the connection generation is superseded", async () => {
     const clock = { now: () => 1_000_000 };
     const capabilities = createPanelCapabilityStore({ clock });

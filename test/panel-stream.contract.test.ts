@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   PANEL_MAX_FRAMES_PER_SECOND,
+  PANEL_MAX_UNACKNOWLEDGED_FRAMES,
   PANEL_MAX_VIEWPORT_HEIGHT,
   PANEL_MAX_VIEWPORT_WIDTH,
   PANEL_MIN_FRAMES_PER_SECOND,
@@ -9,9 +10,9 @@ import {
   PANEL_RECONNECT_MAX_BACKOFF_MS,
 } from "../src/shared/contracts.js";
 import {
-  adaptFrameRate,
   clampViewport,
   createAutomationStreamAdapter,
+  createFrameWindow,
   frameIntervalMs,
   reconnectBackoffMs,
 } from "../src/panel/panel-stream.js";
@@ -45,18 +46,53 @@ describe("Automation Mode stream policy contract", () => {
     });
   });
 
-  it("adapts between 5 and 15 frames per second under congestion", () => {
-    expect(adaptFrameRate(15, 0)).toBe(PANEL_MAX_FRAMES_PER_SECOND);
-    expect(adaptFrameRate(15, 1)).toBe(10);
-    expect(adaptFrameRate(15, 3)).toBe(PANEL_MIN_FRAMES_PER_SECOND);
-    // Congestion never lowers below the floor and headroom never exceeds the ceiling.
-    expect(adaptFrameRate(2, 5)).toBe(PANEL_MIN_FRAMES_PER_SECOND);
-    expect(adaptFrameRate(30, 0)).toBe(PANEL_MAX_FRAMES_PER_SECOND);
+  it("starts at the frame-rate ceiling within the 5 to 15 FPS window", () => {
     const adapter = createAutomationStreamAdapter();
-    expect(adapter.applyCongestion(2)).toBe(PANEL_MIN_FRAMES_PER_SECOND);
-    expect(adapter.fps).toBe(PANEL_MIN_FRAMES_PER_SECOND);
+    expect(adapter.fps).toBe(PANEL_MAX_FRAMES_PER_SECOND);
+    expect(adapter.minFps).toBe(PANEL_MIN_FRAMES_PER_SECOND);
     expect(frameIntervalMs(PANEL_MIN_FRAMES_PER_SECOND)).toBe(200);
     expect(frameIntervalMs(PANEL_MAX_FRAMES_PER_SECOND)).toBe(67);
+  });
+
+  it("sends frames only while no more than two await acknowledgement", () => {
+    expect(PANEL_MAX_UNACKNOWLEDGED_FRAMES).toBe(2);
+    const window = createFrameWindow<{ sequence: number }>();
+    expect(window.canSend()).toBe(true);
+    window.markSent(1);
+    window.markSent(2);
+    expect(window.canSend()).toBe(false);
+    expect(window.unacknowledged).toBe(2);
+    // Frames offered while the window is full are not queued: the newest
+    // replaces the one held before it.
+    window.hold({ sequence: 3 });
+    window.hold({ sequence: 4 });
+    expect(window.acknowledge(1)).toEqual({ sequence: 4 });
+    // The held frame is handed out once.
+    expect(window.acknowledge(1)).toBeUndefined();
+  });
+
+  it("treats an acknowledgement as covering every earlier frame", () => {
+    const window = createFrameWindow<{ sequence: number }>();
+    window.markSent(5);
+    window.markSent(6);
+    window.hold({ sequence: 7 });
+    // The panel skipped drawing 5 because 6 decoded first.
+    expect(window.acknowledge(6)).toEqual({ sequence: 7 });
+    expect(window.unacknowledged).toBe(0);
+    window.markSent(7);
+    expect(window.acknowledge(99)).toBeUndefined();
+    expect(window.unacknowledged).toBe(0);
+  });
+
+  it("keeps a held frame while the window stays full and forgets everything on reset", () => {
+    const window = createFrameWindow<{ sequence: number }>();
+    window.markSent(1);
+    window.markSent(2);
+    window.hold({ sequence: 3 });
+    expect(window.acknowledge(0)).toBeUndefined();
+    window.reset();
+    expect(window.unacknowledged).toBe(0);
+    expect(window.acknowledge(2)).toBeUndefined();
   });
 
   it("freezes input immediately on disconnect and reclaims within the 10-second window", () => {
