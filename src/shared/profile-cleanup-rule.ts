@@ -35,6 +35,18 @@ export type ProfileKeepReason =
   | "recent";
 
 /**
+ * A saved profile, or one with a confirmed sign-in, holds a login someone
+ * may reuse. Cleanup never deletes it, though it may remove its Rebuildable
+ * Data.
+ */
+export function keepsSavedSignIn(profile: BrowserProfile) {
+  return (
+    profile.reusable === true ||
+    (profile.sites ?? []).some(({ status }) => status === "signed-in")
+  );
+}
+
+/**
  * Why cleanup keeps a profile, or null when it is an unused worker profile:
  * a thread's default profile, still under its default name, never saved or
  * signed in, selected nowhere, not running, and untouched for `idleMs`.

@@ -9,6 +9,7 @@ import {
   rename,
   rm,
   unlink,
+  utimes,
   writeFile,
 } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
@@ -45,8 +46,15 @@ import {
   scopedProfileId,
   threadProfileDefaultName,
 } from "../shared/profile-scope.js";
-import { profileKeepReason } from "../shared/profile-cleanup-rule.js";
+import {
+  keepsSavedSignIn,
+  profileKeepReason,
+} from "../shared/profile-cleanup-rule.js";
 import { withoutBrowserInstance } from "../browser/browser-runtime.js";
+import {
+  RUN_DIRECTORY_NAME,
+  removeStaleRunDirectories,
+} from "./run-directories.js";
 
 const PROFILE_DIRECTORY_MODE = 0o700;
 const PROFILE_MANIFEST_MODE = 0o600;
@@ -138,12 +146,27 @@ export interface BrowserProfileStore {
   ): Promise<BrowserProfileExpiryResponse>;
   /** Finish interrupted lifecycle work; true when any was found. */
   reconcileProfileLifecycle(hostId: string): Promise<boolean>;
+  /** Bring all profiles on a host under one storage limit (ADR 0024). */
+  enforceStorageLimit?(
+    hostId: string,
+    limitBytes: number,
+    running?: (profileId: string) => Promise<boolean>,
+  ): Promise<StorageLimitResult>;
+  /** Delete week-old launch folders under the run directory; returns count. */
+  removeStaleLaunchFolders?(): Promise<number>;
   /** Last file change and size of the listed profiles still on disk. */
   profileUsage?(
     hostId: string,
     profileIds: readonly string[],
   ): Promise<StoredProfileUsage[]>;
 }
+
+export type StorageLimitResult = {
+  /** All profiles' disk space once cleanup is done. */
+  usedBytes: number;
+  rebuildableDataProfileIds: string[];
+  deletedProfileIds: string[];
+};
 
 export type StoredProfileUsage = {
   profileId: string;
@@ -871,6 +894,85 @@ async function treeUsage(
   return usage;
 }
 
+/**
+ * Rebuildable Data (ADR 0024): what Chrome recreates on its own, relative to
+ * a profile's chrome-data. Downloaded components, web caches, and crash and
+ * metrics scratch files only. Site authentication and storage, such as
+ * Cookies, Local Storage, IndexedDB, Login Data, Session Storage,
+ * Preferences, and History, are never listed.
+ */
+export const REBUILDABLE_DATA_PATHS = [
+  "component_crx_cache",
+  "optimization_guide_model_store",
+  "Safe Browsing",
+  "WasmTtsEngine",
+  "OnDeviceHeadSuggestModel",
+  "BrowserMetrics-spare.pma",
+  "BrowserMetrics",
+  "GPUPersistentCache",
+  "extensions_crx_cache",
+  "GrShaderCache",
+  "ShaderCache",
+  "Crashpad",
+  "Default/Cache",
+  "Default/Code Cache",
+  "Default/GPUCache",
+  "Default/DawnGraphiteCache",
+  "Default/DawnWebGPUCache",
+  "Default/Service Worker/CacheStorage",
+  "Default/Service Worker/ScriptCache",
+] as const;
+
+/** A directory itself, not a symlink to one. False when missing. */
+async function realDirectory(path: string) {
+  try {
+    return (await lstat(path)).isDirectory();
+  } catch (error) {
+    if (missing(error)) return false;
+    throw error;
+  }
+}
+
+/**
+ * Remove a profile's {@link REBUILDABLE_DATA_PATHS} and return the bytes
+ * freed. A path is skipped when it, or any folder above it, is a symlink, so
+ * nothing outside the profile is touched. The folders keep their
+ * modification times: removal is not use. Callers make sure no Browser
+ * Instance is running for the profile.
+ */
+export async function removeRebuildableData(browserDataPath: string) {
+  if (!(await realDirectory(browserDataPath))) return 0;
+  let freed = 0;
+  for (const relativePath of REBUILDABLE_DATA_PATHS) {
+    const segments = relativePath.split("/");
+    let parent = browserDataPath;
+    let contained = true;
+    for (const segment of segments.slice(0, -1)) {
+      parent = join(parent, segment);
+      if (!(await realDirectory(parent))) {
+        contained = false;
+        break;
+      }
+    }
+    if (!contained) continue;
+    const path = join(parent, segments.at(-1)!);
+    let metadata;
+    try {
+      metadata = await lstat(path);
+    } catch (error) {
+      if (missing(error)) continue;
+      throw error;
+    }
+    if (metadata.isSymbolicLink()) continue;
+    const parentTimes = await lstat(parent);
+    const usage = await treeUsage(path);
+    await rm(path, { recursive: true, force: true });
+    await utimes(parent, parentTimes.atime, parentTimes.mtime);
+    freed += usage?.size ?? 0;
+  }
+  return freed;
+}
+
 async function profileDirectoryMetadata(path: string) {
   try {
     const metadata = await lstat(path);
@@ -1235,6 +1337,13 @@ export function createFileBrowserProfileStore(
           : await resetBrowserState(paths, journal);
     if (journal.operation !== "reset") {
       await writeJson(paths.manifestPath, manifest, ownership);
+    }
+    // An Archived Profile keeps its site state, not its Rebuildable Data. A
+    // reset archives the old identity the same way.
+    if (journal.operation === "archive" || journal.operation === "reset") {
+      await withoutBrowserInstance(paths.runtimeManifestPath, () =>
+        removeRebuildableData(paths.browserDataPath),
+      );
     }
     return manifest;
   }
@@ -1894,6 +2003,98 @@ export function createFileBrowserProfileStore(
     });
   }
 
+  /**
+   * Bring all profiles on a host under `limitBytes` (ADR 0024): first remove
+   * Rebuildable Data from the least recently used profiles, then delete
+   * Archived Profiles, oldest first. Saved and signed-in profiles may lose
+   * Rebuildable Data but are never deleted, and a profile with a running
+   * Browser Instance is skipped. Measuring walks every profile, so it runs
+   * without the storage lock; each deletion takes it and checks again.
+   */
+  async function enforceStorageLimit(
+    hostId: string,
+    limitBytes: number,
+    running: (profileId: string) => Promise<boolean> = async () => false,
+  ): Promise<StorageLimitResult> {
+    const inventory = await listProfilesUnlocked(hostId);
+    const measured = [];
+    for (const profile of inventory.profiles) {
+      const paths = profilePaths(
+        options.rootDirectory,
+        options.installationId,
+        hostId,
+        profile.profileId,
+      );
+      const files = await treeUsage(paths.profileDirectory);
+      if (files === null) continue;
+      measured.push({ profile, paths, ...files });
+    }
+    let usedBytes = measured.reduce((total, { size }) => total + size, 0);
+    const result: StorageLimitResult = {
+      usedBytes,
+      rebuildableDataProfileIds: [],
+      deletedProfileIds: [],
+    };
+    const leastRecentlyUsed = [...measured].sort(
+      (left, right) => left.newest - right.newest,
+    );
+    for (const entry of leastRecentlyUsed) {
+      if (usedBytes <= limitBytes) break;
+      if (await running(entry.profile.profileId)) continue;
+      const freed = await withoutBrowserInstance(
+        entry.paths.runtimeManifestPath,
+        () => removeRebuildableData(entry.paths.browserDataPath),
+      );
+      if (freed === null || freed === 0) continue;
+      usedBytes -= freed;
+      entry.size -= freed;
+      result.rebuildableDataProfileIds.push(entry.profile.profileId);
+    }
+    const oldestArchived = measured
+      .filter(
+        ({ profile }) =>
+          profile.state === "archived" && !keepsSavedSignIn(profile),
+      )
+      .sort((left, right) =>
+        left.profile.archivedAt!.localeCompare(right.profile.archivedAt!),
+      );
+    for (const entry of oldestArchived) {
+      if (usedBytes <= limitBytes) break;
+      const deleted = await withMutationLock(
+        options,
+        hostId,
+        ownership,
+        async () => {
+          const current = (
+            await reconcileBeforeLifecycle(hostId)
+          ).profiles.find(
+            ({ profileId }) => profileId === entry.profile.profileId,
+          );
+          if (current?.state !== "archived" || keepsSavedSignIn(current)) {
+            return false;
+          }
+          await beginLifecycle("delete", {
+            hostId,
+            profileId: current.profileId,
+          });
+          return true;
+        },
+      );
+      if (!deleted) continue;
+      usedBytes -= entry.size;
+      result.deletedProfileIds.push(entry.profile.profileId);
+    }
+    result.usedBytes = Math.max(0, usedBytes);
+    return result;
+  }
+
+  async function removeStaleLaunchFolders(now = clock().getTime()) {
+    return removeStaleRunDirectories(
+      join(options.rootDirectory, RUN_DIRECTORY_NAME),
+      now,
+    );
+  }
+
   function expiredProfiles(inventory: BrowserProfileInventory) {
     return inventory.profiles.filter(
       (profile) =>
@@ -1990,6 +2191,8 @@ export function createFileBrowserProfileStore(
     resetProfile,
     deleteProfile,
     expireArchivedProfiles,
+    enforceStorageLimit,
+    removeStaleLaunchFolders,
     reconcileProfileLifecycle,
   };
 }
