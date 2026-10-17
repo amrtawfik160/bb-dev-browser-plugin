@@ -28,7 +28,7 @@ _Avoid_: Client browser, server browser
 A named, host-local browser identity containing site authentication and storage. A profile may be reused across repositories on the same host but is never synchronized to another host.
 Threads receive separate default profiles; calls without a thread receive a project default. Explicit profile selections, including an agent's thread selection through `browser_sessions`, opt into sharing cookies. Automation gives each thread a named Browser Tab from its first script call, so saving or sharing a profile preserves its multi-call workflow. Browser processes remain bounded independently of the number of stored profiles.
 When its thread is archived, a thread's default profile sleeps, and an unsaved one becomes an Archived Profile seven days later; when the thread is deleted, an unsaved profile becomes an Archived Profile at once. Profiles of threads archived before this rule existed are released only by an owner-run sweep that reports them first. Profiles with a confirmed sign-in are saved for reuse and stay active until the owner archives or deletes them. Explicitly selected profiles are never released by thread lifecycle.
-An unused worker profile is a thread's default profile still under its default name, never saved or signed in, selected nowhere, with no running Browser Instance, and untouched for over a day. The owner deletes all of them at once from Browser Settings; with the owner's automatic cleanup on, one is deleted once it has been unused for two days.
+An unused worker profile is a thread's default profile still under its default name, never saved or signed in, selected nowhere, with no running Browser Instance, and untouched for over a day. The owner deletes all of them at once from Browser Settings; automatic cleanup, on unless the owner turns it off, deletes one once it has been unused for two days.
 _Avoid_: Account, global session
 
 **Sign-in Confirmation**:
@@ -36,8 +36,12 @@ A dated hint for one exact origin in a Browser Profile, recorded by the owner cl
 _Avoid_: Live authentication inventory, cookie scan
 
 **Archived Profile**:
-A stopped, grant-free Browser Profile retained temporarily for recovery before permanent deletion.
+A stopped, grant-free Browser Profile retained temporarily for recovery before permanent deletion. It keeps its site authentication and storage but not its Rebuildable Data.
 _Avoid_: Deleted profile, sleeping profile
+
+**Rebuildable Data**:
+The part of a Browser Profile the browser recreates on its own, such as web caches and browser-downloaded components. Cleanup may remove it from any profile, including one with a confirmed sign-in; site authentication and storage are never Rebuildable Data.
+_Avoid_: Profile state, junk
 
 **Profile Grant**:
 A persistent authorization allowing agents from one BB project to fully automate one Browser Profile within its Origin Scope. Owner interaction needs no grant. A project receives a whole-web grant through Default Access; file transfer and invalid-certificate access require separate owner opt-ins.
@@ -90,6 +94,10 @@ _Avoid_: Raw automation endpoint
 **axi Session**:
 One agent session's chrome-devtools-axi bridge, named per thread and connected to that session's Session CDP Proxy. Agents drive it with `bb plugin run browser axi <command>`, exactly as `chrome-devtools-axi <command>`.
 _Avoid_: Browser command, BB browser dialect
+
+**Logical Viewport**:
+The page size a Browser Profile's active tab renders at, shared by every Browser Panel showing it. It follows the controlling panel unless the owner picks a device size, which also makes a phone or tablet choice look like that device to sites, and the profile keeps that choice until the owner changes it. Panels smaller than the Logical Viewport shrink it to fit. Agent tabs keep their own size.
+_Avoid_: Panel size, window size
 
 **Browser Tab**:
 A page belonging to a Browser Profile's shared tab set and visible from every Browser Panel using that profile. Each profile has one active tab shared across its panels, chosen only by the owner. Automation binds each thread to a named tab from its first call; that tab works in the background, and every panel can still select and watch it. An explicit tab ID overrides that binding.
