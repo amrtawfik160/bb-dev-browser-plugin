@@ -1096,6 +1096,31 @@ describe("Browser Instance runtime", () => {
       expect(launch.chromeArguments).toContain(
         "--js-flags=--max-old-space-size=512",
       );
+      // Rebuildable Data stays small (ADR 0024): no component or model
+      // downloads, a capped web cache, and Safe Browsing left on.
+      expect(launch.chromeArguments).toContain("--disable-component-update");
+      expect(launch.chromeArguments).toContain(
+        `--disk-cache-size=${100 * 1024 * 1024}`,
+      );
+      const disabledFeatures = launch.chromeArguments.filter((argument) =>
+        argument.startsWith("--disable-features="),
+      );
+      expect(disabledFeatures).toHaveLength(1);
+      expect(disabledFeatures[0]!.split("=")[1]!.split(",")).toEqual(
+        expect.arrayContaining([
+          "PasswordManagerEnabled",
+          "AutofillAddressEnabled",
+          "AutofillCreditCardEnabled",
+          "AutofillServerCommunication",
+          "BackForwardCache",
+          "OptimizationHints",
+          "OptimizationHintsFetching",
+          "OptimizationTargetPrediction",
+          "OmniboxOnDeviceHeadProviderIncognito",
+          "OmniboxOnDeviceHeadProviderNonIncognito",
+        ]),
+      );
+      expect(launch.chromeArguments.join(" ")).not.toMatch(/safebrowsing/iu);
 
       await fixture.runtime.stop(fixture.target);
       for (const [name, contents] of retainedFiles) {
