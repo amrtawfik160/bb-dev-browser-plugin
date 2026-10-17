@@ -527,4 +527,80 @@ describe("host-owned Panel session", () => {
       await rm(dataDir, { recursive: true, force: true });
     }
   });
+  it("captures at twice the density only while the controller is viewed on the host itself", async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), "host-panel-density-"));
+    const captures: Array<{ width: number; maxDensity?: number }> = [];
+    const source: ScreencastSource = {
+      ...idleFrameSource(),
+      setViewport(viewport, capture) {
+        captures.push({
+          width: viewport.width,
+          maxDensity: capture?.maxDensity,
+        });
+      },
+    };
+    const host = experimental_createHostEntryHarness(
+      createBrowserHostEntry(
+        {
+          inspect: healthyStatus,
+          diagnostics: () => {
+            throw new Error("not used");
+          },
+        },
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { frameSource: () => source },
+      ),
+      {
+        experimental_paths: {
+          dataDir,
+          tempDir: join(dataDir, "tmp"),
+        },
+      },
+    );
+    const identities = {
+      panelId: "panel-density",
+      ownerSessionId: "owner-session-density",
+    };
+    let socket: WebSocket | undefined;
+    try {
+      const opened = await host.experimental_call("panelTransport", {
+        hostId: HOST_ID,
+        profileId: DEFAULT_PROFILE_ID,
+        ...identities,
+      });
+      if (opened.outcome !== "opened") throw new Error("expected a transport");
+      socket = (await connectAndRedeem(opened, identities)).socket;
+      await host.experimental_call("panelControl", {
+        hostId: HOST_ID,
+        profileId: DEFAULT_PROFILE_ID,
+        ...identities,
+        viewport: { width: 800, height: 600 },
+        viewedOnHost: true,
+      });
+      await waitFor(() =>
+        captures.at(-1)?.width === 800 && captures.at(-1)?.maxDensity === 2
+          ? true
+          : undefined,
+      );
+      // A report that does not say where the panel is shown fails toward 1x.
+      await host.experimental_call("panelControl", {
+        hostId: HOST_ID,
+        profileId: DEFAULT_PROFILE_ID,
+        ...identities,
+        viewport: { width: 800, height: 600 },
+      });
+      await waitFor(() =>
+        captures.at(-1)?.maxDensity === 1 ? true : undefined,
+      );
+    } finally {
+      socket?.close();
+      await host.experimental_dispose().catch(() => undefined);
+      await rm(dataDir, { recursive: true, force: true });
+    }
+  });
 });

@@ -18,6 +18,26 @@ export function browserClientTimezone() {
 }
 
 /**
+ * Whether BB itself is open on a loopback address, which means the panel is
+ * shown on the workspace host. BB Connect and every other address count as
+ * remote, and so does anything this cannot read: the cost of guessing wrong
+ * toward remote is a softer picture, toward local a slower one.
+ */
+export function panelViewedOnHost(
+  hostname: string | undefined = globalThis.location?.hostname,
+) {
+  if (hostname === undefined) return false;
+  const normalized = hostname.toLowerCase().replace(/\.$/u, "");
+  return (
+    normalized === "localhost" ||
+    normalized.endsWith(".localhost") ||
+    normalized === "[::1]" ||
+    normalized === "::1" ||
+    /^127(?:\.\d{1,3}){3}$/u.test(normalized)
+  );
+}
+
+/**
  * Hand the owner a file through the browser's own download path. Test
  * renderers lack object URLs; there the preview the caller also shows is the
  * whole result, so nothing is lost by skipping the download.

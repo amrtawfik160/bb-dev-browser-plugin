@@ -1574,7 +1574,11 @@ export function createBrowserHostEntry(
       const controllerViewport = session.controllerViewport;
       if (controllerViewport === null) return;
       stream.setViewport(controllerViewport);
-      source.setViewport?.(controllerViewport);
+      // Twice the density only pays off on the host's own screen; through BB
+      // Connect it doubles the bytes for detail nobody sees (ADR 0007).
+      source.setViewport?.(controllerViewport, {
+        maxDensity: session.controllerViewedOnHost ? 2 : 1,
+      });
     };
     applyControllerViewport();
     const connection = await session.joinPanel(
@@ -2161,6 +2165,7 @@ export function createBrowserHostEntry(
           request.ownerSessionId,
           request.viewport,
         );
+        session.setViewedOnHost(request.panelId, request.viewedOnHost === true);
         // A panel reports its size every time it changes, not only when it
         // first joins, so the capture tracks the size the owner is actually
         // looking at. Only the controller's size drives page layout; a
@@ -2177,6 +2182,7 @@ export function createBrowserHostEntry(
           profileId: request.profileId,
         };
         const session = panelControlSession(target);
+        session.setViewedOnHost(request.panelId, request.viewedOnHost === true);
         await session.takeControl(request.panelId, request.viewport);
         // Owner takeover ends the agent's Control Lease: dismiss any open agent
         // dialog so it cannot strand behind an invisible modal block.
@@ -2206,6 +2212,7 @@ export function createBrowserHostEntry(
           profileId: request.profileId,
         };
         const session = panelControlSession(target);
+        session.setViewedOnHost(request.panelId, request.viewedOnHost === true);
         // Reclaim the controller's own lease after a reconnect. If an agent
         // acquired a lease while the controller was disconnected, the owner
         // reclaim interrupts it just like Take control so the page is preserved

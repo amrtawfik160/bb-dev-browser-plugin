@@ -44,6 +44,11 @@ export type CdpScreencastSourceOptions = {
    */
   viewport?: { width: number; height: number };
   /**
+   * Upper bound on device pixels per logical pixel. The host raises it to 2
+   * only while the controller is viewed on the host itself; defaults to 1.
+   */
+  maxDensity?: number;
+  /**
    * A new top-level target was created (for example an open-link-new-tab
    * context action). The host enrolls it as a BrowserTab in the shared strip
    * so created targets are normalized into the profile's ordered tab set rather
@@ -70,7 +75,8 @@ type CdpResponse = {
 type CdpEvent = { method: string; params?: unknown; sessionId?: string };
 
 const SCREENCAST_FORMAT = "jpeg" as const;
-const SCREENCAST_QUALITY = 95;
+// Quality 75 keeps text legible at well under half the bytes of quality 95.
+const SCREENCAST_QUALITY = 75;
 /** Shared empty payload. The JPEG stays in `wireData` as base64. */
 const UNDECODED_FRAME_BYTES = new Uint8Array();
 // Frame acknowledgements provide pacing; capture every available update.
@@ -105,6 +111,7 @@ export function createCdpScreencastSource(
     width: PANEL_MAX_VIEWPORT_WIDTH,
     height: PANEL_MAX_VIEWPORT_HEIGHT,
   };
+  let maxDensity = Math.max(1, options.maxDensity ?? 1);
   function clampScreencastViewport(next: { width: number; height: number }) {
     return {
       width: Math.max(1, Math.min(next.width, PANEL_MAX_VIEWPORT_WIDTH)),
@@ -241,10 +248,11 @@ export function createCdpScreencastSource(
 
   async function startScreencast(session: string) {
     const clamped = clampScreencastViewport(viewport);
-    // Render small panels at up to 2x density while retaining the stream's
-    // physical pixel bounds. Page layout and input remain in CSS pixels.
+    // Render small panels at up to the allowed density while retaining the
+    // stream's physical pixel bounds. Page layout and input remain in CSS
+    // pixels.
     const density = Math.min(
-      2,
+      maxDensity,
       PANEL_MAX_VIEWPORT_WIDTH / clamped.width,
       PANEL_MAX_VIEWPORT_HEIGHT / clamped.height,
     );
@@ -687,9 +695,22 @@ export function createCdpScreencastSource(
         screenshotPending = false;
       }
     },
-    /** Restart capture at the controller's new logical viewport. */
-    setViewport(next: { width: number; height: number }) {
-      viewport = clampScreencastViewport(next);
+    /**
+     * Restart capture at the controller's new logical viewport or density.
+     * Every control-state update re-applies the viewport, so an unchanged
+     * one keeps the running capture instead of restarting it.
+     */
+    setViewport(next: { width: number; height: number }, capture) {
+      const clamped = clampScreencastViewport(next);
+      const density = Math.max(1, capture?.maxDensity ?? 1);
+      if (
+        clamped.width === viewport.width &&
+        clamped.height === viewport.height &&
+        density === maxDensity
+      )
+        return;
+      viewport = clamped;
+      maxDensity = density;
       if (screencastStarted && sessionId !== undefined) {
         void startScreencast(sessionId).catch(() => undefined);
       }

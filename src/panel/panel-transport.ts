@@ -91,9 +91,13 @@ export interface ScreencastSource {
   /**
    * Apply the controller's logical viewport to the capture so the screencast
    * tracks the controller viewport rather than an independent size. Optional;
-   * sources without a dynamic viewport ignore it.
+   * sources without a dynamic viewport ignore it. `maxDensity` bounds the
+   * capture's device pixels per logical pixel; sources default to 1.
    */
-  setViewport?(viewport: { width: number; height: number }): void;
+  setViewport?(
+    viewport: { width: number; height: number },
+    capture?: { maxDensity: number },
+  ): void;
   /**
    * Subscribe to page dialogs (alert/confirm/prompt/beforeunload). The source
    * invokes {@link onDialog} for each `Page.javascriptDialogOpening` event so

@@ -51,6 +51,7 @@ import {
 import { Field, inputClassName } from "./panel-primitives.js";
 import {
   administrationErrorMessage,
+  panelViewedOnHost,
   saveExportedBytes,
   saveJsonFile,
 } from "./browser-client-utils.js";
@@ -1149,6 +1150,7 @@ function usePanelViewportReport({
           panelId,
           ownerSessionId,
           viewport: { width, height },
+          viewedOnHost: panelViewedOnHost(),
         })
         .then((response) => {
           if (!disposed && !isPanelIdentityRejection(response)) {
@@ -1239,6 +1241,7 @@ function usePanelControlSession({
           profileId: status.profileId,
           panelId,
           ownerSessionId,
+          viewedOnHost: panelViewedOnHost(),
         })
         .then((response) => {
           if (!disposed && !isPanelIdentityRejection(response)) {
@@ -1278,6 +1281,7 @@ function usePanelControlSession({
             profileId,
             panelId,
             ownerSessionId,
+            viewedOnHost: panelViewedOnHost(),
           })
         : await rpc.call("browser_panel_release_control", {
             hostId,
@@ -1306,6 +1310,7 @@ function usePanelControlSession({
         profileId,
         panelId,
         ownerSessionId,
+        viewedOnHost: panelViewedOnHost(),
       });
       if (isPanelIdentityRejection(response)) return null;
       setControl(response);

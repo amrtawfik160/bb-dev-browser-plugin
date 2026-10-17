@@ -335,6 +335,33 @@ describe("shared Panel session per Browser Profile", () => {
     await sessions.dispose();
   });
 
+  it("knows whether the controller is viewed on the host itself and defaults to remote", async () => {
+    const { sessions } = setup();
+    const session = sessions.sessionFor({
+      hostId: HOST_ID,
+      profileId: PROFILE_A,
+    });
+    const emitted: number[] = [];
+    session.subscribe(() => emitted.push(emitted.length));
+    session.connectPanel("panel-1", "owner-session-1");
+    session.connectPanel("panel-2", "owner-session-2");
+    expect(session.controllerViewedOnHost).toBe(false);
+
+    const before = emitted.length;
+    session.setViewedOnHost("panel-1", true);
+    expect(session.controllerViewedOnHost).toBe(true);
+    expect(emitted.length).toBe(before + 1);
+    // A spectator's location never changes the shared capture.
+    session.setViewedOnHost("panel-2", true);
+    session.setViewedOnHost("panel-2", false);
+    expect(emitted.length).toBe(before + 1);
+    expect(session.controllerViewedOnHost).toBe(true);
+
+    await session.takeControl("panel-2");
+    expect(session.controllerViewedOnHost).toBe(false);
+    await sessions.dispose();
+  });
+
   it("shows a working agent on the shared session state while the owner takes control", async () => {
     const controlLeases = createControlLeaseManager();
     const { sessions } = setup({ controlLeases });

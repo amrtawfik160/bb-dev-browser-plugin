@@ -2317,6 +2317,12 @@ export const browserPanelControlRequestSchema = z
         height: z.number().int().positive(),
       })
       .optional(),
+    /**
+     * Whether the panel is displayed on the workspace host itself. Only then
+     * does the controller's capture use twice the density; a panel viewed
+     * through BB Connect, or one that does not say, gets 1x (ADR 0007).
+     */
+    viewedOnHost: z.boolean().optional(),
   })
   .strict();
 
