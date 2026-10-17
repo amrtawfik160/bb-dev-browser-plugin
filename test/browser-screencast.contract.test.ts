@@ -171,12 +171,51 @@ async function waitForStartScreencast(
 }
 
 describe("CDP screencast source contract", () => {
+  it("captures at the logical viewport density unless told the panel is on the host", async () => {
+    const stub = createCdpEndpointStub();
+    const controller = new AbortController();
+    const source = createCdpScreencastSource({
+      resolveEndpoint: async () => stub.endpoint,
+      viewport: { width: 1280, height: 720 },
+    });
+    const streaming = source
+      .start(() => undefined, controller.signal)
+      .catch((error: unknown) => {
+        if (!controller.signal.aborted) throw error;
+      });
+    try {
+      await waitForStartScreencast(stub);
+      expect(stub.startScreencastCalls[0]).toMatchObject({
+        maxWidth: 1280,
+        maxHeight: 720,
+        quality: 75,
+      });
+      expect(stub.commands).toContainEqual({
+        method: "Emulation.setDeviceMetricsOverride",
+        params: {
+          width: 1280,
+          height: 720,
+          deviceScaleFactor: 1,
+          scale: 1,
+          dontSetVisibleSize: true,
+          mobile: false,
+        },
+      });
+    } finally {
+      controller.abort();
+      await source.stop();
+      await streaming;
+      await stub.close();
+    }
+  });
+
   it("preserves logical layout while capturing at higher density within pixel bounds", async () => {
     const stub = createCdpEndpointStub();
     const controller = new AbortController();
     const source = createCdpScreencastSource({
       resolveEndpoint: async () => stub.endpoint,
       viewport: { width: 1280, height: 720 },
+      maxDensity: 2,
     });
     // Abort can race the final startup acknowledgement. Consume that expected
     // cancellation and await the background operation during teardown.
@@ -190,7 +229,7 @@ describe("CDP screencast source contract", () => {
       expect(stub.startScreencastCalls[0]).toMatchObject({
         maxWidth: 1920,
         maxHeight: 1080,
-        quality: 95,
+        quality: 75,
       });
       expect(stub.commands).toContainEqual({
         method: "Emulation.setDeviceMetricsOverride",
@@ -211,6 +250,37 @@ describe("CDP screencast source contract", () => {
       controller.abort();
       await source.stop();
       await streaming;
+      await stub.close();
+    }
+  });
+
+  it("restarts capture when the density changes and not when nothing changed", async () => {
+    const stub = createCdpEndpointStub();
+    const controller = new AbortController();
+    const source = createCdpScreencastSource({
+      resolveEndpoint: async () => stub.endpoint,
+      viewport: { width: 500, height: 400 },
+    });
+    try {
+      void source.start(() => undefined, controller.signal);
+      await waitForStartScreencast(stub);
+      expect(stub.startScreencastCalls[0]).toMatchObject({
+        maxWidth: 500,
+        maxHeight: 400,
+      });
+      source.setViewport?.({ width: 500, height: 400 }, { maxDensity: 1 });
+      source.setViewport?.({ width: 500, height: 400 }, { maxDensity: 2 });
+      await waitForStartScreencast(stub, 2);
+      expect(stub.startScreencastCalls[1]).toMatchObject({
+        maxWidth: 1000,
+        maxHeight: 800,
+      });
+      source.setViewport?.({ width: 500, height: 400 }, { maxDensity: 2 });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(stub.startScreencastCalls).toHaveLength(2);
+    } finally {
+      controller.abort();
+      await source.stop();
       await stub.close();
     }
   });
@@ -258,6 +328,7 @@ describe("CDP screencast source contract", () => {
     const source = createCdpScreencastSource({
       resolveEndpoint: async () => stub.endpoint,
       viewport: { width: 500, height: 400 },
+      maxDensity: 2,
     });
     try {
       void source.start(() => undefined, controller.signal);
@@ -268,7 +339,7 @@ describe("CDP screencast source contract", () => {
       });
       // The controller drives layout; a viewport change restarts the capture at
       // the new dimensions so spectators letterbox the exact controller viewport.
-      source.setViewport?.({ width: 1600, height: 900 });
+      source.setViewport?.({ width: 1600, height: 900 }, { maxDensity: 2 });
       await waitForStartScreencast(stub, 2);
       expect(
         stub.startScreencastCalls.some(

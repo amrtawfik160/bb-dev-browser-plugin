@@ -1,4 +1,147 @@
 import { useEffect, useRef, type RefObject } from "react";
+import { PANEL_CLIENT_INPUT_MAX_PER_SECOND } from "../shared/contracts.js";
+
+/**
+ * Pointer moves and wheel deltas are sent at most this often. The stream shows
+ * at most 15 frames a second, so a faster pace adds load without being seen.
+ */
+const CONTINUOUS_INPUT_INTERVAL_MS = 25;
+const RATE_WINDOW_MS = 1_000;
+
+type WheelInput = {
+  kind: "wheel";
+  x: number;
+  y: number;
+  deltaX: number;
+  deltaY: number;
+  modifiers: number;
+};
+
+export type InputPacerOptions = {
+  send: (payload: unknown) => void;
+  now?: () => number;
+  setTimer?: (callback: () => void, delayMs: number) => unknown;
+  clearTimer?: (timer: unknown) => void;
+  maxPerSecond?: number;
+};
+
+/**
+ * Pace page input below the host's per-second limit. Pointer moves keep only
+ * the latest position and wheel events add their deltas together, so a fast
+ * trackpad flick arrives as a few messages that still scroll the full
+ * distance. Clicks, keys, and text are never delayed or dropped; a click
+ * sends any pending move or scroll first so the page sees them in order.
+ */
+export function createInputPacer(options: InputPacerOptions) {
+  const now = options.now ?? (() => performance.now());
+  const setTimer =
+    options.setTimer ??
+    ((callback: () => void, delayMs: number) => setTimeout(callback, delayMs));
+  const clearTimer =
+    options.clearTimer ??
+    ((timer: unknown) => clearTimeout(timer as ReturnType<typeof setTimeout>));
+  const maxPerSecond =
+    options.maxPerSecond ?? PANEL_CLIENT_INPUT_MAX_PER_SECOND;
+  const sentAt: number[] = [];
+  let pendingMove: unknown = null;
+  let pendingWheel: WheelInput | null = null;
+  let lastContinuousAt = -Infinity;
+  let timer: unknown;
+
+  function emit(payload: unknown, at: number) {
+    sentAt.push(at);
+    options.send(payload);
+  }
+
+  function pendingCount() {
+    return Number(pendingMove !== null) + Number(pendingWheel !== null);
+  }
+
+  function flushPending(at: number) {
+    if (pendingCount() === 0) return;
+    if (pendingMove !== null) emit(pendingMove, at);
+    if (pendingWheel !== null) emit(pendingWheel, at);
+    pendingMove = null;
+    pendingWheel = null;
+    lastContinuousAt = at;
+  }
+
+  /** Milliseconds until the pending input fits both the pace and the cap. */
+  function delayUntilRoom(at: number) {
+    while (sentAt.length > 0 && at - sentAt[0]! >= RATE_WINDOW_MS)
+      sentAt.shift();
+    const paced = lastContinuousAt + CONTINUOUS_INPUT_INTERVAL_MS - at;
+    const over = sentAt.length + pendingCount() - maxPerSecond;
+    const capped = over <= 0 ? 0 : sentAt[over - 1]! + RATE_WINDOW_MS - at;
+    return Math.max(0, paced, capped);
+  }
+
+  function schedule() {
+    if (timer !== undefined) return;
+    const at = now();
+    const delay = delayUntilRoom(at);
+    if (delay === 0) {
+      flushPending(at);
+      return;
+    }
+    timer = setTimer(() => {
+      timer = undefined;
+      schedule();
+    }, delay);
+  }
+
+  function cancelTimer() {
+    if (timer === undefined) return;
+    clearTimer(timer);
+    timer = undefined;
+  }
+
+  return {
+    move(payload: unknown) {
+      pendingMove = payload;
+      schedule();
+    },
+    wheel(payload: WheelInput) {
+      if (
+        pendingWheel !== null &&
+        pendingWheel.modifiers !== payload.modifiers
+      ) {
+        // A modifier changes what scrolling means (zoom, horizontal), so the
+        // earlier deltas go out on their own.
+        cancelTimer();
+        flushPending(now());
+      }
+      pendingWheel =
+        pendingWheel === null
+          ? payload
+          : {
+              ...payload,
+              deltaX: pendingWheel.deltaX + payload.deltaX,
+              deltaY: pendingWheel.deltaY + payload.deltaY,
+            };
+      schedule();
+    },
+    /** Press or release: any pending move or scroll lands first. */
+    button(payload: unknown) {
+      cancelTimer();
+      const at = now();
+      flushPending(at);
+      emit(payload, at);
+    },
+    /**
+     * Keys and text go out at once. They do not depend on where the pointer
+     * is, so pending moves and scrolls keep their pace instead of being
+     * flushed early on every keystroke.
+     */
+    key(payload: unknown) {
+      emit(payload, now());
+    },
+    dispose() {
+      cancelTimer();
+      flushPending(now());
+    },
+  };
+}
 
 type Modifiers = {
   altKey: boolean;
@@ -70,8 +213,9 @@ export function useBrowserPageInput(
     const textInput = inputElement;
     const keys = new Map<string, KeyboardEvent>();
     let heldMouse: ReturnType<typeof mousePayload> | null = null;
-    let lastMove = 0;
-    const emit = (payload: unknown) => sendRef.current(payload);
+    const pacer = createInputPacer({
+      send: (payload) => sendRef.current(payload),
+    });
 
     function mousePayload(event: MouseEvent, action: string) {
       const point = browserPagePoint(canvas, event.clientX, event.clientY);
@@ -96,11 +240,11 @@ export function useBrowserPageInput(
       event.preventDefault();
       textInput.focus({ preventScroll: true });
       heldMouse = payload;
-      emit(payload);
+      pacer.button(payload);
     }
     function mouseUp(event: MouseEvent) {
       if (heldMouse === null) return;
-      emit(
+      pacer.button(
         mousePayload(event, "mouseReleased") ?? {
           ...heldMouse,
           action: "mouseReleased",
@@ -110,10 +254,8 @@ export function useBrowserPageInput(
       heldMouse = null;
     }
     function mouseMove(event: MouseEvent) {
-      if (event.timeStamp - lastMove < 16) return;
-      lastMove = event.timeStamp;
       const payload = mousePayload(event, "mouseMoved");
-      if (payload !== null) emit(payload);
+      if (payload !== null) pacer.move(payload);
     }
     function wheel(event: WheelEvent) {
       const point = browserPagePoint(canvas, event.clientX, event.clientY);
@@ -125,7 +267,7 @@ export function useBrowserPageInput(
           : event.deltaMode === 2
             ? Number(canvas.dataset.viewportHeight) || canvas.height
             : 1 / point.scale;
-      emit({
+      pacer.wheel({
         kind: "wheel",
         x: point.x,
         y: point.y,
@@ -155,23 +297,23 @@ export function useBrowserPageInput(
         return;
       event.preventDefault();
       keys.set(event.code || event.key, event);
-      emit(keyPayload(event, "keyDown"));
+      pacer.key(keyPayload(event, "keyDown"));
     }
     function keyUp(event: KeyboardEvent) {
       event.stopPropagation();
       if (!keys.delete(event.code || event.key)) return;
       event.preventDefault();
-      emit(keyPayload(event, "keyUp"));
+      pacer.key(keyPayload(event, "keyUp"));
     }
     function releaseInput() {
-      for (const event of keys.values()) emit(keyPayload(event, "keyUp"));
+      for (const event of keys.values()) pacer.key(keyPayload(event, "keyUp"));
       keys.clear();
       if (heldMouse !== null)
-        emit({ ...heldMouse, action: "mouseReleased", buttons: 0 });
+        pacer.button({ ...heldMouse, action: "mouseReleased", buttons: 0 });
       heldMouse = null;
     }
     function compositionEnd(event: CompositionEvent) {
-      if (event.data !== "") emit({ kind: "text", text: event.data });
+      if (event.data !== "") pacer.key({ kind: "text", text: event.data });
       textInput.value = "";
     }
     function focusTextInput() {
@@ -182,7 +324,7 @@ export function useBrowserPageInput(
       const text = event.clipboardData?.getData("text/plain");
       if (!text) return;
       event.preventDefault();
-      emit({ kind: "text", text });
+      pacer.key({ kind: "text", text });
     }
     canvas.addEventListener("focus", focusTextInput);
     window.addEventListener("blur", releaseInput);
@@ -197,6 +339,7 @@ export function useBrowserPageInput(
     textInput.addEventListener("paste", paste);
     return () => {
       releaseInput();
+      pacer.dispose();
       textInput.value = "";
       canvas.removeEventListener("focus", focusTextInput);
       window.removeEventListener("blur", releaseInput);

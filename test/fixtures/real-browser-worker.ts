@@ -525,7 +525,7 @@ if (action === "panel-transport") {
   const redeemed = gateway.validate(redeem);
   const replayed = gateway.validate(redeem);
   // A real Automation Mode frame stays within the viewport and FPS bounds.
-  const congestionFps = stream.applyCongestion(1);
+  const streamFps = stream.fps;
   const reconnectBackoffs = [
     stream.nextReconnectDelayMs(),
     stream.nextReconnectDelayMs(),
@@ -539,7 +539,7 @@ if (action === "panel-transport") {
     redeemed: redeemed.outcome === "accepted",
     replayed: replayed.outcome === "rejected",
     viewport: stream.viewport,
-    fps: congestionFps,
+    fps: streamFps,
     reconnectBackoffMs: reconnectBackoffs,
     reclaimWindowMs: PANEL_RECLAIM_WINDOW_MS,
     revoked: capabilities.size() === 0,

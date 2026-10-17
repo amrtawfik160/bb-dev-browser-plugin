@@ -126,6 +126,8 @@ export type LifecyclePanel = ReturnType<typeof within> &
     gatewayPort: number;
     get redeemed(): boolean;
     get framesReceived(): number;
+    /** Frame sequences the panel acknowledged back to the host. */
+    get framesAcknowledged(): number[];
     get connectionAttempts(): number;
   };
 
@@ -333,6 +335,7 @@ export async function createPublicPanelLifecycleHarness(options?: {
 
   type ParsedPanelMessage = {
     type?: string;
+    sequence?: number;
     category?: string;
     capabilityId?: string;
     secret?: string;
@@ -535,6 +538,20 @@ export async function createPublicPanelLifecycleHarness(options?: {
             parsedMessages(port).filter((message) => message.type === "frame")
               .length,
           0,
+        );
+      },
+    });
+    Object.defineProperty(assigned, "framesAcknowledged", {
+      configurable: true,
+      enumerable: true,
+      get() {
+        // Port logs hold what the panel sent as well as what it received.
+        return issuedGatewayPorts(request.panelId).flatMap((port) =>
+          parsedMessages(port).flatMap((message) =>
+            message.type === "ack" && typeof message.sequence === "number"
+              ? [message.sequence]
+              : [],
+          ),
         );
       },
     });

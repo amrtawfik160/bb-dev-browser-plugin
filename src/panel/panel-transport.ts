@@ -6,7 +6,7 @@ import {
 } from "../shared/panel-screenshot.js";
 import { createServer, type Server } from "node:http";
 import type { PanelGateway } from "./panel-gateway.js";
-import type { PanelStreamAdapter } from "./panel-stream.js";
+import { createFrameWindow, type PanelStreamAdapter } from "./panel-stream.js";
 import type {
   ClipboardExchange,
   TransferClipboardActor,
@@ -35,9 +35,10 @@ import {
  * Automation Mode stream transport. The host binds a dynamic loopback gateway
  * (net.Server + WebSocket), redeems the single-use Panel Capability in the
  * first WebSocket message, drives a {@link ScreencastSource} to produce frames,
- * delivers frames over the WebSocket, receives input messages, and applies the
- * Panel Stream policy (viewport clamp up to 1920x1080, adaptive 5-15 FPS, input
- * freeze on disconnect, 10-second reclaim, bounded reconnect backoff). Chrome,
+ * delivers frames over the WebSocket while no more than two await the panel's
+ * acknowledgement, receives input messages, and applies the Panel Stream
+ * policy (viewport clamp up to 1920x1080, at most 15 FPS, input freeze on
+ * disconnect, 10-second reclaim, bounded reconnect backoff). Chrome,
  * CDP, and the gateway never bind externally; the gateway binds to 127.0.0.1
  * only.
  */
@@ -91,9 +92,13 @@ export interface ScreencastSource {
   /**
    * Apply the controller's logical viewport to the capture so the screencast
    * tracks the controller viewport rather than an independent size. Optional;
-   * sources without a dynamic viewport ignore it.
+   * sources without a dynamic viewport ignore it. `maxDensity` bounds the
+   * capture's device pixels per logical pixel; sources default to 1.
    */
-  setViewport?(viewport: { width: number; height: number }): void;
+  setViewport?(
+    viewport: { width: number; height: number },
+    capture?: { maxDensity: number },
+  ): void;
   /**
    * Subscribe to page dialogs (alert/confirm/prompt/beforeunload). The source
    * invokes {@link onDialog} for each `Page.javascriptDialogOpening` event so
@@ -249,6 +254,7 @@ export function createPanelTransportServer(
   let authorized = false;
   let firstMessageTimeout: ReturnType<typeof setTimeout> | undefined;
   let streamAbort: AbortController | undefined;
+  const frameWindow = createFrameWindow<ScreencastFrame>();
   /**
    * Open dialogs keyed by id, so multiple dialogs stay answerable and a
    * reconnect re-pushes each still-open event exactly once. Cleared when the
@@ -460,6 +466,7 @@ export function createPanelTransportServer(
       fps: stream.fps,
     });
     clearFailClosedTimer();
+    frameWindow.reset();
     streamAbort?.abort();
     const subscriptionAbort = new AbortController();
     streamAbort = subscriptionAbort;
@@ -504,6 +511,16 @@ export function createPanelTransportServer(
 
   function deliverFrame(socket: WebSocket, frame: ScreencastFrame) {
     if (disposed || socket.readyState !== socket.OPEN || !authorized) return;
+    // Wait for the panel to show what it already has. Holding only the newest
+    // frame keeps a slow link current instead of queueing stale pixels.
+    if (!frameWindow.canSend()) {
+      frameWindow.hold(frame);
+      return;
+    }
+    sendFrame(socket, frame);
+  }
+
+  function sendFrame(socket: WebSocket, frame: ScreencastFrame) {
     // Skip frames while a slow viewer still has more than two frames queued,
     // so host memory stays bounded; the next frame after it drains is current.
     if (socket.bufferedAmount > gateway.messageMaxBytes * 2) return;
@@ -520,6 +537,7 @@ export function createPanelTransportServer(
     const result = gateway.validate(envelope);
     if (result.outcome !== "accepted") return;
     if (result.message.kind !== "frame") return;
+    frameWindow.markSent(frame.sequence);
     sendProtocol(socket, {
       protocolVersion: PANEL_PROTOCOL_VERSION,
       type: "frame",
@@ -527,6 +545,18 @@ export function createPanelTransportServer(
       mimeType: frame.mimeType,
       data: payload.data,
     });
+  }
+
+  function acknowledgeFrame(socket: WebSocket, sequence: number) {
+    const next = frameWindow.acknowledge(sequence);
+    if (
+      next === undefined ||
+      disposed ||
+      socket.readyState !== socket.OPEN ||
+      !authorized
+    )
+      return;
+    sendFrame(socket, next);
   }
 
   function handleMessage(raw: unknown) {
@@ -549,12 +579,23 @@ export function createPanelTransportServer(
     }
     const result = gateway.validate(gatewayRaw);
     if (result.outcome !== "accepted") {
+      // Page input over the per-second limit is dropped, not a protocol
+      // fault: a fast trackpad flick must not cost the owner the connection.
+      // Chrome actions over the same limit still fail closed.
+      if (result.reason === "rate-limited" && decoded.message.type === "input")
+        return;
       closeConnection(result.reason);
       return;
     }
     const message = result.message;
     if (message.kind === "redeem") {
       if (!authorized) startStreaming(socket);
+      return;
+    }
+    // Acknowledgements only pace this connection's frames, so one that
+    // arrives while a replacement generation takes over is harmless.
+    if (message.kind === "ack") {
+      acknowledgeFrame(socket, message.sequence);
       return;
     }
     if (!acceptsGeneration()) {
@@ -758,7 +799,7 @@ export function createPanelTransportServer(
         .catch(() => undefined);
       return;
     }
-    // ack and ping are accepted by the gateway but carry no transport action.
+    // ping is accepted by the gateway but carries no transport action.
   }
 
   async function handleConnection(socket: WebSocket) {

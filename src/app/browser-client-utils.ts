@@ -18,6 +18,26 @@ export function browserClientTimezone() {
 }
 
 /**
+ * Whether BB itself is open on a loopback address, which means the panel is
+ * shown on the workspace host. BB Connect and every other address count as
+ * remote, and so does anything this cannot read: the cost of guessing wrong
+ * toward remote is a softer picture, toward local a slower one.
+ */
+export function panelViewedOnHost(
+  hostname: string | undefined = globalThis.location?.hostname,
+) {
+  if (hostname === undefined) return false;
+  const normalized = hostname.toLowerCase().replace(/\.$/u, "");
+  return (
+    normalized === "localhost" ||
+    normalized.endsWith(".localhost") ||
+    normalized === "[::1]" ||
+    normalized === "::1" ||
+    /^127(?:\.\d{1,3}){3}$/u.test(normalized)
+  );
+}
+
+/**
  * Hand the owner a file through the browser's own download path. Test
  * renderers lack object URLs; there the preview the caller also shows is the
  * whole result, so nothing is lost by skipping the download.
@@ -35,6 +55,24 @@ function saveBlob(name: string, blob: Blob) {
 }
 
 /**
+ * Decode base64 into bytes, natively where the browser offers it. A frame is
+ * hundreds of kilobytes, so the fallback fills the array in one pass instead
+ * of mapping each character through a callback.
+ */
+export function base64Bytes(data: string): Uint8Array<ArrayBuffer> {
+  const withNative = Uint8Array as unknown as {
+    fromBase64?: (value: string) => Uint8Array<ArrayBuffer>;
+  };
+  if (typeof withNative.fromBase64 === "function")
+    return withNative.fromBase64(data);
+  const decoded = atob(data);
+  const bytes = new Uint8Array(decoded.length);
+  for (let index = 0; index < decoded.length; index += 1)
+    bytes[index] = decoded.charCodeAt(index);
+  return bytes;
+}
+
+/**
  * Save exported client bytes as a browser download so the owner receives the
  * file. Privacy-safe: the bytes are the owner's own quarantined file, and
  * leaving quarantine took an explicit owner decision to get here.
@@ -45,10 +83,7 @@ export function saveExportedBytes(
   data: string | undefined,
 ) {
   if (data === undefined) return;
-  const decoded = atob(data);
-  const bytes = Uint8Array.from(decoded, (character) =>
-    character.charCodeAt(0),
-  );
+  const bytes = base64Bytes(data);
   saveBlob(
     safeName,
     new Blob([bytes], {

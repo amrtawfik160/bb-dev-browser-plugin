@@ -1,5 +1,6 @@
 import {
   PANEL_MAX_FRAMES_PER_SECOND,
+  PANEL_MAX_UNACKNOWLEDGED_FRAMES,
   PANEL_MAX_VIEWPORT_HEIGHT,
   PANEL_MAX_VIEWPORT_WIDTH,
   PANEL_MIN_FRAMES_PER_SECOND,
@@ -12,8 +13,10 @@ import type { PanelCapabilityStore } from "./panel-capability.js";
 /**
  * Automation Mode stream policy. The controlling panel drives one shared
  * logical viewport within supported bounds (up to 1920x1080). Other panels
- * scale and letterbox it. The stream adapts between 5 and 15 frames per
- * second. Input freezes immediately on disconnect; the same panel has a
+ * scale and letterbox it. The browser produces at most 15 frames per second,
+ * and each panel receives them only as fast as it acknowledges displaying
+ * them, so a slow link lowers its frame rate rather than its currency. Input
+ * freezes immediately on disconnect; the same panel has a
  * 10-second reclaim window and stream reconnect uses bounded backoff.
  * Scheduled authorization rotation replaces the live connection without
  * blanking the stream; a failed rotation freezes input and reconnects. v1
@@ -53,25 +56,46 @@ export function clampViewport(viewport: PanelViewport): PanelViewport {
 }
 
 /**
- * Adapt the frame rate between 5 and 15 FPS. Congestion lowers the rate
- * toward the floor; headroom raises it toward the ceiling. The returned
- * millisecond interval is always within the supported window.
+ * Frame flow control for one panel connection. A frame is sent only while
+ * fewer than {@link PANEL_MAX_UNACKNOWLEDGED_FRAMES} await the panel's
+ * acknowledgement. A frame offered while the window is full is held, never
+ * queued: a newer frame replaces it, and it goes out as soon as an
+ * acknowledgement frees room, so the panel always catches up to the present.
+ * An acknowledgement covers every frame up to its sequence, because the panel
+ * skips drawing a frame that a newer one overtook.
  */
-export function adaptFrameRate(
-  currentFps: number,
-  congestionLevel: number,
-  options: { minFps?: number; maxFps?: number } = {},
-): number {
-  const minFps = options.minFps ?? PANEL_MIN_FRAMES_PER_SECOND;
-  const maxFps = options.maxFps ?? PANEL_MAX_FRAMES_PER_SECOND;
-  const clampedCurrent = Math.max(minFps, Math.min(currentFps, maxFps));
-  // congestionLevel is a non-negative ratio; 0 is uncongested, >=1 saturated.
-  const safeCongestion = Math.max(0, congestionLevel);
-  const target = Math.max(
-    minFps,
-    Math.min(maxFps, clampedCurrent - safeCongestion * 5),
-  );
-  return Math.round(target);
+export function createFrameWindow<Frame extends { sequence: number }>(
+  limit = PANEL_MAX_UNACKNOWLEDGED_FRAMES,
+) {
+  let inFlight: number[] = [];
+  let held: Frame | undefined;
+
+  return {
+    canSend() {
+      return inFlight.length < limit;
+    },
+    markSent(sequence: number) {
+      inFlight.push(sequence);
+    },
+    hold(frame: Frame) {
+      held = frame;
+    },
+    /** Returns the held frame when the acknowledgement made room for it. */
+    acknowledge(sequence: number): Frame | undefined {
+      inFlight = inFlight.filter((sent) => sent > sequence);
+      if (held === undefined || inFlight.length >= limit) return undefined;
+      const next = held;
+      held = undefined;
+      return next;
+    },
+    reset() {
+      inFlight = [];
+      held = undefined;
+    },
+    get unacknowledged() {
+      return inFlight.length;
+    },
+  };
 }
 
 export function frameIntervalMs(fps: number): number {
@@ -109,7 +133,7 @@ export function createAutomationStreamAdapter(
     width: PANEL_MAX_VIEWPORT_WIDTH,
     height: PANEL_MAX_VIEWPORT_HEIGHT,
   };
-  let fps = maxFps;
+  const fps = maxFps;
   let state: PanelStreamState = "idle";
   let disconnectedAt: number | undefined;
   let reconnectAttempt = 0;
@@ -117,11 +141,6 @@ export function createAutomationStreamAdapter(
   function setViewport(next: PanelViewport): PanelViewport {
     viewport = clampViewport(next);
     return viewport;
-  }
-
-  function applyCongestion(congestionLevel: number): number {
-    fps = adaptFrameRate(fps, congestionLevel, { minFps, maxFps });
-    return fps;
   }
 
   function start() {
@@ -228,7 +247,6 @@ export function createAutomationStreamAdapter(
 
   return {
     setViewport,
-    applyCongestion,
     start,
     freezeInput,
     markCapabilityDisconnected,

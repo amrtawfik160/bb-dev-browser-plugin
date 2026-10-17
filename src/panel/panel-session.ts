@@ -105,6 +105,8 @@ type PanelSessionRecord = {
   connection: PanelSessionConnection;
   role: PanelRole;
   viewport: PanelViewport;
+  /** Whether the panel is displayed on the workspace host itself. */
+  viewedOnHost: boolean;
   authoritativeGeneration: number | null;
   pendingGeneration: number | null;
   nextGeneration: number;
@@ -386,6 +388,7 @@ export function createPanelSession(options: PanelSessionOptions = {}) {
       connection: "connected",
       role,
       viewport: clamped,
+      viewedOnHost: false,
       authoritativeGeneration: null,
       pendingGeneration: null,
       nextGeneration: 0,
@@ -571,6 +574,19 @@ export function createPanelSession(options: PanelSessionOptions = {}) {
     return true;
   }
 
+  /**
+   * Record where a panel is displayed. Only the controller's location shapes
+   * the shared capture, so only its change notifies listeners.
+   */
+  function setViewedOnHost(panelId: string, viewedOnHost: boolean) {
+    const member = panels.get(panelId);
+    if (member === undefined || member.viewedOnHost === viewedOnHost)
+      return false;
+    member.viewedOnHost = viewedOnHost;
+    if (controllerPanelId === panelId) emit();
+    return true;
+  }
+
   function canInput(panelId: string) {
     expireReclaim();
     const member = panels.get(panelId);
@@ -744,6 +760,7 @@ export function createPanelSession(options: PanelSessionOptions = {}) {
     takeControl,
     releaseControl,
     setViewport,
+    setViewedOnHost,
     canInput,
     canNavigate,
     role,
@@ -774,6 +791,10 @@ export function createPanelSession(options: PanelSessionOptions = {}) {
     },
     get controllerViewport() {
       return controllerViewport;
+    },
+    get controllerViewedOnHost() {
+      if (controllerPanelId === null) return false;
+      return panels.get(controllerPanelId)?.viewedOnHost ?? false;
     },
   };
 }
