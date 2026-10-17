@@ -1142,6 +1142,80 @@ describe("Panel transport server contract", () => {
     }
   });
 
+  it("drops page input over the per-second limit and keeps the connection open", async () => {
+    let now = 1_000_000;
+    const clock = { now: () => now };
+    const capabilities = createPanelCapabilityStore({ clock });
+    const gateway = createPanelGateway({
+      capabilities,
+      hostId,
+      profileId,
+      clock,
+    });
+    const stream = createAutomationStreamAdapter({ clock, capabilities });
+    const source = createFakeScreencastSource({ frameCount: 0 });
+    const transport = createPanelTransportServer({
+      gateway,
+      stream,
+      source,
+      clock,
+    });
+    const port = await transport.start();
+    try {
+      const socket = await connect(port);
+      const inbox = collectMessages(socket);
+      let closed = false;
+      socket.once("close", () => {
+        closed = true;
+      });
+      send(
+        socket,
+        redeemMessage(
+          capabilities.issue({ ownerSessionId, panelId, hostId, profileId }),
+        ),
+      );
+      await inbox.waitFor(
+        (message) => decode<{ type: string }>(message).type === "ready",
+      );
+      // A fast trackpad flick: twice the limit inside one second.
+      let sequence = 1;
+      for (
+        let index = 0;
+        index < PANEL_GATEWAY_INPUT_MAX_PER_SECOND * 2;
+        index += 1
+      ) {
+        send(socket, {
+          type: "input",
+          sequence: sequence++,
+          payload: { kind: "wheel", index },
+        });
+      }
+      await waitFor(
+        () => source.inputs.length === PANEL_GATEWAY_INPUT_MAX_PER_SECOND,
+      );
+      // The next window accepts input again on the same connection.
+      now += 1_000;
+      send(socket, {
+        type: "input",
+        sequence: sequence++,
+        payload: { kind: "click" },
+      });
+      await waitFor(() =>
+        source.inputs.some(
+          (input) => (input as { kind?: string }).kind === "click",
+        ),
+      );
+      expect(source.inputs).toHaveLength(
+        PANEL_GATEWAY_INPUT_MAX_PER_SECOND + 1,
+      );
+      expect(closed).toBe(false);
+      expect(stream.state).toBe("streaming");
+      socket.close();
+    } finally {
+      await transport.stop();
+    }
+  });
+
   it("fails closed when auxiliary clipboard actions exceed the rate limit", async () => {
     const clock = { now: () => 1_000_000 };
     const capabilities = createPanelCapabilityStore({ clock });

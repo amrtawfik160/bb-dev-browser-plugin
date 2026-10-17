@@ -74,6 +74,12 @@ export const PANEL_GATEWAY_BIND_HOST = "127.0.0.1";
 export const PANEL_PROTOCOL_VERSION = 1 as const;
 export const PANEL_GATEWAY_MESSAGE_MAX_BYTES = 2 * 1024 * 1024;
 export const PANEL_GATEWAY_INPUT_MAX_PER_SECOND = 60;
+/**
+ * The panel paces pointer and wheel input to this rate, leaving the rest of
+ * the host limit for clicks and keys, which are never delayed. The host drops
+ * whatever still exceeds its own limit.
+ */
+export const PANEL_CLIENT_INPUT_MAX_PER_SECOND = 40;
 export const PANEL_GATEWAY_BANDWIDTH_BYTES_PER_SECOND =
   PANEL_MAX_FRAMES_PER_SECOND * PANEL_GATEWAY_MESSAGE_MAX_BYTES;
 export const PANEL_RECONNECT_INITIAL_BACKOFF_MS = 500;

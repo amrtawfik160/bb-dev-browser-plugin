@@ -549,6 +549,11 @@ export function createPanelTransportServer(
     }
     const result = gateway.validate(gatewayRaw);
     if (result.outcome !== "accepted") {
+      // Page input over the per-second limit is dropped, not a protocol
+      // fault: a fast trackpad flick must not cost the owner the connection.
+      // Chrome actions over the same limit still fail closed.
+      if (result.reason === "rate-limited" && decoded.message.type === "input")
+        return;
       closeConnection(result.reason);
       return;
     }
