@@ -238,8 +238,6 @@ export type PanelProtocolDecodeResult =
   | { outcome: "accepted"; message: PanelProtocolMessage }
   | { outcome: "rejected"; error: PanelProtocolError };
 
-const utf8 = new TextEncoder();
-
 const PROTOCOL_TYPES = [
   "screenshot_request",
   "screenshot_chunk",
@@ -508,8 +506,36 @@ const pingSchema = z
   })
   .strict();
 
-function utf8ByteLength(value: string) {
-  return utf8.encode(value).byteLength;
+/**
+ * Whether a string's UTF-8 encoding is longer than `maxBytes`, without
+ * encoding it. A frame is hundreds of kilobytes of base64; copying it only to
+ * measure it costs as much as the check protects against.
+ */
+function exceedsUtf8Bytes(value: string, maxBytes: number) {
+  // Each UTF-16 code unit encodes to one, two, or three UTF-8 bytes; a
+  // surrogate pair encodes to four, two per unit.
+  if (value.length > maxBytes) return true;
+  if (value.length * 3 <= maxBytes) return false;
+  let bytes = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const unit = value.charCodeAt(index);
+    if (unit < 0x80) bytes += 1;
+    else if (unit < 0x800) bytes += 2;
+    else if (
+      unit >= 0xd800 &&
+      unit <= 0xdbff &&
+      index + 1 < value.length &&
+      value.charCodeAt(index + 1) >= 0xdc00 &&
+      value.charCodeAt(index + 1) <= 0xdfff
+    ) {
+      bytes += 4;
+      index += 1;
+    }
+    // Other units, including a lone surrogate encoded as U+FFFD.
+    else bytes += 3;
+    if (bytes > maxBytes) return true;
+  }
+  return false;
 }
 
 function protocolError(
@@ -937,7 +963,7 @@ export function encodePanelProtocolMessage(
 ): PanelProtocolEncodeResult {
   const raw = JSON.stringify(message);
   const maxBytes = options.maxBytes ?? PANEL_GATEWAY_MESSAGE_MAX_BYTES;
-  if (utf8ByteLength(raw) > maxBytes) {
+  if (exceedsUtf8Bytes(raw, maxBytes)) {
     return { outcome: "rejected", error: protocolError("too-large") };
   }
   return { outcome: "encoded", raw };
@@ -948,7 +974,7 @@ export function decodePanelProtocolMessage(
   context: PanelProtocolDecodeContext,
 ): PanelProtocolDecodeResult {
   const maxBytes = context.maxBytes ?? PANEL_GATEWAY_MESSAGE_MAX_BYTES;
-  if (utf8ByteLength(raw) > maxBytes) return rejected("too-large");
+  if (exceedsUtf8Bytes(raw, maxBytes)) return rejected("too-large");
   const parsed = parseJsonObject(raw);
   if (parsed.outcome === "rejected") return parsed;
   const value = parsed.value;

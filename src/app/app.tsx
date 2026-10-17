@@ -51,6 +51,7 @@ import {
 import { Field, inputClassName } from "./panel-primitives.js";
 import {
   administrationErrorMessage,
+  base64Bytes,
   panelViewedOnHost,
   saveExportedBytes,
   saveJsonFile,
@@ -411,7 +412,8 @@ function PanelStreamSurface({
       if (pendingSocket !== null) pendingSocket.close();
     }
 
-    let newestFrame = 0;
+    let newestDrawnFrame = 0;
+    let frameOrder = 0;
     /**
      * Tell the host this connection is done with a frame, drawn or skipped,
      * so it sends the next one. It sends no more than two ahead of these.
@@ -426,35 +428,51 @@ function PanelStreamSurface({
       if (encoded.outcome === "encoded") frameSocket.send(encoded.raw);
     }
 
+    async function decodeFrame(frame: { mimeType: string; data: string }) {
+      // createImageBitmap decodes the JPEG off the main thread from its
+      // bytes; a data: URL image decoded it on the thread handling input.
+      return createImageBitmap(
+        new Blob([base64Bytes(frame.data)], { type: frame.mimeType }),
+      );
+    }
+
     function drawFrame(
       frameSocket: WebSocket,
       frame: { sequence: number; mimeType: string; data: string },
     ) {
-      const canvas = canvasRef.current;
-      if (canvas === null) {
+      const order = ++frameOrder;
+      if (
+        canvasRef.current === null ||
+        typeof createImageBitmap !== "function"
+      ) {
         acknowledgeFrame(frameSocket, frame.sequence);
         return;
       }
-      const image = new Image();
-      const order = ++newestFrame;
-      image.addEventListener("error", () =>
-        acknowledgeFrame(frameSocket, frame.sequence),
-      );
-      image.addEventListener("load", () => {
-        acknowledgeFrame(frameSocket, frame.sequence);
-        if (disposed || order !== newestFrame) return;
-        // Keep the encoded frame's pixels. Drawing into the logical viewport
-        // first discarded the extra density before CSS displayed the canvas.
-        if (canvas.width !== image.naturalWidth)
-          canvas.width = image.naturalWidth;
-        if (canvas.height !== image.naturalHeight)
-          canvas.height = image.naturalHeight;
-        const context = canvas.getContext("2d");
-        if (context === null) return;
-        context.clearRect(0, 0, canvas.width, canvas.height);
-        context.drawImage(image, 0, 0, canvas.width, canvas.height);
-      });
-      image.src = `data:${frame.mimeType};base64,${frame.data}`;
+      void decodeFrame(frame)
+        .then(
+          (bitmap) => {
+            const canvas = canvasRef.current;
+            // A newer frame that decoded first wins; this one is skipped.
+            if (disposed || canvas === null || order < newestDrawnFrame) {
+              bitmap.close();
+              return;
+            }
+            newestDrawnFrame = order;
+            // Keep the encoded frame's pixels. Drawing into the logical
+            // viewport first discarded the extra density before CSS displayed
+            // the canvas.
+            if (canvas.width !== bitmap.width) canvas.width = bitmap.width;
+            if (canvas.height !== bitmap.height) canvas.height = bitmap.height;
+            const context = canvas.getContext("2d");
+            if (context !== null) {
+              context.clearRect(0, 0, canvas.width, canvas.height);
+              context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+            }
+            bitmap.close();
+          },
+          () => undefined,
+        )
+        .finally(() => acknowledgeFrame(frameSocket, frame.sequence));
     }
 
     function streamUrl(

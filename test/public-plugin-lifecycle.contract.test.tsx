@@ -516,12 +516,11 @@ describe("public Browser Panel lifecycle seam", () => {
   });
 
   it("routes remote panels to their shared gateway ports and paints the received page", async () => {
-    class DecodedImage extends EventTarget {
-      set src(_value: string) {
-        queueMicrotask(() => this.dispatchEvent(new Event("load")));
-      }
-    }
-    vi.stubGlobal("Image", DecodedImage);
+    const decoded: Blob[] = [];
+    vi.stubGlobal("createImageBitmap", async (blob: Blob) => {
+      decoded.push(blob);
+      return { width: 1, height: 1, close() {} };
+    });
     const painted = new Set<HTMLCanvasElement>();
     const getContext = vi
       .spyOn(HTMLCanvasElement.prototype, "getContext")
@@ -546,6 +545,20 @@ describe("public Browser Panel lifecycle seam", () => {
         await waitFor(() =>
           expect(painted.has(canvas as HTMLCanvasElement)).toBe(true),
         );
+      }
+      // The panel decodes the frame's bytes, not a data: URL.
+      expect(decoded[0]?.type).toBe("image/png");
+      const bytes = await new Promise<ArrayBuffer>((resolve) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result as ArrayBuffer);
+        reader.readAsArrayBuffer(decoded[0]!);
+      });
+      expect([...new Uint8Array(bytes).slice(1, 4)]).toEqual([
+        0x50, 0x4e, 0x47,
+      ]);
+      // Each panel acknowledges the frame it drew so the host sends the next.
+      for (const panel of [first, second]) {
+        await waitFor(() => expect(panel.framesAcknowledged).toContain(1));
       }
       await browser.forcePhysicalSocketLoss(first);
       const reconnecting = await first.findByText(

@@ -568,6 +568,37 @@ describe("versioned Panel wire protocol", () => {
     expectPrivacySafe(decoded.error.message);
   });
 
+  it("measures the size cap in UTF-8 bytes at the exact boundary", () => {
+    const message = {
+      protocolVersion: PANEL_PROTOCOL_VERSION,
+      type: "input" as const,
+      sequence: 1,
+      payload: { text: "é€😀" },
+    };
+    const encodedBytes = (raw: string) =>
+      new TextEncoder().encode(raw).byteLength;
+    const decodeAt = (raw: string, maxBytes: number) =>
+      decodePanelProtocolMessage(raw, {
+        direction: "client-to-host",
+        phase: "authenticated",
+        maxBytes,
+      }).outcome;
+    // Two-, three-, and four-byte characters, and a lone surrogate that
+    // UTF-8 replaces with a three-byte character.
+    const raw = JSON.stringify(message).replace("😀", "😀\ud800");
+    const bytes = encodedBytes(raw);
+    expect(bytes).toBeGreaterThan(raw.length);
+    expect(decodeAt(raw, bytes)).toBe("accepted");
+    expect(decodeAt(raw, bytes - 1)).toBe("rejected");
+    const encoded = encodedBytes(JSON.stringify(message));
+    expect(
+      encodePanelProtocolMessage(message, { maxBytes: encoded }).outcome,
+    ).toBe("encoded");
+    expect(
+      encodePanelProtocolMessage(message, { maxBytes: encoded - 1 }).outcome,
+    ).toBe("rejected");
+  });
+
   it("rejects an oversized auxiliary message before it reaches Browser Profile state", () => {
     const encoded = encodePanelProtocolMessage(dialogResponseMessage, {
       maxBytes: 8,

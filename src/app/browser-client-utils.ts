@@ -55,6 +55,24 @@ function saveBlob(name: string, blob: Blob) {
 }
 
 /**
+ * Decode base64 into bytes, natively where the browser offers it. A frame is
+ * hundreds of kilobytes, so the fallback fills the array in one pass instead
+ * of mapping each character through a callback.
+ */
+export function base64Bytes(data: string): Uint8Array<ArrayBuffer> {
+  const withNative = Uint8Array as unknown as {
+    fromBase64?: (value: string) => Uint8Array<ArrayBuffer>;
+  };
+  if (typeof withNative.fromBase64 === "function")
+    return withNative.fromBase64(data);
+  const decoded = atob(data);
+  const bytes = new Uint8Array(decoded.length);
+  for (let index = 0; index < decoded.length; index += 1)
+    bytes[index] = decoded.charCodeAt(index);
+  return bytes;
+}
+
+/**
  * Save exported client bytes as a browser download so the owner receives the
  * file. Privacy-safe: the bytes are the owner's own quarantined file, and
  * leaving quarantine took an explicit owner decision to get here.
@@ -65,10 +83,7 @@ export function saveExportedBytes(
   data: string | undefined,
 ) {
   if (data === undefined) return;
-  const decoded = atob(data);
-  const bytes = Uint8Array.from(decoded, (character) =>
-    character.charCodeAt(0),
-  );
+  const bytes = base64Bytes(data);
   saveBlob(
     safeName,
     new Blob([bytes], {
