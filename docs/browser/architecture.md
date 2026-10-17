@@ -60,6 +60,19 @@ summarizes the runtime and indexes them.
   action. Both skip profiles selected outside the thread's scope and never block
   the thread transition. Saved profiles with a sign-in confirmation survive
   thread deletion until explicitly archived or deleted. (ADRs 0018, 0020)
+- Profile storage is bounded by keeping only site state. Chrome starts with
+  `--disable-component-update`, Optimization Guide and on-device suggestion
+  models off, and a 100 MB `--disk-cache-size`; Safe Browsing lists still
+  update. Archiving removes a profile's Rebuildable Data
+  (`REBUILDABLE_DATA_PATHS`), never following symlinks or touching site
+  authentication and storage. A six-hourly server pass calls the host's
+  `maintainProfileStorage` on each connected host: it expires Archived
+  Profiles, deletes launch folders under `run/` older than seven days whose
+  helper is gone, and meets the owner's storage limit (10 GB default) by
+  removing Rebuildable Data from least recently used, stopped profiles, then
+  deleting unsaved Archived Profiles oldest first. The thread release in the
+  same schedule takes every thread archived past the grace, however old.
+  (ADR 0024)
 - Local development prefers a stable **Project Loopback Alias** such as
   `p-<project-hash>.localhost:<port>`. Raw localhost is an explicit compatibility
   fallback. (ADR 0013)

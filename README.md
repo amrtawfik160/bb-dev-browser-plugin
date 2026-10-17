@@ -69,6 +69,17 @@ to sleep; deleting a thread archives its unsaved browser profile, which stays
 recoverable until it expires. Profiles saved by a confirmed sign-in survive
 thread deletion until you archive or delete them in Browser Settings.
 
+Profile storage stays bounded. The browser does not download Chrome's optional
+components or models (Safe Browsing stays on), and each profile's web cache is
+capped at about 100 MB. Archiving a profile removes its caches and downloaded
+components but keeps its sign-ins. All profiles on a host share one storage
+limit, 10 GB by default, set in Browser Settings > Profiles. Every six hours,
+cleanup over the limit first removes caches from the least recently used
+profiles, then permanently deletes the oldest Archived Profiles; it never
+deletes a saved or signed-in profile. The same pass expires Archived Profiles,
+deletes unused worker profiles unless you turn that off, and removes week-old
+browser launch folders.
+
 **Automation Mode.** You and granted agents share the stream and take turns
 with input.
 
