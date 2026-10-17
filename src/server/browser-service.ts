@@ -151,7 +151,9 @@ import {
 } from "../shared/profile-scope.js";
 import {
   automaticCleanupSetting,
+  profileStorageLimitBytes,
   setAutomaticCleanup,
+  setProfileStorageLimitBytes,
 } from "./profile-cleanup.js";
 import {
   AUTOMATIC_CLEANUP_IDLE_MS,
@@ -563,15 +565,10 @@ export function panelIdentity(input: BrowserStatusInput): BrowserIdentity {
  * Archived Profile, recoverable until it expires.
  */
 const ARCHIVED_THREAD_PROFILE_GRACE_MS = 7 * 24 * 60 * 60 * 1_000;
-/**
- * The periodic release only takes threads archived within this window after
- * the grace. Older ones go through `sweep-thread-profiles --apply`, so a
- * backlog is never released without a dry run first.
- */
-const ARCHIVED_THREAD_PROFILE_WINDOW_MS = 7 * 24 * 60 * 60 * 1_000;
 const ARCHIVED_THREAD_PROFILE_SWEEP_INTERVAL_MS = 6 * 60 * 60 * 1_000;
 const THREAD_LIST_PAGE = 500;
-const AUTOMATIC_CLEANUP_INTERVAL_MS = 6 * 60 * 60 * 1_000;
+/** Worker cleanup, expiry, and the storage limit share one schedule. */
+const PROFILE_STORAGE_MAINTENANCE_INTERVAL_MS = 6 * 60 * 60 * 1_000;
 /** Measuring hundreds of profiles walks every file in them. */
 const PROFILE_USAGE_DEADLINE_MS = 10 * 60 * 1_000;
 
@@ -1093,6 +1090,11 @@ export function createBrowserService(
     };
   }
 
+  /**
+   * Every thread archived past the grace, however long ago, so a backlog
+   * from before thread lifecycle existed is released once without the
+   * owner-run sweep.
+   */
   function scheduleArchivedThreadProfileRelease() {
     let running = false;
     const run = async () => {
@@ -1100,11 +1102,7 @@ export function createBrowserService(
       running = true;
       try {
         await releaseArchivedThreadProfiles(
-          await archivedThreadProfiles(
-            ARCHIVED_THREAD_PROFILE_GRACE_MS,
-            ARCHIVED_THREAD_PROFILE_GRACE_MS +
-              ARCHIVED_THREAD_PROFILE_WINDOW_MS,
-          ),
+          await archivedThreadProfiles(ARCHIVED_THREAD_PROFILE_GRACE_MS),
         );
       } catch (error) {
         bb.log.warn(
@@ -1373,36 +1371,77 @@ export function createBrowserService(
     return { enabled: setAutomaticCleanup(database, request.enabled) };
   }
 
+  function profileStorageLimit(authority: unknown) {
+    requireOwnerSettingsAuthority(authority);
+    return { limitBytes: profileStorageLimitBytes(database) };
+  }
+
+  function setProfileStorageLimit(
+    authority: unknown,
+    request: { limitBytes: number },
+  ) {
+    requireOwnerSettingsAuthority(authority);
+    return {
+      limitBytes: setProfileStorageLimitBytes(database, request.limitBytes),
+    };
+  }
+
   /**
-   * With the owner's setting on, delete worker profiles that matched the
-   * rule for {@link AUTOMATIC_CLEANUP_IDLE_MS} on every connected host.
+   * Expire Archived Profiles, delete stale launch folders, and bring all
+   * profiles on the host under the owner's storage limit. The host records
+   * the system Activity for what it removes.
    */
-  function scheduleAutomaticProfileCleanup() {
+  async function maintainProfileStorage(hostId: string) {
+    return host.call(
+      "maintainProfileStorage",
+      { hostId, limitBytes: profileStorageLimitBytes(database) },
+      withHostCallDeadline({ hostId }, PROFILE_USAGE_DEADLINE_MS),
+    );
+  }
+
+  /**
+   * On every connected host: with the owner's setting on, delete worker
+   * profiles that matched the rule for {@link AUTOMATIC_CLEANUP_IDLE_MS};
+   * then run {@link maintainProfileStorage}.
+   */
+  function scheduleProfileStorageMaintenance() {
+    let running = false;
     const run = async () => {
-      if (automaticCleanupSetting(database) !== "on") return;
+      if (running) return;
+      running = true;
       try {
         const hosts = await bb.sdk.hosts.list();
         for (const { id: hostId } of hosts.filter(
           ({ status }) => status === "connected",
         )) {
-          // Another run still going takes this turn; the next one retries.
-          const run = startCleanupJob(
-            hostId,
-            null,
-            AUTOMATIC_CLEANUP_IDLE_MS,
-            "system",
-          );
-          if (run === null) return;
-          await run;
+          if (automaticCleanupSetting(database) === "on") {
+            // Another cleanup still going takes this turn; the next retries.
+            await startCleanupJob(
+              hostId,
+              null,
+              AUTOMATIC_CLEANUP_IDLE_MS,
+              "system",
+            );
+          }
+          await maintainProfileStorage(hostId).catch((error: unknown) => {
+            bb.log.warn(
+              `Browser could not keep profile storage under its limit: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          });
         }
       } catch (error) {
         bb.log.warn(
-          `Browser could not clean up unused worker profiles: ${error instanceof Error ? error.message : String(error)}`,
+          `Browser could not maintain profile storage: ${error instanceof Error ? error.message : String(error)}`,
         );
+      } finally {
+        running = false;
       }
     };
     const first = setTimeout(() => void run(), 60_000);
-    const timer = setInterval(() => void run(), AUTOMATIC_CLEANUP_INTERVAL_MS);
+    const timer = setInterval(
+      () => void run(),
+      PROFILE_STORAGE_MAINTENANCE_INTERVAL_MS,
+    );
     first.unref?.();
     timer.unref?.();
     bb.onDispose(() => {
@@ -3395,7 +3434,7 @@ export function createBrowserService(
   subscribeToProjectDeletion();
   subscribeToThreadLifecycle();
   scheduleArchivedThreadProfileRelease();
-  scheduleAutomaticProfileCleanup();
+  scheduleProfileStorageMaintenance();
 
   /**
    * Stage an explicitly selected workspace or displaying-client file through
@@ -3785,6 +3824,8 @@ export function createBrowserService(
     cleanUpProfiles,
     profileCleanupStatus,
     setAutomaticProfileCleanup,
+    profileStorageLimit,
+    setProfileStorageLimit,
   };
 }
 

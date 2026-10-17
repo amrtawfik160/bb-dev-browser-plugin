@@ -14,3 +14,7 @@ While page input has focus, keyboard shortcuts belong to the controlled page
 and cannot bubble into BB's panel-close or panel-toggle commands. Native paste
 and composition still deliver text once. Shift+Escape releases page input;
 BB shortcuts remain available after focus moves outside the page surface.
+
+Amended for stream performance: frames use JPEG quality 75,
+capture at twice the density only when viewed on the host itself, and are sent
+only while no more than two frames await the panel's acknowledgement.

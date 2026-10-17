@@ -409,6 +409,38 @@ function runtimeKey(
 export const RENDERER_PROCESS_LIMIT = 8;
 export const RENDERER_HEAP_LIMIT_MB = 512;
 
+/**
+ * Each active profile's web cache is capped (ADR 0024). Chrome otherwise
+ * sizes it from free disk space, which multiplies across hundreds of
+ * thread profiles.
+ */
+export const BROWSER_DISK_CACHE_BYTES = 100 * 1024 * 1024;
+
+/**
+ * Chrome features turned off for every Browser Instance, passed as one
+ * `--disable-features` switch because Chrome reads only the last one.
+ */
+const DISABLED_CHROME_FEATURES = [
+  "PasswordManagerEnabled",
+  "AutofillAddressEnabled",
+  "AutofillCreditCardEnabled",
+  "AutofillServerCommunication",
+  // BackForwardCache is off so that going back to a document is always a
+  // network navigation the Origin Scope route can see: an owner tab parked
+  // on about:blank during an agent call cannot be restored from cache behind
+  // the guard's back.
+  "BackForwardCache",
+  // Rebuildable Data (ADR 0024). Optimization Guide hints and prediction
+  // models, and the omnibox's on-device suggestion models, are downloaded
+  // outside the component updater, so --disable-component-update alone
+  // leaves them on. Checked against Chrome 154.
+  "OptimizationHints",
+  "OptimizationHintsFetching",
+  "OptimizationTargetPrediction",
+  "OmniboxOnDeviceHeadProviderIncognito",
+  "OmniboxOnDeviceHeadProviderNonIncognito",
+] as const;
+
 async function browserArguments(
   target: BrowserInstanceTarget,
   profileDirectory: string,
@@ -429,11 +461,12 @@ async function browserArguments(
     "--disable-background-timer-throttling",
     "--disable-backgrounding-occluded-windows",
     "--disable-renderer-backgrounding",
-    // BackForwardCache is off so that going back to a document is always a
-    // network navigation the Origin Scope route can see: an owner tab parked on
-    // about:blank during an agent call cannot be restored from cache behind the
-    // guard's back.
-    "--disable-features=PasswordManagerEnabled,AutofillAddressEnabled,AutofillCreditCardEnabled,AutofillServerCommunication,BackForwardCache",
+    `--disable-features=${DISABLED_CHROME_FEATURES.join(",")}`,
+    // No component downloads, such as text-to-speech, suggestion models,
+    // and Widevine (ADR 0024). Safe Browsing lists come through their own
+    // update protocol, not the component updater, so site warnings stay on.
+    "--disable-component-update",
+    `--disk-cache-size=${BROWSER_DISK_CACHE_BYTES}`,
     `--renderer-process-limit=${RENDERER_PROCESS_LIMIT}`,
     `--js-flags=--max-old-space-size=${RENDERER_HEAP_LIMIT_MB}`,
     `--lang=${target.locale}`,

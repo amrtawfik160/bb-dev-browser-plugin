@@ -2591,6 +2591,10 @@ export default function plugin(bb: BbPluginApi) {
       browser.profileCleanupStatus(ownerAuthority),
     browser_profile_cleanup_automatic_set: (input) =>
       browser.setAutomaticProfileCleanup(ownerAuthority, input),
+    browser_profile_storage_limit: () =>
+      browser.profileStorageLimit(ownerAuthority),
+    browser_profile_storage_limit_set: (input) =>
+      browser.setProfileStorageLimit(ownerAuthority, input),
     browser_profile_backup: (input) => browser.backupProfile(input),
     browser_profile_restore: (input) => browser.restoreProfile(input),
     browser_profile_import: (input) => browser.importProfile(input),

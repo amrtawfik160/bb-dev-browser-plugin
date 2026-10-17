@@ -1010,7 +1010,7 @@ export async function createPublicPluginHarness(options?: {
           { signal },
         );
       }
-      if (method === "profileUsage") {
+      if (method === "profileUsage" || method === "maintainProfileStorage") {
         return host.experimental_call(method, input as never, {
           signal,
         }) as Promise<unknown>;
@@ -1516,6 +1516,16 @@ export async function createPublicPluginHarness(options?: {
         "browser_profile_cleanup_automatic_set",
         input,
       ) as Promise<{ enabled: boolean }>,
+    browser_profile_storage_limit: () =>
+      backend.harness.behavior.callRpc(
+        "browser_profile_storage_limit",
+        {},
+      ) as Promise<{ limitBytes: number }>,
+    browser_profile_storage_limit_set: (input: { limitBytes: number }) =>
+      backend.harness.behavior.callRpc(
+        "browser_profile_storage_limit_set",
+        input,
+      ) as Promise<{ limitBytes: number }>,
     browser_profile_backup: (input: {
       hostId: string;
       profileId: string;

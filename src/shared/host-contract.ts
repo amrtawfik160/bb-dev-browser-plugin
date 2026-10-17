@@ -44,6 +44,8 @@ import {
   browserScopedProfileRequestSchema,
   browserProfileDeleteRequestSchema,
   browserProfileExpiryResponseSchema,
+  browserProfileStorageMaintenanceRequestSchema,
+  browserProfileStorageMaintenanceResponseSchema,
   browserProfileUsageRequestSchema,
   browserProfileUsageResponseSchema,
   browserProfileBackupRequestSchema,
@@ -263,6 +265,10 @@ export const browserHostContract = defineRpcContract({
   expireArchivedProfiles: {
     input: browserProfileHostTargetSchema,
     output: browserProfileExpiryResponseSchema,
+  },
+  maintainProfileStorage: {
+    input: browserProfileStorageMaintenanceRequestSchema,
+    output: browserProfileStorageMaintenanceResponseSchema,
   },
   profileUsage: {
     input: browserProfileUsageRequestSchema,

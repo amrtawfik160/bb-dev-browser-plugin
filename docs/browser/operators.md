@@ -182,7 +182,31 @@ bb browser restore-archived --profile <id> [--host <id>] [--json]     # restore 
 ```
 
 An Archived Profile is stopped, loses all Profile Grants, and is retained for
-**30 days** (`PROFILE_ARCHIVE_RETENTION_DAYS`).
+**30 days** (`PROFILE_ARCHIVE_RETENTION_DAYS`). Archiving removes its
+Rebuildable Data, such as web caches and downloaded Chrome components, and
+keeps site authentication and storage, so a restored profile is still signed
+in. Expiry runs every six hours, not only when profiles are listed.
+
+## Profile storage limit
+
+All profiles on a host share one storage limit, **10 GB** by default, set in
+Browser Settings > Profiles. Every six hours, on each connected host:
+
+1. Unused worker profiles are deleted after two days, unless the owner turned
+   automatic cleanup off.
+2. Expired Archived Profiles are deleted.
+3. Launch folders under `/var/lib/bb-browser/run` older than seven days, whose
+   helper no longer answers, are deleted.
+4. Over the limit, Rebuildable Data is removed from the least recently used
+   profiles without a running Browser Instance, then unsaved Archived Profiles
+   are permanently deleted, oldest first. Saved and signed-in profiles may lose
+   Rebuildable Data but are never deleted to meet the limit, so usage can stay
+   above it.
+
+Each removal is a system Activity Record (`storage-limit`, outcome
+`rebuildable-data-removed` or `deleted`). Threads archived more than seven days
+ago, however long ago, release their default profiles in the same schedule;
+`sweep-thread-profiles` remains for a dry-run report.
 
 ## Profile maintenance
 
@@ -214,6 +238,8 @@ Profile and transfer quotas (verified in `contracts.ts`):
 | Activity Records per profile | 10,000 entries | —                  |
 | Activity Records retention   | 30 days        | —                  |
 | Archived Profile retention   | 30 days        | —                  |
+| All profiles on a host       | 10 GB          | 10,000 GB          |
+| Web cache per active profile | 100 MiB        | —                  |
 
 Adjust download limits from a thread:
 
@@ -238,7 +264,8 @@ and an optional `controlLease`.
 
 - **Profiles and authenticated data** are retained on disable/uninstall; only
   `bb browser purge` removes them.
-- **Archived Profiles** are retained 30 days.
+- **Archived Profiles** are retained 30 days, without Rebuildable Data, or
+  less when the host storage limit needs the room.
 - **Host Downloads** expire after 7 days unless explicitly deleted or purged.
 - **Activity Records** expire after 30 days or 10,000 entries per profile.
 - **Transfer Staging** is one-use and removed after use, cancellation, failure,

@@ -1,0 +1,11 @@
+# Bound profile storage by keeping only site state
+
+Every thread gets its own default Browser Profile (ADR 0017), and Chrome fills each one with about 150 MB that it can recreate on its own: downloaded components such as optimization models, text-to-speech, and suggestion models, plus web caches. Site authentication and storage, the only part worth keeping, was under 0.5% of a 102 GB profile store. Archiving freed nothing, because an Archived Profile kept every file for 30 days, and the expiry was only checked when profiles were listed.
+
+Profile storage is now bounded by treating that recreatable part as Rebuildable Data. The browser starts with Chrome's component downloads turned off, except Safe Browsing, which stays on because its site warnings protect both the owner and agents; and each active profile's web cache is capped. Archiving a profile removes its Rebuildable Data at once, so an Archived Profile keeps only site authentication and storage during its recovery period and still restores signed in. Cleanup may remove Rebuildable Data from any profile, including one with a confirmed sign-in, but never site authentication or storage.
+
+All profiles on a host share one storage limit, 10 GB by default and changeable in Browser Settings. Over the limit, cleanup first removes Rebuildable Data from the least recently used profiles, then permanently deletes Archived Profiles, oldest first; it never deletes a saved or signed-in profile to meet the limit. Expiry runs on a schedule instead of only when profiles are listed, profiles of threads archived before ADR 0018 are swept automatically once, and automatic cleanup of unused worker profiles is on unless the owner turns it off.
+
+Turning component downloads off also stops certificate revocation lists, the certificate transparency list, lookalike-site warnings, the subresource filter, and Widevine. Keeping them updating measured 67 MB more per fresh profile on Chrome 154, mostly a text-to-speech engine and the component download cache that no switch removes, so we accepted that loss and kept only Safe Browsing.
+
+We rejected sharing one copy of Chrome's components across profiles, because Chrome has no supported way to do it, and a per-profile limit, because the cost comes from hundreds of ordinary profiles rather than a few large ones.
